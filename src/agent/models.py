@@ -123,3 +123,21 @@ class RunManifest(JsonModel):
     source_data_path: str | None = None
     outputs: dict[str, str] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
+
+
+class ToolchainReport(JsonModel):
+    docker_cli_available: bool
+    docker_daemon_available: bool
+    docker_client_version: str | None = None
+    docker_server_version: str | None = None
+    git_available: bool
+    java_available: bool
+    fragpipe_root: str | None = None
+    msdt_converter_root: str | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
+class MaterializedTaskBundle(JsonModel):
+    plan: DdaExecutionPlan
+    converter_config_path: Path
+    materialized_workflow_path: Path

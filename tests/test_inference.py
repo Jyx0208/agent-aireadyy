@@ -83,3 +83,41 @@ def test_infer_attributes_uses_file_name_hints_when_metadata_is_sparse():
 
     assert attrs.enzyme.value == "Lys-C"
     assert attrs.enzyme.source == "file_name_rule"
+
+
+def test_infer_attributes_defaults_to_dda_in_orbitrap_proteomics_context():
+    context = ProjectContext(
+        project_accession="PXD000004",
+        file_name="sample.raw",
+        metadata={
+            "projectDescription": MetadataValue(
+                value="Immunoprecipitation followed by mass spectrometry analysis to identify binding partners.",
+                source="pride.projectDescription",
+                source_level="project",
+                completeness=0.8,
+            ),
+            "sampleProcessingProtocol": MetadataValue(
+                value="Trypsin digestion followed by LC-MS/MS analysis.",
+                source="pride.sampleProcessingProtocol",
+                source_level="project",
+                completeness=0.8,
+            ),
+            "organisms": MetadataValue(
+                value=["Mus musculus (mouse)"],
+                source="pride.organisms",
+                source_level="project",
+                completeness=1.0,
+            ),
+            "instruments": MetadataValue(
+                value=["LTQ Orbitrap Velos"],
+                source="pride.instruments",
+                source_level="project",
+                completeness=1.0,
+            ),
+        },
+    )
+
+    attrs = infer_attributes(context)
+
+    assert attrs.acquisition_mode.value == "DDA"
+    assert attrs.acquisition_mode.source == "rule_fallback"

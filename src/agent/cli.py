@@ -5,11 +5,31 @@ from pathlib import Path
 import typer
 
 from agent.ai_ready.exporter import export_ai_ready_bundle
+from agent.execution.bundle import materialize_dda_task_bundle
 from agent.input.normalizer import normalize_input
 from agent.orchestrator.pipeline import AgentService
+from agent.runtime.bootstrap import bootstrap_msdt_converter
+from agent.runtime.toolchain import detect_toolchain
 from agent.utils import write_json
 
 app = typer.Typer(help="PRIDE-first AI-ready data agent aligned with MSDT-Converter.")
+
+
+@app.command("check-runtime")
+def check_runtime(
+    fragpipe_root: Path | None = typer.Option(None, help="Optional local FragPipe root to report."),
+    converter_root: Path | None = typer.Option(None, help="Optional local MSDT-Converter root to report."),
+) -> None:
+    report = detect_toolchain(fragpipe_root=fragpipe_root, msdt_converter_root=converter_root)
+    typer.echo(report.model_dump_json(indent=2))
+
+
+@app.command("bootstrap-msdt-converter")
+def bootstrap_msdt_converter_command(
+    destination: Path = typer.Option(Path("external"), help="Directory where MSDT-Converter should be downloaded."),
+) -> None:
+    repo_root = bootstrap_msdt_converter(destination=destination)
+    typer.echo(str(repo_root))
 
 
 @app.command("resolve-project")
@@ -39,6 +59,24 @@ def plan_dda_run(input_value: str, source_data_path: Path, output_dir: Path) -> 
     attributes = service.infer_attributes(context)
     service.write_task_bundle(output_dir, resolution, context, attributes, plan)
     typer.echo(plan.model_dump_json(indent=2))
+
+
+@app.command("prepare-dda-bundle")
+def prepare_dda_bundle(input_value: str, source_data_path: Path, output_dir: Path) -> None:
+    service = AgentService()
+    task = normalize_input(input_value)
+    resolution, context, _ = service.plan_dda_run(task, source_data_path, output_dir)
+    attributes = service.infer_attributes(context)
+    bundle = materialize_dda_task_bundle(
+        task=task,
+        project_resolution=resolution,
+        project_context=context,
+        attributes=attributes,
+        source_data_path=source_data_path,
+        output_dir=output_dir,
+    )
+    service.write_task_bundle(output_dir, resolution, context, attributes, bundle.plan)
+    typer.echo(bundle.model_dump_json(indent=2))
 
 
 @app.command("run-dda-msdt")
