@@ -78,6 +78,12 @@ def _infer_acquisition_mode(context: ProjectContext) -> AttributeValue:
         return _attribute("DDA", 0.7, "rule", text[:200])
     if dia and dda:
         return _attribute("ambiguous", 0.4, "rule", text[:200], conflict=True)
+    instrument_text = _flatten(context.metadata.get("instruments").value) if context.metadata.get("instruments") else ""
+    protocol_text = _flatten(context.metadata.get("sampleProcessingProtocol").value) if context.metadata.get("sampleProcessingProtocol") else ""
+    if re.search(r"orbitrap|q exactive|exploris|ltq", instrument_text, re.IGNORECASE) and re.search(
+        r"mass spectrometry|lc-ms/ms|trypsin|immunoprecipitation|proteom", text + "\n" + protocol_text, re.IGNORECASE
+    ):
+        return _attribute("DDA", 0.45, "rule_fallback", (text + "\n" + protocol_text)[:200])
     return _attribute("unknown", 0.0, "none", "")
 
 

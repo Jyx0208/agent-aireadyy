@@ -4,3 +4,5 @@ __pycache__/
 .test_tmp/
 pytest-cache-files-*/
 _gitrepo/
+external/
+sample_task/
