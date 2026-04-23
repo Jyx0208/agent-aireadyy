@@ -3,6 +3,11 @@
 Python implementation of a PRIDE-first AI-ready data agent aligned with the
 `guomics-lab/MSDT-Converter` input and output contracts.
 
+## Architecture
+
+Detailed module design and data-object recommendations are documented in
+[docs/module-architecture.md](docs/module-architecture.md).
+
 ## Available Commands
 
 - `check-runtime`

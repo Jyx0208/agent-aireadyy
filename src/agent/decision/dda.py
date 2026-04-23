@@ -19,11 +19,20 @@ def _detect_raw_type(source_data_path: Path) -> str:
 
 
 def _species_fasta_name(species: str) -> tuple[str, str]:
-    mapping = {
-        "homo sapiens": ("Homo_sapiens_reviewed.fasta", "inferred"),
-        "mus musculus": ("Mus_musculus_reviewed.fasta", "inferred"),
-    }
-    return mapping.get(species.lower(), ("generic_reference_with_contaminants.fasta", "defaulted"))
+    normalized = species.lower()
+    multi_species_groups = [
+        ("homo sapiens", "human"),
+        ("mus musculus", "mouse"),
+        ("escherichia coli", "e. coli"),
+        ("saccharomyces cerevisiae", "yeast"),
+    ]
+    if sum(1 for aliases in multi_species_groups if any(alias in normalized for alias in aliases)) > 1:
+        return "generic_reference_with_contaminants.fasta", "defaulted"
+    if "homo sapiens" in normalized or "human" in normalized:
+        return "Homo_sapiens_reviewed.fasta", "inferred"
+    if "mus musculus" in normalized or "mouse" in normalized:
+        return "Mus_musculus_reviewed.fasta", "inferred"
+    return "generic_reference_with_contaminants.fasta", "defaulted"
 
 
 def _workflow_name(attributes: AttributeSet, raw_data_type: str) -> str:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from agent.execution.fragpipe import FragPipeRunner
+from agent.execution.workflow import materialize_workflow_with_attributes
 from agent.models import AttributeSet, DdaExecutionPlan, InputTask, MaterializedTaskBundle, ProjectContext, ProjectResolution
 from agent.msdt_converter.runner import MSDTConverterRunner
 
@@ -30,7 +32,15 @@ def materialize_dda_task_bundle(
 
     fragpipe = FragPipeRunner(fragpipe_root=Path("."))  # path is irrelevant for manifest/workflow materialization
     fragpipe.materialize_manifest(plan)
-    workflow_path = fragpipe.materialize_workflow_copy(plan)
+    task_root = Path(output_dir)
+    workflows_dir = task_root / "workflows"
+    workflows_dir.mkdir(parents=True, exist_ok=True)
+    workflow_path = workflows_dir / plan.fragpipe_workflow_path.name
+    materialize_workflow_with_attributes(plan.fragpipe_workflow_path, workflow_path, attributes)
+    fasta_dir = task_root / "fasta"
+    fasta_dir.mkdir(parents=True, exist_ok=True)
+    materialized_fasta_path = fasta_dir / plan.fasta_path.name
+    shutil.copyfile(plan.fasta_path, materialized_fasta_path)
 
     converter = MSDTConverterRunner(converter_root=Path("."))
     config_path = converter.write_config(plan)
@@ -39,4 +49,6 @@ def materialize_dda_task_bundle(
         plan=plan,
         converter_config_path=config_path,
         materialized_workflow_path=workflow_path,
+        materialized_fasta_path=materialized_fasta_path,
+        task_root=task_root,
     )

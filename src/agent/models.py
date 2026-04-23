@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 
 SourceType = Literal["local_path", "url", "file_name"]
-TaskStatus = Literal["resolved", "needs_review", "blocked", "completed"]
+TaskStatus = Literal["resolved", "needs_review", "blocked", "completed", "failed"]
 
 
 class JsonModel(BaseModel):
@@ -73,6 +73,18 @@ class ProjectContext(JsonModel):
     project_files: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class FileAsset(JsonModel):
+    original_file_name: str
+    resolved_asset_type: Literal["mzml", "tims", "raw", "wiff", "unknown"]
+    matched_project_file: str | None = None
+    download_url: str | None = None
+    local_path: Path | None = None
+    prepared_path: Path | None = None
+    requires_conversion: bool = False
+    asset_confidence: float = 0.0
+    match_type: str = "unresolved"
+
+
 class AttributeValue(JsonModel):
     value: Any
     confidence: float
@@ -125,6 +137,25 @@ class RunManifest(JsonModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class ReviewItem(JsonModel):
+    task_id: str
+    source_file: str
+    project_accession: str | None = None
+    stage: str
+    reasons: list[str] = Field(default_factory=list)
+    created_at: datetime
+
+
+class TaskStateSnapshot(JsonModel):
+    task_id: str
+    status: TaskStatus
+    stage: str
+    source_file: str
+    project_accession: str | None = None
+    updated_at: datetime
+    notes: list[str] = Field(default_factory=list)
+
+
 class ToolchainReport(JsonModel):
     docker_cli_available: bool
     docker_daemon_available: bool
@@ -132,6 +163,7 @@ class ToolchainReport(JsonModel):
     docker_server_version: str | None = None
     git_available: bool
     java_available: bool
+    msconvert_available: bool = False
     fragpipe_root: str | None = None
     msdt_converter_root: str | None = None
     notes: list[str] = Field(default_factory=list)
@@ -141,3 +173,13 @@ class MaterializedTaskBundle(JsonModel):
     plan: DdaExecutionPlan
     converter_config_path: Path
     materialized_workflow_path: Path
+    materialized_fasta_path: Path
+    task_root: Path
+
+
+class PridePlanResult(JsonModel):
+    resolution: ProjectResolution
+    context: ProjectContext
+    asset: FileAsset
+    attributes: AttributeSet
+    plan: DdaExecutionPlan
