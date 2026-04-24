@@ -30,9 +30,11 @@ class DockerMSDTConverterRunner:
         return self._sage_workdir(bundle) / f"{bundle.plan.source_data_path.stem}_search_result.tsv"
 
     def write_container_config(self, bundle: MaterializedTaskBundle) -> Path:
+        is_mgf = bundle.plan.raw_data_type == "mgf"
+        is_mzml = bundle.plan.raw_data_type == "mzml"
         config = {
             "generate_rawspectrum": {
-                "need": True,
+                "need": not is_mgf,
                 "data_type": bundle.plan.raw_data_type,
                 "data_path": self._container_path(bundle, bundle.plan.source_data_path),
                 "output": self._container_path(bundle, bundle.plan.rawspectrum_output_path),
@@ -45,7 +47,7 @@ class DockerMSDTConverterRunner:
                 "config_path": self._container_path(bundle, self._sage_workdir(bundle) / "sage_config.json"),
             },
             "generate_fragpipe_search_result": {
-                "need": True,
+                "need": is_mzml,
                 "workdir": self._container_path(bundle, bundle.plan.fragpipe_workdir),
                 "data_path": self._container_path(bundle, bundle.plan.source_data_path),
                 "fasta_path": self._container_path(bundle, bundle.materialized_fasta_path),
@@ -54,7 +56,7 @@ class DockerMSDTConverterRunner:
                 "thread_num": bundle.plan.thread_num,
             },
             "generate_msdt": {
-                "need": True,
+                "need": not is_mgf,
                 "tims": {
                     "need_tims": bundle.plan.raw_data_type == "tims",
                     "rawspectrum_path": self._container_path(bundle, bundle.plan.rawspectrum_output_path) if bundle.plan.raw_data_type == "tims" else "",
@@ -85,9 +87,9 @@ class DockerMSDTConverterRunner:
             },
             "convert_2_msdt": {
                 "mgf": {
-                    "need": False,
-                    "mgf_path": "",
-                    "output_path": "",
+                    "need": is_mgf,
+                    "mgf_path": self._container_path(bundle, bundle.plan.source_data_path) if is_mgf else "",
+                    "output_path": self._container_path(bundle, bundle.plan.output_paths["fp_msdt"]) if is_mgf else "",
                     "field_type_dict": {
                         "TITLE": "string",
                         "PEPMASS": "float",

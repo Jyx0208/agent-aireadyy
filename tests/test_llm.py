@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from agent.inference.rules import infer_attributes
-from agent.llm.reasoner import OpenAICompatibleReasoner, confirm_no_sdrf_parameters, confirm_sdrf_parameters
+from agent.llm.reasoner import OpenAICompatibleReasoner, _metadata_context_text, confirm_no_sdrf_parameters, confirm_sdrf_parameters
 from agent.models import AttributeValue, MetadataValue, ProjectContext
 from agent.orchestrator.pipeline import AgentService
 
@@ -18,6 +18,7 @@ class FakeReasoner:
                     "precursor_tol": "10ppm",
                     "fragment_tol": "20ppm",
                     "missed_cleavages": 2,
+                    "data_family": "thermo_raw",
                 },
                 confidence=0.88,
                 source="llm_confirmed",
@@ -118,9 +119,78 @@ def test_llm_confirmation_updates_search_hints_when_no_sdrf():
 
     assert reasoner.calls == 1
     assert confirmed.search_parameter_hints.value["precursor_tol"] == "10ppm"
+    assert "data_family" in confirmed.search_parameter_hints.value
     assert confirmed.search_parameter_hints.source == "llm_confirmed"
     assert confirmed.enzyme.value == "Lys-C"
     assert confirmed.enzyme.source == "llm_confirmed"
+
+
+def test_llm_confirmation_keeps_fasta_and_workflow_recommendations_in_hints():
+    context = ProjectContext(
+        project_accession="PXD000010",
+        file_name="ASP-N_F4-R1.raw",
+        metadata={
+            "projectDescription": MetadataValue(
+                value="Asp-N Giardia proteomics searched against GiardiaDB.",
+                source="pride.projectDescription",
+                source_level="project",
+                completeness=0.8,
+            )
+        },
+        sdrf_rows=[],
+    )
+    base = infer_attributes(context)
+
+    class FastaWorkflowReasoner:
+        def confirm_search_parameters(self, context, attributes):
+            return {
+                "search_parameter_hints": AttributeValue(
+                    value={
+                        "database": "GiardiaDB Assemblage A WB release 34",
+                        "recommended_fasta_name": "GiardiaDB-34_AassemblageA_AnnotatedProteins.fasta",
+                        "recommended_fasta_url": None,
+                        "recommended_fasta_source": "project protocol names GiardiaDB release 34",
+                        "recommended_workflow_name": "LFQ_DDA_generic.workflow",
+                        "workflow_rationale": "label-free DDA raw file",
+                    },
+                    confidence=0.9,
+                    source="llm_confirmed",
+                    evidence_excerpt="Project description and target file imply Asp-N LFQ DDA against GiardiaDB.",
+                    conflict_flag=False,
+                )
+            }
+
+    confirmed = confirm_no_sdrf_parameters(context, base, llm_reasoner=FastaWorkflowReasoner())
+
+    hints = confirmed.search_parameter_hints.value
+    assert hints["recommended_fasta_name"] == "GiardiaDB-34_AassemblageA_AnnotatedProteins.fasta"
+    assert hints["recommended_workflow_name"] == "LFQ_DDA_generic.workflow"
+
+
+def test_no_sdrf_llm_context_includes_parameter_and_fasta_files():
+    context = ProjectContext(
+        project_accession="PXD000020",
+        file_name="sample_F1_R1.mzML",
+        metadata={
+            "projectDescription": MetadataValue(
+                value="DDA phosphoproteomics searched with MSFragger using trypsin.",
+                source="pride.projectDescription",
+                source_level="project",
+                completeness=0.8,
+            )
+        },
+        project_files=[
+            {"fileName": "sample_F1_R1.mzML"},
+            {"fileName": "fragpipe.workflow"},
+            {"fileName": "fragger.params"},
+            {"fileName": "rice_reference.fasta"},
+        ],
+    )
+
+    text = _metadata_context_text(context)
+
+    assert "parameter_or_workflow_files: fragpipe.workflow; fragger.params" in text
+    assert "fasta_files: rice_reference.fasta" in text
 
 
 def test_openai_compatible_reasoner_defaults_to_gpt_5_4():
@@ -170,7 +240,7 @@ def test_llm_confirmation_emits_report_messages():
     assert any("\u5927\u6a21\u578b\u786e\u8ba4\u7ed3\u679c\u5df2\u5408\u5e76" in line for line in messages)
 
 
-def test_llm_confirmation_falls_back_to_rules_when_reasoner_fails():
+def test_llm_confirmation_blocks_no_sdrf_when_reasoner_fails():
     context = ProjectContext(
         project_accession="PXD000014",
         file_name="sample.raw",
@@ -187,7 +257,9 @@ def test_llm_confirmation_falls_back_to_rules_when_reasoner_fails():
         report=messages.append,
     )
 
-    assert confirmed == base
+    assert confirmed.search_parameter_hints.conflict_flag is True
+    assert confirmed.search_parameter_hints.source == "llm_required"
+    assert "llm_confirmation_error" in confirmed.search_parameter_hints.value
     assert any("\u5927\u6a21\u578b\u786e\u8ba4\u5931\u8d25" in line for line in messages)
 
 

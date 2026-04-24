@@ -89,6 +89,85 @@ def test_prepare_file_asset_decompresses_mzml_gz(tmp_path: Path):
     assert prepared_path.read_bytes() == b"<mzML />"
 
 
+def test_resolve_file_asset_marks_mzxml_for_conversion(tmp_path: Path):
+    task = normalize_input("sample.mzXML")
+    context = _project_context(
+        task.file_name,
+        [
+            {
+                "fileName": "sample.mzXML",
+                "publicFileLocations": [{"value": "ftp://ftp.pride.ebi.ac.uk/pride/data/archive/sample.mzXML"}],
+            }
+        ],
+    )
+
+    asset = resolve_file_asset(task=task, context=context, work_dir=tmp_path)
+
+    assert asset.resolved_asset_type == "mzxml"
+    assert asset.requires_conversion is True
+    assert asset.prepared_path == tmp_path / "assets" / "prepared" / "sample.mzML"
+
+
+def test_prepare_file_asset_decompresses_mgf_gz(tmp_path: Path):
+    class FakeClient:
+        def download_binary(self, url: str) -> bytes:
+            assert url == "https://ftp.pride.ebi.ac.uk/pride/data/archive/sample.mgf.gz"
+            return gzip.compress(b"BEGIN IONS\nEND IONS\n")
+
+    task = normalize_input("sample.mgf")
+    context = _project_context(
+        task.file_name,
+        [
+            {
+                "fileName": "sample.mgf.gz",
+                "publicFileLocations": [{"value": "ftp://ftp.pride.ebi.ac.uk/pride/data/archive/sample.mgf.gz"}],
+            }
+        ],
+    )
+    asset = resolve_file_asset(task=task, context=context, work_dir=tmp_path)
+
+    prepared_path = prepare_file_asset(FakeClient(), asset, converter=None)  # type: ignore[arg-type]
+
+    assert asset.resolved_asset_type == "mgf"
+    assert prepared_path == tmp_path / "assets" / "prepared" / "sample.mgf"
+    assert prepared_path.read_bytes() == b"BEGIN IONS\nEND IONS\n"
+
+
+def test_prepare_file_asset_extracts_raw_zip_before_conversion(tmp_path: Path):
+    events: list[tuple[str, str]] = []
+
+    class FakeClient:
+        def download_binary(self, url: str) -> bytes:
+            archive_path = tmp_path / "sample.raw.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("nested/sample.raw", "raw")
+            return archive_path.read_bytes()
+
+    class FakeConverter:
+        def convert_to_mzml(self, source: Path, target: Path) -> Path:
+            events.append(("convert", source.name))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"mzml")
+            return target
+
+    asset = FileAsset(
+        original_file_name="sample.raw",
+        resolved_asset_type="raw",
+        matched_project_file="sample.raw.zip",
+        download_url="https://ftp.pride.ebi.ac.uk/pride/data/archive/sample.raw.zip",
+        local_path=tmp_path / "assets" / "downloads" / "sample.raw.zip",
+        prepared_path=tmp_path / "assets" / "prepared" / "sample.mzML",
+        requires_conversion=True,
+        asset_confidence=1.0,
+        match_type="stem",
+    )
+
+    prepared_path = prepare_file_asset(FakeClient(), asset, FakeConverter())
+
+    assert prepared_path.read_bytes() == b"mzml"
+    assert events == [("convert", "sample.raw")]
+
+
 def test_prepare_file_asset_extracts_bruker_d_zip(tmp_path: Path):
     class FakeClient:
         def download_binary(self, url: str) -> bytes:

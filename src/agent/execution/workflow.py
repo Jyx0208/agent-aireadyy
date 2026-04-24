@@ -68,6 +68,23 @@ def _search_hint_overrides(attributes: AttributeSet) -> dict[str, Any]:
 
 def _enzyme_overrides(attributes: AttributeSet) -> dict[str, Any]:
     enzyme = str(attributes.enzyme.value or "").lower()
+    normalized = re.sub(r"[^a-z0-9]+", "", enzyme)
+    if "aspn" in normalized:
+        return {
+            "msfragger.search_enzyme_name_1": "aspn",
+            "msfragger.search_enzyme_cut_1": "D",
+            "msfragger.search_enzyme_nocut_1": "",
+            "msfragger.search_enzyme_sense_1": "N",
+            "msfragger.misc.fragger.enzyme-dropdown-1": "aspn",
+        }
+    if "argc" in normalized:
+        return {
+            "msfragger.search_enzyme_name_1": "argc",
+            "msfragger.search_enzyme_cut_1": "R",
+            "msfragger.search_enzyme_nocut_1": "P",
+            "msfragger.search_enzyme_sense_1": "C",
+            "msfragger.misc.fragger.enzyme-dropdown-1": "argc",
+        }
     if "lys" in enzyme and "c" in enzyme:
         return {
             "msfragger.search_enzyme_name_1": "lysc",

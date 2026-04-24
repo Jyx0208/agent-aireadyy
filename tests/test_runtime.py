@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import gzip
 import json
@@ -33,6 +33,12 @@ def _attributes() -> AttributeSet:
         fractionation_hint=AttributeValue(value=None, confidence=0.0, source="none", evidence_excerpt="", conflict_flag=False),
         search_parameter_hints=AttributeValue(value={"precursor_tol": "20ppm"}, confidence=0.6, source="rule", evidence_excerpt="profile", conflict_flag=False),
     )
+
+
+def _reviewed_fasta(tmp_path: Path) -> Path:
+    path = tmp_path / "reviewed_reference.fasta"
+    path.write_text(">sp|P1|REVIEWED_TEST\nMPEPTIDEK\n", encoding="utf-8")
+    return path
 
 
 def test_detect_toolchain_reports_missing_java_and_docker_server(monkeypatch):
@@ -110,6 +116,7 @@ def test_materialize_dda_task_bundle_writes_runtime_files(tmp_path: Path):
         attributes=_attributes(),
         source_data_path=tmp_path / "WT_5_Lys-c.mzML",
         output_dir=tmp_path / "task_out",
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
     )
 
     assert not bundle.plan.manifest_path.exists()
@@ -150,13 +157,14 @@ def test_materialize_dda_task_bundle_copies_external_source_into_task_root(tmp_p
         attributes=_attributes(),
         source_data_path=source_path,
         output_dir=tmp_path / "task_out",
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
     )
 
     assert bundle.plan.source_data_path == tmp_path / "task_out" / "input" / "WT_5_Lys-c.mzML"
     assert bundle.plan.source_data_path.read_text(encoding="utf-8") == "<mzML />"
 
 
-def test_materialize_dda_task_bundle_keeps_fragpipe_workflow_unmodified(tmp_path: Path):
+def test_materialize_dda_task_bundle_applies_fragpipe_workflow_attributes(tmp_path: Path):
     task = normalize_input("WT_5_Lys-c.raw")
     resolution = ProjectResolution(
         primary_project=ProjectCandidate(
@@ -214,12 +222,52 @@ def test_materialize_dda_task_bundle_keeps_fragpipe_workflow_unmodified(tmp_path
         attributes=attributes,
         source_data_path=tmp_path / "WT_5_Lys-c.mzML",
         output_dir=tmp_path / "task_out",
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
     )
 
     source_workflow = bundle.plan.fragpipe_workflow_path.read_text(encoding="utf-8")
     workflow_text = bundle.materialized_workflow_path.read_text(encoding="utf-8")
 
-    assert workflow_text == source_workflow
+    assert workflow_text != source_workflow
+    assert "msfragger.search_enzyme_name_1=lysc" in workflow_text
+    assert "msfragger.precursor_mass_lower=-10" in workflow_text
+    assert "msfragger.fragment_mass_units=0" in workflow_text
+
+
+def test_materialize_dda_task_bundle_applies_aspn_to_fragpipe_workflow(tmp_path: Path):
+    task = normalize_input("ASP-N_F4-R1.raw")
+    resolution = ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession="PXD123456",
+            matched_file="ASP-N_F4-R1.raw",
+            match_type="exact",
+            match_score=100,
+            evidence=["exact"],
+            metadata_consistency=1.0,
+        ),
+        alternative_projects=[],
+        resolution_reason="exact match",
+        resolution_confidence=1.0,
+        needs_review=False,
+    )
+    context = ProjectContext(project_accession="PXD123456", file_name="ASP-N_F4-R1.raw")
+    attributes = _attributes()
+    attributes.enzyme = AttributeValue(value="Asp-N", confidence=0.98, source="llm_confirmed", evidence_excerpt="ASP-N")
+
+    bundle = materialize_dda_task_bundle(
+        task=task,
+        project_resolution=resolution,
+        project_context=context,
+        attributes=attributes,
+        source_data_path=tmp_path / "ASP-N_F4-R1.mzML",
+        output_dir=tmp_path / "task_out",
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
+    )
+
+    workflow_text = bundle.materialized_workflow_path.read_text(encoding="utf-8")
+    assert "msfragger.search_enzyme_name_1=aspn" in workflow_text
+    assert "msfragger.search_enzyme_cut_1=D" in workflow_text
+    assert "msfragger.search_enzyme_sense_1=N" in workflow_text
 
 
 def test_materialize_dda_task_bundle_downloads_reproduced_project_fasta(tmp_path: Path, monkeypatch):
@@ -374,3 +422,5 @@ def _minimal_plan(tmp_path: Path, workflow_path: Path):
         },
         needs_review=False,
     )
+
+

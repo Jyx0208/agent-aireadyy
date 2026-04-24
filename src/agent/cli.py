@@ -201,11 +201,37 @@ def prepare_msdt_docker_input(input_value: str, source_data_path: Path, output_d
 
 
 @app.command("prepare-pride-msdt-docker-input")
-def prepare_pride_msdt_docker_input(input_value: str, output_dir: Path) -> None:
+def prepare_pride_msdt_docker_input(
+    input_value: str,
+    output_dir: Path,
+    reviewed_fasta_path: Path | None = typer.Option(None, help="Human-reviewed local FASTA path to use instead of inferred/default FASTA."),
+    reviewed_fasta_url: str | None = typer.Option(None, help="Human-reviewed FASTA URL to download and use."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Automatically accept LLM FASTA recommendation when it includes a URL."),
+) -> None:
     service = AgentService(reporter=_build_reporter(output_dir))
     task = normalize_input(input_value)
+
+    def confirm_llm_fasta(recommendation: dict) -> bool:
+        typer.echo("大模型推荐了可下载 FASTA，请确认是否使用：")
+        typer.echo(f"  FASTA: {recommendation.get('name') or '未知'}")
+        typer.echo(f"  URL: {recommendation.get('url')}")
+        typer.echo(f"  来源: {recommendation.get('source') or '未知'}")
+        if recommendation.get("database"):
+            typer.echo(f"  数据库线索: {recommendation.get('database')}")
+        if recommendation.get("workflow"):
+            typer.echo(f"  workflow 建议: {recommendation.get('workflow')}")
+        if yes:
+            return True
+        return typer.confirm("是否下载并使用这个 FASTA？", default=False)
+
     try:
-        bundle, _, _ = service.prepare_pride_msdt_docker_input(task=task, output_dir=output_dir)
+        bundle, _, _ = service.prepare_pride_msdt_docker_input(
+            task=task,
+            output_dir=output_dir,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+            confirm_llm_recommended_fasta=confirm_llm_fasta if reviewed_fasta_path is None and reviewed_fasta_url is None else None,
+        )
     except (AssetPreparationError, ReviewRequiredError):
         typer.echo(_review_message(output_dir), err=True)
         raise typer.Exit(1)

@@ -59,6 +59,10 @@ def _merge_attribute(current: AttributeValue, proposed: AttributeValue) -> Attri
         return current
     if _is_missing(current.value):
         return proposed
+    if isinstance(current.value, Mapping) and isinstance(proposed.value, Mapping):
+        merged_value = dict(current.value)
+        merged_value.update(proposed.value)
+        return proposed.model_copy(update={"value": merged_value})
     if _same_value(current.value, proposed.value):
         return proposed
     if current.source.startswith("pride.") and current.confidence >= 0.9:
@@ -122,26 +126,55 @@ def _metadata_context_text(context: ProjectContext, include_project_files: bool 
     project_file_names = [str(item.get("fileName", "")) for item in context.project_files if item.get("fileName")]
     if include_project_files and project_file_names:
         lines.append("project_files: " + "; ".join(project_file_names[:80]))
+        parameter_like = [
+            name
+            for name in project_file_names
+            if any(
+                token in name.lower()
+                for token in ("param", "workflow", "fragger", "fragpipe", "sage", "msfragger", "search", "readme", "metadata")
+            )
+        ]
+        fasta_like = [
+            name
+            for name in project_file_names
+            if name.lower().endswith((".fasta", ".fa", ".faa", ".fasta.gz", ".fa.gz", ".faa.gz"))
+        ]
+        if parameter_like:
+            lines.append("parameter_or_workflow_files: " + "; ".join(parameter_like[:40]))
+        if fasta_like:
+            lines.append("fasta_files: " + "; ".join(fasta_like[:40]))
     return "\n".join(lines)
 
 
 def _no_sdrf_attribute_prompt(context: ProjectContext, attributes: AttributeSet) -> str:
     current = attributes.model_dump(mode="json")
     return (
-        "You are confirming proteomics raw-file metadata when no SDRF rows are available.\n"
-        "Use only the project metadata, protocol descriptions, project file names, and target file name below.\n"
+        "You are confirming proteomics raw-file metadata and search parameters when no SDRF rows are available.\n"
+        "Use only the project web/API metadata, protocol descriptions, project file names, target file name, "
+        "and obvious parameter/workflow/FASTA file names listed below.\n"
+        "Your goal is to infer the most likely file-level workflow inputs for constructing an MSDT-Converter input package.\n"
         "Return strict JSON. Keys may include acquisition_mode, species, instrument_name, instrument_family, "
         "enzyme, labeling_strategy, fixed_mods, variable_mods, fractionation_hint, search_parameter_hints.\n"
         "Each key must be an object with value, confidence, source, evidence_excerpt, conflict_flag.\n"
-        "For Sage config generation, normalize search_parameter_hints using keys such as precursor_tol, "
-        "fragment_tol, missed_cleavages, precursor_charge, isotope_errors, min_peaks, max_peaks, "
-        "min_matched_peaks, max_variable_mods, tmt_channel_count, and data_family. "
-        "data_family should be one of mzml, tims, thermo_raw, sciex_wiff, mgf, or unknown. "
+        "For search configuration, extract or infer search_parameter_hints with normalized keys: "
+        "search_engine, database, enzyme, missed_cleavages, precursor_tol, fragment_tol, precursor_charge, "
+        "isotope_errors, min_peaks, max_peaks, min_matched_peaks, max_variable_mods, fdr, "
+        "tmt_channel_count, data_family, sidecar_patterns, recommended_fasta_name, recommended_fasta_url, "
+        "recommended_fasta_source, recommended_workflow_name, workflow_rationale. "
+        "data_family should be one of mzml, mzxml, tims, thermo_raw, sciex_wiff, mgf, mzid, or unknown. "
         "Also include sidecar_patterns when project files imply companion files such as .wiff.scan. "
+        "For FASTA, prefer a project-provided FASTA file when listed. If no FASTA file is listed, identify the "
+        "database/FASTA needed from protocols or parameter-file names; include a URL only if it is explicitly "
+        "present in the supplied context, otherwise leave recommended_fasta_url null. "
+        "For workflow, recommend only one of these existing templates when appropriate: "
+        "LFQ_DDA_generic.workflow, LFQ_DDA_generic_tims.workflow, LFQ_DDA_human_noNQ.workflow, "
+        "LFQ_DDA_human_noNQ_tims.workflow, TMT_DDA_generic.workflow, TMT_DDA_human.workflow, "
+        "iTRAQ_DDA_generic.workflow, iTRAQ_DDA_human.workflow. "
         "Normalize fixed_mods and variable_mods "
         "as human-readable modification strings with residue/site and mass when available, e.g. "
         "Carbamidomethyl (C) 57.02146, Oxidation (M) 15.9949, TMT (K) 229.16293.\n"
         "Normalize labeling_strategy to label-free, TMT, iTRAQ, SILAC, or unknown.\n"
+        "If the file name implies fraction/replicate/condition, put that in fractionation_hint rather than inventing biology.\n"
         "Use source='llm_confirmed'. Keep evidence_excerpt short and grounded in the supplied text.\n"
         "Set confidence lower when inferred from weak naming patterns. Do not invent unsupported values.\n\n"
         f"Project context:\n{_metadata_context_text(context)}\n\n"
@@ -162,7 +195,9 @@ def _sdrf_attribute_prompt(context: ProjectContext, attributes: AttributeSet) ->
         "For Sage config generation, extract enzyme, missed_cleavages, precursor_tol, fragment_tol, "
         "fixed_mods, variable_mods, labeling_strategy, precursor_charge, isotope_errors, min_peaks, max_peaks, "
         "min_matched_peaks, max_variable_mods, tmt_channel_count, data_family, and sidecar_patterns when SDRF rows or "
-        "project metadata explicitly provide them. Use normalized modification strings with residue/site and mass "
+        "project metadata explicitly provide them. Also include recommended_fasta_name, recommended_fasta_url, "
+        "recommended_fasta_source, recommended_workflow_name, and workflow_rationale when SDRF rows or metadata "
+        "make FASTA/workflow selection explicit. Use normalized modification strings with residue/site and mass "
         "when available, e.g. Carbamidomethyl (C) 57.02146, Oxidation (M) 15.9949, TMT (K) 229.16293.\n"
         "Use source='llm_confirmed'. Prefer normalized human-readable values over raw NT=/AC= strings.\n"
         "When SDRF rows represent multiple organisms in one file, summarize species as a multi-species mixture.\n"
@@ -228,6 +263,20 @@ def default_llm_reasoner() -> LLMReasoner | None:
     return OpenAICompatibleReasoner(api_key=api_key, model=model, base_url=base_url)
 
 
+def _mark_no_sdrf_llm_blocked(attributes: AttributeSet, reason: str) -> AttributeSet:
+    current = attributes.search_parameter_hints.value
+    hints = dict(current) if isinstance(current, Mapping) else {}
+    hints["llm_confirmation_error"] = reason
+    blocked_hints = AttributeValue(
+        value=hints,
+        confidence=0.0,
+        source="llm_required",
+        evidence_excerpt=reason,
+        conflict_flag=True,
+    )
+    return attributes.model_copy(update={"search_parameter_hints": blocked_hints})
+
+
 def confirm_no_sdrf_parameters(
     context: ProjectContext,
     attributes: AttributeSet,
@@ -238,23 +287,25 @@ def confirm_no_sdrf_parameters(
         return attributes
 
     if report is not None:
-        report("未找到 SDRF 行；将结合项目描述和文件名线索判断参数。")
+        report("\u672a\u627e\u5230 SDRF \u884c\uff1b\u5c06\u7ed3\u5408 PRIDE \u9879\u76ee\u63cf\u8ff0\u3001\u534f\u8bae\u3001\u6587\u4ef6\u540d\u548c\u53c2\u6570/FASTA \u6587\u4ef6\u7ebf\u7d22\u63a8\u65ad\u641c\u5e93\u53c2\u6570\u3002")
 
     reasoner = llm_reasoner or default_llm_reasoner()
     if reasoner is None:
+        reason = "No SDRF rows are available and no LLM reasoner is configured; strict search parameters cannot be inferred safely."
         if report is not None:
-            report("未配置大模型推理器；保留规则推断结果。")
-        return attributes
+            report("未配置大模型推理器；未找到 SDRF 时不再使用规则猜测搜库参数，请人工复核。")
+        return _mark_no_sdrf_llm_blocked(attributes, reason)
 
     if report is not None:
-        report("正在调用大模型确认文件属性和搜库参数。")
+        report("\u6b63\u5728\u8c03\u7528\u5927\u6a21\u578b\u786e\u8ba4\u6587\u4ef6\u5c5e\u6027\u548c\u641c\u5e93\u53c2\u6570\u3002")
 
     try:
         updates = reasoner.confirm_search_parameters(context, attributes)
     except Exception as exc:
+        reason = f"LLM confirmation failed for no-SDRF input: {exc}"
         if report is not None:
-            report(f"大模型确认失败；保留规则推断结果。原因={exc}")
-        return attributes
+            report(f"大模型确认失败；未找到 SDRF 时不再使用规则猜测搜库参数，请人工复核。原因={exc}")
+        return _mark_no_sdrf_llm_blocked(attributes, reason)
     merged = attributes.model_dump()
     for field_name, proposed_value in updates.items():
         if field_name not in AttributeSet.model_fields:
@@ -274,9 +325,8 @@ def confirm_no_sdrf_parameters(
         result = result.model_copy(update={"instrument_family": _derive_instrument_family(result.instrument_name.value)})
 
     if report is not None:
-        report("大模型确认结果已合并到属性推断中。")
+        report("\u5927\u6a21\u578b\u786e\u8ba4\u7ed3\u679c\u5df2\u5408\u5e76\u5230\u5c5e\u6027\u63a8\u65ad\u4e2d\u3002")
     return result
-
 
 def confirm_sdrf_parameters(
     context: ProjectContext,
@@ -292,13 +342,13 @@ def confirm_sdrf_parameters(
         return attributes
 
     if report is not None:
-        report(f"找到匹配的 SDRF 行（{len(context.sdrf_rows)} 行）；正在用大模型汇总文件级 workflow 属性。")
+        report(f"\u627e\u5230\u5339\u914d\u7684 SDRF \u884c\uff08{len(context.sdrf_rows)} \u884c\uff09\uff1b\u6b63\u5728\u7528\u5927\u6a21\u578b\u6c47\u603b\u6587\u4ef6\u7ea7 workflow \u5c5e\u6027\u3002")
 
     try:
         updates = reasoner.confirm_search_parameters(context, attributes)
     except Exception as exc:
         if report is not None:
-            report(f"大模型 SDRF 汇总失败；保留确定性 SDRF 推断结果。原因={exc}")
+            report(f"\u5927\u6a21\u578b SDRF \u6c47\u603b\u5931\u8d25\uff1b\u4fdd\u7559\u786e\u5b9a\u6027 SDRF \u63a8\u65ad\u7ed3\u679c\u3002\u539f\u56e0={exc}")
         return attributes
 
     merged = attributes.model_dump()
@@ -311,7 +361,9 @@ def confirm_sdrf_parameters(
         if _is_missing(proposed.value):
             continue
         current = getattr(attributes, field_name)
-        if proposed.confidence >= 0.85:
+        if field_name == "search_parameter_hints":
+            merged[field_name] = _merge_attribute(current, proposed)
+        elif proposed.confidence >= 0.85:
             merged[field_name] = proposed
         else:
             merged[field_name] = _merge_attribute(current, proposed)
@@ -325,5 +377,5 @@ def confirm_sdrf_parameters(
         result = result.model_copy(update={"instrument_family": _derive_instrument_family(result.instrument_name.value)})
 
     if report is not None:
-        report("大模型 SDRF 汇总结果已合并到属性推断中。")
+        report("\u5927\u6a21\u578b SDRF \u6c47\u603b\u7ed3\u679c\u5df2\u5408\u5e76\u5230\u5c5e\u6027\u63a8\u65ad\u4e2d\u3002")
     return result

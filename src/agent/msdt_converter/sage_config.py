@@ -82,8 +82,27 @@ def _hint_value(attributes: AttributeSet, *keys: str) -> Any:
 
 def _enzyme_config(attributes: AttributeSet) -> dict[str, Any]:
     enzyme = str(attributes.enzyme.value or "").lower()
+    normalized = re.sub(r"[^a-z0-9]+", "", enzyme)
     missed = _hint_value(attributes, "missed_cleavages", "allowed_missed_cleavages")
     missed_cleavages = int(missed) if missed not in (None, "") else 2
+    if "aspn" in normalized:
+        return {
+            "missed_cleavages": missed_cleavages,
+            "min_len": 5,
+            "max_len": 50,
+            "cleave_at": "D",
+            "restrict": "",
+            "c_terminal": False,
+        }
+    if "argc" in normalized:
+        return {
+            "missed_cleavages": missed_cleavages,
+            "min_len": 5,
+            "max_len": 50,
+            "cleave_at": "R",
+            "restrict": "P",
+            "c_terminal": True,
+        }
     if "lys" in enzyme and "c" in enzyme:
         return {
             "missed_cleavages": missed_cleavages,

@@ -34,6 +34,12 @@ def _attributes() -> AttributeSet:
     )
 
 
+def _reviewed_fasta(tmp_path: Path) -> Path:
+    path = tmp_path / "reviewed_reference.fasta"
+    path.write_text(">sp|P1|REVIEWED_TEST\nMPEPTIDEK\n", encoding="utf-8")
+    return path
+
+
 def test_run_pride_dda_msdt_docker_executes_runner(tmp_path: Path, monkeypatch):
     service = AgentService(pride_client=None)
     task = normalize_input("WT_5_Lys-c.raw")
@@ -104,7 +110,11 @@ def test_run_pride_dda_msdt_docker_executes_runner(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr("agent.orchestrator.pipeline.DockerMSDTConverterRunner", FakeDockerRunner)
 
-    manifest = service.run_pride_dda_msdt_docker(task=task, output_dir=tmp_path / "task_out")
+    manifest = service.run_pride_dda_msdt_docker(
+        task=task,
+        output_dir=tmp_path / "task_out",
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
+    )
 
     assert manifest.status == "completed"
     assert called["image"] == "guomics2017/msdt-converter:v1.3"
@@ -175,7 +185,11 @@ def test_run_pride_dda_msdt_docker_marks_failed_when_msdt_output_missing(tmp_pat
 
     monkeypatch.setattr("agent.orchestrator.pipeline.DockerMSDTConverterRunner", FakeDockerRunner)
 
-    manifest = service.run_pride_dda_msdt_docker(task=task, output_dir=tmp_path / "task_out")
+    manifest = service.run_pride_dda_msdt_docker(
+        task=task,
+        output_dir=tmp_path / "task_out",
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
+    )
 
     assert manifest.status == "failed"
     assert any("MSDT output missing" in note for note in manifest.notes)
@@ -221,6 +235,7 @@ def test_docker_runner_uses_materialized_workflow_path_in_config(tmp_path: Path)
         attributes=_attributes(),
         source_data_path=source_data_path,
         output_dir=tmp_path / "task_out",
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
     )
     runner = DockerMSDTConverterRunner()
 

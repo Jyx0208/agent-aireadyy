@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from agent.ai_ready.exporter import export_ai_ready_bundle
 from agent.audit.review import append_review_item, build_review_item, build_task_state_snapshot, write_task_state
@@ -49,6 +49,20 @@ class AgentService:
         if isinstance(value, list):
             return ", ".join(str(item) for item in value)
         return str(value)
+
+    @staticmethod
+    def _search_hints(attributes) -> dict[str, Any]:
+        hints = attributes.search_parameter_hints.value
+        return dict(hints) if isinstance(hints, dict) else {}
+
+    @staticmethod
+    def _can_retry_with_reviewed_llm_fasta(plan: DdaExecutionPlan, attributes) -> bool:
+        hints = AgentService._search_hints(attributes)
+        return (
+            plan.needs_review
+            and bool(hints.get("recommended_fasta_url"))
+            and any("占位" in issue or "placeholder" in issue.lower() for issue in plan.blocking_issues)
+        )
 
     def _report_resolution_summary(self, resolution: ProjectResolution) -> None:
         primary = resolution.primary_project
@@ -178,6 +192,9 @@ class AgentService:
         self,
         task: InputTask,
         output_dir: str | Path,
+        reviewed_fasta_path: str | Path | None = None,
+        reviewed_fasta_url: str | None = None,
+        reviewed_fasta_name: str | None = None,
     ) -> PridePlanResult:
         resolution = self.resolve_project(task.original_input)
         if resolution.primary_project:
@@ -209,6 +226,9 @@ class AgentService:
             attributes=attributes,
             output_dir=output_dir,
             project_context=context,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+            reviewed_fasta_name=reviewed_fasta_name,
         )
         self._report(f"[5/5] DDA 执行计划已生成。workflow={plan.fragpipe_workflow_path.name}")
         self._report_plan_summary(plan)
@@ -333,8 +353,15 @@ class AgentService:
         task: InputTask,
         output_dir: str | Path,
         image: str = "guomics2017/msdt-converter:v1.3",
+        reviewed_fasta_path: str | Path | None = None,
+        reviewed_fasta_url: str | None = None,
     ) -> RunManifest:
-        bundle, result, prepared_path = self.prepare_pride_msdt_docker_input(task=task, output_dir=output_dir)
+        bundle, result, prepared_path = self.prepare_pride_msdt_docker_input(
+            task=task,
+            output_dir=output_dir,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+        )
         self._report("任务输入包已生成，开始运行 MSDT-Converter Docker 流程。")
         runner = DockerMSDTConverterRunner(image=image, report=self.reporter)
         docker_result = runner.run(bundle)
@@ -400,8 +427,45 @@ class AgentService:
         self,
         task: InputTask,
         output_dir: str | Path,
+        reviewed_fasta_path: str | Path | None = None,
+        reviewed_fasta_url: str | None = None,
+        reviewed_fasta_name: str | None = None,
+        confirm_llm_recommended_fasta: Callable[[dict[str, Any]], bool] | None = None,
     ):
-        result = self.plan_dda_run_from_pride(task=task, output_dir=output_dir)
+        result = self.plan_dda_run_from_pride(
+            task=task,
+            output_dir=output_dir,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+            reviewed_fasta_name=reviewed_fasta_name,
+        )
+        active_reviewed_fasta_path = reviewed_fasta_path
+        active_reviewed_fasta_url = reviewed_fasta_url
+        active_reviewed_fasta_name = reviewed_fasta_name
+        if (
+            confirm_llm_recommended_fasta is not None
+            and active_reviewed_fasta_path is None
+            and active_reviewed_fasta_url is None
+            and self._can_retry_with_reviewed_llm_fasta(result.plan, result.attributes)
+        ):
+            hints = self._search_hints(result.attributes)
+            recommendation = {
+                "name": hints.get("recommended_fasta_name") or hints.get("database"),
+                "url": hints.get("recommended_fasta_url"),
+                "source": hints.get("recommended_fasta_source"),
+                "database": hints.get("database"),
+                "workflow": hints.get("recommended_workflow_name"),
+            }
+            if confirm_llm_recommended_fasta(recommendation):
+                active_reviewed_fasta_url = str(recommendation["url"])
+                active_reviewed_fasta_name = str(recommendation["name"] or "")
+                self._report(f"已确认使用 LLM 推荐 FASTA：{active_reviewed_fasta_name or active_reviewed_fasta_url}")
+                result = self.plan_dda_run_from_pride(
+                    task=task,
+                    output_dir=output_dir,
+                    reviewed_fasta_url=active_reviewed_fasta_url,
+                    reviewed_fasta_name=active_reviewed_fasta_name,
+                )
         if result.plan.needs_review:
             self.write_task_bundle(
                 output_dir,
@@ -450,6 +514,9 @@ class AgentService:
             attributes=result.attributes,
             source_data_path=prepared_path,
             output_dir=output_dir,
+            reviewed_fasta_path=active_reviewed_fasta_path,
+            reviewed_fasta_url=active_reviewed_fasta_url,
+            reviewed_fasta_name=active_reviewed_fasta_name,
         )
         self.write_task_bundle(
             output_dir,

@@ -38,7 +38,7 @@ class RawToMzMLConverter:
             "-o",
             str(target.parent),
         ]
-        emit(self.report, f"正在使用本地 msconvert 转换 RAW 文件：{source.name} -> {target.name}")
+        emit(self.report, f"正在使用本地 msconvert 转换质谱文件：{source.name} -> {target.name}")
         run_command_streaming(command, report=self.report)
         if not target.exists():
             raise FileNotFoundError(f"msconvert did not produce the expected mzML file: {target}")
@@ -82,7 +82,7 @@ class DockerPwizConverter:
     def convert_to_mzml(self, source: Path, target: Path) -> Path:
         target.parent.mkdir(parents=True, exist_ok=True)
         command = self.build_command(source, target)
-        emit(self.report, f"正在使用 Docker ProteoWizard 转换 RAW 文件：{source.name} -> {target.name}")
+        emit(self.report, f"正在使用 Docker ProteoWizard 转换质谱文件：{source.name} -> {target.name}")
         run_command_streaming(command, report=self.report)
         if not target.exists():
             raise FileNotFoundError(f"Docker ProteoWizard did not produce the expected mzML file: {target}")
@@ -156,6 +156,45 @@ def _extract_archive(source: Path, target: Path) -> Path:
     return target
 
 
+def _extract_single_file(source: Path, target_dir: Path, suffixes: tuple[str, ...]) -> Path:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    extract_root = target_dir / f"{source.name}.extracting"
+    if extract_root.exists():
+        shutil.rmtree(extract_root)
+    extract_root.mkdir(parents=True)
+
+    lower_name = source.name.lower()
+    if lower_name.endswith(".zip"):
+        with zipfile.ZipFile(source) as archive:
+            for member in archive.infolist():
+                destination = (extract_root / member.filename).resolve()
+                destination.relative_to(extract_root.resolve())
+            archive.extractall(extract_root)
+    elif lower_name.endswith((".tar.gz", ".tgz")):
+        with tarfile.open(source) as archive:
+            for member in archive.getmembers():
+                destination = (extract_root / member.name).resolve()
+                destination.relative_to(extract_root.resolve())
+            archive.extractall(extract_root)
+    else:
+        raise ValueError(f"Unsupported archive format: {source}")
+
+    candidates = [
+        path
+        for path in extract_root.rglob("*")
+        if path.is_file() and path.name.lower().endswith(suffixes)
+    ]
+    if len(candidates) != 1:
+        shutil.rmtree(extract_root)
+        raise ValueError(f"归档文件中需要且只能包含 1 个可用文件，实际找到 {len(candidates)} 个：{source}")
+    target_path = target_dir / candidates[0].name
+    if target_path.exists():
+        target_path.unlink()
+    shutil.move(str(candidates[0]), str(target_path))
+    shutil.rmtree(extract_root)
+    return target_path
+
+
 def _has_prepared_artifact(path: Path) -> bool:
     if path.is_file():
         return path.stat().st_size > 0
@@ -169,7 +208,7 @@ def _can_reuse_prepared_asset(asset: FileAsset, local_path: Path | None = None) 
         return False
     if local_path is not None and local_path == asset.prepared_path:
         return False
-    return asset.requires_conversion or asset.resolved_asset_type in {"mzml", "tims"}
+    return asset.requires_conversion or asset.resolved_asset_type in {"mzml", "mgf", "mzid", "tims"}
 
 
 def prepare_file_asset(
@@ -190,13 +229,13 @@ def prepare_file_asset(
 
     _download_sidecars(client, asset, report=report)
     if (
-        asset.resolved_asset_type == "mzml"
+        asset.resolved_asset_type in {"mzml", "mgf", "mzid"}
         and asset.prepared_path is not None
         and local_path != asset.prepared_path
-        and local_path.name.lower().endswith(".mzml.gz")
+        and local_path.name.lower().endswith((".mzml.gz", ".mgf.gz", ".mzid.gz"))
     ):
         asset.prepared_path.parent.mkdir(parents=True, exist_ok=True)
-        emit(report, f"正在解压 gzipped mzML 文件：{local_path.name} -> {asset.prepared_path.name}")
+        emit(report, f"正在解压 gzip 压缩文件：{local_path.name} -> {asset.prepared_path.name}")
         with gzip.open(local_path, "rb") as source, asset.prepared_path.open("wb") as target:
             shutil.copyfileobj(source, target)
         emit(report, f"解压完成：{asset.prepared_path}")
@@ -214,15 +253,25 @@ def prepare_file_asset(
         return local_path
     if not asset.prepared_path:
         raise ValueError("A convertible file asset must define a prepared_path.")
-    emit(report, f"数据文件需要格式转换：{local_path.name} -> {asset.prepared_path.name}")
+    conversion_source = local_path
+    if local_path.name.lower().endswith(".raw.zip"):
+        emit(report, f"正在解压 RAW zip 归档：{local_path.name}")
+        conversion_source = _extract_single_file(local_path, local_path.parent, (".raw",))
+    elif asset.resolved_asset_type == "mzxml" and local_path.name.lower().endswith(".mzxml.gz"):
+        conversion_source = local_path.with_suffix("")
+        if not conversion_source.exists() or conversion_source.stat().st_size == 0:
+            emit(report, f"正在解压 mzXML gzip 文件：{local_path.name} -> {conversion_source.name}")
+            with gzip.open(local_path, "rb") as source, conversion_source.open("wb") as target:
+                shutil.copyfileobj(source, target)
+    emit(report, f"数据文件需要格式转换：{conversion_source.name} -> {asset.prepared_path.name}")
     try:
-        return converter.convert_to_mzml(local_path, asset.prepared_path)
+        return converter.convert_to_mzml(conversion_source, asset.prepared_path)
     except Exception as exc:
         emit(report, f"主转换器失败：{exc}")
         if fallback_converter is None:
             raise AssetPreparationError(str(exc), local_path=local_path) from exc
         emit(report, "正在切换到备用转换器")
         try:
-            return fallback_converter.convert_to_mzml(local_path, asset.prepared_path)
+            return fallback_converter.convert_to_mzml(conversion_source, asset.prepared_path)
         except Exception as fallback_exc:
             raise AssetPreparationError(str(fallback_exc), local_path=local_path) from fallback_exc

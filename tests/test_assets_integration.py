@@ -31,6 +31,12 @@ def _attributes() -> AttributeSet:
     )
 
 
+def _reviewed_fasta(tmp_path: Path) -> Path:
+    path = tmp_path / "reviewed_reference.fasta"
+    path.write_text(">sp|P1|REVIEWED_TEST\nMPEPTIDEK\n", encoding="utf-8")
+    return path
+
+
 def test_plan_dda_run_from_pride_asset_uses_resolved_prepared_path(tmp_path: Path, monkeypatch):
     messages: list[str] = []
     service = AgentService(pride_client=None, reporter=messages.append)
@@ -147,7 +153,11 @@ def test_prepare_pride_msdt_docker_input_uses_only_file_name(tmp_path: Path, mon
     )
     monkeypatch.setattr(service, "prepare_asset", fake_prepare_asset)
 
-    bundle, result, prepared_path = service.prepare_pride_msdt_docker_input(task=task, output_dir=tmp_path / "task_out")
+    bundle, result, prepared_path = service.prepare_pride_msdt_docker_input(
+        task=task,
+        output_dir=tmp_path / "task_out",
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
+    )
 
     assert result.resolution.primary_project.project_accession == "PXD123456"
     assert prepared_path.name == "WT_5_Lys-c.mzML"

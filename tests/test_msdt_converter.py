@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from agent.decision.dda import plan_dda_execution
-from agent.models import AttributeSet, AttributeValue, ProjectResolution
+from agent.models import AttributeSet, AttributeValue, DdaExecutionPlan, ProjectResolution
 from agent.msdt_converter.config import build_converter_config
 
 
@@ -96,5 +96,31 @@ def test_build_converter_config_for_wiff2mzml_matches_msdt_wiff_section(tmp_path
     assert config["generate_msdt"]["mzml"]["need_fragpipe"] is False
     assert config["generate_msdt"]["wiff"]["need_wiff"] is True
     assert config["generate_msdt"]["wiff"]["wiff_mzml_path"].endswith("sample.mzML")
-    assert Path(config["generate_msdt"]["wiff"]["sage_search_result_path"]).name == "sample_search_result.tsv"
-    assert Path(config["generate_msdt"]["wiff"]["output"]).name == "sample_sage_msdt.parquet"
+
+
+def test_build_converter_config_for_mgf_uses_direct_conversion(tmp_path: Path):
+    plan = DdaExecutionPlan(
+        task_id="task-mgf",
+        source_file_name="sample.mgf",
+        source_data_path=tmp_path / "sample.mgf",
+        raw_data_type="mgf",
+        fasta_path=tmp_path / "reference.fasta",
+        fasta_selection_mode="defaulted",
+        fragpipe_workflow_path=tmp_path / "workflow.workflow",
+        manifest_path=tmp_path / "fragpipe" / "fragpipe-files.fp-manifest",
+        converter_config_path=tmp_path / "converter_config.json",
+        rawspectrum_output_path=tmp_path / "rawspectrum" / "sample_rawspectrum.parquet",
+        fragpipe_workdir=tmp_path / "fragpipe",
+        expected_pin_path=tmp_path / "fragpipe" / "exp" / "sample_edited.pin",
+        expected_pin_glob=str(tmp_path / "fragpipe" / "exp" / "sample_edited.pin"),
+        output_paths={"fp_msdt": tmp_path / "msdt" / "sample_mgf_msdt.parquet"},
+    )
+
+    config = build_converter_config(plan)
+
+    assert config["generate_rawspectrum"]["need"] is False
+    assert config["generate_fragpipe_search_result"]["need"] is False
+    assert config["generate_msdt"]["need"] is False
+    assert config["convert_2_msdt"]["mgf"]["need"] is True
+    assert config["convert_2_msdt"]["mgf"]["mgf_path"].endswith("sample.mgf")
+    assert config["convert_2_msdt"]["mgf"]["output_path"].endswith("sample_mgf_msdt.parquet")

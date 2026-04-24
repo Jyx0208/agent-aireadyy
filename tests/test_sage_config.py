@@ -92,3 +92,23 @@ def test_build_sage_config_uses_llm_extended_search_hints(tmp_path: Path):
     assert config["min_matched_peaks"] == 5
     assert config["database"]["max_variable_mods"] == 3
     assert config["quant"] == {"tmt": "Tmt18"}
+
+
+def test_build_sage_config_supports_aspn_enzyme(tmp_path: Path):
+    attributes = AttributeSet(
+        acquisition_mode=AttributeValue(value="DDA", confidence=1.0, source="llm_confirmed", evidence_excerpt="DDA"),
+        species=AttributeValue(value="Giardia intestinalis assemblage A", confidence=1.0, source="llm_confirmed", evidence_excerpt="Giardia"),
+        instrument_name=AttributeValue(value="LTQ Orbitrap Velos", confidence=1.0, source="llm_confirmed", evidence_excerpt="instrument"),
+        instrument_family=AttributeValue(value="orbitrap", confidence=1.0, source="llm_confirmed", evidence_excerpt="instrument"),
+        enzyme=AttributeValue(value="Asp-N", confidence=1.0, source="llm_confirmed", evidence_excerpt="Asp-N"),
+        labeling_strategy=AttributeValue(value="label-free", confidence=1.0, source="llm_confirmed", evidence_excerpt="label-free"),
+        fixed_mods=AttributeValue(value=["Carbamidomethyl (C) 57.02146"], confidence=1.0, source="llm_confirmed", evidence_excerpt="mods"),
+        variable_mods=AttributeValue(value=[], confidence=1.0, source="llm_confirmed", evidence_excerpt="mods"),
+        fractionation_hint=AttributeValue(value=None, confidence=0.0, source="none", evidence_excerpt=""),
+        search_parameter_hints=AttributeValue(value={"missed_cleavages": 2}, confidence=1.0, source="llm_confirmed", evidence_excerpt="search params"),
+    )
+
+    config = build_sage_config(_plan(tmp_path), attributes)
+
+    assert config["database"]["enzyme"]["cleave_at"] == "D"
+    assert config["database"]["enzyme"]["c_terminal"] is False

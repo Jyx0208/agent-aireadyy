@@ -10,21 +10,30 @@ def _classify_asset_type(file_name: str) -> str:
     lower_name = file_name.lower()
     if lower_name.endswith((".mzml", ".mzml.gz")):
         return "mzml"
+    if lower_name.endswith((".mzxml", ".mzxml.gz")):
+        return "mzxml"
     if lower_name.endswith((".d", ".d.zip", ".d.tar.gz", ".d.tgz")):
         return "tims"
     if lower_name.endswith((".raw", ".raw.zip")):
         return "raw"
     if lower_name.endswith((".wiff", ".wiff2")):
         return "wiff"
+    if lower_name.endswith((".mgf", ".mgf.gz")):
+        return "mgf"
+    if lower_name.endswith((".mzid", ".mzid.gz")):
+        return "mzid"
     return "unknown"
 
 
 def _asset_priority(asset_type: str) -> int:
     priorities = {
-        "mzml": 4,
-        "tims": 3,
-        "raw": 2,
-        "wiff": 1,
+        "mzml": 7,
+        "mzxml": 6,
+        "tims": 5,
+        "raw": 4,
+        "wiff": 3,
+        "mgf": 2,
+        "mzid": 1,
         "unknown": 0,
     }
     return priorities.get(asset_type, 0)
@@ -35,6 +44,10 @@ def _match_info(task: InputTask, project_file_name: str) -> tuple[int, str] | No
 
     if project_task.normalized_name == task.normalized_name:
         return 100, "exact"
+    if project_task.normalized_name == f"{task.normalized_name}.gz":
+        return 100, "compressed"
+    if project_task.stem.lower() == task.file_name.lower():
+        return 100, "compressed"
     if project_task.stem.lower() == task.stem.lower():
         return 100, "stem"
 
@@ -68,8 +81,11 @@ def _safe_file_name(file_name: str) -> str:
 
 def _prepared_stem(file_name: str, asset_type: str) -> str:
     lower_name = file_name.lower()
-    if lower_name.endswith(".mzml.gz"):
-        return Path(file_name).stem
+    if lower_name.endswith(".mzxml.gz"):
+        return file_name[: -len(".mzxml.gz")]
+    for extension in (".mzml.gz", ".mgf.gz", ".mzid.gz"):
+        if lower_name.endswith(extension):
+            return file_name[:-3]
     for extension in (".d.tar.gz", ".d.tgz", ".d.zip", ".raw.zip"):
         if lower_name.endswith(extension):
             return file_name[: -len(extension)]
@@ -161,10 +177,10 @@ def resolve_file_asset(task: InputTask, context: ProjectContext, work_dir: str |
     local_path = downloads_dir / local_file_name
 
     prepared_stem = _prepared_stem(local_file_name, asset_type)
-    requires_conversion = asset_type in {"raw", "wiff"}
+    requires_conversion = asset_type in {"raw", "wiff", "mzxml"}
     if requires_conversion:
         prepared_path = prepared_dir / f"{prepared_stem}.mzML"
-    elif local_file_name.lower().endswith(".mzml.gz"):
+    elif local_file_name.lower().endswith((".mzml.gz", ".mgf.gz", ".mzid.gz")):
         prepared_path = prepared_dir / prepared_stem
     elif asset_type == "tims" and local_file_name.lower().endswith((".d.zip", ".d.tar.gz", ".d.tgz")):
         prepared_path = prepared_dir / f"{prepared_stem}.d"

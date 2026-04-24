@@ -15,10 +15,11 @@ def build_converter_config(plan: DdaExecutionPlan) -> dict:
     is_mzml = plan.raw_data_type == "mzml"
     is_tims = plan.raw_data_type == "tims"
     is_wiff = plan.raw_data_type == "wiff2mzml"
+    is_mgf = plan.raw_data_type == "mgf"
     uses_sage_msdt = is_tims or is_wiff
     return {
         "generate_rawspectrum": {
-            "need": True,
+            "need": not is_mgf,
             "data_type": plan.raw_data_type,
             "data_path": str(plan.source_data_path),
             "output": str(plan.rawspectrum_output_path),
@@ -31,7 +32,7 @@ def build_converter_config(plan: DdaExecutionPlan) -> dict:
             "config_path": str(_sage_workdir(plan) / "sage_config.json"),
         },
         "generate_fragpipe_search_result": {
-            "need": True,
+            "need": is_mzml,
             "workdir": str(plan.fragpipe_workdir),
             "data_path": str(plan.source_data_path),
             "fasta_path": str(plan.fasta_path),
@@ -40,7 +41,7 @@ def build_converter_config(plan: DdaExecutionPlan) -> dict:
             "thread_num": plan.thread_num,
         },
         "generate_msdt": {
-            "need": True,
+            "need": not is_mgf,
             "tims": {
                 "need_tims": is_tims,
                 "rawspectrum_path": str(plan.rawspectrum_output_path) if is_tims else "",
@@ -71,9 +72,9 @@ def build_converter_config(plan: DdaExecutionPlan) -> dict:
         },
         "convert_2_msdt": {
             "mgf": {
-                "need": False,
-                "mgf_path": "",
-                "output_path": "",
+                "need": is_mgf,
+                "mgf_path": str(plan.source_data_path) if is_mgf else "",
+                "output_path": str(plan.output_paths["fp_msdt"]) if is_mgf else "",
                 "field_type_dict": {
                     "TITLE": "string",
                     "PEPMASS": "float",

@@ -6,6 +6,8 @@ import shutil
 from pathlib import Path
 
 from agent.models import AttributeSet, DdaExecutionPlan, InputTask, MaterializedTaskBundle, ProjectContext, ProjectResolution
+from agent.execution.workflow import materialize_workflow_with_attributes
+from agent.decision.dda import is_placeholder_fasta
 from agent.msdt_converter.runner import MSDTConverterRunner
 from agent.msdt_converter.sage_config import build_sage_config
 from agent.pride.client import PrideClient
@@ -62,6 +64,9 @@ def materialize_dda_task_bundle(
     attributes: AttributeSet,
     source_data_path: str | Path,
     output_dir: str | Path,
+    reviewed_fasta_path: str | Path | None = None,
+    reviewed_fasta_url: str | None = None,
+    reviewed_fasta_name: str | None = None,
 ) -> MaterializedTaskBundle:
     from agent.decision.dda import plan_dda_execution
 
@@ -75,18 +80,23 @@ def materialize_dda_task_bundle(
         attributes=attributes,
         output_dir=output_dir,
         project_context=project_context,
+        reviewed_fasta_path=reviewed_fasta_path,
+        reviewed_fasta_url=reviewed_fasta_url,
+        reviewed_fasta_name=reviewed_fasta_name,
     )
     if plan.needs_review:
         raise ValueError(f"Cannot materialize a strict DDA bundle while the plan needs review: {plan.blocking_issues}")
+    if is_placeholder_fasta(plan.fasta_path):
+        raise ValueError(f"Cannot materialize a strict DDA bundle with placeholder FASTA: {plan.fasta_path}")
 
     workflows_dir = task_root / "workflows"
     workflows_dir.mkdir(parents=True, exist_ok=True)
     workflow_path = workflows_dir / plan.fragpipe_workflow_path.name
-    shutil.copyfile(plan.fragpipe_workflow_path, workflow_path)
+    materialize_workflow_with_attributes(plan.fragpipe_workflow_path, workflow_path, attributes)
     fasta_dir = task_root / "fasta"
     fasta_dir.mkdir(parents=True, exist_ok=True)
     materialized_fasta_path = fasta_dir / plan.fasta_path.name
-    if plan.fasta_selection_mode == "reproduced":
+    if plan.fasta_selection_mode in {"reproduced", "reviewed"} and plan.fasta_download_url:
         if not plan.fasta_download_url:
             raise ValueError("Cannot reproduce project FASTA without a download URL.")
         client = PrideClient()
@@ -96,6 +106,8 @@ def materialize_dda_task_bundle(
             client.close()
     else:
         shutil.copyfile(plan.fasta_path, materialized_fasta_path)
+    if is_placeholder_fasta(materialized_fasta_path):
+        raise ValueError(f"Downloaded/materialized FASTA is a placeholder and cannot be used: {materialized_fasta_path}")
 
     _write_sage_config(plan, attributes)
 
