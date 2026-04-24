@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 
@@ -221,13 +222,35 @@ class OpenAICompatibleReasoner:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
+    def _post_chat_completion(self, payload: dict[str, Any]) -> httpx.Response:
+        last_error: Exception | None = None
+        for _ in range(3):
+            response = httpx.post(
+                f"{self.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json=payload,
+                timeout=self.timeout,
+            )
+            try:
+                response.raise_for_status()
+                return response
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                status_code = exc.response.status_code
+                if status_code < 500:
+                    raise
+                time.sleep(1)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("LLM request failed without an HTTP response.")
+
     def confirm_search_parameters(
         self,
         context: ProjectContext,
         attributes: AttributeSet,
     ) -> Mapping[str, AttributeValue]:
         prompt = _sdrf_attribute_prompt(context, attributes) if context.sdrf_rows else _no_sdrf_attribute_prompt(context, attributes)
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "response_format": {"type": "json_object"},
             "messages": [
@@ -238,13 +261,14 @@ class OpenAICompatibleReasoner:
                 {"role": "user", "content": prompt},
             ],
         }
-        response = httpx.post(
-            f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json=payload,
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
+        try:
+            response = self._post_chat_completion(payload)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code < 500:
+                raise
+            fallback_payload = dict(payload)
+            fallback_payload.pop("response_format", None)
+            response = self._post_chat_completion(fallback_payload)
         content = response.json()["choices"][0]["message"]["content"]
         decoded = json.loads(content)
         return {

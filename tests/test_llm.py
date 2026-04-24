@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+
+import httpx
+
 from agent.inference.rules import infer_attributes
 from agent.llm.reasoner import OpenAICompatibleReasoner, _metadata_context_text, confirm_no_sdrf_parameters, confirm_sdrf_parameters
 from agent.models import AttributeValue, MetadataValue, ProjectContext
@@ -197,6 +201,50 @@ def test_openai_compatible_reasoner_defaults_to_gpt_5_4():
     reasoner = OpenAICompatibleReasoner(api_key="test-key")
 
     assert reasoner.model == "gpt-5.4"
+
+
+def test_openai_compatible_reasoner_falls_back_when_json_mode_returns_5xx(monkeypatch):
+    calls = []
+
+    def fake_post(url, headers, json, timeout):
+        calls.append(json)
+        request = httpx.Request("POST", url)
+        if "response_format" in json:
+            return httpx.Response(502, request=request, text="bad gateway")
+        content = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json_module.dumps(
+                            {
+                                "enzyme": {
+                                    "value": "Asp-N",
+                                    "confidence": 0.95,
+                                    "source": "llm_confirmed",
+                                    "evidence_excerpt": "ASP-N file name",
+                                    "conflict_flag": False,
+                                }
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+        return httpx.Response(200, request=request, json=content)
+
+    json_module = json
+    monkeypatch.setattr("agent.llm.reasoner.httpx.post", fake_post)
+    monkeypatch.setattr("agent.llm.reasoner.time.sleep", lambda *_: None)
+
+    context = ProjectContext(project_accession="PXD019949", file_name="ASP-N_F4-R1.raw", metadata={}, sdrf_rows=[])
+    attributes = infer_attributes(context)
+    reasoner = OpenAICompatibleReasoner(api_key="test-key", base_url="http://example.test/v1")
+
+    updates = reasoner.confirm_search_parameters(context, attributes)
+
+    assert updates["enzyme"].value == "Asp-N"
+    assert any("response_format" in payload for payload in calls)
+    assert any("response_format" not in payload for payload in calls)
 
 
 def test_llm_confirmation_is_skipped_when_sdrf_exists():
