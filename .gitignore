@@ -6,6 +6,7 @@ pytest-cache-files-*/
 _gitrepo/
 external/
 sample_task/
+.agent_cache/
 
 # Local tool archives and unpacked vendor bundles
 FragPipe-*.zip

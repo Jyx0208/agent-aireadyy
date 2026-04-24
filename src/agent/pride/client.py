@@ -81,7 +81,7 @@ class PrideClient:
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
         if report is not None:
-            report(f"Downloading {url}")
+            report(f"正在下载：{url}")
 
         with self._client.stream("GET", url) as response:
             response.raise_for_status()
@@ -125,9 +125,9 @@ class PrideClient:
                 }
             )
             if total > 0:
-                report(f"Download complete: {target_path} ({downloaded}/{total} bytes)")
+                report(f"下载完成：{target_path}（{downloaded}/{total} bytes）")
             else:
-                report(f"Download complete: {target_path}")
+                report(f"下载完成：{target_path}")
         return target_path
 
     @staticmethod

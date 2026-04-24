@@ -21,6 +21,15 @@ def _normalize_name(value: str) -> str:
     return normalize_input(value).normalized_name if value else value
 
 
+def _entry_names(entries: Iterable[dict[str, Any]]) -> list[str]:
+    names = []
+    for entry in entries:
+        name = entry.get("name")
+        if name:
+            names.append(str(name))
+    return names
+
+
 def _sdrf_candidate_columns(columns: Iterable[str]) -> list[str]:
     result = []
     for column in columns:
@@ -96,19 +105,19 @@ def build_project_context(
             completeness=1.0 if project.get("dataProcessingProtocol") else 0.0,
         ),
         "organisms": MetadataValue(
-            value=[entry.get("name") for entry in project.get("organisms", [])],
+            value=_entry_names(project.get("organisms", [])),
             source="pride.organisms",
             source_level="project",
             completeness=1.0 if project.get("organisms") else 0.0,
         ),
         "instruments": MetadataValue(
-            value=[entry.get("name") for entry in project.get("instruments", [])],
+            value=_entry_names(project.get("instruments", [])),
             source="pride.instruments",
             source_level="project",
             completeness=1.0 if project.get("instruments") else 0.0,
         ),
         "experimentTypes": MetadataValue(
-            value=[entry.get("name") for entry in project.get("experimentTypes", [])],
+            value=_entry_names(project.get("experimentTypes", [])),
             source="pride.experimentTypes",
             source_level="project",
             completeness=1.0 if project.get("experimentTypes") else 0.0,

@@ -5,9 +5,10 @@ from pathlib import Path
 import typer
 
 from agent.ai_ready.exporter import export_ai_ready_bundle
+from agent.assets.preparer import AssetPreparationError
 from agent.execution.bundle import materialize_dda_task_bundle
 from agent.input.normalizer import normalize_input
-from agent.orchestrator.pipeline import AgentService
+from agent.orchestrator.pipeline import AgentService, ReviewRequiredError
 from agent.progress import render_download_progress
 from agent.runtime.bootstrap import bootstrap_msdt_converter
 from agent.runtime.toolchain import detect_toolchain
@@ -62,6 +63,13 @@ def _build_reporter(output_dir: Path | None = None) -> ConsoleReporter:
     if output_dir is not None:
         log_path = output_dir / "logs" / "runtime.log"
     return ConsoleReporter(log_path=log_path)
+
+
+def _msdt_docker_command(output_dir: Path) -> str:
+    return (
+        f'docker run --rm -v "{Path(output_dir).resolve()}:/workspace" '
+        "guomics2017/msdt-converter:v1.3 -config /workspace/converter_config.json"
+    )
 
 
 @app.command("check-runtime")
@@ -174,14 +182,50 @@ def prepare_dda_bundle(input_value: str, source_data_path: Path, output_dir: Pat
     typer.echo(bundle.model_dump_json(indent=2))
 
 
+@app.command("prepare-msdt-docker-input")
+def prepare_msdt_docker_input(input_value: str, source_data_path: Path, output_dir: Path) -> None:
+    service = AgentService(reporter=_build_reporter(output_dir))
+    task = normalize_input(input_value)
+    resolution, context, _ = service.plan_dda_run(task, source_data_path, output_dir)
+    attributes = service.infer_attributes(context)
+    bundle = materialize_dda_task_bundle(
+        task=task,
+        project_resolution=resolution,
+        project_context=context,
+        attributes=attributes,
+        source_data_path=source_data_path,
+        output_dir=output_dir,
+    )
+    service.write_task_bundle(output_dir, resolution, context, attributes, bundle.plan)
+    typer.echo(f"请使用下面的命令运行 MSDT-Converter Docker：{_msdt_docker_command(output_dir)}")
+
+
+@app.command("prepare-pride-msdt-docker-input")
+def prepare_pride_msdt_docker_input(input_value: str, output_dir: Path) -> None:
+    service = AgentService(reporter=_build_reporter(output_dir))
+    task = normalize_input(input_value)
+    try:
+        bundle, _, _ = service.prepare_pride_msdt_docker_input(task=task, output_dir=output_dir)
+    except (AssetPreparationError, ReviewRequiredError):
+        typer.echo(_review_message(output_dir), err=True)
+        raise typer.Exit(1)
+    typer.echo(f"请使用下面的命令运行 MSDT-Converter Docker：{_msdt_docker_command(output_dir)}")
+    typer.echo(bundle.model_dump_json(indent=2))
+
+
+def _review_message(output_dir: Path) -> str:
+    return (
+        "当前输入包需要人工复核，暂不能运行 MSDT-Converter Docker。"
+        f"请查看 {output_dir / 'review_queue.json'} 和 {output_dir / 'task_state.json'}。"
+    )
+
+
 @app.command("run-dda-msdt")
 def run_dda_msdt(
     input_value: str,
     source_data_path: Path,
     output_dir: Path,
-    fragpipe_root: Path = typer.Option(..., help="Pinned FragPipe root, expected version family 21.1."),
-    converter_root: Path = typer.Option(..., help="Path to the MSDT-Converter repository."),
-    java_home: Path | None = typer.Option(None, help="Optional JAVA_HOME override."),
+    converter_root: Path = typer.Option(..., help="Path to the MSDT-Converter repository. It must contain convert.py and bundled FragPipe assets."),
 ) -> None:
     service = AgentService(reporter=_build_reporter(output_dir))
     task = normalize_input(input_value)
@@ -189,9 +233,7 @@ def run_dda_msdt(
         task=task,
         source_data_path=source_data_path,
         output_dir=output_dir,
-        fragpipe_root=fragpipe_root,
         converter_root=converter_root,
-        java_home=java_home,
     )
     typer.echo(manifest.model_dump_json(indent=2))
 

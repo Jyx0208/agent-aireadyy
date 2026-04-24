@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import gzip
 import json
 import zipfile
 from pathlib import Path
 
+from agent.decision.dda import plan_dda_execution
 from agent.execution.bundle import materialize_dda_task_bundle
-from agent.execution.fragpipe import FragPipeRunner
 from agent.input.normalizer import normalize_input
 from agent.models import (
     AttributeSet,
@@ -111,15 +112,51 @@ def test_materialize_dda_task_bundle_writes_runtime_files(tmp_path: Path):
         output_dir=tmp_path / "task_out",
     )
 
-    assert bundle.plan.manifest_path.exists()
+    assert not bundle.plan.manifest_path.exists()
     assert bundle.materialized_workflow_path.exists()
     assert bundle.materialized_workflow_path.parent.name == "workflows"
     assert bundle.materialized_fasta_path.exists()
+    sage_config = json.loads((tmp_path / "task_out" / "sage" / "sage_config.json").read_text(encoding="utf-8"))
+    assert sage_config["database"]["enzyme"]["cleave_at"] == "K"
     assert bundle.converter_config_path.exists()
     assert json.loads(bundle.converter_config_path.read_text(encoding="utf-8"))["generate_fragpipe_search_result"]["need"] is True
 
 
-def test_materialize_dda_task_bundle_writes_search_parameter_hints_to_workflow(tmp_path: Path):
+def test_materialize_dda_task_bundle_copies_external_source_into_task_root(tmp_path: Path):
+    task = normalize_input("WT_5_Lys-c.raw")
+    resolution = ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession="PXD123456",
+            matched_file="WT_5_Lys-c.raw",
+            match_type="exact",
+            match_score=100,
+            evidence=["exact"],
+            metadata_consistency=1.0,
+        ),
+        alternative_projects=[],
+        resolution_reason="exact match",
+        resolution_confidence=1.0,
+        needs_review=False,
+    )
+    context = ProjectContext(project_accession="PXD123456", file_name="WT_5_Lys-c.raw")
+    source_path = tmp_path / "external_data" / "WT_5_Lys-c.mzML"
+    source_path.parent.mkdir()
+    source_path.write_text("<mzML />", encoding="utf-8")
+
+    bundle = materialize_dda_task_bundle(
+        task=task,
+        project_resolution=resolution,
+        project_context=context,
+        attributes=_attributes(),
+        source_data_path=source_path,
+        output_dir=tmp_path / "task_out",
+    )
+
+    assert bundle.plan.source_data_path == tmp_path / "task_out" / "input" / "WT_5_Lys-c.mzML"
+    assert bundle.plan.source_data_path.read_text(encoding="utf-8") == "<mzML />"
+
+
+def test_materialize_dda_task_bundle_keeps_fragpipe_workflow_unmodified(tmp_path: Path):
     task = normalize_input("WT_5_Lys-c.raw")
     resolution = ProjectResolution(
         primary_project=ProjectCandidate(
@@ -179,23 +216,10 @@ def test_materialize_dda_task_bundle_writes_search_parameter_hints_to_workflow(t
         output_dir=tmp_path / "task_out",
     )
 
+    source_workflow = bundle.plan.fragpipe_workflow_path.read_text(encoding="utf-8")
     workflow_text = bundle.materialized_workflow_path.read_text(encoding="utf-8")
 
-    assert "msfragger.precursor_mass_lower=-10" in workflow_text
-    assert "msfragger.precursor_mass_upper=10" in workflow_text
-    assert "msfragger.precursor_mass_units=1" in workflow_text
-    assert "msfragger.fragment_mass_tolerance=0.5" in workflow_text
-    assert "msfragger.fragment_mass_units=0" in workflow_text
-    assert "msfragger.allowed_missed_cleavage_1=2" in workflow_text
-    assert "msfragger.search_enzyme_name_1=lysc" in workflow_text
-    assert "msfragger.search_enzyme_cut_1=K" in workflow_text
-    assert "57.02146,C,true,3" in workflow_text
-    assert "42.0106,[^,true,1" in workflow_text
-    assert "27.9949,[^,true,1" in workflow_text
-    assert "15.9949,M,true,3" in workflow_text
-    assert "0.984016,NQ,true,3" in workflow_text
-    assert "-17.0265,nQnC,true,1" in workflow_text
-    assert "0.0,C (cysteine),true,-1" in workflow_text
+    assert workflow_text == source_workflow
 
 
 def test_materialize_dda_task_bundle_downloads_reproduced_project_fasta(tmp_path: Path, monkeypatch):
@@ -269,26 +293,61 @@ def test_materialize_dda_task_bundle_downloads_reproduced_project_fasta(tmp_path
     assert bundle.materialized_fasta_path.name == "project_reference.fasta"
 
 
-def test_fragpipe_runner_materializes_workflow_with_attribute_overrides(tmp_path: Path):
-    profile = tmp_path / "profile.workflow"
-    profile.write_text("workflow.description=test\n", encoding="utf-8")
-    attributes = _attributes()
-    attributes.search_parameter_hints = AttributeValue(
-        value={"precursor_tol": "10ppm", "fragment_tol": "0.5Da", "missed_cleavages": 2},
-        confidence=0.9,
-        source="llm_confirmed",
-        evidence_excerpt="confirmed",
-        conflict_flag=False,
+def test_materialize_dda_task_bundle_decompresses_reproduced_project_fasta_gz(tmp_path: Path, monkeypatch):
+    task = normalize_input("WT_5_Lys-c.raw")
+    resolution = ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession="PXD123456",
+            matched_file="WT_5_Lys-c.raw",
+            match_type="exact",
+            match_score=100,
+            evidence=["exact"],
+            metadata_consistency=1.0,
+        ),
+        alternative_projects=[],
+        resolution_reason="exact match",
+        resolution_confidence=1.0,
+        needs_review=False,
     )
-    plan = _minimal_plan(tmp_path, profile)
-    runner = FragPipeRunner(fragpipe_root=tmp_path / "FragPipe")
+    context = ProjectContext(
+        project_accession="PXD123456",
+        file_name="WT_5_Lys-c.raw",
+        project_files=[
+            {
+                "fileName": "project_reference.fasta.gz",
+                "publicFileLocations": [
+                    {"value": "ftp://ftp.pride.ebi.ac.uk/pride/data/archive/2024/01/PXD123456/project_reference.fasta.gz"}
+                ],
+            }
+        ],
+    )
 
-    workflow_copy = runner.materialize_workflow_copy(plan, attributes=attributes)
-    workflow_text = workflow_copy.read_text(encoding="utf-8")
+    class FakePrideClient:
+        @staticmethod
+        def first_download_url(file_record):
+            return "https://ftp.pride.ebi.ac.uk/pride/data/archive/2024/01/PXD123456/project_reference.fasta.gz"
 
-    assert "msfragger.precursor_mass_lower=-10" in workflow_text
-    assert "msfragger.fragment_mass_tolerance=0.5" in workflow_text
-    assert "msfragger.search_enzyme_name_1=lysc" in workflow_text
+        def download_to_path(self, url, target_path, report=None):
+            Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(target_path).write_bytes(gzip.compress(b">sp|P1|\nPEPTIDE\n"))
+            return Path(target_path)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("agent.execution.bundle.PrideClient", FakePrideClient)
+
+    bundle = materialize_dda_task_bundle(
+        task=task,
+        project_resolution=resolution,
+        project_context=context,
+        attributes=_attributes(),
+        source_data_path=tmp_path / "WT_5_Lys-c.mzML",
+        output_dir=tmp_path / "task_out",
+    )
+
+    assert bundle.materialized_fasta_path.name == "project_reference.fasta"
+    assert bundle.materialized_fasta_path.read_text(encoding="utf-8") == ">sp|P1|\nPEPTIDE\n"
 
 
 def _minimal_plan(tmp_path: Path, workflow_path: Path):

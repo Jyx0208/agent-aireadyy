@@ -7,11 +7,10 @@ from typing import Callable
 from agent.ai_ready.exporter import export_ai_ready_bundle
 from agent.audit.review import append_review_item, build_review_item, build_task_state_snapshot, write_task_state
 from agent.assets.downloader import download_file_asset
-from agent.assets.preparer import DockerPwizConverter, RawToMzMLConverter, prepare_file_asset
+from agent.assets.preparer import AssetPreparationError, DockerPwizConverter, RawToMzMLConverter, prepare_file_asset
 from agent.assets.resolver import resolve_file_asset
 from agent.decision.dda import plan_dda_execution
 from agent.execution.bundle import materialize_dda_task_bundle
-from agent.execution.fragpipe import FragPipeRunner
 from agent.inference.rules import infer_attributes
 from agent.llm.reasoner import LLMReasoner, confirm_no_sdrf_parameters, confirm_sdrf_parameters
 from agent.metadata.context import build_project_context
@@ -22,6 +21,10 @@ from agent.msdt_converter.runner import MSDTConverterRunner
 from agent.pride.client import PrideClient
 from agent.pride.resolver import resolve_input_to_project
 from agent.utils import write_json
+
+
+class ReviewRequiredError(RuntimeError):
+    pass
 
 
 class AgentService:
@@ -50,63 +53,70 @@ class AgentService:
     def _report_resolution_summary(self, resolution: ProjectResolution) -> None:
         primary = resolution.primary_project
         if primary is None:
-            self._report("Decision summary: no primary PRIDE project resolved.")
+            self._report("项目解析摘要：未解析到主 PRIDE 项目。")
             return
         self._report(
-            "Decision summary: "
-            f"project={primary.project_accession}; matched_file={primary.matched_file}; "
-            f"match_type={primary.match_type}; match_score={primary.match_score}; "
-            f"resolution_confidence={resolution.resolution_confidence:.2f}"
+            "项目解析摘要："
+            f"项目={primary.project_accession}；匹配文件={primary.matched_file}；"
+            f"匹配类型={primary.match_type}；匹配分数={primary.match_score}；"
+            f"解析置信度={resolution.resolution_confidence:.2f}"
         )
         if resolution.resolution_reason:
-            self._report(f"Decision reason: {resolution.resolution_reason}")
+            self._report(f"解析原因：{resolution.resolution_reason}")
 
     def _report_metadata_summary(self, context: ProjectContext) -> None:
         organisms = self._format_value(context.metadata.get("organisms").value) if context.metadata.get("organisms") else ""
         instruments = self._format_value(context.metadata.get("instruments").value) if context.metadata.get("instruments") else ""
         experiment_types = self._format_value(context.metadata.get("experimentTypes").value) if context.metadata.get("experimentTypes") else ""
         self._report(
-            "Metadata summary: "
-            f"sdrf_rows={len(context.sdrf_rows)}; organisms={organisms or 'unknown'}; "
-            f"instruments={instruments or 'unknown'}; experiment_types={experiment_types or 'unknown'}"
+            "项目元数据摘要："
+            f"SDRF 行数={len(context.sdrf_rows)}；物种={organisms or '未知'}；"
+            f"仪器={instruments or '未知'}；实验类型={experiment_types or '未知'}"
         )
 
     def _report_attribute_summary(self, attributes) -> None:
+        hints = attributes.search_parameter_hints.value if isinstance(attributes.search_parameter_hints.value, dict) else {}
         self._report(
-            "Attribute decision: "
-            f"acquisition_mode={attributes.acquisition_mode.value} [{attributes.acquisition_mode.source}, {attributes.acquisition_mode.confidence:.2f}]; "
-            f"species={attributes.species.value} [{attributes.species.source}, {attributes.species.confidence:.2f}]; "
-            f"instrument={attributes.instrument_name.value} [{attributes.instrument_name.source}, {attributes.instrument_name.confidence:.2f}]; "
-            f"enzyme={attributes.enzyme.value} [{attributes.enzyme.source}, {attributes.enzyme.confidence:.2f}]"
+            "属性判断："
+            f"采集模式={attributes.acquisition_mode.value} [{attributes.acquisition_mode.source}, {attributes.acquisition_mode.confidence:.2f}]；"
+            f"物种={attributes.species.value} [{attributes.species.source}, {attributes.species.confidence:.2f}]；"
+            f"仪器={attributes.instrument_name.value} [{attributes.instrument_name.source}, {attributes.instrument_name.confidence:.2f}]；"
+            f"酶={attributes.enzyme.value} [{attributes.enzyme.source}, {attributes.enzyme.confidence:.2f}]"
         )
         self._report(
-            "Search decision: "
-            f"params={self._format_value(attributes.search_parameter_hints.value) or 'none'}; "
-            f"fixed_mods={self._format_value(attributes.fixed_mods.value) or 'none'}; "
-            f"variable_mods={self._format_value(attributes.variable_mods.value) or 'none'}"
+            "搜库参数判断："
+            f"参数={self._format_value(attributes.search_parameter_hints.value) or '无'}；"
+            f"固定修饰={self._format_value(attributes.fixed_mods.value) or '无'}；"
+            f"可变修饰={self._format_value(attributes.variable_mods.value) or '无'}"
         )
+        if hints.get("data_family") or hints.get("sidecar_patterns"):
+            self._report(
+                "数据适配提示："
+                f"数据类型={hints.get('data_family', '未知')}；"
+                f"sidecar 文件模式={self._format_value(hints.get('sidecar_patterns', [])) or '无'}"
+            )
 
     def _report_plan_summary(self, plan: DdaExecutionPlan) -> None:
         self._report(
-            "Execution decision: "
-            f"raw_type={plan.raw_data_type}; fasta={plan.fasta_path.name} ({plan.fasta_selection_mode}); "
-            f"workflow={plan.fragpipe_workflow_path.name}; threads={plan.thread_num}"
+            "执行计划："
+            f"原始数据类型={plan.raw_data_type}；FASTA={plan.fasta_path.name} ({plan.fasta_selection_mode})；"
+            f"workflow={plan.fragpipe_workflow_path.name}；线程数={plan.thread_num}"
         )
         self._report(
-            "Execution outputs: "
-            f"rawspectrum={plan.rawspectrum_output_path}; fp_pin={plan.expected_pin_path}; "
+            "预期输出："
+            f"rawspectrum={plan.rawspectrum_output_path}；fp_pin={plan.expected_pin_path}；"
             f"fp_msdt={plan.output_paths['fp_msdt']}"
         )
 
     def _report_asset_summary(self, asset: FileAsset) -> None:
         self._report(
-            "Asset decision: "
-            f"resolved_type={asset.resolved_asset_type}; matched_file={asset.matched_project_file or 'unknown'}; "
-            f"requires_conversion={asset.requires_conversion}; asset_confidence={asset.asset_confidence:.2f}"
+            "文件资产判断："
+            f"解析类型={asset.resolved_asset_type}；匹配文件={asset.matched_project_file or '未知'}；"
+            f"是否需要转换={asset.requires_conversion}；资产置信度={asset.asset_confidence:.2f}"
         )
 
     def resolve_project(self, raw_input: str) -> ProjectResolution:
-        self._report(f"[1/5] Resolving project for file: {raw_input}")
+        self._report(f"[1/5] 正在根据文件名解析 PRIDE 项目：{raw_input}")
         return resolve_input_to_project(self.pride_client, raw_input)
 
     def build_context(self, resolution: ProjectResolution, file_name: str) -> ProjectContext:
@@ -159,6 +169,7 @@ class AgentService:
             project_resolution=resolution,
             attributes=attributes,
             output_dir=output_dir,
+            project_context=context,
         )
         self._report_plan_summary(plan)
         return resolution, context, plan
@@ -170,24 +181,24 @@ class AgentService:
     ) -> PridePlanResult:
         resolution = self.resolve_project(task.original_input)
         if resolution.primary_project:
-            self._report(f"Selected primary project: {resolution.primary_project.project_accession}")
+            self._report(f"已选择主项目：{resolution.primary_project.project_accession}")
         else:
-            self._report("No primary project could be resolved.")
+            self._report("未能解析到主项目。")
         self._report_resolution_summary(resolution)
         context = self.build_context(resolution, task.file_name) if resolution.primary_project else ProjectContext(
             project_accession="unknown",
             file_name=task.file_name,
         )
-        self._report(f"[2/5] Project context ready. SDRF rows: {len(context.sdrf_rows)}")
+        self._report(f"[2/5] 项目上下文已准备完成。SDRF 行数：{len(context.sdrf_rows)}")
         self._report_metadata_summary(context)
         asset = self.resolve_asset(task, context, output_dir)
         self._report(
-            f"[3/5] Resolved asset: {asset.matched_project_file or 'unknown'} "
-            f"({asset.resolved_asset_type}, requires_conversion={asset.requires_conversion})"
+            f"[3/5] 已解析数据文件：{asset.matched_project_file or '未知'} "
+            f"（类型={asset.resolved_asset_type}，是否需要转换={asset.requires_conversion}）"
         )
         self._report_asset_summary(asset)
         attributes = self.infer_attributes(context)
-        self._report(f"[4/5] Attribute inference complete. acquisition_mode={attributes.acquisition_mode.value}")
+        self._report(f"[4/5] 文件属性推断完成。采集模式={attributes.acquisition_mode.value}")
         self._report_attribute_summary(attributes)
         source_data_path = asset.prepared_path or asset.local_path or Path(output_dir) / "assets" / "prepared" / f"{task.stem}.mzML"
         plan = plan_dda_execution(
@@ -197,8 +208,9 @@ class AgentService:
             project_resolution=resolution,
             attributes=attributes,
             output_dir=output_dir,
+            project_context=context,
         )
-        self._report(f"[5/5] DDA execution plan ready. workflow={plan.fragpipe_workflow_path.name}")
+        self._report(f"[5/5] DDA 执行计划已生成。workflow={plan.fragpipe_workflow_path.name}")
         self._report_plan_summary(plan)
         return PridePlanResult(
             resolution=resolution,
@@ -250,14 +262,12 @@ class AgentService:
         task: InputTask,
         source_data_path: str | Path,
         output_dir: str | Path,
-        fragpipe_root: str | Path,
         converter_root: str | Path,
-        java_home: str | Path | None = None,
     ) -> RunManifest:
         resolution, context, plan = self.plan_dda_run(task, source_data_path, output_dir)
         attributes = self.infer_attributes(context)
-        self.write_task_bundle(output_dir, resolution, context, attributes, plan)
         if plan.needs_review:
+            self.write_task_bundle(output_dir, resolution, context, attributes, plan)
             manifest = RunManifest(
                 task_id=task.task_id,
                 created_at=datetime.now(UTC),
@@ -281,13 +291,18 @@ class AgentService:
             )
             return manifest
 
-        fragpipe = FragPipeRunner(fragpipe_root=fragpipe_root, java_home=java_home)
-        fragpipe.materialize_manifest(plan)
-        fragpipe.materialize_workflow_copy(plan, attributes=attributes)
-        fragpipe_result = fragpipe.run(plan, attributes=attributes)
+        bundle = materialize_dda_task_bundle(
+            task=task,
+            project_resolution=resolution,
+            project_context=context,
+            attributes=attributes,
+            source_data_path=source_data_path,
+            output_dir=output_dir,
+        )
+        self.write_task_bundle(output_dir, resolution, context, attributes, bundle.plan)
 
         converter = MSDTConverterRunner(converter_root=converter_root)
-        converter_result = converter.run(plan)
+        converter_result = converter.run(bundle.plan)
 
         manifest = RunManifest(
             task_id=task.task_id,
@@ -296,8 +311,8 @@ class AgentService:
             project_accession=resolution.primary_project.project_accession if resolution.primary_project else None,
             source_file=task.file_name,
             source_data_path=str(source_data_path),
-            outputs={key: str(value) for key, value in plan.output_paths.items()},
-            notes=[fragpipe_result.stdout, converter_result.stdout],
+            outputs={key: str(value) for key, value in bundle.plan.output_paths.items()},
+            notes=[converter_result.stdout],
         )
         write_json(Path(output_dir) / "run_manifest.json", manifest)
         write_task_state(
@@ -319,30 +334,8 @@ class AgentService:
         output_dir: str | Path,
         image: str = "guomics2017/msdt-converter:v1.3",
     ) -> RunManifest:
-        result = self.plan_dda_run_from_pride(task=task, output_dir=output_dir)
-        prepared_path = self.prepare_asset(result.asset)
-        bundle = materialize_dda_task_bundle(
-            task=task,
-            project_resolution=result.resolution,
-            project_context=result.context,
-            attributes=result.attributes,
-            source_data_path=prepared_path,
-            output_dir=output_dir,
-        )
-        self.write_task_bundle(
-            output_dir,
-            result.resolution,
-            result.context,
-            result.attributes,
-            bundle.plan,
-            asset=result.asset,
-        )
-        self._report(
-            "Materialized execution assets: "
-            f"workflow={bundle.materialized_workflow_path}; fasta={bundle.materialized_fasta_path}; "
-            f"converter_config={bundle.converter_config_path}"
-        )
-        self._report("Materialized task bundle. Starting Docker MSDT pipeline.")
+        bundle, result, prepared_path = self.prepare_pride_msdt_docker_input(task=task, output_dir=output_dir)
+        self._report("任务输入包已生成，开始运行 MSDT-Converter Docker 流程。")
         runner = DockerMSDTConverterRunner(image=image, report=self.reporter)
         docker_result = runner.run(bundle)
         msdt_output = bundle.plan.output_paths.get("fp_msdt")
@@ -402,6 +395,79 @@ class AgentService:
             ),
         )
         return manifest
+
+    def prepare_pride_msdt_docker_input(
+        self,
+        task: InputTask,
+        output_dir: str | Path,
+    ):
+        result = self.plan_dda_run_from_pride(task=task, output_dir=output_dir)
+        if result.plan.needs_review:
+            self.write_task_bundle(
+                output_dir,
+                result.resolution,
+                result.context,
+                result.attributes,
+                result.plan,
+                asset=result.asset,
+            )
+            message = f"当前计划需要人工复核，暂不下载或准备数据文件。原因：{result.plan.blocking_issues}"
+            self._report(message)
+            raise ReviewRequiredError(message)
+        try:
+            prepared_path = self.prepare_asset(result.asset)
+        except AssetPreparationError as exc:
+            output_dir = Path(output_dir)
+            reason = (
+                "数据文件准备需要 RAW/vendor 格式转换，但当前没有可用转换器。"
+                "请安装 ProteoWizard msconvert，或启动 Docker Desktop 以使用 ProteoWizard Docker 备用转换。"
+                f"已下载的文件保留在：{exc.local_path}。详细信息：{exc}"
+            )
+            self._report(reason)
+            self.write_task_bundle(
+                output_dir,
+                result.resolution,
+                result.context,
+                result.attributes,
+                result.plan.model_copy(update={"needs_review": True, "blocking_issues": result.plan.blocking_issues + [reason]}),
+                asset=result.asset,
+            )
+            append_review_item(
+                output_dir / "review_queue.json",
+                build_review_item(
+                    task_id=task.task_id,
+                    source_file=task.file_name,
+                    project_accession=result.resolution.primary_project.project_accession if result.resolution.primary_project else None,
+                    stage="asset_preparation",
+                    reasons=[reason],
+                ),
+            )
+            raise
+        bundle = materialize_dda_task_bundle(
+            task=task,
+            project_resolution=result.resolution,
+            project_context=result.context,
+            attributes=result.attributes,
+            source_data_path=prepared_path,
+            output_dir=output_dir,
+        )
+        self.write_task_bundle(
+            output_dir,
+            result.resolution,
+            result.context,
+            result.attributes,
+            bundle.plan,
+            asset=result.asset,
+        )
+        docker_runner = DockerMSDTConverterRunner(image="guomics2017/msdt-converter:v1.3", report=self.reporter)
+        if hasattr(docker_runner, "write_container_config"):
+            docker_runner.write_container_config(bundle)
+        self._report(
+            "MSDT-Converter 输入包已生成："
+            f"workflow={bundle.materialized_workflow_path}；fasta={bundle.materialized_fasta_path}；"
+            f"converter_config={bundle.converter_config_path}"
+        )
+        return bundle, result, prepared_path
 
     def export_ai_ready(
         self,

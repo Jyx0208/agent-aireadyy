@@ -10,14 +10,34 @@ from agent.models import InputTask
 
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
+_COMPOUND_EXTENSIONS = (
+    ".mzml.gz",
+    ".fasta.gz",
+    ".fa.gz",
+    ".faa.gz",
+    ".d.zip",
+    ".d.tar.gz",
+    ".d.tgz",
+    ".raw.zip",
+)
+
+
+def _split_name(file_name: str) -> tuple[str, str]:
+    lower_name = file_name.lower()
+    for extension in _COMPOUND_EXTENSIONS:
+        if lower_name.endswith(extension):
+            return file_name[: -len(extension)], extension
+    if "." in file_name:
+        stem, extension = file_name.rsplit(".", 1)
+        return stem, f".{extension.lower()}"
+    return file_name, ""
 
 
 def _normalize_name(file_name: str) -> str:
-    if "." in file_name:
-        stem, extension = file_name.rsplit(".", 1)
+    stem, extension = _split_name(file_name)
+    if extension:
         normalized_stem = _NON_ALNUM.sub("-", stem.lower()).strip("-")
-        normalized_ext = extension.lower()
-        return f"{normalized_stem}.{normalized_ext}"
+        return f"{normalized_stem}{extension}"
     return _NON_ALNUM.sub("-", file_name.lower()).strip("-")
 
 
@@ -38,12 +58,7 @@ def _extract_file_name(raw_input: str) -> tuple[str, str]:
 
 def normalize_input(raw_input: str) -> InputTask:
     file_name, source_type = _extract_file_name(raw_input)
-    if "." in file_name:
-        stem, extension = file_name.rsplit(".", 1)
-        extension = f".{extension.lower()}"
-    else:
-        stem = file_name
-        extension = ""
+    stem, extension = _split_name(file_name)
 
     normalized_name = _normalize_name(file_name)
     digest = hashlib.sha1(raw_input.encode("utf-8")).hexdigest()[:12]

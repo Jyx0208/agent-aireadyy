@@ -133,6 +133,15 @@ def _no_sdrf_attribute_prompt(context: ProjectContext, attributes: AttributeSet)
         "Return strict JSON. Keys may include acquisition_mode, species, instrument_name, instrument_family, "
         "enzyme, labeling_strategy, fixed_mods, variable_mods, fractionation_hint, search_parameter_hints.\n"
         "Each key must be an object with value, confidence, source, evidence_excerpt, conflict_flag.\n"
+        "For Sage config generation, normalize search_parameter_hints using keys such as precursor_tol, "
+        "fragment_tol, missed_cleavages, precursor_charge, isotope_errors, min_peaks, max_peaks, "
+        "min_matched_peaks, max_variable_mods, tmt_channel_count, and data_family. "
+        "data_family should be one of mzml, tims, thermo_raw, sciex_wiff, mgf, or unknown. "
+        "Also include sidecar_patterns when project files imply companion files such as .wiff.scan. "
+        "Normalize fixed_mods and variable_mods "
+        "as human-readable modification strings with residue/site and mass when available, e.g. "
+        "Carbamidomethyl (C) 57.02146, Oxidation (M) 15.9949, TMT (K) 229.16293.\n"
+        "Normalize labeling_strategy to label-free, TMT, iTRAQ, SILAC, or unknown.\n"
         "Use source='llm_confirmed'. Keep evidence_excerpt short and grounded in the supplied text.\n"
         "Set confidence lower when inferred from weak naming patterns. Do not invent unsupported values.\n\n"
         f"Project context:\n{_metadata_context_text(context)}\n\n"
@@ -150,6 +159,11 @@ def _sdrf_attribute_prompt(context: ProjectContext, attributes: AttributeSet) ->
         "Return strict JSON. Keys may include acquisition_mode, species, instrument_name, instrument_family, "
         "enzyme, labeling_strategy, fixed_mods, variable_mods, fractionation_hint, search_parameter_hints.\n"
         "Each key must be an object with value, confidence, source, evidence_excerpt, conflict_flag.\n"
+        "For Sage config generation, extract enzyme, missed_cleavages, precursor_tol, fragment_tol, "
+        "fixed_mods, variable_mods, labeling_strategy, precursor_charge, isotope_errors, min_peaks, max_peaks, "
+        "min_matched_peaks, max_variable_mods, tmt_channel_count, data_family, and sidecar_patterns when SDRF rows or "
+        "project metadata explicitly provide them. Use normalized modification strings with residue/site and mass "
+        "when available, e.g. Carbamidomethyl (C) 57.02146, Oxidation (M) 15.9949, TMT (K) 229.16293.\n"
         "Use source='llm_confirmed'. Prefer normalized human-readable values over raw NT=/AC= strings.\n"
         "When SDRF rows represent multiple organisms in one file, summarize species as a multi-species mixture.\n"
         "Do not invent parameters not grounded in the supplied SDRF rows or metadata.\n\n"
@@ -224,22 +238,22 @@ def confirm_no_sdrf_parameters(
         return attributes
 
     if report is not None:
-        report("No SDRF rows found; checking project descriptions and file-level hints.")
+        report("未找到 SDRF 行；将结合项目描述和文件名线索判断参数。")
 
     reasoner = llm_reasoner or default_llm_reasoner()
     if reasoner is None:
         if report is not None:
-            report("No LLM reasoner configured; keeping rule-based attributes.")
+            report("未配置大模型推理器；保留规则推断结果。")
         return attributes
 
     if report is not None:
-        report("Invoking LLM to confirm attributes and search parameters.")
+        report("正在调用大模型确认文件属性和搜库参数。")
 
     try:
         updates = reasoner.confirm_search_parameters(context, attributes)
     except Exception as exc:
         if report is not None:
-            report(f"LLM confirmation failed; keeping rule-based attributes. reason={exc}")
+            report(f"大模型确认失败；保留规则推断结果。原因={exc}")
         return attributes
     merged = attributes.model_dump()
     for field_name, proposed_value in updates.items():
@@ -260,7 +274,7 @@ def confirm_no_sdrf_parameters(
         result = result.model_copy(update={"instrument_family": _derive_instrument_family(result.instrument_name.value)})
 
     if report is not None:
-        report("LLM confirmation merged into inferred attributes.")
+        report("大模型确认结果已合并到属性推断中。")
     return result
 
 
@@ -278,13 +292,13 @@ def confirm_sdrf_parameters(
         return attributes
 
     if report is not None:
-        report(f"Matched SDRF rows found ({len(context.sdrf_rows)}); using LLM to summarize file-level workflow attributes.")
+        report(f"找到匹配的 SDRF 行（{len(context.sdrf_rows)} 行）；正在用大模型汇总文件级 workflow 属性。")
 
     try:
         updates = reasoner.confirm_search_parameters(context, attributes)
     except Exception as exc:
         if report is not None:
-            report(f"LLM SDRF summarization failed; keeping deterministic SDRF attributes. reason={exc}")
+            report(f"大模型 SDRF 汇总失败；保留确定性 SDRF 推断结果。原因={exc}")
         return attributes
 
     merged = attributes.model_dump()
@@ -311,5 +325,5 @@ def confirm_sdrf_parameters(
         result = result.model_copy(update={"instrument_family": _derive_instrument_family(result.instrument_name.value)})
 
     if report is not None:
-        report("LLM SDRF summarization merged into inferred attributes.")
+        report("大模型 SDRF 汇总结果已合并到属性推断中。")
     return result

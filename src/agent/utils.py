@@ -37,7 +37,7 @@ def run_command_streaming(
     report: Callable[[Any], None] | None = None,
     cwd: str | Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    emit(report, f"Running command: {' '.join(command)}")
+    emit(report, f"正在运行命令：{' '.join(command)}")
     process = subprocess.Popen(
         command,
         cwd=str(cwd) if cwd is not None else None,

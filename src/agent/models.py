@@ -76,10 +76,12 @@ class ProjectContext(JsonModel):
 class FileAsset(JsonModel):
     original_file_name: str
     resolved_asset_type: Literal["mzml", "tims", "raw", "wiff", "unknown"]
+    project_accession: str | None = None
     matched_project_file: str | None = None
     download_url: str | None = None
     local_path: Path | None = None
     prepared_path: Path | None = None
+    sidecar_files: list[dict[str, Any]] = Field(default_factory=list)
     requires_conversion: bool = False
     asset_confidence: float = 0.0
     match_type: str = "unresolved"
@@ -110,9 +112,10 @@ class DdaExecutionPlan(JsonModel):
     task_id: str
     source_file_name: str
     source_data_path: Path
-    raw_data_type: Literal["mzml", "tims"]
+    raw_data_type: Literal["mzml", "tims", "wiff2mzml"]
     fasta_path: Path
     fasta_selection_mode: Literal["reproduced", "inferred", "defaulted"]
+    fasta_download_url: str | None = None
     fragpipe_workflow_path: Path
     manifest_path: Path
     converter_config_path: Path

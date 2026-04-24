@@ -100,7 +100,7 @@ def test_plan_dda_execution_generates_converter_compatible_paths(tmp_path: Path)
     assert plan.fasta_path.name == "Homo_sapiens_reviewed.fasta"
     assert plan.fragpipe_workflow_path.name == "LFQ_DDA_human_noNQ.workflow"
     assert plan.manifest_path.name == "fragpipe-files.fp-manifest"
-    assert plan.expected_pin_glob.endswith("sample.mzML_edited.pin")
+    assert plan.expected_pin_glob.endswith("sample_edited.pin")
     assert plan.output_paths["fp_msdt"].suffix == ".parquet"
 
 
@@ -150,6 +150,22 @@ def test_plan_dda_execution_uses_generic_fasta_for_multi_species_mixture(tmp_pat
     assert plan.fasta_selection_mode == "defaulted"
 
 
+def test_plan_dda_execution_uses_wiff2mzml_mode_for_converted_sciex_input(tmp_path: Path):
+    attributes = _dda_attributes()
+
+    plan = plan_dda_execution(
+        task_id="task-wiff",
+        source_file_name="sample.wiff",
+        source_data_path=tmp_path / "sample.mzML",
+        project_resolution=ProjectResolution.empty(),
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.raw_data_type == "wiff2mzml"
+    assert plan.output_paths["fp_msdt"].name == "sample_sage_msdt.parquet"
+
+
 def test_plan_dda_execution_rejects_dia_for_strict_msdt(tmp_path: Path):
     attributes = _dda_attributes()
     attributes.acquisition_mode = AttributeValue(
@@ -171,6 +187,50 @@ def test_plan_dda_execution_rejects_dia_for_strict_msdt(tmp_path: Path):
 
     assert plan.needs_review is True
     assert "DIA" in plan.blocking_issues[0]
+
+
+def test_plan_dda_execution_accepts_dda_pasef_as_dda(tmp_path: Path):
+    attributes = _dda_attributes()
+    attributes.acquisition_mode = AttributeValue(
+        value="DDA-PASEF",
+        confidence=0.95,
+        source="llm_confirmed",
+        evidence_excerpt="TIMS DDA-PASEF",
+        conflict_flag=False,
+    )
+    attributes.species = AttributeValue(
+        value="Acinetobacter baumannii",
+        confidence=1.0,
+        source="sdrf",
+        evidence_excerpt="Acinetobacter baumannii",
+        conflict_flag=False,
+    )
+    attributes.instrument_name = AttributeValue(
+        value="Bruker timsTOF Pro 2",
+        confidence=0.95,
+        source="sdrf",
+        evidence_excerpt="timsTOF Pro 2",
+        conflict_flag=False,
+    )
+    attributes.instrument_family = AttributeValue(
+        value="timsTOF",
+        confidence=0.95,
+        source="rule",
+        evidence_excerpt="timsTOF Pro 2",
+        conflict_flag=False,
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-dda-pasef",
+        source_file_name="tims_21nov0901_Slot1-6_1_313.mzML",
+        source_data_path=tmp_path / "tims_21nov0901_Slot1-6_1_313.mzML",
+        project_resolution=ProjectResolution.empty(),
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is False
+    assert plan.fragpipe_workflow_path.name == "LFQ_DDA_generic.workflow"
 
 
 def test_plan_dda_execution_prefers_project_fasta_over_species_guess(tmp_path: Path):
@@ -244,3 +304,68 @@ def test_plan_dda_execution_requires_review_when_multiple_project_fastas_exist(t
 
     assert plan.needs_review is True
     assert any("FASTA" in issue for issue in plan.blocking_issues)
+
+
+def test_plan_dda_execution_requires_review_for_top_down_project(tmp_path: Path):
+    attributes = _dda_attributes()
+    context = ProjectContext(
+        project_accession="PXD_TOPDOWN",
+        file_name="sample.raw",
+        metadata={
+            "experimentTypes": MetadataValue(
+                value=["Top-down proteomics"],
+                source="pride.experimentTypes",
+                source_level="project",
+                completeness=1.0,
+            )
+        },
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-topdown",
+        source_file_name="sample.raw",
+        source_data_path=tmp_path / "sample.mzML",
+        project_resolution=ProjectResolution.empty(),
+        project_context=context,
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is True
+    assert any("Top-down" in issue for issue in plan.blocking_issues)
+
+
+def test_plan_dda_execution_requires_review_for_multi_metadata_without_sdrf(tmp_path: Path):
+    attributes = _dda_attributes()
+    context = ProjectContext(
+        project_accession="PXD_MULTI",
+        file_name="sample.raw",
+        metadata={
+            "organisms": MetadataValue(
+                value=["Homo sapiens", "Mus musculus"],
+                source="pride.organisms",
+                source_level="project",
+                completeness=1.0,
+            ),
+            "instruments": MetadataValue(
+                value=["Orbitrap Fusion Lumos", "Q Exactive"],
+                source="pride.instruments",
+                source_level="project",
+                completeness=1.0,
+            ),
+        },
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-multi-metadata",
+        source_file_name="sample.raw",
+        source_data_path=tmp_path / "sample.mzML",
+        project_resolution=ProjectResolution.empty(),
+        project_context=context,
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is True
+    assert any("多个物种" in issue for issue in plan.blocking_issues)
+    assert any("多个仪器" in issue for issue in plan.blocking_issues)

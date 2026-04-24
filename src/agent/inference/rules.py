@@ -95,6 +95,15 @@ def _infer_species(context: ProjectContext) -> AttributeValue:
     organisms = context.metadata.get("organisms")
     if organisms and organisms.value:
         if isinstance(organisms.value, list) and organisms.value:
+            unique_values = [str(value) for value in dict.fromkeys(organisms.value) if str(value).strip()]
+            if len(unique_values) > 1:
+                return _attribute(
+                    "; ".join(unique_values),
+                    0.5,
+                    "pride.organisms",
+                    _flatten(unique_values),
+                    conflict=True,
+                )
             return _attribute(organisms.value[0], 0.9, "pride.organisms", str(organisms.value[0]))
         return _attribute(organisms.value, 0.9, "pride.organisms", _flatten(organisms.value))
     return _attribute("unknown", 0.0, "none", "")
@@ -108,6 +117,15 @@ def _infer_instrument_name(context: ProjectContext) -> AttributeValue:
     instruments = context.metadata.get("instruments")
     if instruments and instruments.value:
         if isinstance(instruments.value, list) and instruments.value:
+            unique_values = [str(value) for value in dict.fromkeys(instruments.value) if str(value).strip()]
+            if len(unique_values) > 1:
+                return _attribute(
+                    "; ".join(unique_values),
+                    0.5,
+                    "pride.instruments",
+                    _flatten(unique_values),
+                    conflict=True,
+                )
             return _attribute(instruments.value[0], 0.9, "pride.instruments", str(instruments.value[0]))
         return _attribute(instruments.value, 0.9, "pride.instruments", _flatten(instruments.value))
     return _attribute("unknown", 0.0, "none", "")
@@ -183,6 +201,14 @@ def infer_attributes(context: ProjectContext) -> AttributeSet:
     species = _infer_species(context)
     instrument_name = _infer_instrument_name(context)
     instrument_family = _infer_instrument_family(str(instrument_name.value))
+    if instrument_name.conflict_flag:
+        instrument_family = _attribute(
+            "unknown",
+            0.4,
+            instrument_name.source,
+            instrument_name.evidence_excerpt,
+            conflict=True,
+        )
     enzyme = _infer_enzyme(context)
     labeling_strategy = _infer_labeling(context)
     fractionation_hint = _infer_fractionation(context)

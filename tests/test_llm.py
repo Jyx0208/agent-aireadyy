@@ -165,9 +165,9 @@ def test_llm_confirmation_emits_report_messages():
 
     confirm_no_sdrf_parameters(context, base, llm_reasoner=reasoner, report=messages.append)
 
-    assert any("No SDRF rows found" in line for line in messages)
-    assert any("Invoking LLM" in line for line in messages)
-    assert any("LLM confirmation merged" in line for line in messages)
+    assert any("\u672a\u627e\u5230 SDRF \u884c" in line for line in messages)
+    assert any("\u6b63\u5728\u8c03\u7528\u5927\u6a21\u578b" in line for line in messages)
+    assert any("\u5927\u6a21\u578b\u786e\u8ba4\u7ed3\u679c\u5df2\u5408\u5e76" in line for line in messages)
 
 
 def test_llm_confirmation_falls_back_to_rules_when_reasoner_fails():
@@ -188,7 +188,7 @@ def test_llm_confirmation_falls_back_to_rules_when_reasoner_fails():
     )
 
     assert confirmed == base
-    assert any("LLM confirmation failed" in line for line in messages)
+    assert any("\u5927\u6a21\u578b\u786e\u8ba4\u5931\u8d25" in line for line in messages)
 
 
 def test_llm_sdrf_confirmation_updates_file_level_attributes():
@@ -237,8 +237,8 @@ def test_llm_sdrf_confirmation_updates_file_level_attributes():
     assert confirmed.instrument_name.value == "Orbitrap Astral"
     assert confirmed.enzyme.value == "Trypsin/P"
     assert confirmed.fixed_mods.value == ["C[57.02]"]
-    assert any("Matched SDRF rows found" in line for line in messages)
-    assert any("LLM SDRF summarization merged" in line for line in messages)
+    assert any("\u627e\u5230\u5339\u914d\u7684 SDRF \u884c" in line for line in messages)
+    assert any("\u5927\u6a21\u578b SDRF \u6c47\u603b\u7ed3\u679c\u5df2\u5408\u5e76" in line for line in messages)
 
 
 def test_agent_service_infer_attributes_uses_llm_when_no_sdrf():
