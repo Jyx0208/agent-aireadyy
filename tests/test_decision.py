@@ -23,6 +23,19 @@ def test_workspace_root_supports_installed_wheel_layout(tmp_path: Path, monkeypa
     assert dda._workspace_root() == installed_root
 
 
+def test_packaged_fragpipe_workflows_are_not_placeholder_stubs() -> None:
+    workflow_dir = dda._workspace_root() / "profiles" / "fragpipe"
+    workflow_paths = sorted(workflow_dir.glob("*.workflow"))
+
+    assert workflow_paths
+    for workflow_path in workflow_paths:
+        text = workflow_path.read_text(encoding="utf-8")
+        assert workflow_path.stat().st_size > 5_000
+        assert "__REPLACE_WITH_DECOY_FASTA__" not in text
+        assert "database.decoy-tag=" in text
+        assert "msfragger." in text
+
+
 def _dda_attributes() -> AttributeSet:
     return AttributeSet(
         acquisition_mode=AttributeValue(

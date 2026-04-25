@@ -187,6 +187,8 @@ python -m agent.cli prepare-pride-msdt-docker-input "P17_severe_NoPOTS.raw" ".\r
 - 写出 `converter_config.json`、FragPipe manifest、workflow 等输入文件。
 - 打印下一步可运行的 `MSDT-Converter` Docker 命令。
 
+内置 FragPipe workflow 模板来自本项目打包时随附的 FragPipe 21.1 官方 workflow（例如 `Default.workflow`、`TMT10.workflow`、`iTRAQ4.workflow`），不是两行占位模板；运行时会再根据 LLM/PRIDE 推断到的酶、修饰和质量误差覆盖关键参数。
+
 ### 直接跑完整 Docker 流程
 
 ```powershell
