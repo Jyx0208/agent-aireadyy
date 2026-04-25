@@ -31,7 +31,10 @@ if (Test-Path $TempDir) {
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 
 foreach ($File in $Tracked) {
-    if ($File -match "^(runs|\.agent_cache|\.venv|dist|external)/") {
+    if ($File -match "^(runs|\.agent_cache|\.venv|dist|external|tests|task_out|task_run_real|\.test_tmp|pytest-cache-files-)/" -or $File -match "^test_") {
+        continue
+    }
+    if ($File -match "(__pycache__|\.pyc$|\.pytest_cache)") {
         continue
     }
 

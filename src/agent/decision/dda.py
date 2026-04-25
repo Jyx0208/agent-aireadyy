@@ -9,7 +9,16 @@ from agent.pride.client import PrideClient
 
 
 def _workspace_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+    module_path = Path(__file__).resolve()
+    candidates = [
+        module_path.parents[3],  # source checkout: <repo>/src/agent/decision/dda.py
+        module_path.parents[2],  # installed wheel: <site-packages>/agent/decision/dda.py
+        Path.cwd(),
+    ]
+    for candidate in candidates:
+        if (candidate / "profiles" / "fragpipe").is_dir():
+            return candidate
+    return candidates[0]
 
 
 def _detect_raw_type(source_data_path: Path, source_file_name: str = "") -> str:

@@ -1,5 +1,6 @@
 ﻿from pathlib import Path
 
+from agent.decision import dda
 from agent.decision.dda import plan_dda_execution
 from agent.models import (
     AttributeSet,
@@ -8,6 +9,18 @@ from agent.models import (
     ProjectContext,
     ProjectResolution,
 )
+
+
+def test_workspace_root_supports_installed_wheel_layout(tmp_path: Path, monkeypatch) -> None:
+    installed_root = tmp_path / "site-packages"
+    module_path = installed_root / "agent" / "decision" / "dda.py"
+    (installed_root / "profiles" / "fragpipe").mkdir(parents=True)
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(dda, "__file__", str(module_path))
+
+    assert dda._workspace_root() == installed_root
 
 
 def _dda_attributes() -> AttributeSet:
