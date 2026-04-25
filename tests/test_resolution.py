@@ -62,3 +62,23 @@ def test_resolve_primary_project_prefers_metadata_consistency_before_date():
     resolution = resolve_primary_project(candidates)
 
     assert resolution.primary_project.project_accession == "PXD_HIGH"
+
+
+def test_resolve_primary_project_marks_prefix_only_match_for_review():
+    candidates = [
+        ProjectCandidate(
+            project_accession="PXD_PREFIX",
+            matched_file="prefix-sample.raw",
+            match_type="prefix",
+            match_score=70,
+            publication_date=date(2020, 1, 1),
+            submission_date=date(2019, 12, 1),
+            evidence=["prefix file match"],
+            metadata_consistency=1.0,
+        )
+    ]
+
+    resolution = resolve_primary_project(candidates)
+
+    assert resolution.needs_review is True
+    assert "review" in resolution.resolution_reason.lower()

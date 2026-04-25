@@ -4,7 +4,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from agent.models import DdaExecutionPlan
+from agent.execution.workflow import materialize_workflow_with_attributes
+from agent.models import AttributeSet, DdaExecutionPlan
 
 
 class FragPipeRunner:
@@ -21,17 +22,20 @@ class FragPipeRunner:
         plan.manifest_path.write_text(f"{plan.source_data_path}\texp\t\tDDA", encoding="utf-8")
         return plan.manifest_path
 
-    def materialize_workflow_copy(self, plan: DdaExecutionPlan) -> Path:
+    def materialize_workflow_copy(self, plan: DdaExecutionPlan, attributes: AttributeSet | None = None) -> Path:
         plan.fragpipe_workdir.mkdir(parents=True, exist_ok=True)
         destination = plan.fragpipe_workdir / plan.fragpipe_workflow_path.name
-        shutil.copyfile(plan.fragpipe_workflow_path, destination)
+        if attributes is None:
+            shutil.copyfile(plan.fragpipe_workflow_path, destination)
+        else:
+            materialize_workflow_with_attributes(plan.fragpipe_workflow_path, destination, attributes)
         return destination
 
-    def run(self, plan: DdaExecutionPlan) -> subprocess.CompletedProcess[str]:
+    def run(self, plan: DdaExecutionPlan, attributes: AttributeSet | None = None) -> subprocess.CompletedProcess[str]:
         if not self.executable.exists():
             raise FileNotFoundError(f"FragPipe executable not found: {self.executable}")
         manifest_path = self.materialize_manifest(plan)
-        workflow_copy = self.materialize_workflow_copy(plan)
+        workflow_copy = self.materialize_workflow_copy(plan, attributes=attributes)
         env = None
         if self.java_home:
             env = {"JAVA_HOME": str(self.java_home)}

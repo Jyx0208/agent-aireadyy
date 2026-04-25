@@ -23,6 +23,16 @@ def test_normalize_url():
     assert task.normalized_name == "sample-01.mzml"
 
 
+def test_normalize_compound_compressed_extension():
+    task = normalize_input("https://example.org/archive/Sample_01.mzML.gz")
+
+    assert task.source_type == "url"
+    assert task.file_name == "Sample_01.mzML.gz"
+    assert task.stem == "Sample_01"
+    assert task.extension == ".mzml.gz"
+    assert task.normalized_name == "sample-01.mzml.gz"
+
+
 def test_normalize_bare_filename():
     task = normalize_input("Sample_Only.d")
 

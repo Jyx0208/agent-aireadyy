@@ -14,6 +14,7 @@ def detect_toolchain(
     docker_cli = shutil.which("docker")
     git_cli = shutil.which("git")
     java_cli = shutil.which("java")
+    msconvert_cli = shutil.which("msconvert")
 
     docker_daemon_available = False
     docker_client_version = None
@@ -42,6 +43,8 @@ def detect_toolchain(
         notes.append("Java runtime is not installed or not on PATH.")
     if not git_cli:
         notes.append("Git is not installed or not on PATH.")
+    if not msconvert_cli:
+        notes.append("msconvert is not installed or not on PATH.")
 
     return ToolchainReport(
         docker_cli_available=bool(docker_cli),
@@ -50,6 +53,7 @@ def detect_toolchain(
         docker_server_version=docker_server_version,
         git_available=bool(git_cli),
         java_available=bool(java_cli),
+        msconvert_available=bool(msconvert_cli),
         fragpipe_root=str(Path(fragpipe_root)) if fragpipe_root else None,
         msdt_converter_root=str(Path(msdt_converter_root)) if msdt_converter_root else None,
         notes=notes,

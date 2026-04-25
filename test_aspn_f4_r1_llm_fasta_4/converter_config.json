@@ -1,0 +1,73 @@
+{
+  "generate_rawspectrum": {
+    "need": true,
+    "data_type": "mzml",
+    "data_path": "C:\\Users\\28425\\Desktop\\科研\\wlu\\agent-aiready\\test_aspn_f4_r1_llm_fasta_4\\assets\\prepared\\ASP-N_F4-R1.mzML",
+    "output": "C:\\Users\\28425\\Desktop\\科研\\wlu\\agent-aiready\\test_aspn_f4_r1_llm_fasta_4\\rawspectrum\\ASP-N_F4-R1_rawspectrum.parquet"
+  },
+  "generate_sage_search_result": {
+    "need": false,
+    "workdir": "C:\\Users\\28425\\Desktop\\科研\\wlu\\agent-aiready\\test_aspn_f4_r1_llm_fasta_4\\sage",
+    "fasta": "C:\\Users\\28425\\.codex\\worktrees\\854c\\agent-aiready\\profiles\\fasta\\generic_reference_with_contaminants.fasta",
+    "data_path": "C:\\Users\\28425\\Desktop\\科研\\wlu\\agent-aiready\\test_aspn_f4_r1_llm_fasta_4\\assets\\prepared\\ASP-N_F4-R1.mzML",
+    "config_path": "C:\\Users\\28425\\Desktop\\科研\\wlu\\agent-aiready\\test_aspn_f4_r1_llm_fasta_4\\sage\\sage_config.json"
+  },
+  "generate_fragpipe_search_result": {
+    "need": true,
+    "workdir": "C:\\Users\\28425\\Desktop\\科研\\wlu\\agent-aiready\\test_aspn_f4_r1_llm_fasta_4\\fragpipe",
+    "data_path": "C:\\Users\\28425\\Desktop\\科研\\wlu\\agent-aiready\\test_aspn_f4_r1_llm_fasta_4\\assets\\prepared\\ASP-N_F4-R1.mzML",
+    "fasta_path": "C:\\Users\\28425\\.codex\\worktrees\\854c\\agent-aiready\\profiles\\fasta\\generic_reference_with_contaminants.fasta",
+    "workflow_path": "C:\\Users\\28425\\.codex\\worktrees\\854c\\agent-aiready\\profiles\\fragpipe\\LFQ_DDA_generic.workflow",
+    "manifest_path": "C:\\Users\\28425\\Desktop\\科研\\wlu\\agent-aiready\\test_aspn_f4_r1_llm_fasta_4\\fragpipe\\fragpipe-files.fp-manifest",
+    "thread_num": 10
+  },
+  "generate_msdt": {
+    "need": true,
+    "tims": {
+      "need_tims": false,
+      "rawspectrum_path": "",
+      "sage_search_result_path": "",
+      "unify_residue": true,
+      "output": ""
+    },
+    "mzml": {
+      "need_mzml": true,
+      "need_sage": false,
+      "need_fragpipe": true,
+      "rawspectrum_path": "C:\\Users\\28425\\Desktop\\科研\\wlu\\agent-aiready\\test_aspn_f4_r1_llm_fasta_4\\rawspectrum\\ASP-N_F4-R1_rawspectrum.parquet",
+      "sage_search_result_path": "",
+      "fp_pin_path": "C:\\Users\\28425\\Desktop\\科研\\wlu\\agent-aiready\\test_aspn_f4_r1_llm_fasta_4\\fragpipe\\exp\\ASP-N_F4-R1_edited.pin",
+      "sage_unify_residue": true,
+      "fp_unify_residue": true,
+      "sage_output": "",
+      "fp_output": "C:\\Users\\28425\\Desktop\\科研\\wlu\\agent-aiready\\test_aspn_f4_r1_llm_fasta_4\\msdt\\ASP-N_F4-R1_fp_msdt.parquet"
+    },
+    "wiff": {
+      "need_wiff": false,
+      "wiff_mzml_path": "",
+      "rawspectrum_path": "",
+      "sage_search_result_path": "",
+      "unify_residue": true,
+      "output": ""
+    }
+  },
+  "convert_2_msdt": {
+    "mgf": {
+      "need": false,
+      "mgf_path": "",
+      "output_path": "",
+      "field_type_dict": {
+        "TITLE": "string",
+        "PEPMASS": "float",
+        "CHARGE": "int",
+        "RTINSECONDS": "float",
+        "INSTRUMENT": "string"
+      }
+    }
+  },
+  "msdt_2_mgf": {
+    "need": false,
+    "msdt_path": "",
+    "output_path": ""
+  }
+}

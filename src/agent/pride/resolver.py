@@ -31,12 +31,15 @@ def resolve_primary_project(candidates: list[ProjectCandidate]) -> ProjectResolu
             reasons.append("earliest project date wins when score and consistency are equal")
 
     confidence = min(1.0, primary.match_score / 100 + primary.metadata_consistency / 2)
+    needs_review = primary.match_type == "prefix" or primary.match_score < 90
+    if needs_review:
+        reasons.append("manual review required for non-exact project match")
     return ProjectResolution(
         primary_project=primary,
         alternative_projects=alternatives,
         resolution_reason="; ".join(reasons),
         resolution_confidence=confidence,
-        needs_review=False,
+        needs_review=needs_review,
     )
 
 

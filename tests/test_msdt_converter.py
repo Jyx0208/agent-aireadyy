@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from agent.decision.dda import plan_dda_execution
-from agent.models import AttributeSet, AttributeValue, ProjectResolution
+from agent.models import AttributeSet, AttributeValue, DdaExecutionPlan, ProjectResolution
 from agent.msdt_converter.config import build_converter_config
 
 
@@ -43,3 +43,84 @@ def test_build_converter_config_matches_expected_sections(tmp_path: Path):
     dumped.write_text(json.dumps(config, indent=2), encoding="utf-8")
     loaded = json.loads(dumped.read_text(encoding="utf-8"))
     assert loaded["generate_fragpipe_search_result"]["workflow_path"].endswith(".workflow")
+
+
+def test_build_converter_config_for_tims_matches_msdt_sage_path_requirements(tmp_path: Path):
+    attributes = _attributes()
+    attributes.instrument_family = AttributeValue(
+        value="tims",
+        confidence=0.9,
+        source="rule",
+        evidence_excerpt="timsTOF",
+        conflict_flag=False,
+    )
+    plan = plan_dda_execution(
+        task_id="task-tims",
+        source_file_name="sample.d",
+        source_data_path=tmp_path / "sample.d",
+        project_resolution=ProjectResolution.empty(),
+        attributes=attributes,
+        output_dir=tmp_path / "out",
+    )
+
+    config = build_converter_config(plan)
+
+    assert config["generate_rawspectrum"]["data_type"] == "tims"
+    assert config["generate_sage_search_result"]["need"] is True
+    assert config["generate_sage_search_result"]["data_path"].endswith("sample.d")
+    assert config["generate_msdt"]["tims"]["need_tims"] is True
+    sage_result_path = Path(config["generate_msdt"]["tims"]["sage_search_result_path"])
+    assert sage_result_path.parent.name == "sage"
+    assert sage_result_path.name == "sample_search_result.tsv"
+    assert Path(config["generate_msdt"]["tims"]["output"]).name == "sample_sage_msdt.parquet"
+    assert config["generate_msdt"]["mzml"]["need_mzml"] is False
+    assert config["generate_msdt"]["mzml"]["fp_output"] == ""
+
+
+def test_build_converter_config_for_wiff2mzml_matches_msdt_wiff_section(tmp_path: Path):
+    plan = plan_dda_execution(
+        task_id="task-wiff",
+        source_file_name="sample.wiff",
+        source_data_path=tmp_path / "sample.mzML",
+        project_resolution=ProjectResolution.empty(),
+        attributes=_attributes(),
+        output_dir=tmp_path / "out",
+    )
+
+    config = build_converter_config(plan)
+
+    assert config["generate_rawspectrum"]["data_type"] == "wiff2mzml"
+    assert config["generate_sage_search_result"]["need"] is True
+    assert config["generate_msdt"]["tims"]["need_tims"] is False
+    assert config["generate_msdt"]["mzml"]["need_mzml"] is False
+    assert config["generate_msdt"]["mzml"]["need_fragpipe"] is False
+    assert config["generate_msdt"]["wiff"]["need_wiff"] is True
+    assert config["generate_msdt"]["wiff"]["wiff_mzml_path"].endswith("sample.mzML")
+
+
+def test_build_converter_config_for_mgf_uses_direct_conversion(tmp_path: Path):
+    plan = DdaExecutionPlan(
+        task_id="task-mgf",
+        source_file_name="sample.mgf",
+        source_data_path=tmp_path / "sample.mgf",
+        raw_data_type="mgf",
+        fasta_path=tmp_path / "reference.fasta",
+        fasta_selection_mode="defaulted",
+        fragpipe_workflow_path=tmp_path / "workflow.workflow",
+        manifest_path=tmp_path / "fragpipe" / "fragpipe-files.fp-manifest",
+        converter_config_path=tmp_path / "converter_config.json",
+        rawspectrum_output_path=tmp_path / "rawspectrum" / "sample_rawspectrum.parquet",
+        fragpipe_workdir=tmp_path / "fragpipe",
+        expected_pin_path=tmp_path / "fragpipe" / "exp" / "sample_edited.pin",
+        expected_pin_glob=str(tmp_path / "fragpipe" / "exp" / "sample_edited.pin"),
+        output_paths={"fp_msdt": tmp_path / "msdt" / "sample_mgf_msdt.parquet"},
+    )
+
+    config = build_converter_config(plan)
+
+    assert config["generate_rawspectrum"]["need"] is False
+    assert config["generate_fragpipe_search_result"]["need"] is False
+    assert config["generate_msdt"]["need"] is False
+    assert config["convert_2_msdt"]["mgf"]["need"] is True
+    assert config["convert_2_msdt"]["mgf"]["mgf_path"].endswith("sample.mgf")
+    assert config["convert_2_msdt"]["mgf"]["output_path"].endswith("sample_mgf_msdt.parquet")

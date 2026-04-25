@@ -121,3 +121,45 @@ def test_infer_attributes_defaults_to_dda_in_orbitrap_proteomics_context():
 
     assert attrs.acquisition_mode.value == "DDA"
     assert attrs.acquisition_mode.source == "rule_fallback"
+
+
+def test_infer_attributes_marks_species_ambiguous_when_project_has_multiple_organisms_without_sdrf():
+    context = ProjectContext(
+        project_accession="PXD000005",
+        file_name="sample.raw",
+        metadata={
+            "organisms": MetadataValue(
+                value=["Homo sapiens", "Escherichia coli"],
+                source="pride.organisms",
+                source_level="project",
+                completeness=1.0,
+            ),
+        },
+    )
+
+    attrs = infer_attributes(context)
+
+    assert attrs.species.conflict_flag is True
+    assert "Homo sapiens" in str(attrs.species.value)
+    assert "Escherichia coli" in str(attrs.species.value)
+
+
+def test_infer_attributes_marks_instrument_ambiguous_when_project_has_multiple_instruments_without_sdrf():
+    context = ProjectContext(
+        project_accession="PXD000006",
+        file_name="sample.raw",
+        metadata={
+            "instruments": MetadataValue(
+                value=["Orbitrap Exploris 480", "timsTOF Pro"],
+                source="pride.instruments",
+                source_level="project",
+                completeness=1.0,
+            ),
+        },
+    )
+
+    attrs = infer_attributes(context)
+
+    assert attrs.instrument_name.conflict_flag is True
+    assert attrs.instrument_family.conflict_flag is True
+    assert attrs.instrument_family.value == "unknown"

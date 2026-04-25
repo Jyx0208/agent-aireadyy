@@ -1,0 +1,13 @@
+{
+  "original_file_name": "ASP-N_F4-R1.raw",
+  "resolved_asset_type": "raw",
+  "project_accession": "PXD019949",
+  "matched_project_file": "ASP-N_F4-R1.raw",
+  "download_url": "https://ftp.pride.ebi.ac.uk/pride/data/archive/2025/08/PXD019949/ASP-N_F4-R1.raw",
+  "local_path": "C:\\Users\\28425\\Desktop\\科研\\wlu\\agent-aiready\\test_aspn_f4_r1_llm_fasta_2\\assets\\downloads\\ASP-N_F4-R1.raw",
+  "prepared_path": "C:\\Users\\28425\\Desktop\\科研\\wlu\\agent-aiready\\test_aspn_f4_r1_llm_fasta_2\\assets\\prepared\\ASP-N_F4-R1.mzML",
+  "sidecar_files": [],
+  "requires_conversion": true,
+  "asset_confidence": 1.0,
+  "match_type": "exact"
+}

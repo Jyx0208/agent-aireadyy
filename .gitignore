@@ -1,8 +1,41 @@
 __pycache__/
 *.pyc
+.env
+.venv/
 .pytest_cache/
 .test_tmp/
 pytest-cache-files-*/
 _gitrepo/
 external/
+dist/
 sample_task/
+.agent_cache/
+
+# Local tool archives and unpacked vendor bundles
+FragPipe-*.zip
+FragPipe-*/
+
+# Generated runs and task outputs
+runs/
+task_out/
+task_run_real/
+
+# Runtime logs and scratch data
+*.log
+
+# Mass spectrometry raw data and derived artifacts
+*.raw
+*.RAW
+*.raw.zip
+*.wiff
+*.wiff.scan
+*.wiff.zip
+*.d/
+*.d.zip
+*.mzML
+*.mzml
+*.mzXML
+*.mzxml
+*.mzid
+*.mgf
+*.parquet
