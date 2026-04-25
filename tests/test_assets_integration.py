@@ -302,7 +302,7 @@ def test_prepare_pride_msdt_docker_input_auto_downloads_species_fasta(tmp_path: 
         return prepared_path
 
     class FakePrideClient:
-        def download_to_path(self, url, target_path):
+        def download_to_path(self, url, target_path, report=None):
             assert "UP000000589" in url
             Path(target_path).parent.mkdir(parents=True, exist_ok=True)
             Path(target_path).write_text(">sp|P1|MOUSE\nMPEPTIDEK\n", encoding="utf-8")
@@ -353,7 +353,7 @@ def test_prepare_pride_msdt_docker_input_confirms_llm_proteome_id_fasta(tmp_path
         return prepared_path
 
     class FakePrideClient:
-        def download_to_path(self, url, target_path):
+        def download_to_path(self, url, target_path, report=None):
             Path(target_path).parent.mkdir(parents=True, exist_ok=True)
             Path(target_path).write_text(">sp|P1|MOUSE\nMPEPTIDEK\n", encoding="utf-8")
             return Path(target_path)

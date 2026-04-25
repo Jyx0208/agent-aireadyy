@@ -560,6 +560,7 @@ class AgentService:
             reviewed_fasta_url=active_reviewed_fasta_url,
             reviewed_fasta_name=active_reviewed_fasta_name,
             accept_search_parameter_review=search_parameters_reviewed,
+            report=self.reporter,
         )
         self.write_task_bundle(
             output_dir,

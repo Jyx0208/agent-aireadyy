@@ -4,6 +4,7 @@ import gzip
 import json
 import shutil
 from pathlib import Path
+from typing import Callable, Any
 
 from agent.models import AttributeSet, DdaExecutionPlan, InputTask, MaterializedTaskBundle, ProjectContext, ProjectResolution
 from agent.execution.workflow import materialize_workflow_with_attributes
@@ -38,15 +39,19 @@ def _materialize_source_data(source_data_path: str | Path, task_root: Path) -> P
     return target_path
 
 
-def _download_fasta(client: PrideClient, url: str, target_path: Path) -> Path:
+def _download_fasta(client: PrideClient, url: str, target_path: Path, report: Callable[[Any], None] | None = None) -> Path:
+    if target_path.exists() and target_path.stat().st_size == 0:
+        target_path.unlink()
     if url.lower().endswith(".gz") and not target_path.name.lower().endswith(".gz"):
         compressed_path = target_path.with_name(f"{target_path.name}.gz")
-        client.download_to_path(url, compressed_path)
+        if compressed_path.exists() and compressed_path.stat().st_size == 0:
+            compressed_path.unlink()
+        client.download_to_path(url, compressed_path, report=report)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         with gzip.open(compressed_path, "rb") as source, target_path.open("wb") as target:
             shutil.copyfileobj(source, target)
         return target_path
-    return client.download_to_path(url, target_path)
+    return client.download_to_path(url, target_path, report=report)
 
 
 def _write_sage_config(plan: DdaExecutionPlan, attributes: AttributeSet) -> Path:
@@ -68,6 +73,7 @@ def materialize_dda_task_bundle(
     reviewed_fasta_url: str | None = None,
     reviewed_fasta_name: str | None = None,
     accept_search_parameter_review: bool = False,
+    report: Callable[[Any], None] | None = None,
 ) -> MaterializedTaskBundle:
     from agent.decision.dda import plan_dda_execution
 
@@ -103,7 +109,7 @@ def materialize_dda_task_bundle(
             raise ValueError("Cannot reproduce project FASTA without a download URL.")
         client = PrideClient()
         try:
-            _download_fasta(client, plan.fasta_download_url, materialized_fasta_path)
+            _download_fasta(client, plan.fasta_download_url, materialized_fasta_path, report=report)
         finally:
             client.close()
     else:
