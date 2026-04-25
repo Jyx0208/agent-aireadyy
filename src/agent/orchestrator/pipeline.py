@@ -527,12 +527,23 @@ class AgentService:
                 active_reviewed_fasta_url = str(recommendation["url"])
                 active_reviewed_fasta_name = str(recommendation["name"] or "")
                 self._report(f"已确认使用 LLM 推荐 FASTA：{active_reviewed_fasta_name or active_reviewed_fasta_url}")
-                result = self.plan_dda_run_from_pride(
-                    task=task,
+                source_data_path = (
+                    result.asset.prepared_path
+                    or result.asset.local_path
+                    or Path(output_dir) / "assets" / "prepared" / f"{task.stem}.mzML"
+                )
+                reviewed_plan = plan_dda_execution(
+                    task_id=task.task_id,
+                    source_file_name=task.file_name,
+                    source_data_path=source_data_path,
+                    project_resolution=result.resolution,
+                    attributes=result.attributes,
                     output_dir=output_dir,
+                    project_context=result.context,
                     reviewed_fasta_url=active_reviewed_fasta_url,
                     reviewed_fasta_name=active_reviewed_fasta_name,
                 )
+                result = result.model_copy(update={"plan": reviewed_plan})
         if result.plan.needs_review and self._search_review_issues(result.plan):
             if confirm_search_parameters is not None and confirm_search_parameters(result):
                 accepted_plan = self._accept_reviewed_search_parameters(result.plan)

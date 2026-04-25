@@ -326,8 +326,13 @@ def test_prepare_pride_msdt_docker_input_confirms_llm_proteome_id_fasta(tmp_path
     service = AgentService(pride_client=None)
     task = normalize_input("mouse.raw")
     context = ProjectContext(project_accession="PXD_MOUSE", file_name="mouse.raw", metadata={}, project_files=[])
+    resolve_calls = []
 
-    monkeypatch.setattr(service, "resolve_project", lambda _: ProjectResolution.empty())
+    def fake_resolve_project(_):
+        resolve_calls.append(True)
+        return ProjectResolution.empty()
+
+    monkeypatch.setattr(service, "resolve_project", fake_resolve_project)
     monkeypatch.setattr(service, "build_context", lambda *args, **kwargs: context)
     monkeypatch.setattr(service, "infer_attributes", lambda *_: _mouse_attributes())
     monkeypatch.setattr(
@@ -372,6 +377,7 @@ def test_prepare_pride_msdt_docker_input_confirms_llm_proteome_id_fasta(tmp_path
     )
 
     assert recommendations
+    assert len(resolve_calls) == 1
     assert "UP000000589" in recommendations[0]["url"]
     assert bundle.materialized_fasta_path.name == "UP000000589_M_musculus.fasta"
 
