@@ -4,6 +4,44 @@
 
 > 当前目标是“先跑起来”：默认会更信任 PRIDE 元数据、SDRF 和大模型推断；不再强制每次手工提供网页或 FASTA URL。批量跑时可用 `-y` 自动确认。
 
+## 产品化一键入口
+
+给普通用户推荐只记一个入口：`start.ps1`。
+
+```powershell
+.\start.ps1 "P17_severe_NoPOTS.raw"
+```
+
+第一次运行会自动检查/创建 `.venv`、安装 Python 包、创建 `.env`，然后开始准备 PRIDE -> mzML -> MSDT Docker 输入。
+
+如果 Windows 执行策略拦截 PowerShell 脚本，可以用：
+
+```powershell
+.\run.bat "P17_severe_NoPOTS.raw"
+```
+
+常用产品化入口：
+
+```powershell
+# 第一次配置 API Key
+.\start.ps1 -Configure
+
+# 只安装环境，不跑数据
+.\start.ps1 -SetupOnly
+
+# 单文件准备输入包
+.\start.ps1 "P17_severe_NoPOTS.raw"
+
+# 指定输出目录
+.\start.ps1 "P17_severe_NoPOTS.raw" -OutputDir ".\runs\p17_severe_nopots"
+
+# 批量运行
+.\start.ps1 -BatchFile ".\files.txt"
+
+# 直接跑完整 Docker 流程
+.\start.ps1 "P17_severe_NoPOTS.raw" -RunFull
+```
+
 ## 快速开始（Windows PowerShell）
 
 ### 1. 准备环境
@@ -81,6 +119,29 @@ notepad files.txt
 ```
 
 `files.txt` 每行一个 PRIDE 文件名，空行和 `#` 注释会被跳过。
+
+## 给别人发 Release ZIP
+
+生成发布包：
+
+```powershell
+.\scripts\package_release.ps1 -Version "0.1.0"
+```
+
+产物会写到：
+
+```text
+dist\agent-aireadyy-v0.1.0.zip
+```
+
+把这个 ZIP 上传到 GitHub Release。用户下载解压后只需要：
+
+```powershell
+.\start.ps1 -Configure
+.\start.ps1 "P17_severe_NoPOTS.raw"
+```
+
+发布包不会包含 `.env`、`.venv`、`runs`、`.agent_cache`、RAW/mzML/parquet 等本地大文件。
 
 ## 常用命令
 
