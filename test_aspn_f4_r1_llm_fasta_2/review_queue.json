@@ -1,0 +1,13 @@
+[
+  {
+    "task_id": "task-9bcc955a-219d-54ae-925a-a3b295c1b234-a7a39d",
+    "source_file": "ASP-N_F4-R1.raw",
+    "project_accession": "PXD019949",
+    "stage": "planning",
+    "reasons": [
+      "搜库参数需要人工复核：LLM confirmation failed for no-SDRF input: Server error '502 Bad Gateway' for url 'http://64.23.231.43:8317/v1/chat/completions'\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/502",
+      "FASTA generic_reference_with_contaminants.fasta 是占位文件，不能作为真实搜库数据库；请提供项目 FASTA 或人工确认的真实 FASTA。"
+    ],
+    "created_at": "2026-04-24T08:51:31.943362Z"
+  }
+]

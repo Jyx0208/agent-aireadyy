@@ -498,3 +498,21 @@ def test_plan_dda_execution_requires_review_for_multi_metadata_without_sdrf(tmp_
     assert plan.needs_review is True
     assert any("占位" in issue for issue in plan.blocking_issues)
     assert any("占位" in issue for issue in plan.blocking_issues)
+
+
+def test_plan_dda_execution_names_query_url_reviewed_fasta_with_fasta_suffix(tmp_path: Path):
+    attributes = _dda_attributes()
+    plan = plan_dda_execution(
+        task_id="task-reviewed-url",
+        source_file_name="sample.raw",
+        source_data_path=tmp_path / "sample.mzML",
+        project_resolution=ProjectResolution.empty(),
+        attributes=attributes,
+        output_dir=tmp_path,
+        reviewed_fasta_url="https://rest.uniprot.org/uniprotkb/stream?compressed=false&format=fasta&query=%28proteome%3AUP000002311%29",
+        accept_search_parameter_review=True,
+    )
+
+    assert plan.fasta_path.name == "reviewed_reference.fasta"
+    assert plan.fasta_selection_mode == "reviewed"
+    assert plan.needs_review is False

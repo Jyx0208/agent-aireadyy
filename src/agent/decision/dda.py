@@ -105,6 +105,8 @@ def _reviewed_fasta_choice(
         file_name = _safe_file_name(reviewed_fasta_name or parsed_name or "reviewed_reference.fasta")
         if file_name.lower().endswith(".gz"):
             file_name = Path(file_name).stem
+        if not file_name.lower().endswith((".fasta", ".fa", ".faa")):
+            file_name = "reviewed_reference.fasta"
         return output_dir / "fasta" / file_name, reviewed_fasta_url
     return None, None
 
@@ -275,6 +277,7 @@ def plan_dda_execution(
     reviewed_fasta_path: str | Path | None = None,
     reviewed_fasta_url: str | None = None,
     reviewed_fasta_name: str | None = None,
+    accept_search_parameter_review: bool = False,
 ) -> DdaExecutionPlan:
     source_data_path = Path(source_data_path)
     output_dir = Path(output_dir)
@@ -304,6 +307,8 @@ def plan_dda_execution(
     blocking_issues.extend(fasta_issues)
     blocking_issues.extend(_context_blocking_issues(project_context))
     blocking_issues.extend(_fasta_blocking_issues(project_context, attributes, fasta_path, fasta_mode, raw_data_type))
+    if accept_search_parameter_review:
+        blocking_issues = [issue for issue in blocking_issues if "搜库参数需要人工复核" not in issue]
 
     rawspectrum_dir = output_dir / "rawspectrum"
     fragpipe_dir = output_dir / "fragpipe"

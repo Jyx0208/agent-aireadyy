@@ -67,6 +67,7 @@ def materialize_dda_task_bundle(
     reviewed_fasta_path: str | Path | None = None,
     reviewed_fasta_url: str | None = None,
     reviewed_fasta_name: str | None = None,
+    accept_search_parameter_review: bool = False,
 ) -> MaterializedTaskBundle:
     from agent.decision.dda import plan_dda_execution
 
@@ -83,6 +84,7 @@ def materialize_dda_task_bundle(
         reviewed_fasta_path=reviewed_fasta_path,
         reviewed_fasta_url=reviewed_fasta_url,
         reviewed_fasta_name=reviewed_fasta_name,
+        accept_search_parameter_review=accept_search_parameter_review,
     )
     if plan.needs_review:
         raise ValueError(f"Cannot materialize a strict DDA bundle while the plan needs review: {plan.blocking_issues}")

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 import typer
 
@@ -21,6 +24,10 @@ class ConsoleReporter:
         self._progress_open = False
         self._last_progress_len = 0
         self._last_progress_line: str | None = None
+        self._activity_open = False
+        self._activity_stop: threading.Event | None = None
+        self._activity_thread: threading.Thread | None = None
+        self._activity_len = 0
         self._log_path = log_path
         if self._log_path is not None:
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -30,8 +37,54 @@ class ConsoleReporter:
             with self._log_path.open("a", encoding="utf-8") as handle:
                 handle.write(message + "\n")
 
+    def _clear_progress_line(self) -> None:
+        if self._progress_open:
+            typer.echo("", err=True)
+            self._progress_open = False
+            self._last_progress_len = 0
+            self._last_progress_line = None
+
+    def _start_activity(self, label: str) -> None:
+        self._clear_progress_line()
+        self._stop_activity(final_message=None)
+        self._log(label)
+        stop_event = threading.Event()
+        self._activity_stop = stop_event
+        self._activity_open = True
+
+        def spin() -> None:
+            frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            index = 0
+            while not stop_event.is_set():
+                line = f"{frames[index % len(frames)]} {label}"
+                padding = " " * max(0, self._activity_len - len(line))
+                typer.echo(f"\r{line}{padding}", err=True, nl=False)
+                self._activity_len = len(line)
+                index += 1
+                stop_event.wait(0.12)
+
+        self._activity_thread = threading.Thread(target=spin, daemon=True)
+        self._activity_thread.start()
+
+    def _stop_activity(self, final_message: str | None = None) -> None:
+        if self._activity_stop is not None:
+            self._activity_stop.set()
+        if self._activity_thread is not None:
+            self._activity_thread.join(timeout=0.5)
+        if self._activity_open:
+            clear_line = "\r" + (" " * self._activity_len) + "\r"
+            typer.echo(clear_line, err=True, nl=False)
+            if final_message:
+                self._log(final_message)
+                typer.echo(final_message, err=True)
+            self._activity_open = False
+            self._activity_len = 0
+        self._activity_stop = None
+        self._activity_thread = None
+
     def __call__(self, message) -> None:
         if isinstance(message, dict) and message.get("kind") == "download_progress":
+            self._stop_activity(final_message=None)
             line = render_download_progress(message)
             is_duplicate = line == self._last_progress_line
             if is_duplicate and not message.get("complete"):
@@ -50,11 +103,16 @@ class ConsoleReporter:
                 self._last_progress_line = None
             return
 
-        if self._progress_open:
-            typer.echo("", err=True)
-            self._progress_open = False
-            self._last_progress_len = 0
-            self._last_progress_line = None
+        if isinstance(message, dict) and message.get("kind") == "activity_start":
+            self._start_activity(str(message.get("label") or "处理中，请稍候…"))
+            return
+
+        if isinstance(message, dict) and message.get("kind") == "activity_stop":
+            self._stop_activity(final_message=message.get("message"))
+            return
+
+        self._stop_activity(final_message=None)
+        self._clear_progress_line()
         self._log(str(message))
         typer.echo(str(message), err=True)
 
@@ -157,10 +215,20 @@ def run_pride_dda_msdt_docker(
     input_value: str,
     output_dir: Path,
     image: str = typer.Option("guomics2017/msdt-converter:v1.3", help="Docker image for MSDT-Converter with bundled FragPipe."),
+    reviewed_fasta_path: Path | None = typer.Option(None, help="Human-reviewed local FASTA path to use instead of inferred/default FASTA."),
+    reviewed_fasta_url: str | None = typer.Option(None, help="Human-reviewed FASTA URL to download and use."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Automatically accept interactive review prompts."),
 ) -> None:
     service = AgentService(reporter=_build_reporter(output_dir))
     task = normalize_input(input_value)
-    manifest = service.run_pride_dda_msdt_docker(task=task, output_dir=output_dir, image=image)
+    manifest = service.run_pride_dda_msdt_docker(
+        task=task,
+        output_dir=output_dir,
+        image=image,
+        reviewed_fasta_path=reviewed_fasta_path,
+        reviewed_fasta_url=reviewed_fasta_url,
+        confirm_search_parameters=_build_search_parameter_confirmation(yes),
+    )
     typer.echo(manifest.model_dump_json(indent=2))
 
 
@@ -206,7 +274,7 @@ def prepare_pride_msdt_docker_input(
     output_dir: Path,
     reviewed_fasta_path: Path | None = typer.Option(None, help="Human-reviewed local FASTA path to use instead of inferred/default FASTA."),
     reviewed_fasta_url: str | None = typer.Option(None, help="Human-reviewed FASTA URL to download and use."),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Automatically accept LLM FASTA recommendation when it includes a URL."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Automatically accept interactive review prompts."),
 ) -> None:
     service = AgentService(reporter=_build_reporter(output_dir))
     task = normalize_input(input_value)
@@ -231,12 +299,47 @@ def prepare_pride_msdt_docker_input(
             reviewed_fasta_path=reviewed_fasta_path,
             reviewed_fasta_url=reviewed_fasta_url,
             confirm_llm_recommended_fasta=confirm_llm_fasta if reviewed_fasta_path is None and reviewed_fasta_url is None else None,
+            confirm_search_parameters=_build_search_parameter_confirmation(yes),
         )
     except (AssetPreparationError, ReviewRequiredError):
         typer.echo(_review_message(output_dir), err=True)
         raise typer.Exit(1)
     typer.echo(f"请使用下面的命令运行 MSDT-Converter Docker：{_msdt_docker_command(output_dir)}")
     typer.echo(bundle.model_dump_json(indent=2))
+
+
+def _format_review_value(value: Any) -> str:
+    if isinstance(value, dict):
+        return "\n".join(f"    - {key}: {val if val not in (None, '') else '未提供'}" for key, val in value.items())
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value) if value else "无"
+    return str(value if value not in (None, "") else "未提供")
+
+
+def _build_search_parameter_confirmation(yes: bool):
+    def confirm(result) -> bool:
+        attrs = result.attributes
+        hints = attrs.search_parameter_hints
+        typer.echo("")
+        typer.echo("需要人工复核搜库参数。当前推断如下：")
+        typer.echo(f"  采集模式: {_format_review_value(attrs.acquisition_mode.value)}")
+        typer.echo(f"  物种: {_format_review_value(attrs.species.value)}")
+        typer.echo(f"  仪器: {_format_review_value(attrs.instrument_name.value)}")
+        typer.echo(f"  酶切酶: {_format_review_value(attrs.enzyme.value)}")
+        typer.echo(f"  固定修饰: {_format_review_value(attrs.fixed_mods.value)}")
+        typer.echo(f"  可变修饰: {_format_review_value(attrs.variable_mods.value)}")
+        typer.echo("  搜库参数:")
+        typer.echo(_format_review_value(hints.value))
+        typer.echo("  复核原因:")
+        for issue in result.plan.blocking_issues:
+            if "搜库参数需要人工复核" in issue:
+                typer.echo(f"    - {issue}")
+        if yes:
+            typer.echo("已通过 --yes 自动确认搜库参数。")
+            return True
+        return typer.confirm("是否确认上述搜库参数并继续？", default=False)
+
+    return confirm
 
 
 def _review_message(output_dir: Path) -> str:

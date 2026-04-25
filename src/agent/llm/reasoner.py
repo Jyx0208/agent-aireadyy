@@ -11,7 +11,7 @@ import httpx
 from agent.models import AttributeSet, AttributeValue, ProjectContext
 
 
-ReportFn = Callable[[str], None]
+ReportFn = Callable[[Any], None]
 
 
 class LLMReasoner(Protocol):
@@ -215,7 +215,7 @@ class OpenAICompatibleReasoner:
         api_key: str,
         model: str = "gpt-5.4",
         base_url: str = "https://api.openai.com/v1",
-        timeout: float = 120.0,
+        timeout: float = 300.0,
     ) -> None:
         self.api_key = api_key
         self.model = model
@@ -278,13 +278,25 @@ class OpenAICompatibleReasoner:
         }
 
 
+def _llm_timeout_from_env(default: float = 300.0) -> float:
+    raw_timeout = os.getenv("AGENT_LLM_TIMEOUT")
+    if not raw_timeout:
+        return default
+    try:
+        timeout = float(raw_timeout)
+    except ValueError:
+        return default
+    return timeout if timeout > 0 else default
+
+
 def default_llm_reasoner() -> LLMReasoner | None:
     api_key = os.getenv("AGENT_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
     model = os.getenv("AGENT_LLM_MODEL", "gpt-5.4")
     base_url = os.getenv("AGENT_LLM_BASE_URL", "https://api.openai.com/v1")
-    return OpenAICompatibleReasoner(api_key=api_key, model=model, base_url=base_url)
+    timeout = _llm_timeout_from_env()
+    return OpenAICompatibleReasoner(api_key=api_key, model=model, base_url=base_url, timeout=timeout)
 
 
 def _mark_no_sdrf_llm_blocked(attributes: AttributeSet, reason: str) -> AttributeSet:
@@ -324,12 +336,17 @@ def confirm_no_sdrf_parameters(
         report("\u6b63\u5728\u8c03\u7528\u5927\u6a21\u578b\u786e\u8ba4\u6587\u4ef6\u5c5e\u6027\u548c\u641c\u5e93\u53c2\u6570\u3002")
 
     try:
+        if report is not None:
+            report({"kind": "activity_start", "label": "大模型正在阅读 PRIDE 元数据并生成搜库参数…"})
         updates = reasoner.confirm_search_parameters(context, attributes)
     except Exception as exc:
         reason = f"LLM confirmation failed for no-SDRF input: {exc}"
         if report is not None:
             report(f"大模型确认失败；未找到 SDRF 时不再使用规则猜测搜库参数，请人工复核。原因={exc}")
         return _mark_no_sdrf_llm_blocked(attributes, reason)
+    finally:
+        if report is not None:
+            report({"kind": "activity_stop", "message": "大模型参数确认完成。"})
     merged = attributes.model_dump()
     for field_name, proposed_value in updates.items():
         if field_name not in AttributeSet.model_fields:
@@ -369,11 +386,16 @@ def confirm_sdrf_parameters(
         report(f"\u627e\u5230\u5339\u914d\u7684 SDRF \u884c\uff08{len(context.sdrf_rows)} \u884c\uff09\uff1b\u6b63\u5728\u7528\u5927\u6a21\u578b\u6c47\u603b\u6587\u4ef6\u7ea7 workflow \u5c5e\u6027\u3002")
 
     try:
+        if report is not None:
+            report({"kind": "activity_start", "label": "大模型正在汇总 SDRF 行和 workflow 属性…"})
         updates = reasoner.confirm_search_parameters(context, attributes)
     except Exception as exc:
         if report is not None:
             report(f"\u5927\u6a21\u578b SDRF \u6c47\u603b\u5931\u8d25\uff1b\u4fdd\u7559\u786e\u5b9a\u6027 SDRF \u63a8\u65ad\u7ed3\u679c\u3002\u539f\u56e0={exc}")
         return attributes
+    finally:
+        if report is not None:
+            report({"kind": "activity_stop", "message": "大模型 SDRF 汇总完成。"})
 
     merged = attributes.model_dump()
     for field_name, proposed_value in updates.items():

@@ -64,6 +64,15 @@ class AgentService:
             and any("占位" in issue or "placeholder" in issue.lower() for issue in plan.blocking_issues)
         )
 
+    @staticmethod
+    def _search_review_issues(plan: DdaExecutionPlan) -> list[str]:
+        return [issue for issue in plan.blocking_issues if "搜库参数需要人工复核" in issue]
+
+    @staticmethod
+    def _accept_reviewed_search_parameters(plan: DdaExecutionPlan) -> DdaExecutionPlan:
+        remaining_issues = [issue for issue in plan.blocking_issues if "搜库参数需要人工复核" not in issue]
+        return plan.model_copy(update={"blocking_issues": remaining_issues, "needs_review": bool(remaining_issues)})
+
     def _report_resolution_summary(self, resolution: ProjectResolution) -> None:
         primary = resolution.primary_project
         if primary is None:
@@ -131,7 +140,11 @@ class AgentService:
 
     def resolve_project(self, raw_input: str) -> ProjectResolution:
         self._report(f"[1/5] 正在根据文件名解析 PRIDE 项目：{raw_input}")
-        return resolve_input_to_project(self.pride_client, raw_input)
+        self._report({"kind": "activity_start", "label": "正在查询 PRIDE Archive API 并匹配项目/文件…"})
+        try:
+            return resolve_input_to_project(self.pride_client, raw_input)
+        finally:
+            self._report({"kind": "activity_stop", "message": "PRIDE 查询完成。"})
 
     def build_context(self, resolution: ProjectResolution, file_name: str) -> ProjectContext:
         if not resolution.primary_project:
@@ -355,12 +368,14 @@ class AgentService:
         image: str = "guomics2017/msdt-converter:v1.3",
         reviewed_fasta_path: str | Path | None = None,
         reviewed_fasta_url: str | None = None,
+        confirm_search_parameters: Callable[[PridePlanResult], bool] | None = None,
     ) -> RunManifest:
         bundle, result, prepared_path = self.prepare_pride_msdt_docker_input(
             task=task,
             output_dir=output_dir,
             reviewed_fasta_path=reviewed_fasta_path,
             reviewed_fasta_url=reviewed_fasta_url,
+            confirm_search_parameters=confirm_search_parameters,
         )
         self._report("任务输入包已生成，开始运行 MSDT-Converter Docker 流程。")
         runner = DockerMSDTConverterRunner(image=image, report=self.reporter)
@@ -431,6 +446,7 @@ class AgentService:
         reviewed_fasta_url: str | None = None,
         reviewed_fasta_name: str | None = None,
         confirm_llm_recommended_fasta: Callable[[dict[str, Any]], bool] | None = None,
+        confirm_search_parameters: Callable[[PridePlanResult], bool] | None = None,
     ):
         result = self.plan_dda_run_from_pride(
             task=task,
@@ -442,6 +458,7 @@ class AgentService:
         active_reviewed_fasta_path = reviewed_fasta_path
         active_reviewed_fasta_url = reviewed_fasta_url
         active_reviewed_fasta_name = reviewed_fasta_name
+        search_parameters_reviewed = False
         if (
             confirm_llm_recommended_fasta is not None
             and active_reviewed_fasta_path is None
@@ -466,6 +483,12 @@ class AgentService:
                     reviewed_fasta_url=active_reviewed_fasta_url,
                     reviewed_fasta_name=active_reviewed_fasta_name,
                 )
+        if result.plan.needs_review and self._search_review_issues(result.plan):
+            if confirm_search_parameters is not None and confirm_search_parameters(result):
+                accepted_plan = self._accept_reviewed_search_parameters(result.plan)
+                result = result.model_copy(update={"plan": accepted_plan})
+                search_parameters_reviewed = True
+                self._report("人工已确认搜库参数；继续处理剩余步骤。")
         if result.plan.needs_review:
             self.write_task_bundle(
                 output_dir,
@@ -517,6 +540,7 @@ class AgentService:
             reviewed_fasta_path=active_reviewed_fasta_path,
             reviewed_fasta_url=active_reviewed_fasta_url,
             reviewed_fasta_name=active_reviewed_fasta_name,
+            accept_search_parameter_review=search_parameters_reviewed,
         )
         self.write_task_bundle(
             output_dir,

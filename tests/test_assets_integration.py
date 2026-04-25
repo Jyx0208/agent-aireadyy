@@ -31,6 +31,21 @@ def _attributes() -> AttributeSet:
     )
 
 
+def _attributes_requiring_search_review() -> AttributeSet:
+    attrs = _attributes()
+    return attrs.model_copy(
+        update={
+            "search_parameter_hints": AttributeValue(
+                value={"precursor_tol": "10 ppm", "fragment_tol": "0.02 Da", "database": "reviewed db"},
+                confidence=0.9,
+                source="llm_confirmed",
+                evidence_excerpt="LLM-confirmed parameters require human review.",
+                conflict_flag=True,
+            )
+        }
+    )
+
+
 def _reviewed_fasta(tmp_path: Path) -> Path:
     path = tmp_path / "reviewed_reference.fasta"
     path.write_text(">sp|P1|REVIEWED_TEST\nMPEPTIDEK\n", encoding="utf-8")
@@ -166,6 +181,66 @@ def test_prepare_pride_msdt_docker_input_uses_only_file_name(tmp_path: Path, mon
     assert config["generate_rawspectrum"]["data_path"].startswith("/workspace/")
     assert config["generate_fragpipe_search_result"]["workflow_path"].startswith("/workspace/workflows/")
     assert (tmp_path / "task_out" / "sage" / "sage_config.json").exists()
+
+
+def test_prepare_pride_msdt_docker_input_continues_after_search_parameter_confirmation(tmp_path: Path, monkeypatch):
+    service = AgentService(pride_client=None)
+    task = normalize_input("WT_5_Lys-c.raw")
+    resolution = ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession="PXD123456",
+            matched_file="WT_5_Lys-c.raw",
+            match_type="exact",
+            match_score=100,
+            evidence=["exact match"],
+            metadata_consistency=1.0,
+        ),
+        alternative_projects=[],
+        resolution_reason="exact match",
+        resolution_confidence=1.0,
+        needs_review=False,
+    )
+    context = ProjectContext(project_accession="PXD123456", file_name="WT_5_Lys-c.raw", metadata={}, project_files=[])
+
+    monkeypatch.setattr(service, "resolve_project", lambda _: resolution)
+    monkeypatch.setattr(service, "build_context", lambda *args, **kwargs: context)
+    monkeypatch.setattr(service, "infer_attributes", lambda *_: _attributes_requiring_search_review())
+    monkeypatch.setattr(
+        service,
+        "resolve_asset",
+        lambda *args, **kwargs: FileAsset(
+            original_file_name="WT_5_Lys-c.raw",
+            resolved_asset_type="mzml",
+            matched_project_file="WT_5_Lys-c.mzML",
+            download_url="https://ftp.pride.ebi.ac.uk/pride/data/archive/WT_5_Lys-c.mzML",
+            local_path=tmp_path / "task_out" / "assets" / "downloads" / "WT_5_Lys-c.mzML",
+            prepared_path=tmp_path / "task_out" / "assets" / "downloads" / "WT_5_Lys-c.mzML",
+            requires_conversion=False,
+            asset_confidence=1.0,
+            match_type="stem",
+        ),
+    )
+
+    def fake_prepare_asset(asset):
+        prepared_path = tmp_path / "task_out" / "assets" / "downloads" / "WT_5_Lys-c.mzML"
+        prepared_path.parent.mkdir(parents=True, exist_ok=True)
+        prepared_path.write_text("mzml", encoding="utf-8")
+        return prepared_path
+
+    monkeypatch.setattr(service, "prepare_asset", fake_prepare_asset)
+    confirmations = []
+
+    bundle, result, _ = service.prepare_pride_msdt_docker_input(
+        task=task,
+        output_dir=tmp_path / "task_out",
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
+        confirm_search_parameters=lambda reviewed_result: confirmations.append(reviewed_result) or True,
+    )
+
+    assert confirmations
+    assert bundle.plan.needs_review is False
+    assert result.plan.needs_review is False
+    assert not any("搜库参数需要人工复核" in issue for issue in result.plan.blocking_issues)
 
 
 def test_prepare_pride_msdt_docker_input_stops_before_download_when_plan_needs_review(tmp_path: Path, monkeypatch):

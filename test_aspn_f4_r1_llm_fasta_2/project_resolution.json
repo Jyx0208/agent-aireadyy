@@ -1,0 +1,18 @@
+{
+  "primary_project": {
+    "project_accession": "PXD019949",
+    "matched_file": "ASP-N_F4-R1.raw",
+    "match_type": "exact",
+    "match_score": 100,
+    "publication_date": "2025-08-28",
+    "submission_date": "2020-06-22",
+    "evidence": [
+      "exact file match"
+    ],
+    "metadata_consistency": 1.0
+  },
+  "alternative_projects": [],
+  "resolution_reason": "Selected PXD019949 by highest match score",
+  "resolution_confidence": 1.0,
+  "needs_review": false
+}

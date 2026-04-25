@@ -5,7 +5,13 @@ import json
 import httpx
 
 from agent.inference.rules import infer_attributes
-from agent.llm.reasoner import OpenAICompatibleReasoner, _metadata_context_text, confirm_no_sdrf_parameters, confirm_sdrf_parameters
+from agent.llm.reasoner import (
+    OpenAICompatibleReasoner,
+    _metadata_context_text,
+    confirm_no_sdrf_parameters,
+    confirm_sdrf_parameters,
+    default_llm_reasoner,
+)
 from agent.models import AttributeValue, MetadataValue, ProjectContext
 from agent.orchestrator.pipeline import AgentService
 
@@ -201,6 +207,27 @@ def test_openai_compatible_reasoner_defaults_to_gpt_5_4():
     reasoner = OpenAICompatibleReasoner(api_key="test-key")
 
     assert reasoner.model == "gpt-5.4"
+    assert reasoner.timeout == 300.0
+
+
+def test_default_llm_reasoner_reads_timeout_from_env(monkeypatch):
+    monkeypatch.setenv("AGENT_LLM_API_KEY", "test-key")
+    monkeypatch.setenv("AGENT_LLM_TIMEOUT", "600")
+
+    reasoner = default_llm_reasoner()
+
+    assert isinstance(reasoner, OpenAICompatibleReasoner)
+    assert reasoner.timeout == 600.0
+
+
+def test_default_llm_reasoner_ignores_invalid_timeout(monkeypatch):
+    monkeypatch.setenv("AGENT_LLM_API_KEY", "test-key")
+    monkeypatch.setenv("AGENT_LLM_TIMEOUT", "not-a-number")
+
+    reasoner = default_llm_reasoner()
+
+    assert isinstance(reasoner, OpenAICompatibleReasoner)
+    assert reasoner.timeout == 300.0
 
 
 def test_openai_compatible_reasoner_falls_back_when_json_mode_returns_5xx(monkeypatch):
