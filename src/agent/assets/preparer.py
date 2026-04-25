@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 from typing import Callable
 
-from agent.assets.downloader import download_file_asset
+from agent.assets.downloader import download_file_asset, invalidate_file_asset_cache
 from agent.models import FileAsset
 from agent.utils import emit, run_command_streaming
 
@@ -211,6 +211,11 @@ def _can_reuse_prepared_asset(asset: FileAsset, local_path: Path | None = None) 
     return asset.requires_conversion or asset.resolved_asset_type in {"mzml", "mgf", "mzid", "tims"}
 
 
+def _looks_like_corrupt_vendor_file_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "corrupt raw file" in text or "rawfileimpl::ctor" in text or "error processing file" in text
+
+
 def prepare_file_asset(
     client,
     asset: FileAsset,
@@ -274,4 +279,20 @@ def prepare_file_asset(
         try:
             return fallback_converter.convert_to_mzml(conversion_source, asset.prepared_path)
         except Exception as fallback_exc:
+            if _looks_like_corrupt_vendor_file_error(fallback_exc):
+                emit(report, "ProteoWizard 报告 RAW/vendor 文件损坏；删除缓存并重新下载后重试一次。")
+                invalidate_file_asset_cache(asset, report=report)
+                if asset.prepared_path.exists():
+                    asset.prepared_path.unlink()
+                redownloaded_path = download_file_asset(client, asset, report=report)
+                retry_source = redownloaded_path
+                if redownloaded_path.name.lower().endswith(".raw.zip"):
+                    retry_source = _extract_single_file(redownloaded_path, redownloaded_path.parent, (".raw",))
+                try:
+                    return fallback_converter.convert_to_mzml(retry_source, asset.prepared_path)
+                except Exception as retry_exc:
+                    raise AssetPreparationError(
+                        f"{retry_exc}；已尝试删除缓存并重新下载一次，仍转换失败。请检查 PRIDE 原始文件是否损坏，或尝试安装本地 ProteoWizard msconvert。",
+                        local_path=redownloaded_path,
+                    ) from retry_exc
             raise AssetPreparationError(str(fallback_exc), local_path=local_path) from fallback_exc

@@ -357,6 +357,40 @@ def test_download_file_asset_reuses_project_cache(tmp_path: Path, monkeypatch):
     assert events == [("download", "https://ftp.pride.ebi.ac.uk/pride/data/archive/sample.raw")]
 
 
+def test_download_file_asset_redownloads_cache_with_wrong_size(tmp_path: Path, monkeypatch):
+    events: list[tuple[str, str]] = []
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setenv("AGENT_PRIDE_CACHE_DIR", str(cache_dir))
+    cached = cache_dir / "PXD123456" / "sample.raw"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"bad")
+
+    class FakeClient:
+        def download_binary(self, url: str) -> bytes:
+            events.append(("download", url))
+            return b"raw-bytes"
+
+    asset = FileAsset(
+        original_file_name="sample.raw",
+        resolved_asset_type="raw",
+        project_accession="PXD123456",
+        matched_project_file="sample.raw",
+        download_url="https://ftp.pride.ebi.ac.uk/pride/data/archive/sample.raw",
+        local_path=tmp_path / "run" / "assets" / "downloads" / "sample.raw",
+        prepared_path=tmp_path / "run" / "assets" / "prepared" / "sample.mzML",
+        expected_size_bytes=len(b"raw-bytes"),
+        requires_conversion=True,
+        asset_confidence=1.0,
+        match_type="exact",
+    )
+
+    downloaded = download_file_asset(FakeClient(), asset)
+
+    assert downloaded.read_bytes() == b"raw-bytes"
+    assert cached.read_bytes() == b"raw-bytes"
+    assert events == [("download", "https://ftp.pride.ebi.ac.uk/pride/data/archive/sample.raw")]
+
+
 def test_resolve_file_asset_prefers_http_compatible_url_over_aspera(tmp_path: Path):
     task = normalize_input("sample.raw")
     context = _project_context(
