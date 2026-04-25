@@ -29,6 +29,10 @@
 # 只安装环境，不跑数据
 .\start.ps1 -SetupOnly
 
+# 使用 conda 环境安装/运行（已有 Anaconda/Miniconda 时推荐）
+.\start.ps1 -SetupOnly -UseConda
+.\start.ps1 "P17_severe_NoPOTS.raw" -UseConda
+
 # 单文件准备输入包
 .\start.ps1 "P17_severe_NoPOTS.raw"
 
@@ -50,6 +54,20 @@
 git clone https://github.com/Jyx0208/agent-aireadyy.git
 cd agent-aireadyy
 .\scripts\setup.ps1
+```
+
+如果你希望使用 conda 而不是项目内 `.venv`：
+
+```powershell
+.\scripts\setup.ps1 -UseConda
+.\start.ps1 "P17_severe_NoPOTS.raw" -UseConda
+```
+
+默认会创建/使用名为 `agent-aiready` 的 conda 环境；也可以指定环境名：
+
+```powershell
+.\scripts\setup.ps1 -UseConda -CondaEnvName "agent-aiready"
+.\start.ps1 "P17_severe_NoPOTS.raw" -UseConda -CondaEnvName "agent-aiready"
 ```
 
 如果你不用脚本，也可以手动安装：

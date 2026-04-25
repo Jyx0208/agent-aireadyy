@@ -16,7 +16,11 @@ param(
 
     [switch]$RunFull,
 
-    [switch]$SkipSetupCheck
+    [switch]$SkipSetupCheck,
+
+    [switch]$UseConda,
+
+    [string]$CondaEnvName = "agent-aiready"
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,6 +51,7 @@ function Write-Usage {
     Write-Host ""
     Write-Host "Install only:"
     Write-Host "  .\start.ps1 -SetupOnly"
+    Write-Host "  .\start.ps1 -SetupOnly -UseConda"
     Write-Host ""
     Write-Host "Full Docker execution instead of only preparing input:"
     Write-Host "  .\start.ps1 `"P17_severe_NoPOTS.raw`" -RunFull"
@@ -84,17 +89,35 @@ function Test-ApiKeyConfigured {
 }
 
 function Ensure-Setup {
-    $Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
-    if ($SkipSetupCheck -and (Test-Path $Python)) {
+    $PythonPathFile = Join-Path $RepoRoot ".agent_python_path"
+    $VenvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+    $ConfiguredPython = $null
+    if (Test-Path $PythonPathFile) {
+        $ConfiguredPython = (Get-Content $PythonPathFile -TotalCount 1).Trim()
+    }
+
+    if ($SkipSetupCheck -and $ConfiguredPython -and (Test-Path $ConfiguredPython)) {
         return
     }
 
-    if (-not (Test-Path $Python)) {
+    if ($UseConda) {
+        Write-Title "First-time setup"
+        & (Join-Path $RepoRoot "scripts\setup.ps1") -NoDev -UseConda -CondaEnvName $CondaEnvName
+        return
+    }
+
+    if ($ConfiguredPython -and (Test-Path $ConfiguredPython)) {
+        Write-Host "Python environment found: $ConfiguredPython"
+        return
+    }
+
+    if (-not (Test-Path $VenvPython)) {
         Write-Title "First-time setup"
         & (Join-Path $RepoRoot "scripts\setup.ps1") -NoDev
         return
     }
 
+    Set-Content -Path $PythonPathFile -Value $VenvPython -Encoding UTF8
     Write-Host "Python environment found: .venv"
 }
 
