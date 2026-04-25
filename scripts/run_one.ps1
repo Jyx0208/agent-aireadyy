@@ -52,7 +52,15 @@ if (-not $OutputDir) {
     $OutputDir = Join-Path "runs" (ConvertTo-SafeName $RawFileName)
 }
 
-$Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+$PythonPathFile = Join-Path $RepoRoot ".agent_python_path"
+$Python = $null
+if (Test-Path $PythonPathFile) {
+    $Python = (Get-Content $PythonPathFile -TotalCount 1).Trim()
+}
+
+if (-not $Python -or -not (Test-Path $Python)) {
+    $Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+}
 if (-not (Test-Path $Python)) {
     $Python = "python"
 }

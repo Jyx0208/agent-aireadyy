@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .env
+.agent_python_path
 .venv/
 .pytest_cache/
 .test_tmp/
