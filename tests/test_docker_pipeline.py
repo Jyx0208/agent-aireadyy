@@ -4,6 +4,8 @@ import subprocess
 from pathlib import Path
 import json
 
+import pandas as pd
+
 from agent.input.normalizer import normalize_input
 from agent.models import (
     AttributeSet,
@@ -105,7 +107,7 @@ def test_run_pride_dda_msdt_docker_executes_runner(tmp_path: Path, monkeypatch):
         def run(self, bundle):
             called["bundle"] = bundle
             bundle.plan.output_paths["fp_msdt"].parent.mkdir(parents=True, exist_ok=True)
-            bundle.plan.output_paths["fp_msdt"].write_text("msdt", encoding="utf-8")
+            pd.DataFrame({"scan": [1], "label": ["PEPTIDE"]}).to_parquet(bundle.plan.output_paths["fp_msdt"])
             return subprocess.CompletedProcess(args=["docker"], returncode=0, stdout="ok", stderr="")
 
     monkeypatch.setattr("agent.orchestrator.pipeline.DockerMSDTConverterRunner", FakeDockerRunner)
@@ -119,6 +121,9 @@ def test_run_pride_dda_msdt_docker_executes_runner(tmp_path: Path, monkeypatch):
     assert manifest.status == "completed"
     assert called["image"] == "guomics2017/msdt-converter:v1.3"
     assert called["bundle"].converter_config_path.exists()
+    assert Path(manifest.outputs["fp_msdt"]).exists()
+    assert Path(manifest.outputs["ai_ready"]).exists()
+    assert Path(manifest.outputs["run_log"]).read_text(encoding="utf-8") == "ok"
 
 
 def test_run_pride_dda_msdt_docker_marks_failed_when_msdt_output_missing(tmp_path: Path, monkeypatch):

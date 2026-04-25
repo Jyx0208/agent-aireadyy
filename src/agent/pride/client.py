@@ -2,15 +2,19 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from pathlib import Path
-from time import monotonic
+from time import monotonic, sleep
 from typing import Any
 
 import httpx
 
 
 class PrideClient:
-    def __init__(self, base_url: str = "https://www.ebi.ac.uk/pride/ws/archive/v2", timeout: float = 30.0):
-        self._client = httpx.Client(base_url=base_url, timeout=timeout, follow_redirects=True)
+    def __init__(self, base_url: str = "https://www.ebi.ac.uk/pride/ws/archive/v2", timeout: float = 60.0):
+        self._client = httpx.Client(
+            base_url=base_url,
+            timeout=httpx.Timeout(timeout, read=max(timeout, 120.0)),
+            follow_redirects=True,
+        )
 
     def close(self) -> None:
         self._client.close()
@@ -75,40 +79,65 @@ class PrideClient:
         response.raise_for_status()
         return response.content
 
-    def download_to_path(self, url: str, target_path: str | Path, report=None) -> Path:
+    def download_to_path(self, url: str, target_path: str | Path, report=None, retries: int = 3) -> Path:
         url = self._normalize_download_url(url) or url
         target_path = Path(target_path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = target_path.with_name(f"{target_path.name}.part")
 
         if report is not None:
-            report(f"正在下载：{url}")
+            report(f"Downloading: {url}")
 
-        with self._client.stream("GET", url) as response:
-            response.raise_for_status()
-            total = int(response.headers.get("Content-Length", "0") or "0")
+        attempts = max(1, retries)
+        last_error: Exception | None = None
+        total = 0
+        downloaded = 0
+        started = monotonic()
+        for attempt in range(1, attempts + 1):
+            if temp_path.exists():
+                temp_path.unlink()
             downloaded = 0
             started = monotonic()
-            with target_path.open("wb") as handle:
-                for chunk in response.iter_bytes():
-                    if not chunk:
-                        continue
-                    handle.write(chunk)
-                    downloaded += len(chunk)
-                    if report is not None:
-                        elapsed = max(monotonic() - started, 0.001)
-                        speed_bps = downloaded / elapsed
-                        eta_seconds = ((total - downloaded) / speed_bps) if total > 0 and speed_bps > 0 else None
-                        report(
-                            {
-                                "kind": "download_progress",
-                                "label": target_path.name,
-                                "downloaded": downloaded,
-                                "total": total,
-                                "speed_bps": speed_bps,
-                                "eta_seconds": eta_seconds,
-                                "complete": False,
-                            }
-                        )
+            try:
+                with self._client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    total = int(response.headers.get("Content-Length", "0") or "0")
+                    with temp_path.open("wb") as handle:
+                        for chunk in response.iter_bytes():
+                            if not chunk:
+                                continue
+                            handle.write(chunk)
+                            downloaded += len(chunk)
+                            if report is not None:
+                                elapsed = max(monotonic() - started, 0.001)
+                                speed_bps = downloaded / elapsed
+                                eta_seconds = ((total - downloaded) / speed_bps) if total > 0 and speed_bps > 0 else None
+                                report(
+                                    {
+                                        "kind": "download_progress",
+                                        "label": target_path.name,
+                                        "downloaded": downloaded,
+                                        "total": total,
+                                        "speed_bps": speed_bps,
+                                        "eta_seconds": eta_seconds,
+                                        "complete": False,
+                                    }
+                                )
+                temp_path.replace(target_path)
+                last_error = None
+                break
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+                last_error = exc
+                if temp_path.exists():
+                    temp_path.unlink()
+                if attempt >= attempts:
+                    break
+                if report is not None:
+                    report(f"Download failed ({attempt}/{attempts}), retrying: {exc}")
+                sleep(min(2 ** (attempt - 1), 8))
+
+        if last_error is not None:
+            raise last_error
 
         if report is not None:
             elapsed = max(monotonic() - started, 0.001)
@@ -125,9 +154,9 @@ class PrideClient:
                 }
             )
             if total > 0:
-                report(f"下载完成：{target_path}（{downloaded}/{total} bytes）")
+                report(f"Download complete: {target_path} ({downloaded}/{total} bytes)")
             else:
-                report(f"下载完成：{target_path}")
+                report(f"Download complete: {target_path}")
         return target_path
 
     @staticmethod

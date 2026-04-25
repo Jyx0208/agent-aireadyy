@@ -75,6 +75,20 @@ class AgentService:
         return plan.model_copy(update={"blocking_issues": remaining_issues, "needs_review": bool(remaining_issues)})
 
     @staticmethod
+    def _runtime_log_path(output_dir: str | Path) -> Path:
+        return Path(output_dir) / "logs" / "runtime.log"
+
+    @staticmethod
+    def _write_run_log(output_dir: str | Path, stdout: str, stderr: str = "") -> Path:
+        log_path = Path(output_dir) / "logs" / "run.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        content = stdout
+        if stderr:
+            content = f"{content}\n\n[stderr]\n{stderr}" if content else f"[stderr]\n{stderr}"
+        log_path.write_text(content, encoding="utf-8")
+        return log_path
+
+    @staticmethod
     def _uniprot_proteome_url(proteome_id: str) -> str:
         return f"https://rest.uniprot.org/uniprotkb/stream?compressed=false&format=fasta&query=%28proteome%3A{proteome_id}%29"
 
@@ -411,6 +425,12 @@ class AgentService:
         self._report("任务输入包已生成，开始运行 MSDT-Converter Docker 流程。")
         runner = DockerMSDTConverterRunner(image=image, report=self.reporter)
         docker_result = runner.run(bundle)
+        run_log_path = self._write_run_log(output_dir, docker_result.stdout, docker_result.stderr)
+        outputs = {key: str(value) for key, value in bundle.plan.output_paths.items()}
+        outputs["run_log"] = str(run_log_path)
+        runtime_log_path = self._runtime_log_path(output_dir)
+        if runtime_log_path.exists():
+            outputs["runtime_log"] = str(runtime_log_path)
         msdt_output = bundle.plan.output_paths.get("fp_msdt")
         if msdt_output is None or not msdt_output.exists():
             notes = [docker_result.stdout, f"MSDT output missing: {msdt_output}"]
@@ -421,7 +441,7 @@ class AgentService:
                 project_accession=result.resolution.primary_project.project_accession if result.resolution.primary_project else None,
                 source_file=task.file_name,
                 source_data_path=str(prepared_path),
-                outputs={key: str(value) for key, value in bundle.plan.output_paths.items()},
+                outputs=outputs,
                 notes=notes,
             )
             write_json(Path(output_dir) / "run_manifest.json", manifest)
@@ -445,16 +465,27 @@ class AgentService:
             )
             append_review_item(Path(output_dir) / "review_queue.json", review_item)
             return manifest
-        manifest = RunManifest(
+        initial_manifest = RunManifest(
             task_id=task.task_id,
             created_at=datetime.now(UTC),
             status="completed",
             project_accession=result.resolution.primary_project.project_accession if result.resolution.primary_project else None,
             source_file=task.file_name,
             source_data_path=str(prepared_path),
-            outputs={key: str(value) for key, value in bundle.plan.output_paths.items()},
+            outputs=outputs,
             notes=[docker_result.stdout],
         )
+        ai_ready_path = self.export_ai_ready(
+            msdt_path=msdt_output,
+            output_dir=Path(output_dir) / "ai_ready",
+            project_accession=initial_manifest.project_accession or "",
+            source_file=task.file_name,
+            attribute_evidence=result.attributes.model_dump(mode="json"),
+            decision_trace=bundle.plan.model_dump(mode="json"),
+            run_manifest=initial_manifest.model_dump(mode="json"),
+        )
+        outputs["ai_ready"] = str(ai_ready_path)
+        manifest = initial_manifest.model_copy(update={"outputs": outputs})
         write_json(Path(output_dir) / "run_manifest.json", manifest)
         write_task_state(
             Path(output_dir) / "task_state.json",

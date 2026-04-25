@@ -169,27 +169,49 @@ if (-not (Test-ApiKeyConfigured $EnvPath)) {
 }
 
 if ($BatchFile) {
-    $Arguments = @($BatchFile, "-OutputRoot", $OutputRoot)
-    if ($NoAutoConfirm) {
-        $Arguments += "-NoAutoConfirm"
+    $BatchScript = Join-Path $RepoRoot "scripts\run_batch.ps1"
+    if ($NoAutoConfirm -and $RunFull) {
+        & $BatchScript -FileList $BatchFile -OutputRoot $OutputRoot -NoAutoConfirm -RunFull
     }
-    if ($RunFull) {
-        $Arguments += "-RunFull"
+    elseif ($NoAutoConfirm) {
+        & $BatchScript -FileList $BatchFile -OutputRoot $OutputRoot -NoAutoConfirm
     }
-    & (Join-Path $RepoRoot "scripts\run_batch.ps1") @Arguments
+    elseif ($RunFull) {
+        & $BatchScript -FileList $BatchFile -OutputRoot $OutputRoot -RunFull
+    }
+    else {
+        & $BatchScript -FileList $BatchFile -OutputRoot $OutputRoot
+    }
     exit $LASTEXITCODE
 }
 
-$RunOneArguments = @($RawFileName)
+$RunOneScript = Join-Path $RepoRoot "scripts\run_one.ps1"
 if ($OutputDir) {
-    $RunOneArguments += $OutputDir
+    if ($NoAutoConfirm -and $RunFull) {
+        & $RunOneScript -RawFileName $RawFileName -OutputDir $OutputDir -NoAutoConfirm -RunFull
+    }
+    elseif ($NoAutoConfirm) {
+        & $RunOneScript -RawFileName $RawFileName -OutputDir $OutputDir -NoAutoConfirm
+    }
+    elseif ($RunFull) {
+        & $RunOneScript -RawFileName $RawFileName -OutputDir $OutputDir -RunFull
+    }
+    else {
+        & $RunOneScript -RawFileName $RawFileName -OutputDir $OutputDir
+    }
 }
-if ($NoAutoConfirm) {
-    $RunOneArguments += "-NoAutoConfirm"
+else {
+    if ($NoAutoConfirm -and $RunFull) {
+        & $RunOneScript -RawFileName $RawFileName -NoAutoConfirm -RunFull
+    }
+    elseif ($NoAutoConfirm) {
+        & $RunOneScript -RawFileName $RawFileName -NoAutoConfirm
+    }
+    elseif ($RunFull) {
+        & $RunOneScript -RawFileName $RawFileName -RunFull
+    }
+    else {
+        & $RunOneScript -RawFileName $RawFileName
+    }
 }
-if ($RunFull) {
-    $RunOneArguments += "-RunFull"
-}
-
-& (Join-Path $RepoRoot "scripts\run_one.ps1") @RunOneArguments
 exit $LASTEXITCODE
