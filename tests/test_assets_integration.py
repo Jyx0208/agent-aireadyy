@@ -46,6 +46,33 @@ def _attributes_requiring_search_review() -> AttributeSet:
     )
 
 
+def _mouse_attributes() -> AttributeSet:
+    attrs = _attributes()
+    return attrs.model_copy(
+        update={
+            "species": AttributeValue(
+                value="Mus musculus",
+                confidence=0.95,
+                source="llm_confirmed",
+                evidence_excerpt="mouse",
+                conflict_flag=False,
+            ),
+            "search_parameter_hints": AttributeValue(
+                value={
+                    "database": "UniProt mouse UP000000589 merged with cRAP",
+                    "recommended_fasta_name": "UP000000589_M_musculus.fasta",
+                    "recommended_fasta_url": None,
+                    "recommended_fasta_source": "LLM found UniProt proteome UP000000589 in protocol",
+                },
+                confidence=0.9,
+                source="llm_confirmed",
+                evidence_excerpt="mouse database",
+                conflict_flag=False,
+            ),
+        }
+    )
+
+
 def _reviewed_fasta(tmp_path: Path) -> Path:
     path = tmp_path / "reviewed_reference.fasta"
     path.write_text(">sp|P1|REVIEWED_TEST\nMPEPTIDEK\n", encoding="utf-8")
@@ -241,6 +268,112 @@ def test_prepare_pride_msdt_docker_input_continues_after_search_parameter_confir
     assert bundle.plan.needs_review is False
     assert result.plan.needs_review is False
     assert not any("搜库参数需要人工复核" in issue for issue in result.plan.blocking_issues)
+
+
+def test_prepare_pride_msdt_docker_input_auto_downloads_species_fasta(tmp_path: Path, monkeypatch):
+    service = AgentService(pride_client=None)
+    task = normalize_input("mouse.raw")
+    resolution = ProjectResolution.empty()
+    context = ProjectContext(project_accession="PXD_MOUSE", file_name="mouse.raw", metadata={}, project_files=[])
+
+    monkeypatch.setattr(service, "resolve_project", lambda _: resolution)
+    monkeypatch.setattr(service, "build_context", lambda *args, **kwargs: context)
+    monkeypatch.setattr(service, "infer_attributes", lambda *_: _mouse_attributes())
+    monkeypatch.setattr(
+        service,
+        "resolve_asset",
+        lambda *args, **kwargs: FileAsset(
+            original_file_name="mouse.raw",
+            resolved_asset_type="mzml",
+            matched_project_file="mouse.mzML",
+            download_url="https://ftp.pride.ebi.ac.uk/pride/data/archive/mouse.mzML",
+            local_path=tmp_path / "task_out" / "assets" / "downloads" / "mouse.mzML",
+            prepared_path=tmp_path / "task_out" / "assets" / "downloads" / "mouse.mzML",
+            requires_conversion=False,
+            asset_confidence=1.0,
+            match_type="stem",
+        ),
+    )
+
+    def fake_prepare_asset(asset):
+        prepared_path = tmp_path / "task_out" / "assets" / "downloads" / "mouse.mzML"
+        prepared_path.parent.mkdir(parents=True, exist_ok=True)
+        prepared_path.write_text("mzml", encoding="utf-8")
+        return prepared_path
+
+    class FakePrideClient:
+        def download_to_path(self, url, target_path):
+            assert "UP000000589" in url
+            Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(target_path).write_text(">sp|P1|MOUSE\nMPEPTIDEK\n", encoding="utf-8")
+            return Path(target_path)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(service, "prepare_asset", fake_prepare_asset)
+    monkeypatch.setattr("agent.execution.bundle.PrideClient", FakePrideClient)
+
+    bundle, result, _ = service.prepare_pride_msdt_docker_input(task=task, output_dir=tmp_path / "task_out")
+
+    assert result.plan.fasta_download_url is not None
+    assert "UP000000589" in result.plan.fasta_download_url
+    assert bundle.materialized_fasta_path.name == "Mus_musculus_reviewed.fasta"
+    assert bundle.materialized_fasta_path.exists()
+
+
+def test_prepare_pride_msdt_docker_input_confirms_llm_proteome_id_fasta(tmp_path: Path, monkeypatch):
+    service = AgentService(pride_client=None)
+    task = normalize_input("mouse.raw")
+    context = ProjectContext(project_accession="PXD_MOUSE", file_name="mouse.raw", metadata={}, project_files=[])
+
+    monkeypatch.setattr(service, "resolve_project", lambda _: ProjectResolution.empty())
+    monkeypatch.setattr(service, "build_context", lambda *args, **kwargs: context)
+    monkeypatch.setattr(service, "infer_attributes", lambda *_: _mouse_attributes())
+    monkeypatch.setattr(
+        service,
+        "resolve_asset",
+        lambda *args, **kwargs: FileAsset(
+            original_file_name="mouse.raw",
+            resolved_asset_type="mzml",
+            matched_project_file="mouse.mzML",
+            download_url="https://ftp.pride.ebi.ac.uk/pride/data/archive/mouse.mzML",
+            local_path=tmp_path / "task_out" / "assets" / "downloads" / "mouse.mzML",
+            prepared_path=tmp_path / "task_out" / "assets" / "downloads" / "mouse.mzML",
+            requires_conversion=False,
+            asset_confidence=1.0,
+            match_type="stem",
+        ),
+    )
+
+    def fake_prepare_asset(asset):
+        prepared_path = tmp_path / "task_out" / "assets" / "downloads" / "mouse.mzML"
+        prepared_path.parent.mkdir(parents=True, exist_ok=True)
+        prepared_path.write_text("mzml", encoding="utf-8")
+        return prepared_path
+
+    class FakePrideClient:
+        def download_to_path(self, url, target_path):
+            Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(target_path).write_text(">sp|P1|MOUSE\nMPEPTIDEK\n", encoding="utf-8")
+            return Path(target_path)
+
+        def close(self):
+            pass
+
+    recommendations = []
+    monkeypatch.setattr(service, "prepare_asset", fake_prepare_asset)
+    monkeypatch.setattr("agent.execution.bundle.PrideClient", FakePrideClient)
+
+    bundle, _, _ = service.prepare_pride_msdt_docker_input(
+        task=task,
+        output_dir=tmp_path / "task_out",
+        confirm_llm_recommended_fasta=lambda recommendation: recommendations.append(recommendation) or True,
+    )
+
+    assert recommendations
+    assert "UP000000589" in recommendations[0]["url"]
+    assert bundle.materialized_fasta_path.name == "UP000000589_M_musculus.fasta"
 
 
 def test_prepare_pride_msdt_docker_input_stops_before_download_when_plan_needs_review(tmp_path: Path, monkeypatch):

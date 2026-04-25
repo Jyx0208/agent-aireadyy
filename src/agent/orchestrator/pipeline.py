@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -72,6 +73,36 @@ class AgentService:
     def _accept_reviewed_search_parameters(plan: DdaExecutionPlan) -> DdaExecutionPlan:
         remaining_issues = [issue for issue in plan.blocking_issues if "搜库参数需要人工复核" not in issue]
         return plan.model_copy(update={"blocking_issues": remaining_issues, "needs_review": bool(remaining_issues)})
+
+    @staticmethod
+    def _uniprot_proteome_url(proteome_id: str) -> str:
+        return f"https://rest.uniprot.org/uniprotkb/stream?compressed=false&format=fasta&query=%28proteome%3A{proteome_id}%29"
+
+    @staticmethod
+    def _fasta_recommendation(result: PridePlanResult) -> dict[str, Any] | None:
+        hints = AgentService._search_hints(result.attributes)
+        hint_text = " ".join(
+            str(value)
+            for value in (
+                hints.get("recommended_fasta_name"),
+                hints.get("recommended_fasta_source"),
+                hints.get("database"),
+                result.attributes.species.value,
+            )
+            if value
+        )
+        proteome_match = re.search(r"\bUP\d{9}\b", hint_text, re.IGNORECASE)
+        derived_url = AgentService._uniprot_proteome_url(proteome_match.group(0).upper()) if proteome_match else None
+        url = hints.get("recommended_fasta_url") or derived_url or result.plan.fasta_download_url
+        if not url:
+            return None
+        return {
+            "name": hints.get("recommended_fasta_name") or result.plan.fasta_path.name,
+            "url": url,
+            "source": hints.get("recommended_fasta_source") or ("LLM/agent 根据物种或 UniProt proteome ID 推断"),
+            "database": hints.get("database"),
+            "workflow": hints.get("recommended_workflow_name"),
+        }
 
     def _report_resolution_summary(self, resolution: ProjectResolution) -> None:
         primary = resolution.primary_project
@@ -459,21 +490,9 @@ class AgentService:
         active_reviewed_fasta_url = reviewed_fasta_url
         active_reviewed_fasta_name = reviewed_fasta_name
         search_parameters_reviewed = False
-        if (
-            confirm_llm_recommended_fasta is not None
-            and active_reviewed_fasta_path is None
-            and active_reviewed_fasta_url is None
-            and self._can_retry_with_reviewed_llm_fasta(result.plan, result.attributes)
-        ):
-            hints = self._search_hints(result.attributes)
-            recommendation = {
-                "name": hints.get("recommended_fasta_name") or hints.get("database"),
-                "url": hints.get("recommended_fasta_url"),
-                "source": hints.get("recommended_fasta_source"),
-                "database": hints.get("database"),
-                "workflow": hints.get("recommended_workflow_name"),
-            }
-            if confirm_llm_recommended_fasta(recommendation):
+        if confirm_llm_recommended_fasta is not None and active_reviewed_fasta_path is None and active_reviewed_fasta_url is None:
+            recommendation = self._fasta_recommendation(result)
+            if recommendation is not None and confirm_llm_recommended_fasta(recommendation):
                 active_reviewed_fasta_url = str(recommendation["url"])
                 active_reviewed_fasta_name = str(recommendation["name"] or "")
                 self._report(f"已确认使用 LLM 推荐 FASTA：{active_reviewed_fasta_name or active_reviewed_fasta_url}")

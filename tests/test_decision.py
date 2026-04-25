@@ -130,6 +130,8 @@ def test_plan_dda_execution_maps_mouse_species_alias_to_mouse_fasta(tmp_path: Pa
 
     assert plan.fasta_path.name == "Mus_musculus_reviewed.fasta"
     assert plan.fasta_selection_mode == "inferred"
+    assert plan.fasta_download_url is not None
+    assert "UP000000589" in plan.fasta_download_url
 
 
 def test_plan_dda_execution_uses_generic_fasta_for_multi_species_mixture(tmp_path: Path):
@@ -342,7 +344,7 @@ def test_plan_dda_execution_requires_review_when_multiple_project_fastas_exist(t
     )
 
     assert plan.needs_review is True
-    assert any("占位" in issue for issue in plan.blocking_issues)
+    assert any("多个项目 FASTA" in issue for issue in plan.blocking_issues)
 
 
 def test_plan_dda_execution_requires_review_for_no_sdrf_unsupported_species_default_fasta(tmp_path: Path):
@@ -461,7 +463,7 @@ def test_plan_dda_execution_requires_review_for_top_down_project(tmp_path: Path)
     )
 
     assert plan.needs_review is True
-    assert any("占位" in issue for issue in plan.blocking_issues)
+    assert any("Top-down" in issue for issue in plan.blocking_issues)
 
 
 def test_plan_dda_execution_requires_review_for_multi_metadata_without_sdrf(tmp_path: Path):
@@ -496,8 +498,8 @@ def test_plan_dda_execution_requires_review_for_multi_metadata_without_sdrf(tmp_
     )
 
     assert plan.needs_review is True
-    assert any("占位" in issue for issue in plan.blocking_issues)
-    assert any("占位" in issue for issue in plan.blocking_issues)
+    assert any("多个物种" in issue for issue in plan.blocking_issues)
+    assert any("多个仪器" in issue for issue in plan.blocking_issues)
 
 
 def test_plan_dda_execution_names_query_url_reviewed_fasta_with_fasta_suffix(tmp_path: Path):

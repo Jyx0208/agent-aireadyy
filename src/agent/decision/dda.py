@@ -28,7 +28,11 @@ def _detect_raw_type(source_data_path: Path, source_file_name: str = "") -> str:
     raise ValueError(f"Unsupported source data path for MSDT-Converter: {source_data_path}")
 
 
-def _species_fasta_name(species: str) -> tuple[str, str]:
+def _uniprot_proteome_url(proteome_id: str) -> str:
+    return f"https://rest.uniprot.org/uniprotkb/stream?compressed=false&format=fasta&query=%28proteome%3A{proteome_id}%29"
+
+
+def _species_fasta_choice(species: str) -> tuple[str, str, str | None]:
     normalized = species.lower()
     multi_species_groups = [
         ("homo sapiens", "human"),
@@ -37,12 +41,16 @@ def _species_fasta_name(species: str) -> tuple[str, str]:
         ("saccharomyces cerevisiae", "yeast"),
     ]
     if sum(1 for aliases in multi_species_groups if any(alias in normalized for alias in aliases)) > 1:
-        return "generic_reference_with_contaminants.fasta", "defaulted"
+        return "generic_reference_with_contaminants.fasta", "defaulted", None
     if "homo sapiens" in normalized or "human" in normalized:
-        return "Homo_sapiens_reviewed.fasta", "inferred"
+        return "Homo_sapiens_reviewed.fasta", "inferred", _uniprot_proteome_url("UP000005640")
     if "mus musculus" in normalized or "mouse" in normalized:
-        return "Mus_musculus_reviewed.fasta", "inferred"
-    return "generic_reference_with_contaminants.fasta", "defaulted"
+        return "Mus_musculus_reviewed.fasta", "inferred", _uniprot_proteome_url("UP000000589")
+    if "saccharomyces cerevisiae" in normalized or "yeast" in normalized:
+        return "Saccharomyces_cerevisiae_reviewed.fasta", "inferred", _uniprot_proteome_url("UP000002311")
+    if "escherichia coli" in normalized or "e. coli" in normalized:
+        return "Escherichia_coli_K12_reviewed.fasta", "inferred", _uniprot_proteome_url("UP000000625")
+    return "generic_reference_with_contaminants.fasta", "defaulted", None
 
 
 def is_placeholder_fasta(path: Path) -> bool:
@@ -236,10 +244,11 @@ def _fasta_blocking_issues(
     fasta_path: Path,
     fasta_mode: str,
     raw_data_type: str,
+    fasta_download_url: str | None = None,
 ) -> list[str]:
     if raw_data_type in {"mgf", "mzid"}:
         return []
-    if is_placeholder_fasta(fasta_path):
+    if is_placeholder_fasta(fasta_path) and not fasta_download_url:
         return [
             f"FASTA {fasta_path.name} 是占位文件，不能作为真实搜库数据库；请提供项目 FASTA 或人工确认的真实 FASTA。"
         ]
@@ -300,13 +309,23 @@ def plan_dda_execution(
         fasta_path = project_fasta_path
         fasta_mode = "reproduced"
     elif reviewed_path is None:
-        fasta_file_name, fasta_mode = _species_fasta_name(str(attributes.species.value))
+        fasta_file_name, fasta_mode, inferred_fasta_url = _species_fasta_choice(str(attributes.species.value))
         fasta_path = workspace_root / "profiles" / "fasta" / fasta_file_name
+        project_fasta_url = inferred_fasta_url
     workflow_name = _llm_confirmed_workflow_name(attributes, workspace_root) or _workflow_name(attributes, raw_data_type)
     blocking_issues = _blocking_issues(attributes, workflow_name, raw_data_type)
     blocking_issues.extend(fasta_issues)
     blocking_issues.extend(_context_blocking_issues(project_context))
-    blocking_issues.extend(_fasta_blocking_issues(project_context, attributes, fasta_path, fasta_mode, raw_data_type))
+    blocking_issues.extend(
+        _fasta_blocking_issues(
+            project_context,
+            attributes,
+            fasta_path,
+            fasta_mode,
+            raw_data_type,
+            fasta_download_url=project_fasta_url,
+        )
+    )
     if accept_search_parameter_review:
         blocking_issues = [issue for issue in blocking_issues if "搜库参数需要人工复核" not in issue]
 

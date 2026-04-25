@@ -50,6 +50,46 @@ class FailingReasoner:
         raise RuntimeError("LLM unavailable")
 
 
+class SpeciesAliasReasoner:
+    def confirm_search_parameters(self, context, attributes):
+        return {
+            "species": AttributeValue(
+                value="Mus musculus",
+                confidence=0.95,
+                source="llm_confirmed",
+                evidence_excerpt="Mouse project metadata.",
+                conflict_flag=False,
+            )
+        }
+
+
+class HighConfidenceLlmReasoner:
+    def confirm_search_parameters(self, context, attributes):
+        return {
+            "species": AttributeValue(
+                value="Mus musculus",
+                confidence=0.95,
+                source="llm_confirmed",
+                evidence_excerpt="Mouse project metadata.",
+                conflict_flag=False,
+            ),
+            "instrument_name": AttributeValue(
+                value="Orbitrap Fusion",
+                confidence=0.95,
+                source="llm_confirmed",
+                evidence_excerpt="Orbitrap Fusion mass spectrometer.",
+                conflict_flag=False,
+            ),
+            "enzyme": AttributeValue(
+                value="Trypsin/LysC",
+                confidence=0.95,
+                source="llm_confirmed",
+                evidence_excerpt="Trypsin/LysC mix.",
+                conflict_flag=False,
+            ),
+        }
+
+
 class FakeSdrfReasoner:
     def __init__(self):
         self.calls = 0
@@ -133,6 +173,66 @@ def test_llm_confirmation_updates_search_hints_when_no_sdrf():
     assert confirmed.search_parameter_hints.source == "llm_confirmed"
     assert confirmed.enzyme.value == "Lys-C"
     assert confirmed.enzyme.source == "llm_confirmed"
+
+
+def test_llm_confirmation_treats_parenthetical_species_alias_as_same_value():
+    context = ProjectContext(
+        project_accession="PXD000010",
+        file_name="sample.raw",
+        metadata={
+            "organisms": MetadataValue(
+                value=["Mus musculus (mouse)"],
+                source="pride.organisms",
+                source_level="project",
+                completeness=1.0,
+            )
+        },
+        sdrf_rows=[],
+    )
+
+    base = infer_attributes(context)
+    confirmed = confirm_no_sdrf_parameters(context, base, llm_reasoner=SpeciesAliasReasoner())
+
+    assert confirmed.species.value == "Mus musculus"
+    assert confirmed.species.conflict_flag is False
+
+
+def test_high_confidence_llm_refines_pride_and_rule_values_without_conflict():
+    context = ProjectContext(
+        project_accession="PXD000010",
+        file_name="sample.raw",
+        metadata={
+            "organisms": MetadataValue(
+                value=["Mus musculus (mouse)"],
+                source="pride.organisms",
+                source_level="project",
+                completeness=1.0,
+            ),
+            "instruments": MetadataValue(
+                value=["quadrupole ion trap orbitrap instrument"],
+                source="pride.instruments",
+                source_level="project",
+                completeness=1.0,
+            ),
+            "sampleProcessingProtocol": MetadataValue(
+                value="Samples were digested with Trypsin/LysC mix.",
+                source="pride.sampleProcessingProtocol",
+                source_level="project",
+                completeness=1.0,
+            ),
+        },
+        sdrf_rows=[],
+    )
+
+    base = infer_attributes(context)
+    confirmed = confirm_no_sdrf_parameters(context, base, llm_reasoner=HighConfidenceLlmReasoner())
+
+    assert confirmed.species.value == "Mus musculus"
+    assert confirmed.species.conflict_flag is False
+    assert confirmed.instrument_name.value == "Orbitrap Fusion"
+    assert confirmed.instrument_name.conflict_flag is False
+    assert confirmed.enzyme.value == "Trypsin/LysC"
+    assert confirmed.enzyme.conflict_flag is False
 
 
 def test_llm_confirmation_keeps_fasta_and_workflow_recommendations_in_hints():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol
@@ -40,7 +41,13 @@ def _is_missing(value: Any) -> bool:
 
 
 def _same_value(left: Any, right: Any) -> bool:
-    return _flatten(left).strip().lower() == _flatten(right).strip().lower()
+    def normalized(value: Any) -> str:
+        text = _flatten(value).strip().lower()
+        text = re.sub(r"\s*\([^)]*\)", "", text)
+        text = re.sub(r"[^a-z0-9]+", " ", text)
+        return " ".join(text.split())
+
+    return normalized(left) == normalized(right)
 
 
 def _conflicting_attribute(current: AttributeValue, proposed: AttributeValue) -> AttributeValue:
@@ -55,6 +62,10 @@ def _conflicting_attribute(current: AttributeValue, proposed: AttributeValue) ->
     )
 
 
+def _is_high_confidence_llm(attribute: AttributeValue) -> bool:
+    return attribute.source.startswith("llm_confirmed") and attribute.confidence >= 0.85
+
+
 def _merge_attribute(current: AttributeValue, proposed: AttributeValue) -> AttributeValue:
     if _is_missing(proposed.value):
         return current
@@ -66,6 +77,8 @@ def _merge_attribute(current: AttributeValue, proposed: AttributeValue) -> Attri
         return proposed.model_copy(update={"value": merged_value})
     if _same_value(current.value, proposed.value):
         return proposed
+    if _is_high_confidence_llm(proposed) and not current.source.startswith("sdrf"):
+        return proposed.model_copy(update={"conflict_flag": False})
     if current.source.startswith("pride.") and current.confidence >= 0.9:
         return _conflicting_attribute(current, proposed)
     if current.confidence >= 0.9 and proposed.confidence < current.confidence:
@@ -165,8 +178,10 @@ def _no_sdrf_attribute_prompt(context: ProjectContext, attributes: AttributeSet)
         "data_family should be one of mzml, mzxml, tims, thermo_raw, sciex_wiff, mgf, mzid, or unknown. "
         "Also include sidecar_patterns when project files imply companion files such as .wiff.scan. "
         "For FASTA, prefer a project-provided FASTA file when listed. If no FASTA file is listed, identify the "
-        "database/FASTA needed from protocols or parameter-file names; include a URL only if it is explicitly "
-        "present in the supplied context, otherwise leave recommended_fasta_url null. "
+        "database/FASTA needed from protocols or parameter-file names. When a UniProt proteome ID such as "
+        "UP000000589, UP000005640, or UP000002311 is stated or confidently implied, include the official "
+        "UniProt stream URL in recommended_fasta_url using format "
+        "https://rest.uniprot.org/uniprotkb/stream?compressed=false&format=fasta&query=%28proteome%3A<PROTEOME_ID>%29. "
         "For workflow, recommend only one of these existing templates when appropriate: "
         "LFQ_DDA_generic.workflow, LFQ_DDA_generic_tims.workflow, LFQ_DDA_human_noNQ.workflow, "
         "LFQ_DDA_human_noNQ_tims.workflow, TMT_DDA_generic.workflow, TMT_DDA_human.workflow, "
@@ -198,7 +213,8 @@ def _sdrf_attribute_prompt(context: ProjectContext, attributes: AttributeSet) ->
         "min_matched_peaks, max_variable_mods, tmt_channel_count, data_family, and sidecar_patterns when SDRF rows or "
         "project metadata explicitly provide them. Also include recommended_fasta_name, recommended_fasta_url, "
         "recommended_fasta_source, recommended_workflow_name, and workflow_rationale when SDRF rows or metadata "
-        "make FASTA/workflow selection explicit. Use normalized modification strings with residue/site and mass "
+        "make FASTA/workflow selection explicit. For UniProt proteome IDs, include the official UniProt stream URL "
+        "in recommended_fasta_url using the proteome ID. Use normalized modification strings with residue/site and mass "
         "when available, e.g. Carbamidomethyl (C) 57.02146, Oxidation (M) 15.9949, TMT (K) 229.16293.\n"
         "Use source='llm_confirmed'. Prefer normalized human-readable values over raw NT=/AC= strings.\n"
         "When SDRF rows represent multiple organisms in one file, summarize species as a multi-species mixture.\n"

@@ -88,7 +88,7 @@ def materialize_dda_task_bundle(
     )
     if plan.needs_review:
         raise ValueError(f"Cannot materialize a strict DDA bundle while the plan needs review: {plan.blocking_issues}")
-    if is_placeholder_fasta(plan.fasta_path):
+    if is_placeholder_fasta(plan.fasta_path) and not plan.fasta_download_url:
         raise ValueError(f"Cannot materialize a strict DDA bundle with placeholder FASTA: {plan.fasta_path}")
 
     workflows_dir = task_root / "workflows"
@@ -98,7 +98,7 @@ def materialize_dda_task_bundle(
     fasta_dir = task_root / "fasta"
     fasta_dir.mkdir(parents=True, exist_ok=True)
     materialized_fasta_path = fasta_dir / plan.fasta_path.name
-    if plan.fasta_selection_mode in {"reproduced", "reviewed"} and plan.fasta_download_url:
+    if plan.fasta_download_url:
         if not plan.fasta_download_url:
             raise ValueError("Cannot reproduce project FASTA without a download URL.")
         client = PrideClient()
