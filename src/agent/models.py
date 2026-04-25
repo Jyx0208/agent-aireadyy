@@ -81,6 +81,7 @@ class FileAsset(JsonModel):
     download_url: str | None = None
     local_path: Path | None = None
     prepared_path: Path | None = None
+    expected_size_bytes: int | None = None
     sidecar_files: list[dict[str, Any]] = Field(default_factory=list)
     requires_conversion: bool = False
     asset_confidence: float = 0.0

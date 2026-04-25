@@ -197,6 +197,7 @@ def resolve_file_asset(task: InputTask, context: ProjectContext, work_dir: str |
         download_url=_first_download_url(file_record),
         local_path=local_path,
         prepared_path=prepared_path,
+        expected_size_bytes=file_record.get("fileSizeBytes"),
         sidecar_files=_sidecar_files(matched_file, context.project_files, downloads_dir),
         requires_conversion=requires_conversion,
         asset_confidence=confidence,
