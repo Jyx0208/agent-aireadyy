@@ -9,7 +9,7 @@ from agent.pride.client import PrideClient
 
 
 def _workspace_root() -> Path:
-    module_path = Path(__file__).resolve()
+    module_path = Path(__file__)
     candidates = [
         module_path.parents[3],  # source checkout: <repo>/src/agent/decision/dda.py
         module_path.parents[2],  # installed wheel: <site-packages>/agent/decision/dda.py
@@ -187,9 +187,15 @@ def _blocking_issues(attributes: AttributeSet, workflow_name: str, raw_data_type
     if raw_data_type == "mzid":
         return ["mzIdentML/mzid 是搜库结果文件，不含完整谱图；当前只能识别，不能自动生成标准 MSDT 输入。"]
     if _is_dia_mode(attributes):
-        # DIA 模式现在支持，但需要检查是否有对应的 workflow
-        if not workflow_name or "DIA" not in workflow_name:
-            issues.append("DIA 数据需要专用的 DIA workflow 模板。")
+        issues.append(
+            "检测到 DIA（数据独立采集）数据。当前系统仅支持 DDA（数据依赖采集）数据处理流程。\n"
+            "DIA 数据建议使用以下专用工具：\n"
+            "  - Spectronaut（商业软件）\n"
+            "  - DIA-NN（免费开源）\n"
+            "  - FragPipe DIA workflow（需单独配置）\n"
+            "如需处理 DIA 数据，请使用上述工具或联系开发者扩展 DIA 支持。"
+        )
+        return issues  # DIA 直接阻断，不检查其他条件
     elif not _is_dda_mode(attributes):
         issues.append(f"无法确认采集模式是否为 DDA：{attributes.acquisition_mode.value}")
     required = {

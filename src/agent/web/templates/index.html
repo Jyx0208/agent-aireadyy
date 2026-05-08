@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PRIDE AI-ready Agent</title>
+<style>
+:root{--bg:#0f1117;--card:#1a1d27;--border:#2a2d3a;--text:#e4e4e7;--muted:#71717a;--accent:#6366f1;--accent-hover:#818cf8;--green:#22c55e;--red:#ef4444;--yellow:#f59e0b;--blue:#3b82f6;--cyan:#06b6d4;--radius:10px}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;background:var(--bg);color:var(--text);min-height:100vh;line-height:1.6}
+.container{max-width:1240px;margin:0 auto;padding:20px}
+header{text-align:center;padding:28px 0 20px;border-bottom:1px solid var(--border);margin-bottom:24px}
+header h1{font-size:1.5rem;font-weight:700;background:linear-gradient(135deg,var(--accent),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+header p{color:var(--muted);font-size:0.85rem;margin-top:4px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
+.form-row{display:flex;gap:12px;margin-bottom:12px;align-items:center}
+.form-row label{min-width:80px;font-size:0.82rem;color:var(--muted);text-align:right}
+.form-row input{flex:1;padding:9px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.88rem;transition:border-color .2s}
+.form-row input:focus{outline:none;border-color:var(--accent)}
+.form-row input::placeholder{color:#4a4a5a}
+.form-row input.error{border-color:var(--red);background:#1a0a0a}
+.main-input{display:flex;gap:10px;margin-bottom:10px}
+.main-input input{flex:1;padding:12px 16px;background:var(--bg);border:2px solid var(--border);border-radius:8px;color:var(--text);font-size:1rem;transition:border-color .2s}
+.main-input input:focus{outline:none;border-color:var(--accent)}
+.btn{padding:12px 24px;border:none;border-radius:8px;font-size:0.9rem;font-weight:600;cursor:pointer;transition:all .15s}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent-hover)}
+.btn-primary:disabled{background:#3a3a5a;cursor:not-allowed}
+.btn-green{background:var(--green);color:#fff}
+.btn-green:hover{background:#16a34a}
+.btn-secondary{background:transparent;color:var(--text);border:1px solid var(--border)}
+.btn-secondary:hover{border-color:var(--accent);color:var(--accent)}
+.btn-secondary:disabled{color:var(--muted);border-color:var(--border);cursor:not-allowed}
+.btn-small{padding:7px 12px;font-size:0.78rem;border-radius:6px}
+.config-actions{display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap;padding-left:92px}
+.inline-status{font-size:0.78rem;color:var(--muted)}
+.inline-status.ok{color:var(--green)}
+.inline-status.error{color:var(--red)}
+.server-status{margin-left:auto;font-size:0.78rem;color:var(--muted)}
+.examples{margin-top:6px;display:flex;gap:6px;flex-wrap:wrap}
+.examples span{background:#1e1e30;color:var(--accent);padding:3px 10px;border-radius:5px;font-size:0.78rem;cursor:pointer;border:1px solid var(--border);transition:all .15s}
+.examples span:hover{background:#252540;border-color:var(--accent)}
+.config-toggle{cursor:pointer;display:flex;align-items:center;gap:6px;font-size:0.82rem;color:var(--muted);margin-bottom:10px;user-select:none}
+.config-toggle .arrow{transition:transform .2s;display:inline-block}
+.config-toggle .arrow.open{transform:rotate(90deg)}
+.config-body{display:none;overflow:hidden}
+.config-body.open{display:block}
+.warn-banner{background:#1a1500;border:1px solid var(--yellow);border-radius:8px;padding:12px 16px;margin-bottom:14px;font-size:0.82rem;color:#fbbf24;display:none}
+.warn-banner.show{display:block}
+.steps{display:flex;gap:4px;margin-bottom:16px}
+.step-item{flex:1;text-align:center;padding:8px 4px;border-radius:6px;font-size:0.75rem;font-weight:500;background:var(--bg);border:1px solid var(--border);color:var(--muted);transition:all .2s}
+.step-item.active{border-color:var(--accent);color:var(--accent);background:#1a1a30}
+.step-item.done{border-color:var(--green);color:var(--green);background:#0a1a0f}
+.step-item.error{border-color:var(--red);color:var(--red);background:#1a0a0a}
+.log-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.log-header span{font-size:0.8rem;color:var(--muted)}
+.log-filters{display:flex;gap:4px}
+.log-filters button{padding:2px 8px;border:1px solid var(--border);background:transparent;color:var(--muted);border-radius:4px;font-size:0.72rem;cursor:pointer;transition:all .15s}
+.log-filters button.active{border-color:var(--accent);color:var(--accent);background:#1a1a30}
+.log-filters button:hover{border-color:var(--accent)}
+.log-box{background:#0d0e12;border:1px solid var(--border);border-radius:8px;padding:14px;height:480px;overflow-y:auto;font-family:"JetBrains Mono","Fira Code","Cascadia Code","Consolas",monospace;font-size:0.78rem;line-height:1.7}
+.log-box::-webkit-scrollbar{width:6px}
+.log-box::-webkit-scrollbar-track{background:transparent}
+.log-box::-webkit-scrollbar-thumb{background:#333;border-radius:3px}
+.log-line{display:flex;gap:8px;padding:1px 0}
+.log-line .ts{color:#4a4a5a;min-width:65px;flex-shrink:0}
+.log-line .badge{min-width:36px;text-align:center;padding:0 4px;border-radius:3px;font-size:0.68rem;font-weight:600;flex-shrink:0}
+.log-line .badge.info{color:var(--blue);background:#1a2040}
+.log-line .badge.llm{color:var(--cyan);background:#0a2030}
+.log-line .badge.debug{color:#8b5cf6;background:#1a1030}
+.log-line .badge.error{color:var(--red);background:#2a0a0a}
+.log-line .badge.step{color:var(--yellow);background:#2a200a}
+.log-line .msg{flex:1;word-break:normal;overflow-wrap:anywhere;white-space:pre-wrap}
+.log-line .msg.error{color:var(--red)}
+.log-line .msg.llm{color:#67e8f9}
+.log-line .msg.step{color:var(--yellow);font-weight:600}
+.log-line .msg.debug{color:#a78bfa}
+.log-line .msg.info{color:var(--text)}
+.status-bar{display:flex;align-items:center;gap:10px;margin-bottom:14px;padding:10px 14px;background:var(--bg);border-radius:8px;border:1px solid var(--border)}
+.status-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+.status-dot.pending{background:var(--yellow)}
+.status-dot.queued{background:var(--yellow)}
+.status-dot.running{background:var(--accent);animation:pulse 1.2s infinite}
+.status-dot.completed{background:var(--green)}
+.status-dot.failed{background:var(--red)}
+.status-dot.blocked{background:var(--yellow)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.status-text{font-size:0.85rem;font-weight:500}
+.status-time{margin-left:auto;font-size:0.78rem;color:var(--muted)}
+.queue-panel{display:none;margin-bottom:14px;padding:10px 14px;background:#17130a;border:1px solid #3a2a0a;border-radius:8px;color:#fbbf24;font-size:0.82rem}
+.queue-panel.show{display:block}
+.run-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:14px;align-items:start}
+.run-main{min-width:0}
+.review-panel{position:sticky;top:16px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;max-height:680px;overflow:auto}
+.review-panel h4{font-size:0.86rem;color:var(--text);margin-bottom:8px}
+.review-updated{font-size:0.72rem;color:var(--muted);margin-bottom:10px}
+.review-empty{font-size:0.78rem;color:var(--muted)}
+.review-item{padding:7px 0;border-top:1px solid var(--border)}
+.review-item:first-of-type{border-top:none}
+.review-label{font-size:0.72rem;color:var(--muted);line-height:1.3}
+.review-value{font-size:0.8rem;color:var(--text);overflow-wrap:anywhere;line-height:1.45}
+.review-meta{font-size:0.68rem;color:#52525b;margin-top:2px}
+.review-item.conflict .review-value{color:#fca5a5}
+.review-issues{margin-top:10px;padding-top:10px;border-top:1px solid #3a2a0a;color:#fbbf24;font-size:0.78rem}
+.review-issues li{margin-left:16px;line-height:1.5}
+.result-panel{margin-top:14px;padding:14px;background:var(--bg);border:1px solid var(--border);border-radius:8px}
+.result-panel h4{font-size:0.85rem;color:var(--green);margin-bottom:8px}
+.result-panel .file-list{font-size:0.78rem;color:var(--muted);font-family:monospace;line-height:1.8;max-height:200px;overflow-y:auto}
+.download-status{display:block;margin-top:8px;font-size:0.78rem;color:var(--muted)}
+.download-status.error{color:var(--red)}
+.blocked-panel{margin-top:14px;padding:14px;background:#1a0f0a;border:1px solid var(--red);border-radius:8px}
+.blocked-panel h4{color:var(--red);font-size:0.85rem;margin-bottom:6px}
+.blocked-panel li{color:#fca5a5;font-size:0.8rem;margin-left:16px;line-height:1.6}
+.footer{text-align:center;padding:20px 0;color:#3a3a4a;font-size:0.75rem;border-top:1px solid var(--border);margin-top:20px}
+@media(max-width:980px){.run-layout{grid-template-columns:1fr}.review-panel{position:static;max-height:none}}
+</style>
+</head>
+<body>
+<div class="container">
+<header>
+<h1>PRIDE AI-ready Agent</h1>
+<p>蛋白质组学自动化数据处理 — 输入 PRIDE 文件名，自动推断参数、下载数据、运行 MSDT-Converter</p>
+</header>
+
+<!-- 配置警告 -->
+<div class="warn-banner" id="warnBanner">
+请先配置大模型 API Key，否则无法运行。
+</div>
+
+<!-- 输入区 -->
+<div class="card">
+<div class="main-input">
+<input type="text" id="inputValue" placeholder="输入 PRIDE 原始文件名，例如 P17_severe_NoPOTS.raw" />
+<button class="btn btn-primary" id="startBtn" onclick="startTask()">开始运行</button>
+</div>
+<div class="examples">
+示例：
+<span onclick="fill('P17_severe_NoPOTS.raw')">P17_severe_NoPOTS.raw</span>
+<span onclick="fill('junge_jo000024_20210119_17951_BioID_FZD4_2.raw')">BioID_FZD4_2.raw</span>
+<span onclick="fill('TOTALRAW_AF_CTRLs.raw')">TOTALRAW_AF_CTRLs.raw</span>
+</div>
+
+<!-- 配置面板 -->
+<div style="margin-top:14px">
+<div class="config-toggle" onclick="toggleConfig()">
+<span class="arrow" id="configArrow">&#9654;</span> 大模型 API 配置 <span id="configStatus"></span>
+</div>
+<div class="config-body" id="configBody">
+<div class="form-row">
+<label>API Key <span style="color:var(--red)">*</span></label>
+<input type="password" id="cfgApiKey" placeholder="sk-..." />
+</div>
+<div class="form-row">
+<label>Base URL</label>
+<input type="text" id="cfgBaseUrl" placeholder="https://api.deepseek.com" />
+</div>
+<div class="form-row">
+<label>模型</label>
+<input type="text" id="cfgModel" placeholder="deepseek-v4-flash" />
+</div>
+<div class="form-row">
+<label>超时(秒)</label>
+<input type="number" id="cfgTimeout" placeholder="1200" />
+</div>
+<div class="config-actions">
+<button class="btn btn-secondary btn-small" id="checkApiBtn" onclick="checkLLMConfig()">检查 API Key</button>
+<span class="inline-status" id="apiCheckStatus"></span>
+<span class="server-status" id="serverStatus"></span>
+</div>
+</div>
+</div>
+</div>
+
+<!-- 进度 + 日志 -->
+<div class="card" id="runCard" style="display:none">
+<div class="steps" id="steps">
+<div class="step-item" data-step="1">1 解析项目</div>
+<div class="step-item" data-step="2">2 下载数据</div>
+<div class="step-item" data-step="3">3 生成输入</div>
+<div class="step-item" data-step="4">4 Docker运行</div>
+<div class="step-item" data-step="5">5 完成</div>
+</div>
+<div class="status-bar">
+<span class="status-dot" id="statusDot"></span>
+<span class="status-text" id="statusText">等待中...</span>
+<span class="status-time" id="statusTime"></span>
+</div>
+<div class="queue-panel" id="queuePanel"></div>
+<div class="run-layout">
+<div class="run-main">
+<div class="log-header">
+<span id="logCount">0 条日志</span>
+<div class="log-filters">
+<button class="active" data-filter="all" onclick="setFilter('all',this)">全部</button>
+<button data-filter="info" onclick="setFilter('info',this)">信息</button>
+<button data-filter="llm" onclick="setFilter('llm',this)">大模型</button>
+<button data-filter="debug" onclick="setFilter('debug',this)">调试</button>
+<button data-filter="error" onclick="setFilter('error',this)">错误</button>
+<button data-filter="step" onclick="setFilter('step',this)">步骤</button>
+</div>
+</div>
+<div class="log-box" id="logBox"></div>
+<div class="result-panel" id="resultPanel" style="display:none">
+<h4>运行完成 — 输出文件</h4>
+<div class="file-list" id="fileList"></div>
+<button class="btn btn-green" id="downloadBtn" style="margin-top:12px" onclick="downloadResults()">下载结果文件 (ZIP)</button>
+<span class="download-status" id="downloadStatus"></span>
+</div>
+<div class="blocked-panel" id="blockedPanel" style="display:none">
+<h4>运行被阻断</h4>
+<ul id="issuesList"></ul>
+</div>
+</div>
+<aside class="review-panel" id="reviewPanel">
+<h4>待复核参数</h4>
+<div class="review-empty">任务开始后会固定显示 workflow、FASTA、搜库参数和需要人工复核的问题。</div>
+</aside>
+</div>
+</div>
+
+<div class="footer">PRIDE AI-ready Agent v0.3.1 &middot; FastAPI + FragPipe + MSDT-Converter + LLM</div>
+</div>
+
+<script>
+let taskId=null,ws=null,currentFilter='all',allLogs=[],startTime=null,timerInterval=null;
+
+function fill(v){document.getElementById('inputValue').value=v}
+
+function toggleConfig(){
+  document.getElementById('configBody').classList.toggle('open');
+  document.getElementById('configArrow').classList.toggle('open');
+}
+
+// 加载配置
+async function loadConfig(){
+  try{
+    const r=await fetch('/api/config');
+    const d=await r.json();
+    document.getElementById('cfgBaseUrl').value=d.base_url||'';
+    document.getElementById('cfgModel').value=d.model||'';
+    document.getElementById('cfgTimeout').value=d.timeout||'';
+    document.getElementById('cfgApiKey').placeholder='请填写本次任务使用的 API Key（必填）';
+    document.getElementById('configStatus').textContent='(每个用户单独填写)';
+    document.getElementById('configStatus').style.color='#f59e0b';
+    document.getElementById('warnBanner').classList.add('show');
+    // 自动展开配置面板
+    document.getElementById('configBody').classList.add('open');
+    document.getElementById('configArrow').classList.add('open');
+    updateServerStatus(d);
+  }catch(e){}
+}
+
+async function loadHealth(){
+  try{
+    const r=await fetch('/api/health');
+    const d=await r.json();
+    updateServerStatus(d);
+  }catch(e){}
+}
+
+function updateServerStatus(d){
+  const running=d.running_tasks||0;
+  const queued=d.queued_tasks||0;
+  const max=d.max_concurrent_tasks||1;
+  document.getElementById('serverStatus').textContent='运行 '+running+'/'+max+' · 排队 '+queued;
+}
+
+// 校验配置
+function validateConfig(){
+  const key=document.getElementById('cfgApiKey').value.trim();
+  if(!key){
+    document.getElementById('cfgApiKey').classList.add('error');
+    document.getElementById('cfgApiKey').focus();
+    // 展开配置面板
+    document.getElementById('configBody').classList.add('open');
+    document.getElementById('configArrow').classList.add('open');
+    return false;
+  }
+  document.getElementById('cfgApiKey').classList.remove('error');
+  return true;
+}
+
+// 输入时移除错误样式
+document.getElementById('cfgApiKey').addEventListener('input',function(){
+  this.classList.remove('error');
+  const status=document.getElementById('apiCheckStatus');
+  status.textContent='';
+  status.className='inline-status';
+  if(this.value.trim()){
+    document.getElementById('warnBanner').classList.remove('show');
+    document.getElementById('configStatus').textContent='';
+  }
+});
+
+function collectConfig(){
+  const cfg={};
+  const ak=document.getElementById('cfgApiKey').value.trim();
+  const bu=document.getElementById('cfgBaseUrl').value.trim();
+  const mo=document.getElementById('cfgModel').value.trim();
+  const to=document.getElementById('cfgTimeout').value.trim();
+  if(ak)cfg.api_key=ak;
+  if(bu)cfg.base_url=bu;
+  if(mo)cfg.model=mo;
+  if(to)cfg.timeout=parseInt(to);
+  return cfg;
+}
+
+async function checkLLMConfig(){
+  if(!validateConfig()){
+    alert('请先填写大模型 API Key');
+    return false;
+  }
+  const btn=document.getElementById('checkApiBtn');
+  const status=document.getElementById('apiCheckStatus');
+  btn.disabled=true;
+  status.textContent='检查中...';
+  status.className='inline-status';
+  try{
+    const resp=await fetch('/api/llm/check',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({llm_config:collectConfig()})
+    });
+    const data=await resp.json();
+    if(data.ok){
+      status.textContent='API Key 可用';
+      status.className='inline-status ok';
+      document.getElementById('cfgApiKey').classList.remove('error');
+      return true;
+    }
+    status.textContent=data.error||'API Key 检查失败';
+    status.className='inline-status error';
+    document.getElementById('cfgApiKey').classList.add('error');
+    return false;
+  }catch(e){
+    status.textContent='检查请求失败';
+    status.className='inline-status error';
+    return false;
+  }finally{
+    btn.disabled=false;
+    loadHealth();
+  }
+}
+
+function setFilter(f,btn){
+  currentFilter=f;
+  document.querySelectorAll('.log-filters button').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  renderLogs();
+}
+
+function renderLogs(){
+  const box=document.getElementById('logBox');
+  box.innerHTML='';
+  allLogs.forEach(log=>{
+    if(currentFilter!=='all'&&log.level&&log.level!==currentFilter)return;
+    const div=document.createElement('div');
+    div.className='log-line';
+    const lvl=log.level||'info';
+    div.innerHTML=`<span class="ts">${log.ts||''}</span><span class="badge ${lvl}">${lvl.toUpperCase()}</span><span class="msg ${lvl}">${esc(log.message||'')}</span>`;
+    box.appendChild(div);
+  });
+  box.scrollTop=box.scrollHeight;
+  document.getElementById('logCount').textContent=allLogs.length+' 条日志';
+}
+
+function receiveLog(msg){
+  if(msg.replace&&msg.key){
+    const idx=allLogs.findIndex(log=>log.key===msg.key);
+    if(idx>=0)allLogs[idx]=msg;
+    else allLogs.push(msg);
+    renderLogs();
+    return;
+  }
+  allLogs.push(msg);
+  renderLogs();
+}
+
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+function setStep(n,status){
+  document.querySelectorAll('.step-item').forEach(el=>{
+    const s=parseInt(el.dataset.step);
+    el.classList.remove('active','done','error');
+    if(s<n)el.classList.add('done');
+    else if(s===n){
+      if(status==='error')el.classList.add('error');
+      else el.classList.add('active');
+    }
+  });
+}
+
+function setStatus(s){
+  const dot=document.getElementById('statusDot');
+  const txt=document.getElementById('statusText');
+  dot.className='status-dot '+s;
+  const m={pending:'等待中...',queued:'排队中...',running:'运行中...',completed:'运行完成',failed:'运行失败',blocked:'已阻断'};
+  txt.textContent=m[s]||s;
+}
+
+function updateQueuePanel(data){
+  const panel=document.getElementById('queuePanel');
+  if(!data||data.status!=='queued'){
+    panel.classList.remove('show');
+    panel.textContent='';
+    return;
+  }
+  const pos=data.queue_position||0;
+  const len=data.queue_length||data.queued_tasks||0;
+  const running=data.running_tasks||0;
+  const max=data.max_concurrent_tasks||1;
+  panel.textContent='任务已进入队列：当前位置 '+pos+'/'+len+'；正在运行 '+running+'/'+max+'。页面保持打开后会自动开始。';
+  panel.classList.add('show');
+}
+
+function startTimer(){
+  startTime=Date.now();
+  timerInterval=setInterval(()=>{
+    if(!startTime)return;
+    const sec=Math.floor((Date.now()-startTime)/1000);
+    document.getElementById('statusTime').textContent=Math.floor(sec/60)+':'+String(sec%60).padStart(2,'0');
+  },1000);
+}
+
+function stopTimer(){if(timerInterval)clearInterval(timerInterval)}
+
+function now(){
+  const d=new Date();
+  return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0');
+}
+
+function addLog(msg){
+  const box=document.getElementById('logBox');
+  const div=document.createElement('div');
+  div.className='log-line';
+  const lvl=msg.level||'info';
+  div.innerHTML=`<span class="ts">${msg.ts||''}</span><span class="badge ${lvl}">${lvl.toUpperCase()}</span><span class="msg ${lvl}">${esc(msg.message||'')}</span>`;
+  box.appendChild(div);
+  box.scrollTop=box.scrollHeight;
+}
+
+function renderReview(summary){
+  const panel=document.getElementById('reviewPanel');
+  if(!summary||!summary.items){
+    panel.innerHTML='<h4>待复核参数</h4><div class="review-empty">任务开始后会固定显示 workflow、FASTA、搜库参数和需要人工复核的问题。</div>';
+    return;
+  }
+  let html='<h4>待复核参数</h4>';
+  html+='<div class="review-updated">更新：'+esc(summary.updated_at||'')+(summary.needs_review?' · 需要复核':' · 当前可用')+'</div>';
+  if(summary.items.length===0){
+    html+='<div class="review-empty">暂无可显示参数。</div>';
+  }else{
+    summary.items.forEach(item=>{
+      const cls=item.conflict?'review-item conflict':'review-item';
+      const meta=[];
+      if(item.source)meta.push(item.source);
+      if(typeof item.confidence==='number')meta.push('confidence '+item.confidence.toFixed(2));
+      html+='<div class="'+cls+'"><div class="review-label">'+esc(item.label||'')+'</div><div class="review-value">'+esc(item.value||'')+'</div>';
+      if(meta.length)html+='<div class="review-meta">'+esc(meta.join(' · '))+'</div>';
+      html+='</div>';
+    });
+  }
+  if(summary.issues&&summary.issues.length){
+    html+='<div class="review-issues"><strong>需要人工复核</strong><ul>';
+    summary.issues.forEach(issue=>{html+='<li>'+esc(issue)+'</li>';});
+    html+='</ul></div>';
+  }
+  panel.innerHTML=html;
+}
+
+async function startTask(){
+  // 校验文件名
+  const input=document.getElementById('inputValue').value.trim();
+  if(!input){alert('请输入 PRIDE 文件名');return;}
+
+  // 校验 API Key
+  if(!validateConfig()){
+    alert('请先填写大模型 API Key');
+    return;
+  }
+
+  const btn=document.getElementById('startBtn');
+  btn.disabled=true;
+  btn.textContent='检查中...';
+
+  document.getElementById('runCard').style.display='block';
+  document.getElementById('resultPanel').style.display='none';
+  document.getElementById('blockedPanel').style.display='none';
+  updateQueuePanel(null);
+  document.getElementById('logBox').innerHTML='';
+  allLogs=[];
+  renderReview(null);
+  document.getElementById('downloadStatus').textContent='';
+  document.getElementById('downloadStatus').className='download-status';
+  setStep(0);
+  setStatus('running');
+  startTimer();
+  addLog({level:'info',message:'正在检查 API Key 和服务器并发限制...',ts:now()});
+
+  // 收集配置
+  const cfg=collectConfig();
+
+  // 创建任务
+  let data;
+  try{
+    const resp=await fetch('/api/tasks',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({input_value:input,llm_config:cfg})
+    });
+    data=await resp.json();
+  }catch(e){
+    addLog({level:'error',message:'请求失败：'+e,ts:now()});
+    setStatus('failed');stopTimer();btn.disabled=false;btn.textContent='开始运行';return;
+  }
+
+  if(data.error){
+    addLog({level:'error',message:data.error,ts:now()});
+    setStatus('failed');stopTimer();btn.disabled=false;btn.textContent='开始运行';
+    // 如果是配置问题，展开配置面板并高亮
+    if(data.error.includes('API Key')||data.error.includes('配置')){
+      document.getElementById('configBody').classList.add('open');
+      document.getElementById('configArrow').classList.add('open');
+      document.getElementById('cfgApiKey').classList.add('error');
+      document.getElementById('cfgApiKey').focus();
+    }
+    loadHealth();
+    return;
+  }
+
+  taskId=data.task_id;
+  addLog({level:'info',message:'任务已创建：'+taskId,ts:now()});
+  if(data.status==='queued'){
+    setStatus('queued');
+    updateQueuePanel(data);
+    btn.textContent='排队中...';
+  }else{
+    btn.textContent='运行中...';
+  }
+  loadHealth();
+
+  // WebSocket
+  const proto=location.protocol==='https:'?'wss:':'ws:';
+  ws=new WebSocket(proto+'//'+location.host+'/ws/tasks/'+taskId);
+
+  ws.onmessage=function(e){
+    const msg=JSON.parse(e.data);
+    if(msg.type==='log'){
+      receiveLog(msg);
+    }else if(msg.type==='step'){
+      setStatus('running');
+      updateQueuePanel(null);
+      btn.textContent='运行中...';
+      setStep(msg.step,'active');
+      allLogs.push({type:'log',level:'step',message:msg.message,ts:msg.ts});
+      if(currentFilter==='all'||currentFilter==='step')addLog({level:'step',message:msg.message,ts:msg.ts});
+    }else if(msg.type==='queue'){
+      setStatus('queued');
+      updateQueuePanel(msg);
+      loadHealth();
+    }else if(msg.type==='review'){
+      renderReview(msg.summary);
+    }else if(msg.type==='done'){
+      updateQueuePanel(null);
+      setStatus(msg.status);stopTimer();btn.disabled=false;btn.textContent='开始运行';
+      if(msg.status==='completed')showResults();
+      if(msg.status==='blocked')loadIssues();
+      loadHealth();
+    }
+  };
+
+  ws.onerror=function(){
+    addLog({level:'error',message:'WebSocket 连接错误',ts:now()});
+    setStatus('failed');stopTimer();btn.disabled=false;btn.textContent='开始运行';
+  };
+
+  ws.onclose=function(){
+    if(document.getElementById('statusDot').classList.contains('running')){
+      setStatus('failed');stopTimer();btn.disabled=false;btn.textContent='开始运行';
+    }
+  };
+}
+
+async function showResults(){
+  const r=await fetch('/api/tasks/'+taskId);
+  const d=await r.json();
+  renderReview(d.review_summary);
+  const fileList=document.getElementById('fileList');
+  const fileLines=allLogs.filter(l=>l.message&&l.message.includes('  (')&&l.message.includes(')')).map(l=>l.message);
+  fileList.innerHTML=fileLines.length>0?fileLines.map(f=>'<div>'+esc(f)+'</div>').join(''):'<div>结果文件已生成，请下载查看。</div>';
+  const status=document.getElementById('downloadStatus');
+  status.textContent=d.can_download?'可以下载 ZIP 结果文件。':'还没有可下载文件，请查看日志确认任务是否已生成输出。';
+  status.className=d.can_download?'download-status':'download-status error';
+  document.getElementById('resultPanel').style.display='block';
+  setStep(5,'done');
+}
+
+async function loadIssues(){
+  const r=await fetch('/api/tasks/'+taskId);
+  const d=await r.json();
+  renderReview(d.review_summary);
+  if(d.blocking_issues&&d.blocking_issues.length>0){
+    const list=document.getElementById('issuesList');
+    list.innerHTML='';
+    d.blocking_issues.forEach(issue=>{const li=document.createElement('li');li.textContent=issue;list.appendChild(li);});
+    document.getElementById('blockedPanel').style.display='block';
+  }
+  setStep(4,'error');
+}
+
+async function downloadResults(){
+  if(!taskId)return;
+  const status=document.getElementById('downloadStatus');
+  status.textContent='正在检查结果文件...';
+  status.className='download-status';
+  try{
+    const r=await fetch('/api/tasks/'+taskId);
+    const d=await r.json();
+    if(!d.can_download){
+      status.textContent='没有可下载文件：任务输出目录为空或尚未生成结果。';
+      status.className='download-status error';
+      return;
+    }
+    const a=document.createElement('a');
+    a.href='/api/tasks/'+taskId+'/download';
+    a.download='';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    status.textContent='下载已开始。';
+  }catch(e){
+    status.textContent='下载失败：'+e;
+    status.className='download-status error';
+  }
+}
+
+loadConfig();
+loadHealth();
+</script>
+</body>
+</html>

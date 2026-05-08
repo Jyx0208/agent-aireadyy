@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from agent.input.normalizer import normalize_input
+from agent.input.normalizer import normalize_input, safe_output_stem
 
 
 def test_normalize_local_path():
@@ -41,3 +41,8 @@ def test_normalize_bare_filename():
     assert task.stem == "Sample_Only"
     assert task.extension == ".d"
     assert Path(task.original_input).name == "Sample_Only.d"
+
+
+def test_safe_output_stem_uses_basename_and_removes_path_segments():
+    assert safe_output_stem("../outside") == "outside"
+    assert safe_output_stem(r"C:\data\Example File.raw") == "Example-File"

@@ -73,3 +73,12 @@ def normalize_input(raw_input: str) -> InputTask:
         stem=stem,
         extension=extension,
     )
+
+
+def safe_output_stem(raw_input: str) -> str:
+    task = normalize_input(raw_input)
+    cleaned = "".join(
+        character if character.isalnum() or character in {"-", "_", "."} else "-"
+        for character in (task.stem or task.normalized_name)
+    ).strip("._-")
+    return cleaned or task.task_id

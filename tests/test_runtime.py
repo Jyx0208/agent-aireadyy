@@ -80,6 +80,26 @@ def test_bootstrap_msdt_converter_from_zip_extracts_repo(tmp_path: Path):
     assert (repo_root / "scripts" / "generate_msdt.py").exists()
 
 
+def test_bootstrap_msdt_converter_from_zip_rejects_path_traversal(tmp_path: Path):
+    zip_path = tmp_path / "bad-msdt.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("../evil/convert.py", "print('bad')\n")
+
+    destination_parent = tmp_path / "safe"
+    destination_parent.mkdir()
+    keep_file = destination_parent / "keep.txt"
+    keep_file.write_text("keep", encoding="utf-8")
+
+    try:
+        bootstrap_msdt_converter_from_zip(zip_bytes=zip_path.read_bytes(), destination=destination_parent / "external")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("path traversal archive should be rejected")
+
+    assert keep_file.read_text(encoding="utf-8") == "keep"
+
+
 def test_materialize_dda_task_bundle_writes_runtime_files(tmp_path: Path):
     task = normalize_input("WT_5_Lys-c.raw")
     resolution = ProjectResolution(

@@ -14,7 +14,7 @@ import typer
 from agent.ai_ready.exporter import export_ai_ready_bundle
 from agent.assets.preparer import AssetPreparationError
 from agent.execution.bundle import materialize_dda_task_bundle
-from agent.input.normalizer import normalize_input
+from agent.input.normalizer import normalize_input, safe_output_stem
 from agent.orchestrator.pipeline import AgentService, ReviewRequiredError
 from agent.progress import render_download_progress
 from agent.runtime.bootstrap import bootstrap_msdt_converter
@@ -283,8 +283,7 @@ def prepare_pride_msdt_docker_input(
     image: str = typer.Option("guomics2017/msdt-converter:v1.3", help="Docker image for MSDT-Converter."),
 ) -> None:
     if output_dir is None:
-        stem = Path(input_value).stem if Path(input_value).suffix else input_value
-        output_dir = Path("runs") / stem
+        output_dir = Path("runs") / safe_output_stem(input_value)
     service = AgentService(reporter=_build_reporter(output_dir))
     task = normalize_input(input_value)
 
