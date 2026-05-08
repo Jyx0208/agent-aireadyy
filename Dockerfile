@@ -5,9 +5,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
-    docker.io \
-    && rm -rf /var/lib/apt/lists/* \
-    && command -v docker
+    && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
 COPY README.md ./

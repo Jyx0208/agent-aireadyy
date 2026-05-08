@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import zipfile
@@ -35,9 +36,11 @@ def test_strip_ansi_removes_llm_color_codes():
     assert _strip_ansi(raw) == "recommended_fasta_url"
 
 
-def test_download_progress_updates_single_visible_log_line():
+def test_download_progress_is_throttled_but_completion_is_logged(monkeypatch):
     task_id = "progress-upsert-test"
     _tasks[task_id] = {"logs": deque(maxlen=10)}
+    times = iter([0.0, 0.1, 0.2])
+    monkeypatch.setattr(web_app, "monotonic", lambda: next(times))
     try:
         reporter = WebReporter(task_id)
 
@@ -61,12 +64,23 @@ def test_download_progress_updates_single_visible_log_line():
                 "complete": False,
             }
         )
+        reporter(
+            {
+                "kind": "download_progress",
+                "label": "Homo_sapiens_reviewed.fasta",
+                "downloaded": 20 * 1024 * 1024,
+                "total": 20 * 1024 * 1024,
+                "speed_bps": 1 * 1024 * 1024,
+                "complete": True,
+            }
+        )
 
         first, second = list(_tasks[task_id]["logs"])
         assert first["key"] == second["key"]
         assert first["replace"] is True
         assert second["replace"] is True
-        assert "Homo_sapiens_reviewed.fasta" in second["message"]
+        assert len(_tasks[task_id]["logs"]) == 2
+        assert "下载完成" in second["message"]
     finally:
         _tasks.pop(task_id, None)
 
@@ -126,20 +140,24 @@ def test_list_public_results_discovers_existing_run_directories(monkeypatch, tmp
     assert results[0]["expires_in_seconds"] <= 7200
 
 
-def test_cleanup_expired_results_deletes_old_runs_but_skips_active_tasks(monkeypatch, tmp_path):
+def test_cleanup_results_keeps_only_four_latest_downloadable_runs(monkeypatch, tmp_path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
-    monkeypatch.setenv("AGENT_RESULT_RETENTION_SECONDS", "7200")
-    old_project = tmp_path / "old-project"
+    monkeypatch.setenv("AGENT_MAX_RESULT_PROJECTS", "4")
     active_project = tmp_path / "active-project"
-    old_project.mkdir()
     active_project.mkdir()
-    (old_project / "result.txt").write_text("old", encoding="utf-8")
     (active_project / "result.txt").write_text("active", encoding="utf-8")
-    old_time = time.time() - 7300
-    os.utime(old_project / "result.txt", (old_time, old_time))
-    os.utime(old_project, (old_time, old_time))
-    os.utime(active_project / "result.txt", (old_time, old_time))
-    os.utime(active_project, (old_time, old_time))
+    base_time = time.time() - 1000
+    for idx in range(6):
+        project = tmp_path / f"done-{idx}"
+        project.mkdir()
+        (project / "result.txt").write_text(str(idx), encoding="utf-8")
+        (project / "task_history.json").write_text(
+            json.dumps({"task_id": f"done-{idx}", "status": "completed", "input_value": f"done-{idx}.raw"}),
+            encoding="utf-8",
+        )
+        stamp = base_time + idx
+        os.utime(project / "result.txt", (stamp, stamp))
+        os.utime(project, (stamp, stamp))
     _tasks["active"] = {"status": "running", "output_dir": str(active_project), "logs": deque(maxlen=10)}
 
     try:
@@ -147,8 +165,11 @@ def test_cleanup_expired_results_deletes_old_runs_but_skips_active_tasks(monkeyp
     finally:
         _tasks.pop("active", None)
 
-    assert removed == ["old-project"]
-    assert not old_project.exists()
+    assert removed == ["done-0", "done-1"]
+    assert not (tmp_path / "done-0").exists()
+    assert not (tmp_path / "done-1").exists()
+    assert (tmp_path / "done-2").exists()
+    assert (tmp_path / "done-5").exists()
     assert active_project.exists()
 
 
@@ -257,6 +278,85 @@ def test_project_history_lists_active_submitters_and_results_without_secrets(mon
     assert "sk-active-secret" not in serialized
     assert "api_key" not in serialized
     assert "llm_config" not in serialized
+
+
+def test_project_history_keeps_record_after_download_directory_is_removed(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    index = tmp_path / "project_history.json"
+    index.write_text(
+        json.dumps(
+            [
+                {
+                    "task_id": "old",
+                    "input_value": "old.raw",
+                    "submitter": "Alice",
+                    "status": "completed",
+                    "output_dir": "old",
+                    "finished_at": "2026-05-08T00:00:00+00:00",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    history = asyncio.run(list_project_history())
+
+    assert history["results"][0]["task_id"] == "old"
+    assert history["results"][0]["status"] == "completed"
+    assert history["results"][0]["can_download"] is False
+
+
+def test_history_reflects_failed_status_and_disables_download(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    result_dir = tmp_path / "failed-project"
+    result_dir.mkdir()
+    (result_dir / "partial.txt").write_text("not a completed result", encoding="utf-8")
+    (result_dir / "task_history.json").write_text(
+        json.dumps({"task_id": "failed", "input_value": "failed.raw", "submitter": "Alice", "status": "failed"}),
+        encoding="utf-8",
+    )
+
+    history = asyncio.run(list_project_history())
+    result = history["results"][0]
+
+    assert result["status"] == "failed"
+    assert result["can_download"] is False
+
+
+def test_running_and_failed_tasks_are_not_downloadable(monkeypatch, tmp_path):
+    running_dir = tmp_path / "running"
+    failed_dir = tmp_path / "failed"
+    running_dir.mkdir()
+    failed_dir.mkdir()
+    (running_dir / "partial.txt").write_text("running", encoding="utf-8")
+    (failed_dir / "partial.txt").write_text("failed", encoding="utf-8")
+    _tasks["running"] = {
+        "task_id": "running",
+        "input_value": "running.raw",
+        "status": "running",
+        "output_dir": str(running_dir),
+        "logs": deque(maxlen=10),
+    }
+    _tasks["failed"] = {
+        "task_id": "failed",
+        "input_value": "failed.raw",
+        "status": "failed",
+        "output_dir": str(failed_dir),
+        "logs": deque(maxlen=10),
+    }
+    try:
+        running_detail = asyncio.run(get_task("running"))
+        failed_detail = asyncio.run(get_task("failed"))
+        running_download = asyncio.run(download_results("running"))
+        failed_download = asyncio.run(download_results("failed"))
+    finally:
+        _tasks.pop("running", None)
+        _tasks.pop("failed", None)
+
+    assert running_detail["can_download"] is False
+    assert failed_detail["can_download"] is False
+    assert running_download == {"error": "任务未完成，不能下载结果"}
+    assert failed_download == {"error": "任务未完成，不能下载结果"}
 
 
 def test_web_task_requires_each_user_api_key_in_request(monkeypatch):
@@ -483,6 +583,7 @@ def test_download_results_attaches_temp_zip_cleanup(tmp_path):
         "task_id": task_id,
         "input_value": "../sample.raw",
         "output_dir": str(output_dir),
+        "status": "completed",
     }
     response = None
     try:

@@ -51,6 +51,7 @@ h1{font-size:1.35rem;letter-spacing:0}
 .result-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel)}
 .result-title{font-size:.84rem;font-weight:650;overflow-wrap:anywhere}
 .result-sub{font-size:.74rem;color:var(--muted);margin-top:2px}
+.result-actions{display:flex;gap:6px;align-items:center}
 .run-card{display:none;margin-top:14px}
 .steps{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:5px;margin-bottom:14px}
 .step-item{padding:8px 5px;text-align:center;font-size:.74rem;color:var(--muted);background:var(--panel);border:1px solid var(--line);border-radius:6px}
@@ -208,13 +209,14 @@ footer{padding:20px 0 4px;color:#575d68;font-size:.74rem;text-align:center}
 </div>
 
 <script>
-let taskId=null,ws=null,currentFilter='all',allLogs=[],startTime=null,timerInterval=null;
+let taskId=null,ws=null,currentFilter='all',allLogs=[],startTime=null,timerInterval=null,renderScheduled=false;
 
 function fill(v){document.getElementById('inputValue').value=v}
 function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function now(){const d=new Date();return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0')}
 function formatSize(n){if(n>1024*1024*1024)return(n/1024/1024/1024).toFixed(1)+' GB';if(n>1024*1024)return(n/1024/1024).toFixed(1)+' MB';if(n>1024)return(n/1024).toFixed(1)+' KB';return(n||0)+' B'}
 function formatRetention(sec){const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60);return h>0?h+' 小时 '+m+' 分钟':m+' 分钟'}
+function statusText(s){return {queued:'排队中',running:'运行中',completed:'已完成',failed:'失败',blocked:'需要复核'}[s]||s||'未知'}
 function toggleConfig(){document.getElementById('configBody').classList.toggle('open')}
 
 async function loadConfig(){
@@ -226,7 +228,7 @@ async function loadConfig(){
     document.getElementById('cfgTimeout').value=d.timeout||'';
     document.getElementById('configBody').classList.add('open');
     document.getElementById('configStatus').textContent='每次任务单独填写';
-    document.getElementById('resultRetention').textContent='结果保存 '+formatRetention(d.result_retention_seconds||7200);
+    document.getElementById('resultRetention').textContent='最多保存 '+(d.max_result_projects||4)+' 个项目下载文件';
     updateServerStatus(d);
   }catch(e){}
 }
@@ -248,7 +250,7 @@ async function loadResults(){
   try{
     const r=await fetch('/api/history');
     const d=await r.json();
-    document.getElementById('publicResultsMeta').textContent='处理队列和可下载结果所有人可见；结果保存 '+formatRetention(d.retention_seconds||7200)+'；API Key 不共享。';
+    document.getElementById('publicResultsMeta').textContent='处理队列和历史状态所有人可见；最多保存 '+(d.max_result_projects||4)+' 个项目下载文件；API Key 不共享。';
     const active=d.active_tasks||[];
     const results=d.results||[];
     if(active.length===0&&results.length===0){
@@ -258,14 +260,15 @@ async function loadResults(){
     const activeHtml=active.map(item=>{
       const pos=item.queue_position?(' · 队列 '+item.queue_position):'';
       return '<div class="result-row"><div><div class="result-title">'+esc(item.input_value||item.output_dir||item.task_id)+'</div><div class="result-sub">'+
-        esc(item.submitter||'未填写')+' · '+esc(item.status||'unknown')+pos+
-        '</div></div><span class="public-meta">处理中</span></div>';
+        esc(item.submitter||'未填写')+' · '+esc(statusText(item.status))+pos+
+        '</div></div><div class="result-actions"><button class="btn btn-secondary btn-small" onclick="attachTask(\''+esc(item.task_id).replace(/'/g,'&#39;')+'\')">查看</button></div></div>';
     }).join('');
     const resultHtml=results.map(item=>{
-      const left=Math.max(0,item.expires_in_seconds||0);
+      const fileInfo=(item.file_count||0)>0?(esc(item.file_count)+' 个文件 · '+formatSize(item.size_bytes)):'下载文件已清理';
+      const action=item.can_download?'<button class="btn btn-secondary btn-small" onclick="downloadPublicResult(\''+esc(item.result_id).replace(/'/g,'&#39;')+'\')">下载</button>':'<span class="public-meta">不可下载</span>';
       return '<div class="result-row"><div><div class="result-title">'+esc(item.input_value||item.name)+'</div><div class="result-sub">'+
-        esc(item.submitter||'未填写')+' · '+esc(item.file_count)+' 个文件 · '+formatSize(item.size_bytes)+' · 剩余 '+formatRetention(left)+
-        '</div></div><button class="btn btn-secondary btn-small" onclick="downloadPublicResult(\''+esc(item.result_id).replace(/'/g,'&#39;')+'\')">下载</button></div>';
+        esc(item.submitter||'未填写')+' · '+esc(statusText(item.status))+' · '+fileInfo+
+        '</div></div><div class="result-actions">'+action+'</div></div>';
     }).join('');
     box.innerHTML=activeHtml+resultHtml;
   }catch(e){
@@ -350,12 +353,21 @@ function renderLogs(){
   document.getElementById('logCount').textContent=allLogs.length+' 条日志';
 }
 
+function scheduleRenderLogs(){
+  if(renderScheduled)return;
+  renderScheduled=true;
+  requestAnimationFrame(()=>{
+    renderScheduled=false;
+    renderLogs();
+  });
+}
+
 function receiveLog(msg){
   if(msg.replace&&msg.key){
     const idx=allLogs.findIndex(log=>log.key===msg.key);
     if(idx>=0)allLogs[idx]=msg;else allLogs.push(msg);
   }else{allLogs.push(msg)}
-  renderLogs();
+  scheduleRenderLogs();
 }
 
 function setStep(n,status){
@@ -414,6 +426,58 @@ function renderReview(summary){
   panel.innerHTML=html;
 }
 
+function resetRunView(){
+  document.getElementById('runCard').style.display='block';
+  document.getElementById('resultPanel').style.display='none';
+  document.getElementById('blockedPanel').style.display='none';
+  document.getElementById('downloadStatus').textContent='';
+  allLogs=[];
+  renderLogs();
+  renderReview(null);
+  setStep(0);
+  updateQueuePanel(null);
+  stopTimer();
+}
+
+function connectTaskSocket(id){
+  if(ws)ws.close();
+  const proto=location.protocol==='https:'?'wss:':'ws:';
+  ws=new WebSocket(proto+'//'+location.host+'/ws/tasks/'+id);
+  ws.onmessage=e=>{
+    const msg=JSON.parse(e.data);
+    if(msg.type==='log')receiveLog(msg);
+    else if(msg.type==='step'){setStatus('running');updateQueuePanel(null);document.getElementById('startBtn').textContent='运行中...';setStep(msg.step,'active');receiveLog({type:'log',level:'step',message:msg.message,ts:msg.ts})}
+    else if(msg.type==='queue'){setStatus('queued');updateQueuePanel(msg);loadHealth()}
+    else if(msg.type==='review')renderReview(msg.summary);
+    else if(msg.type==='done'){
+      updateQueuePanel(null);setStatus(msg.status);stopTimer();document.getElementById('startBtn').disabled=false;document.getElementById('startBtn').textContent='启动';
+      if(msg.status==='completed')showResults();
+      if(msg.status==='blocked'||msg.status==='failed')loadIssues();
+      loadHealth();loadResults();
+    }
+  };
+  ws.onerror=()=>{receiveLog({type:'log',level:'error',message:'WebSocket 连接错误',ts:now()});loadHealth()};
+}
+
+async function attachTask(id){
+  taskId=id;
+  resetRunView();
+  startTimer();
+  try{
+    const r=await fetch('/api/tasks/'+id);
+    const d=await r.json();
+    if(d.error){receiveLog({type:'log',level:'error',message:d.error,ts:now()});setStatus('failed');stopTimer();return}
+    setStatus(d.status);
+    setStep(d.step||0,d.status==='failed'?'error':'active');
+    renderReview(d.review_summary);
+    updateQueuePanel(d.status==='queued'?d:null);
+    connectTaskSocket(id);
+  }catch(e){
+    receiveLog({type:'log',level:'error',message:'读取任务失败：'+e,ts:now()});
+    setStatus('failed');stopTimer();
+  }
+}
+
 async function startTask(){
   const input=document.getElementById('inputValue').value.trim();
   if(!input){alert('请输入 PRIDE 文件名');return}
@@ -421,11 +485,7 @@ async function startTask(){
   if(!validateConfig()){alert('请先填写 API Key');return}
   const btn=document.getElementById('startBtn');
   btn.disabled=true;btn.textContent='创建中...';
-  document.getElementById('runCard').style.display='block';
-  document.getElementById('resultPanel').style.display='none';
-  document.getElementById('blockedPanel').style.display='none';
-  document.getElementById('downloadStatus').textContent='';
-  allLogs=[];renderLogs();renderReview(null);setStep(0);setStatus('running');updateQueuePanel(null);startTimer();
+  resetRunView();setStatus('running');startTimer();
   receiveLog({type:'log',level:'info',message:'正在检查 API Key 并创建任务...',ts:now()});
 
   let data;
@@ -444,23 +504,7 @@ async function startTask(){
   receiveLog({type:'log',level:'info',message:'任务已创建：'+taskId,ts:now()});
   if(data.status==='queued'){setStatus('queued');updateQueuePanel(data);btn.textContent='排队中...'}else{btn.textContent='运行中...'}
   loadHealth();
-
-  const proto=location.protocol==='https:'?'wss:':'ws:';
-  ws=new WebSocket(proto+'//'+location.host+'/ws/tasks/'+taskId);
-  ws.onmessage=e=>{
-    const msg=JSON.parse(e.data);
-    if(msg.type==='log')receiveLog(msg);
-    else if(msg.type==='step'){setStatus('running');updateQueuePanel(null);btn.textContent='运行中...';setStep(msg.step,'active');receiveLog({type:'log',level:'step',message:msg.message,ts:msg.ts})}
-    else if(msg.type==='queue'){setStatus('queued');updateQueuePanel(msg);loadHealth()}
-    else if(msg.type==='review')renderReview(msg.summary);
-    else if(msg.type==='done'){
-      updateQueuePanel(null);setStatus(msg.status);stopTimer();btn.disabled=false;btn.textContent='启动';
-      if(msg.status==='completed')showResults();
-      if(msg.status==='blocked')loadIssues();
-      loadHealth();loadResults();
-    }
-  };
-  ws.onerror=()=>{receiveLog({type:'log',level:'error',message:'WebSocket 连接错误',ts:now()});setStatus('failed');stopTimer();btn.disabled=false;btn.textContent='启动'};
+  connectTaskSocket(taskId);
 }
 
 async function showResults(){
