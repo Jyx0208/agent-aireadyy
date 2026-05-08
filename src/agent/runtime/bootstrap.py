@@ -24,7 +24,7 @@ def bootstrap_msdt_converter_from_zip(zip_bytes: bytes, destination: str | Path)
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
         top_levels = {Path(name).parts[0] for name in archive.namelist() if name.strip()}
         if len(top_levels) != 1:
-            raise ValueError("MSDT-Converter archive has an unexpected layout.")
+            raise ValueError("MSDT-Converter 归档文件结构异常。")
         extracted_root_name = next(iter(top_levels))
         temp_extract_dir = destination / extracted_root_name
         if temp_extract_dir.exists():

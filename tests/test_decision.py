@@ -102,7 +102,7 @@ def _dda_attributes() -> AttributeSet:
             conflict_flag=False,
         ),
         search_parameter_hints=AttributeValue(
-            value={"precursor_tol": "20ppm"},
+            value={"precursor_tol": "20ppm", "recommended_workflow_name": "Default.workflow"},
             confidence=0.6,
             source="rule",
             evidence_excerpt="Orbitrap default profile",
@@ -129,7 +129,7 @@ def test_plan_dda_execution_generates_converter_compatible_paths(tmp_path: Path)
 
     assert plan.raw_data_type == "mzml"
     assert plan.fasta_path.name == "Homo_sapiens_reviewed.fasta"
-    assert plan.fragpipe_workflow_path.name == "LFQ_DDA_human_noNQ.workflow"
+    assert plan.fragpipe_workflow_path.name == "Default.workflow"
     assert plan.manifest_path.name == "fragpipe-files.fp-manifest"
     assert plan.expected_pin_glob.endswith("sample_edited.pin")
     assert plan.output_paths["fp_msdt"].suffix == ".parquet"
@@ -285,6 +285,13 @@ def test_plan_dda_execution_accepts_dda_pasef_as_dda(tmp_path: Path):
         evidence_excerpt="timsTOF Pro 2",
         conflict_flag=False,
     )
+    attributes.search_parameter_hints = AttributeValue(
+        value={"recommended_workflow_name": "LFQ-MBR.workflow"},
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="LLM confirmed DDA-PASEF workflow",
+        conflict_flag=False,
+    )
 
     plan = plan_dda_execution(
         task_id="task-dda-pasef",
@@ -297,7 +304,7 @@ def test_plan_dda_execution_accepts_dda_pasef_as_dda(tmp_path: Path):
     )
 
     assert plan.needs_review is False
-    assert plan.fragpipe_workflow_path.name == "LFQ_DDA_generic.workflow"
+    assert plan.fragpipe_workflow_path.name == "LFQ-MBR.workflow"
 
 
 def test_plan_dda_execution_prefers_project_fasta_over_species_guess(tmp_path: Path):
@@ -383,7 +390,7 @@ def test_plan_dda_execution_requires_review_for_no_sdrf_unsupported_species_defa
         conflict_flag=False,
     )
     attributes.search_parameter_hints = AttributeValue(
-        value={"database": "GiardiaDB Assemblage A release 34"},
+        value={"database": "GiardiaDB Assemblage A release 34", "recommended_workflow_name": "Default.workflow"},
         confidence=0.9,
         source="llm_confirmed",
         evidence_excerpt="database hint",
@@ -422,7 +429,7 @@ def test_plan_dda_execution_requires_review_for_no_sdrf_unsupported_species_defa
 def test_plan_dda_execution_uses_existing_llm_recommended_workflow(tmp_path: Path):
     attributes = _dda_attributes()
     attributes.search_parameter_hints = AttributeValue(
-        value={"recommended_workflow_name": "TMT_DDA_generic.workflow"},
+        value={"recommended_workflow_name": "TMT10.workflow"},
         confidence=0.9,
         source="llm_confirmed",
         evidence_excerpt="LLM confirmed TMT workflow",
@@ -438,7 +445,7 @@ def test_plan_dda_execution_uses_existing_llm_recommended_workflow(tmp_path: Pat
         output_dir=tmp_path,
     )
 
-    assert plan.fragpipe_workflow_path.name == "TMT_DDA_generic.workflow"
+    assert plan.fragpipe_workflow_path.name == "TMT10.workflow"
 
 
 def test_plan_dda_execution_ignores_unknown_llm_recommended_workflow(tmp_path: Path):
@@ -460,7 +467,8 @@ def test_plan_dda_execution_ignores_unknown_llm_recommended_workflow(tmp_path: P
         output_dir=tmp_path,
     )
 
-    assert plan.fragpipe_workflow_path.name == "LFQ_DDA_human_noNQ.workflow"
+    assert plan.needs_review is True
+    assert any("不存在" in issue for issue in plan.blocking_issues)
 
 
 def test_plan_dda_execution_requires_review_for_top_down_project(tmp_path: Path):

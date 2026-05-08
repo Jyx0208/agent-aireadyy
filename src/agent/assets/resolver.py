@@ -75,7 +75,7 @@ def _safe_file_name(file_name: str) -> str:
     posix_name = PurePosixPath(file_name).name
     windows_name = PureWindowsPath(posix_name).name
     if windows_name in {"", ".", ".."}:
-        raise ValueError(f"Invalid project file name: {file_name}")
+        raise ValueError(f"无效的项目文件名：{file_name}")
     return windows_name
 
 

@@ -17,6 +17,11 @@ from agent.models import (
     ProjectResolution,
 )
 from agent.orchestrator.pipeline import AgentService
+
+
+class _DummyReasoner:
+    def confirm_search_parameters(self, context, attributes):
+        return {}
 from agent.execution.bundle import materialize_dda_task_bundle
 from agent.msdt_converter.docker_runner import DockerMSDTConverterRunner
 
@@ -32,7 +37,7 @@ def _attributes() -> AttributeSet:
         fixed_mods=AttributeValue(value=["C[57.02]"], confidence=0.7, source="default", evidence_excerpt="mods", conflict_flag=False),
         variable_mods=AttributeValue(value=["M[15.99]"], confidence=0.7, source="default", evidence_excerpt="mods", conflict_flag=False),
         fractionation_hint=AttributeValue(value=None, confidence=0.0, source="none", evidence_excerpt="", conflict_flag=False),
-        search_parameter_hints=AttributeValue(value={"precursor_tol": "20ppm"}, confidence=0.6, source="rule", evidence_excerpt="profile", conflict_flag=False),
+        search_parameter_hints=AttributeValue(value={"precursor_tol": "20ppm", "recommended_workflow_name": "Default.workflow"}, confidence=0.6, source="rule", evidence_excerpt="profile", conflict_flag=False),
     )
 
 
@@ -43,7 +48,7 @@ def _reviewed_fasta(tmp_path: Path) -> Path:
 
 
 def test_run_pride_dda_msdt_docker_executes_runner(tmp_path: Path, monkeypatch):
-    service = AgentService(pride_client=None)
+    service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
     task = normalize_input("WT_5_Lys-c.raw")
 
     resolution = ProjectResolution(
@@ -127,7 +132,7 @@ def test_run_pride_dda_msdt_docker_executes_runner(tmp_path: Path, monkeypatch):
 
 
 def test_run_pride_dda_msdt_docker_marks_failed_when_msdt_output_missing(tmp_path: Path, monkeypatch):
-    service = AgentService(pride_client=None)
+    service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
     task = normalize_input("WT_5_Lys-c.raw")
 
     resolution = ProjectResolution(
@@ -248,4 +253,4 @@ def test_docker_runner_uses_materialized_workflow_path_in_config(tmp_path: Path)
     config = json.loads(config_path.read_text(encoding="utf-8"))
 
     assert config["generate_fragpipe_search_result"]["workflow_path"].startswith("/workspace/workflows/")
-    assert config["generate_fragpipe_search_result"]["workflow_path"] != "/workspace/fragpipe/LFQ_DDA_human_noNQ.workflow"
+    assert config["generate_fragpipe_search_result"]["workflow_path"] != "/workspace/fragpipe/Default.workflow"

@@ -27,7 +27,7 @@ def test_export_ai_ready_bundle_adds_provenance_columns(tmp_path: Path):
         project_accession="PXD123456",
         source_file="sample.raw",
         attribute_evidence={"acquisition_mode": "DDA"},
-        decision_trace={"workflow": "LFQ_DDA_human_noNQ.workflow"},
+        decision_trace={"workflow": "Default.workflow"},
         run_manifest={"task_id": "task-004"},
     )
 

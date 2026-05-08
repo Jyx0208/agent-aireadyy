@@ -15,6 +15,11 @@ from agent.models import (
 from agent.orchestrator.pipeline import AgentService
 
 
+class _DummyReasoner:
+    def confirm_search_parameters(self, context, attributes):
+        return {}
+
+
 def _attributes() -> AttributeSet:
     return AttributeSet(
         acquisition_mode=AttributeValue(value="unknown", confidence=0.0, source="none", evidence_excerpt="", conflict_flag=False),
@@ -68,7 +73,7 @@ def test_write_task_state_snapshot_persists_json(tmp_path: Path):
 
 
 def test_write_task_bundle_writes_review_queue_when_plan_needs_review(tmp_path: Path):
-    service = AgentService(pride_client=None)
+    service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
     resolution = ProjectResolution(
         primary_project=ProjectCandidate(
             project_accession="PXD123456",

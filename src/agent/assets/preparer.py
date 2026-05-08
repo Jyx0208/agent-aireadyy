@@ -41,7 +41,7 @@ class RawToMzMLConverter:
         emit(self.report, f"正在使用本地 msconvert 转换质谱文件：{source.name} -> {target.name}")
         run_command_streaming(command, report=self.report)
         if not target.exists():
-            raise FileNotFoundError(f"msconvert did not produce the expected mzML file: {target}")
+            raise FileNotFoundError(f"msconvert 未生成预期的 mzML 文件：{target}")
         emit(self.report, f"转换完成：{target}")
         return target
 
@@ -85,7 +85,7 @@ class DockerPwizConverter:
         emit(self.report, f"正在使用 Docker ProteoWizard 转换质谱文件：{source.name} -> {target.name}")
         run_command_streaming(command, report=self.report)
         if not target.exists():
-            raise FileNotFoundError(f"Docker ProteoWizard did not produce the expected mzML file: {target}")
+            raise FileNotFoundError(f"Docker ProteoWizard 未生成预期的 mzML 文件：{target}")
         emit(self.report, f"转换完成：{target}")
         return target
 
@@ -142,7 +142,7 @@ def _extract_archive(source: Path, target: Path) -> Path:
                 destination.relative_to(extract_root.resolve())
             archive.extractall(extract_root)
     else:
-        raise ValueError(f"Unsupported archive format: {source}")
+        raise ValueError(f"不支持的归档格式：{source}")
 
     candidates = [path for path in extract_root.rglob(target.name) if path.is_dir()]
     if candidates:
@@ -177,7 +177,7 @@ def _extract_single_file(source: Path, target_dir: Path, suffixes: tuple[str, ..
                 destination.relative_to(extract_root.resolve())
             archive.extractall(extract_root)
     else:
-        raise ValueError(f"Unsupported archive format: {source}")
+        raise ValueError(f"不支持的归档格式：{source}")
 
     candidates = [
         path
@@ -257,7 +257,7 @@ def prepare_file_asset(
         emit(report, f"数据文件已可直接用于执行：{local_path}")
         return local_path
     if not asset.prepared_path:
-        raise ValueError("A convertible file asset must define a prepared_path.")
+        raise ValueError("可转换的文件资产必须定义 prepared_path。")
     conversion_source = local_path
     if local_path.name.lower().endswith(".raw.zip"):
         emit(report, f"正在解压 RAW zip 归档：{local_path.name}")

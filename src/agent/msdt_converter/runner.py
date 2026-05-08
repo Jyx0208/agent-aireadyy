@@ -23,7 +23,7 @@ class MSDTConverterRunner:
         config_path = self.write_config(plan)
         convert_script = self.converter_root / "convert.py"
         if not convert_script.exists():
-            raise FileNotFoundError(f"MSDT-Converter convert.py not found: {convert_script}")
+            raise FileNotFoundError(f"未找到 MSDT-Converter 的 convert.py 脚本：{convert_script}")
         cmd = [sys.executable, str(convert_script), "-config", str(config_path)]
         return subprocess.run(
             cmd,

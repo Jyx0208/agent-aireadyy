@@ -91,9 +91,9 @@ notepad .env
 示例配置（不要把真实 Key 提交到 GitHub）：
 
 ```env
-AGENT_LLM_API_KEY=your_siliconflow_api_key
-AGENT_LLM_BASE_URL=https://api.siliconflow.cn/v1
-AGENT_LLM_MODEL=Pro/moonshotai/Kimi-K2.6
+AGENT_LLM_API_KEY=your_deepseek_api_key
+AGENT_LLM_BASE_URL=https://api.deepseek.com
+AGENT_LLM_MODEL=deepseek-v4-flash
 AGENT_LLM_TIMEOUT=900
 ```
 
@@ -187,7 +187,45 @@ python -m agent.cli prepare-pride-msdt-docker-input "P17_severe_NoPOTS.raw" ".\r
 - 写出 `converter_config.json`、FragPipe manifest、workflow 等输入文件。
 - 打印下一步可运行的 `MSDT-Converter` Docker 命令。
 
-内置 FragPipe workflow 模板来自本项目打包时随附的 FragPipe 21.1 官方 workflow（例如 `Default.workflow`、`TMT10.workflow`、`iTRAQ4.workflow`），不是两行占位模板；运行时会再根据 LLM/PRIDE 推断到的酶、修饰和质量误差覆盖关键参数。
+内置 FragPipe workflow 模板来自 FragPipe 21.1 官方发布，包含 62 个完整 workflow 配置。支持的 workflow 类型包括：
+
+**DDA LFQ：**
+- `Default.workflow` - 默认 LFQ DDA
+- `LFQ-MBR.workflow` - LFQ with Match-Between-Runs
+- `LFQ-phospho.workflow` - LFQ 磷酸化修饰
+- `LFQ-ubiquitin.workflow` - LFQ 泛素化修饰
+
+**DDA TMT：**
+- `TMT10.workflow` - TMT 10-plex
+- `TMT10-MS3.workflow` - TMT 10-plex MS3
+- `TMT10-phospho.workflow` - TMT 10-plex 磷酸化
+- `TMT10-ubiquitin.workflow` - TMT 10-plex 泛素化
+- `TMT16.workflow` - TMT 16-plex
+- `TMT16-MS3.workflow` - TMT 16-plex MS3
+- `TMT16-phospho.workflow` - TMT 16-plex 磷酸化
+
+**DDA iTRAQ：**
+- `iTRAQ4.workflow` - iTRAQ 4-plex
+- `iTRAQ4-phospho.workflow` - iTRAQ 4-plex 磷酸化
+
+**DDA SILAC：**
+- `SILAC3.workflow` - SILAC 3-plex
+- `SILAC3-phospho.workflow` - SILAC 3-plex 磷酸化
+
+**DIA：**
+- `DIA_SpecLib_Quant.workflow` - DIA 标准定量
+- `DIA_SpecLib_Quant_Phospho.workflow` - DIA 磷酸化
+- `DIA_DIA-Umpire_SpecLib_Quant.workflow` - DIA-Umpire 方法
+
+**特殊应用：**
+- `Open.workflow` - 开放搜索
+- `FPOP.workflow` - FPOP 氧化标记
+- `Nonspecific-HLA.workflow` - HLA 非特异性酶切
+- `glyco-N-LFQ.workflow` - N-糖基化 LFQ
+- `glyco-N-TMT.workflow` - N-糖基化 TMT
+- 其他 60+ 个专业 workflow...
+
+运行时会根据 LLM/PRIDE 推断到的酶、修饰和质量误差自动选择最合适的 workflow 并覆盖关键参数。
 
 ### 直接跑完整 Docker 流程
 

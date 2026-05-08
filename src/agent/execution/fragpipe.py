@@ -33,7 +33,7 @@ class FragPipeRunner:
 
     def run(self, plan: DdaExecutionPlan, attributes: AttributeSet | None = None) -> subprocess.CompletedProcess[str]:
         if not self.executable.exists():
-            raise FileNotFoundError(f"FragPipe executable not found: {self.executable}")
+            raise FileNotFoundError(f"未找到 FragPipe 可执行文件：{self.executable}")
         manifest_path = self.materialize_manifest(plan)
         workflow_copy = self.materialize_workflow_copy(plan, attributes=attributes)
         env = None

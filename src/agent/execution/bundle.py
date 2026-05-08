@@ -93,9 +93,9 @@ def materialize_dda_task_bundle(
         accept_search_parameter_review=accept_search_parameter_review,
     )
     if plan.needs_review:
-        raise ValueError(f"Cannot materialize a strict DDA bundle while the plan needs review: {plan.blocking_issues}")
+        raise ValueError(f"无法生成严格的 DDA 任务包：计划需要人工复核。原因：{plan.blocking_issues}")
     if is_placeholder_fasta(plan.fasta_path) and not plan.fasta_download_url:
-        raise ValueError(f"Cannot materialize a strict DDA bundle with placeholder FASTA: {plan.fasta_path}")
+        raise ValueError(f"无法生成严格的 DDA 任务包：FASTA 文件是占位文件。{plan.fasta_path}")
 
     workflows_dir = task_root / "workflows"
     workflows_dir.mkdir(parents=True, exist_ok=True)
@@ -105,8 +105,6 @@ def materialize_dda_task_bundle(
     fasta_dir.mkdir(parents=True, exist_ok=True)
     materialized_fasta_path = fasta_dir / plan.fasta_path.name
     if plan.fasta_download_url:
-        if not plan.fasta_download_url:
-            raise ValueError("Cannot reproduce project FASTA without a download URL.")
         client = PrideClient()
         try:
             _download_fasta(client, plan.fasta_download_url, materialized_fasta_path, report=report)
@@ -115,7 +113,7 @@ def materialize_dda_task_bundle(
     else:
         shutil.copyfile(plan.fasta_path, materialized_fasta_path)
     if is_placeholder_fasta(materialized_fasta_path):
-        raise ValueError(f"Downloaded/materialized FASTA is a placeholder and cannot be used: {materialized_fasta_path}")
+        raise ValueError(f"下载/生成的 FASTA 文件是占位文件，不能用于搜库：{materialized_fasta_path}")
 
     _write_sage_config(plan, attributes)
 

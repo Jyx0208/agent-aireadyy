@@ -93,9 +93,9 @@ def _reuse_or_remove(path: Path, expected_size_bytes: int | None, label: str, re
 
 def download_file_asset(client, asset: FileAsset, report: Callable[[str], None] | None = None) -> Path:
     if not asset.download_url:
-        raise ValueError("Cannot download a file asset without a download URL.")
+        raise ValueError("无法下载文件资产：缺少下载 URL。")
     if not asset.local_path:
-        raise ValueError("Cannot download a file asset without a local target path.")
+        raise ValueError("无法下载文件资产：缺少本地目标路径。")
 
     if _reuse_or_remove(asset.local_path, asset.expected_size_bytes, "已下载的数据文件", report):
         return asset.local_path
@@ -118,8 +118,8 @@ def download_file_asset(client, asset: FileAsset, report: Callable[[str], None] 
         actual = download_target.stat().st_size if download_target.exists() else 0
         _unlink_file(download_target)
         raise IOError(
-            f"Downloaded file size does not match PRIDE metadata: {download_target} "
-            f"({actual}/{asset.expected_size_bytes} bytes)"
+            f"下载的文件大小与 PRIDE 元数据不匹配：{download_target} "
+            f"({actual}/{asset.expected_size_bytes} 字节)"
         )
 
     if cache_path:

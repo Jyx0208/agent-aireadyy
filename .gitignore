@@ -40,3 +40,6 @@ task_run_real/
 *.mzid
 *.mgf
 *.parquet
+
+# Claude Code local config
+.claude/

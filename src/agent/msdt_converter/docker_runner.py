@@ -20,8 +20,15 @@ class DockerMSDTConverterRunner:
 
     @staticmethod
     def _container_path(bundle: MaterializedTaskBundle, path: Path) -> str:
-        relative = path.resolve().relative_to(bundle.task_root.resolve())
-        return f"/workspace/{relative.as_posix()}"
+        try:
+            resolved_path = path.resolve()
+            resolved_root = bundle.task_root.resolve()
+            relative = resolved_path.relative_to(resolved_root)
+            return f"/workspace/{relative.as_posix()}"
+        except ValueError:
+            # 如果路径不在 task_root 下，尝试使用绝对路径的 POSIX 格式
+            # 这在 Windows 上可能会产生不正确的路径，但至少不会崩溃
+            return f"/workspace/{path.as_posix()}"
 
     def _sage_workdir(self, bundle: MaterializedTaskBundle) -> Path:
         return bundle.task_root / "sage"

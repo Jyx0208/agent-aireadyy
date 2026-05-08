@@ -260,7 +260,7 @@ def test_llm_confirmation_keeps_fasta_and_workflow_recommendations_in_hints():
                         "recommended_fasta_name": "GiardiaDB-34_AassemblageA_AnnotatedProteins.fasta",
                         "recommended_fasta_url": None,
                         "recommended_fasta_source": "project protocol names GiardiaDB release 34",
-                        "recommended_workflow_name": "LFQ_DDA_generic.workflow",
+                        "recommended_workflow_name": "LFQ-MBR.workflow",
                         "workflow_rationale": "label-free DDA raw file",
                     },
                     confidence=0.9,
@@ -274,7 +274,7 @@ def test_llm_confirmation_keeps_fasta_and_workflow_recommendations_in_hints():
 
     hints = confirmed.search_parameter_hints.value
     assert hints["recommended_fasta_name"] == "GiardiaDB-34_AassemblageA_AnnotatedProteins.fasta"
-    assert hints["recommended_workflow_name"] == "LFQ_DDA_generic.workflow"
+    assert hints["recommended_workflow_name"] == "LFQ-MBR.workflow"
 
 
 def test_no_sdrf_llm_context_includes_parameter_and_fasta_files():
@@ -306,7 +306,7 @@ def test_no_sdrf_llm_context_includes_parameter_and_fasta_files():
 def test_openai_compatible_reasoner_defaults_to_gpt_5_4():
     reasoner = OpenAICompatibleReasoner(api_key="test-key")
 
-    assert reasoner.model == "gpt-5.4"
+    assert reasoner.model == "deepseek-v4-flash"
     assert reasoner.timeout == 300.0
 
 
@@ -333,34 +333,57 @@ def test_default_llm_reasoner_ignores_invalid_timeout(monkeypatch):
 def test_openai_compatible_reasoner_falls_back_when_json_mode_returns_5xx(monkeypatch):
     calls = []
 
-    def fake_post(url, headers, json, timeout):
+    class FakeStreamResponse:
+        def __init__(self, status_code, lines, request):
+            self.status_code = status_code
+            self._lines = lines
+            self._request = request
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    f"{self.status_code}", request=self._request, response=self
+                )
+
+        def iter_lines(self):
+            return iter(self._lines)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    def fake_stream(method, url, headers, json, timeout):
         calls.append(json)
         request = httpx.Request("POST", url)
         if "response_format" in json:
-            return httpx.Response(502, request=request, text="bad gateway")
-        content = {
-            "choices": [
-                {
-                    "message": {
-                        "content": json_module.dumps(
-                            {
-                                "enzyme": {
-                                    "value": "Asp-N",
-                                    "confidence": 0.95,
-                                    "source": "llm_confirmed",
-                                    "evidence_excerpt": "ASP-N file name",
-                                    "conflict_flag": False,
+            return FakeStreamResponse(502, [], request)
+        content = json_module.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "content": json_module.dumps(
+                                {
+                                    "enzyme": {
+                                        "value": "Asp-N",
+                                        "confidence": 0.95,
+                                        "source": "llm_confirmed",
+                                        "evidence_excerpt": "ASP-N file name",
+                                        "conflict_flag": False,
+                                    }
                                 }
-                            }
-                        )
+                            )
+                        }
                     }
-                }
-            ]
-        }
-        return httpx.Response(200, request=request, json=content)
+                ]
+            }
+        )
+        return FakeStreamResponse(200, [f"data: {content}", "data: [DONE]"], request)
 
     json_module = json
-    monkeypatch.setattr("agent.llm.reasoner.httpx.post", fake_post)
+    monkeypatch.setattr("agent.llm.reasoner.httpx.stream", fake_stream)
     monkeypatch.setattr("agent.llm.reasoner.time.sleep", lambda *_: None)
 
     context = ProjectContext(project_accession="PXD019949", file_name="ASP-N_F4-R1.raw", metadata={}, sdrf_rows=[])

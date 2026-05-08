@@ -163,65 +163,44 @@ def _metadata_context_text(context: ProjectContext, include_project_files: bool 
 def _no_sdrf_attribute_prompt(context: ProjectContext, attributes: AttributeSet) -> str:
     current = attributes.model_dump(mode="json")
     return (
-        "You are confirming proteomics raw-file metadata and search parameters when no SDRF rows are available.\n"
-        "Use only the project web/API metadata, protocol descriptions, project file names, target file name, "
-        "and obvious parameter/workflow/FASTA file names listed below.\n"
-        "Your goal is to infer the most likely file-level workflow inputs for constructing an MSDT-Converter input package.\n"
-        "Return strict JSON. Keys may include acquisition_mode, species, instrument_name, instrument_family, "
-        "enzyme, labeling_strategy, fixed_mods, variable_mods, fractionation_hint, search_parameter_hints.\n"
-        "Each key must be an object with value, confidence, source, evidence_excerpt, conflict_flag.\n"
-        "For search configuration, extract or infer search_parameter_hints with normalized keys: "
-        "search_engine, database, enzyme, missed_cleavages, precursor_tol, fragment_tol, precursor_charge, "
-        "isotope_errors, min_peaks, max_peaks, min_matched_peaks, max_variable_mods, fdr, "
-        "tmt_channel_count, data_family, sidecar_patterns, recommended_fasta_name, recommended_fasta_url, "
-        "recommended_fasta_source, recommended_workflow_name, workflow_rationale. "
-        "data_family should be one of mzml, mzxml, tims, thermo_raw, sciex_wiff, mgf, mzid, or unknown. "
-        "Also include sidecar_patterns when project files imply companion files such as .wiff.scan. "
-        "For FASTA, prefer a project-provided FASTA file when listed. If no FASTA file is listed, identify the "
-        "database/FASTA needed from protocols or parameter-file names. When a UniProt proteome ID such as "
-        "UP000000589, UP000005640, or UP000002311 is stated or confidently implied, include the official "
-        "UniProt stream URL in recommended_fasta_url using format "
-        "https://rest.uniprot.org/uniprotkb/stream?compressed=false&format=fasta&query=%28proteome%3A<PROTEOME_ID>%29. "
-        "For workflow, recommend only one of these existing templates when appropriate: "
-        "LFQ_DDA_generic.workflow, LFQ_DDA_generic_tims.workflow, LFQ_DDA_human_noNQ.workflow, "
-        "LFQ_DDA_human_noNQ_tims.workflow, TMT_DDA_generic.workflow, TMT_DDA_human.workflow, "
-        "iTRAQ_DDA_generic.workflow, iTRAQ_DDA_human.workflow. "
-        "Normalize fixed_mods and variable_mods "
-        "as human-readable modification strings with residue/site and mass when available, e.g. "
-        "Carbamidomethyl (C) 57.02146, Oxidation (M) 15.9949, TMT (K) 229.16293.\n"
-        "Normalize labeling_strategy to label-free, TMT, iTRAQ, SILAC, or unknown.\n"
-        "If the file name implies fraction/replicate/condition, put that in fractionation_hint rather than inventing biology.\n"
-        "Use source='llm_confirmed'. Keep evidence_excerpt short and grounded in the supplied text.\n"
-        "Set confidence lower when inferred from weak naming patterns. Do not invent unsupported values.\n\n"
+        "Confirm proteomics file metadata and search parameters. Return a FLAT JSON object (no nesting).\n\n"
+        "Required keys (each is {value, confidence, source, evidence_excerpt, conflict_flag}):\n"
+        "acquisition_mode, species, instrument_name, instrument_family, enzyme, labeling_strategy, "
+        "fixed_mods, variable_mods, fractionation_hint, search_parameter_hints.\n\n"
+        "search_parameter_hints.value must include: missed_cleavages, precursor_tol, fragment_tol, "
+        "min_peaks, max_variable_mods, data_family, "
+        "recommended_workflow_name, recommended_fasta_name, recommended_fasta_url, recommended_fasta_source.\n\n"
+        "Available workflows:\n"
+        "  DDA LFQ: Default.workflow, LFQ-MBR.workflow, LFQ-phospho.workflow, LFQ-ubiquitin.workflow\n"
+        "  DDA TMT: TMT10.workflow, TMT10-MS3.workflow, TMT16.workflow, TMT16-MS3.workflow\n"
+        "  DIA: DIA_SpecLib_Quant.workflow, DIA_SpecLib_Quant_Phospho.workflow\n"
+        "  Special: Open.workflow, FPOP.workflow, Nonspecific-HLA.workflow, glyco-N-LFQ.workflow\n\n"
+        "Use source='llm_confirmed'. Prefer normalized values. Do not invent unsupported values.\n\n"
         f"Project context:\n{_metadata_context_text(context)}\n\n"
-        f"Current rule-based attributes:\n{json.dumps(current, ensure_ascii=False)}"
+        f"Current attributes:\n{json.dumps(current, ensure_ascii=False)}"
     )
 
 
 def _sdrf_attribute_prompt(context: ProjectContext, attributes: AttributeSet) -> str:
     current = attributes.model_dump(mode="json")
     return (
-        "You are summarizing matched SDRF rows into a single file-level proteomics workflow decision.\n"
-        "Treat SDRF as the primary source. Use project metadata only to disambiguate or normalize SDRF values.\n"
-        "The matched SDRF rows may describe mixtures, ontology-coded strings such as NT=... or AC=..., "
-        "and workflow/search settings spread across multiple rows.\n"
-        "Return strict JSON. Keys may include acquisition_mode, species, instrument_name, instrument_family, "
-        "enzyme, labeling_strategy, fixed_mods, variable_mods, fractionation_hint, search_parameter_hints.\n"
-        "Each key must be an object with value, confidence, source, evidence_excerpt, conflict_flag.\n"
-        "For Sage config generation, extract enzyme, missed_cleavages, precursor_tol, fragment_tol, "
-        "fixed_mods, variable_mods, labeling_strategy, precursor_charge, isotope_errors, min_peaks, max_peaks, "
-        "min_matched_peaks, max_variable_mods, tmt_channel_count, data_family, and sidecar_patterns when SDRF rows or "
-        "project metadata explicitly provide them. Also include recommended_fasta_name, recommended_fasta_url, "
-        "recommended_fasta_source, recommended_workflow_name, and workflow_rationale when SDRF rows or metadata "
-        "make FASTA/workflow selection explicit. For UniProt proteome IDs, include the official UniProt stream URL "
-        "in recommended_fasta_url using the proteome ID. Use normalized modification strings with residue/site and mass "
-        "when available, e.g. Carbamidomethyl (C) 57.02146, Oxidation (M) 15.9949, TMT (K) 229.16293.\n"
-        "Use source='llm_confirmed'. Prefer normalized human-readable values over raw NT=/AC= strings.\n"
-        "When SDRF rows represent multiple organisms in one file, summarize species as a multi-species mixture.\n"
-        "Do not invent parameters not grounded in the supplied SDRF rows or metadata.\n\n"
+        "Summarize SDRF rows into file-level proteomics attributes. Return a FLAT JSON object (no nesting).\n\n"
+        "Required keys (each is {value, confidence, source, evidence_excerpt, conflict_flag}):\n"
+        "acquisition_mode, species, instrument_name, instrument_family, enzyme, labeling_strategy, "
+        "fixed_mods, variable_mods, fractionation_hint, search_parameter_hints.\n\n"
+        "search_parameter_hints.value must include: missed_cleavages, precursor_tol, fragment_tol, "
+        "min_peaks, max_variable_mods, data_family, "
+        "recommended_workflow_name, recommended_fasta_name, recommended_fasta_url, recommended_fasta_source.\n\n"
+        "Available workflows:\n"
+        "  DDA LFQ: Default.workflow, LFQ-MBR.workflow, LFQ-phospho.workflow, LFQ-ubiquitin.workflow\n"
+        "  DDA TMT: TMT10.workflow, TMT10-MS3.workflow, TMT16.workflow, TMT16-MS3.workflow\n"
+        "  DIA: DIA_SpecLib_Quant.workflow, DIA_SpecLib_Quant_Phospho.workflow\n"
+        "  Special: Open.workflow, FPOP.workflow, Nonspecific-HLA.workflow, glyco-N-LFQ.workflow\n\n"
+        "Use source='llm_confirmed'. Prefer normalized values over raw NT=/AC= strings.\n"
+        "Do not invent parameters not grounded in SDRF rows or metadata.\n\n"
         f"Project context:\n{_metadata_context_text(context, include_project_files=False)}\n\n"
         f"Matched SDRF rows:\n{json.dumps(context.sdrf_rows, ensure_ascii=False)}\n\n"
-        f"Current deterministic attributes:\n{json.dumps(current, ensure_ascii=False)}"
+        f"Current attributes:\n{json.dumps(current, ensure_ascii=False)}"
     )
 
 
@@ -229,8 +208,8 @@ class OpenAICompatibleReasoner:
     def __init__(
         self,
         api_key: str,
-        model: str = "gpt-5.4",
-        base_url: str = "https://api.openai.com/v1",
+        model: str = "deepseek-v4-flash",
+        base_url: str = "https://api.deepseek.com",
         timeout: float = 300.0,
     ) -> None:
         self.api_key = api_key
@@ -258,34 +237,105 @@ class OpenAICompatibleReasoner:
                 time.sleep(1)
         if last_error is not None:
             raise last_error
-        raise RuntimeError("LLM request failed without an HTTP response.")
+        raise RuntimeError("大模型请求失败：未收到 HTTP 响应。")
+
+    def _stream_chat_completion(self, payload: dict[str, Any], report: Callable | None = None) -> str:
+        import sys
+        # 暂停 spinner，避免 \r 覆盖流式输出
+        if report is not None:
+            report({"kind": "activity_stop", "message": ""})
+        stream_payload = {**payload, "stream": True}
+        # 流式模式：connect/read/write 用不同超时，read 要足够长（模型思考可能很久）
+        stream_timeout = httpx.Timeout(connect=30, read=self.timeout, write=30, pool=30)
+        last_error: Exception | None = None
+        for attempt in range(3):
+            full_content = ""
+            full_reasoning = ""
+            sys.stderr.write(f"[调试] 开始流式请求 attempt={attempt+1}, model={self.model}, timeout={self.timeout}s\n")
+            sys.stderr.flush()
+            try:
+                with httpx.stream(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json=stream_payload,
+                    timeout=stream_timeout,
+                ) as response:
+                    sys.stderr.write(f"[调试] 已连接, status={response.status_code}\n")
+                    sys.stderr.flush()
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            delta = chunk["choices"][0].get("delta", {})
+                            reasoning = delta.get("reasoning_content", "")
+                            content = delta.get("content", "")
+                            if reasoning:
+                                full_reasoning += reasoning
+                                sys.stderr.write(f"\033[90m{reasoning}\033[0m")
+                                sys.stderr.flush()
+                            if content:
+                                full_content += content
+                                sys.stderr.write(content)
+                                sys.stderr.flush()
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+                if full_reasoning or full_content:
+                    sys.stderr.write("\n")
+                    sys.stderr.flush()
+                return full_content
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                if exc.response.status_code < 500:
+                    raise
+                sys.stderr.write(f"\n[重试 {attempt+1}/3] 服务器错误 {exc.response.status_code}，重试中...\n")
+                sys.stderr.flush()
+                time.sleep(2)
+            except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+                last_error = exc
+                sys.stderr.write(f"\n[重试 {attempt+1}/3] 请求超时，重试中...\n")
+                sys.stderr.flush()
+                time.sleep(2)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("大模型流式请求失败：未收到响应。")
 
     def confirm_search_parameters(
         self,
         context: ProjectContext,
         attributes: AttributeSet,
     ) -> Mapping[str, AttributeValue]:
+        import sys
         prompt = _sdrf_attribute_prompt(context, attributes) if context.sdrf_rows else _no_sdrf_attribute_prompt(context, attributes)
+        sys.stderr.write(f"\n[调试] prompt 长度={len(prompt)} 字符\n")
+        sys.stderr.write(f"[调试] prompt 内容:\n{'='*60}\n{prompt}\n{'='*60}\n")
+        sys.stderr.flush()
         payload: dict[str, Any] = {
             "model": self.model,
             "response_format": {"type": "json_object"},
             "messages": [
                 {
                     "role": "system",
-                    "content": "Return only valid JSON for proteomics metadata confirmation.",
+                    "content": "You are a proteomics metadata assistant. Return ONLY a flat JSON object with the requested keys. Do NOT wrap in nested objects like 'deterministic_attributes' or 'sage_config'. Return the raw keys directly at the top level.",
                 },
                 {"role": "user", "content": prompt},
             ],
         }
         try:
-            response = self._post_chat_completion(payload)
+            content = self._stream_chat_completion(payload)
         except httpx.HTTPStatusError as exc:
+            sys.stderr.write(f"[调试] JSON模式失败 status={exc.response.status_code}, 尝试无JSON模式\n")
+            sys.stderr.flush()
             if exc.response.status_code < 500:
                 raise
             fallback_payload = dict(payload)
             fallback_payload.pop("response_format", None)
-            response = self._post_chat_completion(fallback_payload)
-        content = response.json()["choices"][0]["message"]["content"]
+            content = self._stream_chat_completion(fallback_payload)
         decoded = json.loads(content)
         return {
             key: attribute
@@ -309,8 +359,8 @@ def default_llm_reasoner() -> LLMReasoner | None:
     api_key = os.getenv("AGENT_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
-    model = os.getenv("AGENT_LLM_MODEL", "gpt-5.4")
-    base_url = os.getenv("AGENT_LLM_BASE_URL", "https://api.openai.com/v1")
+    model = os.getenv("AGENT_LLM_MODEL", "deepseek-v4-flash")
+    base_url = os.getenv("AGENT_LLM_BASE_URL", "https://api.deepseek.com")
     timeout = _llm_timeout_from_env()
     return OpenAICompatibleReasoner(api_key=api_key, model=model, base_url=base_url, timeout=timeout)
 
@@ -343,27 +393,47 @@ def confirm_no_sdrf_parameters(
 
     reasoner = llm_reasoner or default_llm_reasoner()
     if reasoner is None:
-        reason = "No SDRF rows are available and no LLM reasoner is configured; strict search parameters cannot be inferred safely."
-        if report is not None:
-            report("未配置大模型推理器；未找到 SDRF 时不再使用规则猜测搜库参数，请人工复核。")
-        return _mark_no_sdrf_llm_blocked(attributes, reason)
+        raise ValueError(
+            "必须配置大模型 API 才能运行。未找到 SDRF 行时需要大模型推断搜库参数。\n"
+            "请设置环境变量 AGENT_LLM_API_KEY。\n"
+            "示例配置：\n"
+            "  AGENT_LLM_API_KEY=your_api_key\n"
+            "  AGENT_LLM_BASE_URL=https://api.deepseek.com\n"
+            "  AGENT_LLM_MODEL=deepseek-v4-flash"
+        )
 
     if report is not None:
         report("\u6b63\u5728\u8c03\u7528\u5927\u6a21\u578b\u786e\u8ba4\u6587\u4ef6\u5c5e\u6027\u548c\u641c\u5e93\u53c2\u6570\u3002")
 
     try:
         if report is not None:
-            report({"kind": "activity_start", "label": "大模型正在阅读 PRIDE 元数据并生成搜库参数…"})
+            report("大模型正在阅读 PRIDE 元数据并生成搜库参数…")
         updates = reasoner.confirm_search_parameters(context, attributes)
     except Exception as exc:
-        reason = f"LLM confirmation failed for no-SDRF input: {exc}"
+        reason = f"无 SDRF 输入时大模型确认失败：{exc}"
         if report is not None:
             report(f"大模型确认失败；未找到 SDRF 时不再使用规则猜测搜库参数，请人工复核。原因={exc}")
         return _mark_no_sdrf_llm_blocked(attributes, reason)
-    finally:
-        if report is not None:
-            report({"kind": "activity_stop", "message": "大模型参数确认完成。"})
     merged = attributes.model_dump()
+    # LLM 可能返回 search_parameter_hints 子字段作为顶层 key
+    _hint_keys = {"recommended_workflow_name", "recommended_fasta_name", "recommended_fasta_url",
+                  "recommended_fasta_source", "workflow_rationale", "database"}
+    extra_hints: dict[str, Any] = {}
+    for key in _hint_keys:
+        if key in updates and key not in AttributeSet.model_fields:
+            val = updates[key]
+            if isinstance(val, dict) and "value" in val:
+                extra_hints[key] = val["value"]
+            else:
+                extra_hints[key] = val
+    if extra_hints:
+        current_hints = merged.get("search_parameter_hints", {})
+        if isinstance(current_hints, dict) and isinstance(current_hints.get("value"), dict):
+            current_hints["value"] = {**current_hints["value"], **extra_hints}
+        else:
+            current_hints = {"value": extra_hints, "confidence": 0.9, "source": "llm_confirmed",
+                             "evidence_excerpt": "", "conflict_flag": False}
+        merged["search_parameter_hints"] = current_hints
     for field_name, proposed_value in updates.items():
         if field_name not in AttributeSet.model_fields:
             continue
@@ -396,24 +466,47 @@ def confirm_sdrf_parameters(
 
     reasoner = llm_reasoner or default_llm_reasoner()
     if reasoner is None:
-        return attributes
+        raise ValueError(
+            "必须配置大模型 API 才能运行。有 SDRF 行时需要大模型汇总 workflow 属性。\n"
+            "请设置环境变量 AGENT_LLM_API_KEY。\n"
+            "示例配置：\n"
+            "  AGENT_LLM_API_KEY=your_api_key\n"
+            "  AGENT_LLM_BASE_URL=https://api.deepseek.com\n"
+            "  AGENT_LLM_MODEL=deepseek-v4-flash"
+        )
 
     if report is not None:
         report(f"\u627e\u5230\u5339\u914d\u7684 SDRF \u884c\uff08{len(context.sdrf_rows)} \u884c\uff09\uff1b\u6b63\u5728\u7528\u5927\u6a21\u578b\u6c47\u603b\u6587\u4ef6\u7ea7 workflow \u5c5e\u6027\u3002")
 
     try:
         if report is not None:
-            report({"kind": "activity_start", "label": "大模型正在汇总 SDRF 行和 workflow 属性…"})
+            report("大模型正在汇总 SDRF 行和 workflow 属性…")
         updates = reasoner.confirm_search_parameters(context, attributes)
     except Exception as exc:
         if report is not None:
             report(f"\u5927\u6a21\u578b SDRF \u6c47\u603b\u5931\u8d25\uff1b\u4fdd\u7559\u786e\u5b9a\u6027 SDRF \u63a8\u65ad\u7ed3\u679c\u3002\u539f\u56e0={exc}")
         return attributes
-    finally:
-        if report is not None:
-            report({"kind": "activity_stop", "message": "大模型 SDRF 汇总完成。"})
 
     merged = attributes.model_dump()
+    # LLM 可能返回 search_parameter_hints 子字段（如 recommended_workflow_name）作为顶层 key
+    _hint_keys = {"recommended_workflow_name", "recommended_fasta_name", "recommended_fasta_url",
+                  "recommended_fasta_source", "workflow_rationale", "database"}
+    extra_hints: dict[str, Any] = {}
+    for key in _hint_keys:
+        if key in updates and key not in AttributeSet.model_fields:
+            val = updates[key]
+            if isinstance(val, dict) and "value" in val:
+                extra_hints[key] = val["value"]
+            else:
+                extra_hints[key] = val
+    if extra_hints:
+        current_hints = merged.get("search_parameter_hints", {})
+        if isinstance(current_hints, dict) and isinstance(current_hints.get("value"), dict):
+            current_hints["value"] = {**current_hints["value"], **extra_hints}
+        else:
+            current_hints = {"value": extra_hints, "confidence": 0.9, "source": "llm_confirmed",
+                             "evidence_excerpt": "", "conflict_flag": False}
+        merged["search_parameter_hints"] = current_hints
     for field_name, proposed_value in updates.items():
         if field_name not in AttributeSet.model_fields:
             continue

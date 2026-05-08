@@ -86,7 +86,7 @@ class PrideClient:
         temp_path = target_path.with_name(f"{target_path.name}.part")
 
         if report is not None:
-            report(f"Downloading: {url}")
+            report(f"正在下载：{url}")
 
         attempts = max(1, retries)
         last_error: Exception | None = None
@@ -133,7 +133,7 @@ class PrideClient:
                 if attempt >= attempts:
                     break
                 if report is not None:
-                    report(f"Download failed ({attempt}/{attempts}), retrying: {exc}")
+                    report(f"下载失败（第 {attempt}/{attempts} 次），正在重试：{exc}")
                 sleep(min(2 ** (attempt - 1), 8))
 
         if last_error is not None:
@@ -154,9 +154,9 @@ class PrideClient:
                 }
             )
             if total > 0:
-                report(f"Download complete: {target_path} ({downloaded}/{total} bytes)")
+                report(f"下载完成：{target_path}（{downloaded}/{total} 字节）")
             else:
-                report(f"Download complete: {target_path}")
+                report(f"下载完成：{target_path}")
         return target_path
 
     @staticmethod

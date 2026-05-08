@@ -39,6 +39,20 @@ class AgentService:
         self.reporter = reporter
         self.llm_reasoner = llm_reasoner
 
+        # 强制要求 LLM 推理器
+        if self.llm_reasoner is None:
+            from agent.llm.reasoner import default_llm_reasoner
+            self.llm_reasoner = default_llm_reasoner()
+
+        if self.llm_reasoner is None:
+            raise ValueError(
+                "必须配置大模型 API 才能运行。请设置环境变量 AGENT_LLM_API_KEY。\n"
+                "示例配置：\n"
+                "  AGENT_LLM_API_KEY=your_api_key\n"
+                "  AGENT_LLM_BASE_URL=https://api.siliconflow.cn/v1\n"
+                "  AGENT_LLM_MODEL=deepseek-v4-flash"
+            )
+
     def _report(self, message: str) -> None:
         if self.reporter is not None:
             self.reporter(message)
@@ -193,7 +207,7 @@ class AgentService:
 
     def build_context(self, resolution: ProjectResolution, file_name: str) -> ProjectContext:
         if not resolution.primary_project:
-            raise ValueError("Cannot build project context without a primary project.")
+            raise ValueError("无法构建项目上下文：缺少主项目。")
         return build_project_context(self.pride_client, resolution.primary_project.project_accession, file_name)
 
     def infer_attributes(self, context: ProjectContext):

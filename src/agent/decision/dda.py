@@ -34,7 +34,7 @@ def _detect_raw_type(source_data_path: Path, source_file_name: str = "") -> str:
         return "mzml"
     if suffix == ".d":
         return "tims"
-    raise ValueError(f"Unsupported source data path for MSDT-Converter: {source_data_path}")
+    raise ValueError(f"MSDT-Converter 不支持的数据格式：{source_data_path}")
 
 
 def _uniprot_proteome_url(proteome_id: str) -> str:
@@ -74,7 +74,7 @@ def _safe_file_name(file_name: str) -> str:
     posix_name = PurePosixPath(file_name).name
     windows_name = PureWindowsPath(posix_name).name
     if windows_name in {"", ".", ".."}:
-        raise ValueError(f"Invalid file name: {file_name}")
+        raise ValueError(f"无效的文件名：{file_name}")
     return windows_name
 
 
@@ -97,7 +97,7 @@ def _project_fasta_choice(
     if not fasta_records:
         return None, None, []
     if len(fasta_records) > 1:
-        return None, None, ["发现多个项目 FASTA 文件，需要人工选择。"]
+        return None, None, ["发现多个项目 FASTA 文件，需要人工选择。请使用 --reviewed-fasta-path 或 --reviewed-fasta-url 指定。"]
 
     fasta_record = fasta_records[0]
     file_name = _safe_file_name(str(fasta_record.get("fileName", "")))
@@ -105,7 +105,7 @@ def _project_fasta_choice(
         file_name = Path(file_name).stem
     download_url = PrideClient.first_download_url(fasta_record)
     if not download_url:
-        return None, None, [f"项目 FASTA 文件 {file_name} 没有可下载地址。"]
+        return None, None, [f"项目 FASTA 文件 {file_name} 没有可用的下载地址。"]
     return output_dir / "fasta" / file_name, download_url, []
 
 
@@ -144,37 +144,23 @@ def _is_dda_mode(attributes: AttributeSet) -> bool:
     return "dda" in mode or "pasef" in mode or "data-dependent" in mode or "data dependent" in mode
 
 
-def _workflow_name(attributes: AttributeSet, raw_data_type: str) -> str:
-    if raw_data_type == "mgf":
-        return "LFQ_DDA_generic.workflow"
-    if raw_data_type == "mzid":
-        return ""
-    label = str(attributes.labeling_strategy.value).lower()
-    species = str(attributes.species.value).lower()
-    multi_species_groups = [
-        ("homo sapiens", "human"),
-        ("mus musculus", "mouse"),
-        ("escherichia coli", "e. coli"),
-        ("saccharomyces cerevisiae", "yeast"),
-    ]
-    is_multi_species = sum(1 for aliases in multi_species_groups if any(alias in species for alias in aliases)) > 1
-    if not _is_dda_mode(attributes):
-        return ""
-    if not is_multi_species and ("human" in species or "homo sapiens" in species):
-        if "tmt" in label:
-            return "TMT_DDA_human.workflow"
-        if "itraq" in label:
-            return "iTRAQ_DDA_human.workflow"
-        if raw_data_type == "tims":
-            return "LFQ_DDA_human_noNQ_tims.workflow"
-        return "LFQ_DDA_human_noNQ.workflow"
-    if "tmt" in label:
-        return "TMT_DDA_generic.workflow"
-    if "itraq" in label:
-        return "iTRAQ_DDA_generic.workflow"
-    if raw_data_type == "tims":
-        return "LFQ_DDA_generic_tims.workflow"
-    return "LFQ_DDA_generic.workflow"
+def _workflow_name_from_llm(attributes: AttributeSet) -> str | None:
+    """从 LLM 推荐结果中获取 workflow 名称。
+
+    必须由大模型推荐 workflow，不使用规则推断。
+    优先从 search_parameter_hints 中提取，其次检查顶层属性。
+    如果大模型未推荐或推荐的 workflow 不存在，返回 None。
+    """
+    hints = _hint_mapping(attributes)
+    value = hints.get("recommended_workflow_name") or hints.get("workflow_name")
+    if value:
+        return str(value)
+    # LLM 可能将 recommended_workflow_name 作为顶层属性返回
+    if hasattr(attributes, "recommended_workflow_name") and attributes.recommended_workflow_name is not None:
+        attr = attributes.recommended_workflow_name
+        if attr.value and str(attr.value).strip():
+            return str(attr.value)
+    return None
 
 
 def _hint_mapping(attributes: AttributeSet) -> dict[str, Any]:
@@ -183,14 +169,14 @@ def _hint_mapping(attributes: AttributeSet) -> dict[str, Any]:
 
 
 def _llm_confirmed_workflow_name(attributes: AttributeSet, workspace_root: Path) -> str | None:
-    hints = _hint_mapping(attributes)
-    value = hints.get("recommended_workflow_name") or hints.get("workflow_name")
-    if not value:
+    """检查 LLM 推荐的 workflow 是否存在。"""
+    workflow_name = _workflow_name_from_llm(attributes)
+    if not workflow_name:
         return None
-    workflow_name = _safe_file_name(str(value))
-    workflow_path = workspace_root / "profiles" / "fragpipe" / workflow_name
+    safe_name = _safe_file_name(workflow_name)
+    workflow_path = workspace_root / "profiles" / "fragpipe" / safe_name
     if workflow_path.exists() and workflow_path.is_file():
-        return workflow_name
+        return safe_name
     return None
 
 
@@ -201,7 +187,9 @@ def _blocking_issues(attributes: AttributeSet, workflow_name: str, raw_data_type
     if raw_data_type == "mzid":
         return ["mzIdentML/mzid 是搜库结果文件，不含完整谱图；当前只能识别，不能自动生成标准 MSDT 输入。"]
     if _is_dia_mode(attributes):
-        issues.append("当前版本暂不支持 DIA/SWATH 数据自动生成严格 MSDT-Converter 搜库输入。")
+        # DIA 模式现在支持，但需要检查是否有对应的 workflow
+        if not workflow_name or "DIA" not in workflow_name:
+            issues.append("DIA 数据需要专用的 DIA workflow 模板。")
     elif not _is_dda_mode(attributes):
         issues.append(f"无法确认采集模式是否为 DDA：{attributes.acquisition_mode.value}")
     required = {
@@ -217,7 +205,7 @@ def _blocking_issues(attributes: AttributeSet, workflow_name: str, raw_data_type
     if attributes.search_parameter_hints.conflict_flag:
         issues.append(f"搜库参数需要人工复核：{attributes.search_parameter_hints.evidence_excerpt}")
     if not workflow_name:
-        issues.append("没有找到与当前推断属性匹配且已验证的 FragPipe workflow 模板。")
+        issues.append("未找到与当前推断属性匹配的 FragPipe workflow 模板。")
     return issues
 
 
@@ -236,14 +224,14 @@ def _context_blocking_issues(project_context: ProjectContext | None) -> list[str
     issues: list[str] = []
     experiment_types = " | ".join(_metadata_values(project_context, "experimentTypes")).lower()
     if "top-down" in experiment_types or "top down" in experiment_types:
-        issues.append("当前 bottom-up MSDT 搜库流程不支持 Top-down proteomics 项目。")
+        issues.append("当前 bottom-up MSDT 搜库流程不支持 Top-down 蛋白质组学项目。")
     if project_context is not None and not project_context.sdrf_rows:
         organisms = set(_metadata_values(project_context, "organisms"))
         instruments = set(_metadata_values(project_context, "instruments"))
         if len(organisms) > 1:
-            issues.append("未找到匹配 SDRF 行，且项目级 metadata 包含多个物种；文件级物种不明确。")
+            issues.append("未找到匹配的 SDRF 行，且项目包含多个物种；无法确定文件级物种信息。")
         if len(instruments) > 1:
-            issues.append("未找到匹配 SDRF 行，且项目级 metadata 包含多个仪器；文件级仪器不明确。")
+            issues.append("未找到匹配的 SDRF 行，且项目包含多个仪器；无法确定文件级仪器信息。")
     return issues
 
 
@@ -259,7 +247,9 @@ def _fasta_blocking_issues(
         return []
     if is_placeholder_fasta(fasta_path) and not fasta_download_url:
         return [
-            f"FASTA {fasta_path.name} 是占位文件，不能作为真实搜库数据库；请提供项目 FASTA 或人工确认的真实 FASTA。"
+            f"FASTA 文件 {fasta_path.name} 是占位文件，不能用于真实搜库。"
+            "请通过 --reviewed-fasta-path 或 --reviewed-fasta-url 参数提供真实的蛋白质序列数据库，"
+            "或确保 PRIDE 项目中包含可用的 FASTA 文件。"
         ]
     if fasta_mode != "defaulted" or project_context is None or project_context.sdrf_rows:
         return []
@@ -279,8 +269,10 @@ def _fasta_blocking_issues(
     if fasta_url:
         suffix += f"；URL：{fasta_url}"
     return [
-        "未找到项目 FASTA，且当前物种没有内置参考库；默认 generic_reference_with_contaminants.fasta "
-        f"只是占位库，不能用于可靠搜库（物种：{species}{suffix}）。"
+        f"未找到项目 FASTA 文件，且当前物种（{species}）没有内置参考库。"
+        f"默认的 generic_reference_with_contaminants.fasta 是占位文件，不能用于可靠搜库。"
+        f"请通过 --reviewed-fasta-path 或 --reviewed-fasta-url 参数提供真实的蛋白质序列数据库。"
+        f"{suffix}"
     ]
 
 
@@ -321,8 +313,18 @@ def plan_dda_execution(
         fasta_file_name, fasta_mode, inferred_fasta_url = _species_fasta_choice(str(attributes.species.value))
         fasta_path = workspace_root / "profiles" / "fasta" / fasta_file_name
         project_fasta_url = inferred_fasta_url
-    workflow_name = _llm_confirmed_workflow_name(attributes, workspace_root) or _workflow_name(attributes, raw_data_type)
-    blocking_issues = _blocking_issues(attributes, workflow_name, raw_data_type)
+
+    # 必须由大模型推荐 workflow，不使用规则推断
+    workflow_name = _llm_confirmed_workflow_name(attributes, workspace_root)
+    if not workflow_name:
+        llm_workflow = _workflow_name_from_llm(attributes)
+        if llm_workflow:
+            blocking_issues = [f"大模型推荐的 workflow '{llm_workflow}' 不存在于 profiles/fragpipe/ 目录中。请检查 workflow 名称是否正确。"]
+        else:
+            blocking_issues = ["大模型未推荐 workflow。必须配置 LLM API 并确保大模型能正确推荐 workflow。请检查 AGENT_LLM_API_KEY 配置。"]
+        workflow_name = ""  # 设置为空，后续会因为 blocking_issues 而被阻止
+    else:
+        blocking_issues = _blocking_issues(attributes, workflow_name, raw_data_type)
     blocking_issues.extend(fasta_issues)
     blocking_issues.extend(_context_blocking_issues(project_context))
     blocking_issues.extend(

@@ -16,6 +16,11 @@ from agent.models import (
 from agent.orchestrator.pipeline import AgentService, ReviewRequiredError
 
 
+class _DummyReasoner:
+    def confirm_search_parameters(self, context, attributes):
+        return {}
+
+
 def _attributes() -> AttributeSet:
     return AttributeSet(
         acquisition_mode=AttributeValue(value="DDA", confidence=1.0, source="rule", evidence_excerpt="DDA", conflict_flag=False),
@@ -27,7 +32,7 @@ def _attributes() -> AttributeSet:
         fixed_mods=AttributeValue(value=["C[57.02]"], confidence=0.7, source="default", evidence_excerpt="mods", conflict_flag=False),
         variable_mods=AttributeValue(value=["M[15.99]"], confidence=0.7, source="default", evidence_excerpt="mods", conflict_flag=False),
         fractionation_hint=AttributeValue(value=None, confidence=0.0, source="none", evidence_excerpt="", conflict_flag=False),
-        search_parameter_hints=AttributeValue(value={"precursor_tol": "20ppm"}, confidence=0.6, source="rule", evidence_excerpt="profile", conflict_flag=False),
+        search_parameter_hints=AttributeValue(value={"precursor_tol": "20ppm", "recommended_workflow_name": "Default.workflow"}, confidence=0.6, source="rule", evidence_excerpt="profile", conflict_flag=False),
     )
 
 
@@ -36,7 +41,7 @@ def _attributes_requiring_search_review() -> AttributeSet:
     return attrs.model_copy(
         update={
             "search_parameter_hints": AttributeValue(
-                value={"precursor_tol": "10 ppm", "fragment_tol": "0.02 Da", "database": "reviewed db"},
+                value={"precursor_tol": "10 ppm", "fragment_tol": "0.02 Da", "database": "reviewed db", "recommended_workflow_name": "Default.workflow"},
                 confidence=0.9,
                 source="llm_confirmed",
                 evidence_excerpt="LLM-confirmed parameters require human review.",
@@ -63,6 +68,7 @@ def _mouse_attributes() -> AttributeSet:
                     "recommended_fasta_name": "UP000000589_M_musculus.fasta",
                     "recommended_fasta_url": None,
                     "recommended_fasta_source": "LLM found UniProt proteome UP000000589 in protocol",
+                    "recommended_workflow_name": "Default.workflow",
                 },
                 confidence=0.9,
                 source="llm_confirmed",
@@ -81,7 +87,7 @@ def _reviewed_fasta(tmp_path: Path) -> Path:
 
 def test_plan_dda_run_from_pride_asset_uses_resolved_prepared_path(tmp_path: Path, monkeypatch):
     messages: list[str] = []
-    service = AgentService(pride_client=None, reporter=messages.append)
+    service = AgentService(pride_client=None, reporter=messages.append, llm_reasoner=_DummyReasoner())
     task = normalize_input("WT_5_Lys-c.raw")
     resolution = ProjectResolution(
         primary_project=ProjectCandidate(
@@ -138,7 +144,7 @@ def test_plan_dda_run_from_pride_asset_uses_resolved_prepared_path(tmp_path: Pat
 
 
 def test_prepare_pride_msdt_docker_input_uses_only_file_name(tmp_path: Path, monkeypatch):
-    service = AgentService(pride_client=None)
+    service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
     task = normalize_input("WT_5_Lys-c.raw")
     resolution = ProjectResolution(
         primary_project=ProjectCandidate(
@@ -211,7 +217,7 @@ def test_prepare_pride_msdt_docker_input_uses_only_file_name(tmp_path: Path, mon
 
 
 def test_prepare_pride_msdt_docker_input_continues_after_search_parameter_confirmation(tmp_path: Path, monkeypatch):
-    service = AgentService(pride_client=None)
+    service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
     task = normalize_input("WT_5_Lys-c.raw")
     resolution = ProjectResolution(
         primary_project=ProjectCandidate(
@@ -271,7 +277,7 @@ def test_prepare_pride_msdt_docker_input_continues_after_search_parameter_confir
 
 
 def test_prepare_pride_msdt_docker_input_auto_downloads_species_fasta(tmp_path: Path, monkeypatch):
-    service = AgentService(pride_client=None)
+    service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
     task = normalize_input("mouse.raw")
     resolution = ProjectResolution.empty()
     context = ProjectContext(project_accession="PXD_MOUSE", file_name="mouse.raw", metadata={}, project_files=[])
@@ -323,7 +329,7 @@ def test_prepare_pride_msdt_docker_input_auto_downloads_species_fasta(tmp_path: 
 
 
 def test_prepare_pride_msdt_docker_input_confirms_llm_proteome_id_fasta(tmp_path: Path, monkeypatch):
-    service = AgentService(pride_client=None)
+    service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
     task = normalize_input("mouse.raw")
     context = ProjectContext(project_accession="PXD_MOUSE", file_name="mouse.raw", metadata={}, project_files=[])
     resolve_calls = []
@@ -383,7 +389,7 @@ def test_prepare_pride_msdt_docker_input_confirms_llm_proteome_id_fasta(tmp_path
 
 
 def test_prepare_pride_msdt_docker_input_stops_before_download_when_plan_needs_review(tmp_path: Path, monkeypatch):
-    service = AgentService(pride_client=None)
+    service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
     task = normalize_input("WT_5_Lys-c.raw")
     resolution = ProjectResolution(
         primary_project=ProjectCandidate(

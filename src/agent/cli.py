@@ -5,6 +5,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import typer
 
 from agent.ai_ready.exporter import export_ai_ready_bundle
@@ -271,11 +275,16 @@ def prepare_msdt_docker_input(input_value: str, source_data_path: Path, output_d
 @app.command("prepare-pride-msdt-docker-input")
 def prepare_pride_msdt_docker_input(
     input_value: str,
-    output_dir: Path,
+    output_dir: Path | None = typer.Argument(None, help="Output directory. Auto-generated from input file name if not specified."),
     reviewed_fasta_path: Path | None = typer.Option(None, help="Human-reviewed local FASTA path to use instead of inferred/default FASTA."),
     reviewed_fasta_url: str | None = typer.Option(None, help="Human-reviewed FASTA URL to download and use."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Automatically accept interactive review prompts."),
+    no_run: bool = typer.Option(False, "--no-run", help="Only prepare input, do not run Docker."),
+    image: str = typer.Option("guomics2017/msdt-converter:v1.3", help="Docker image for MSDT-Converter."),
 ) -> None:
+    if output_dir is None:
+        stem = Path(input_value).stem if Path(input_value).suffix else input_value
+        output_dir = Path("runs") / stem
     service = AgentService(reporter=_build_reporter(output_dir))
     task = normalize_input(input_value)
 
@@ -304,8 +313,21 @@ def prepare_pride_msdt_docker_input(
     except (AssetPreparationError, ReviewRequiredError):
         typer.echo(_review_message(output_dir), err=True)
         raise typer.Exit(1)
-    typer.echo(f"请使用下面的命令运行 MSDT-Converter Docker：{_msdt_docker_command(output_dir)}")
-    typer.echo(bundle.model_dump_json(indent=2))
+
+    if no_run:
+        typer.echo(f"输入包已准备完成。手动运行 Docker：{_msdt_docker_command(output_dir)}")
+        return
+
+    typer.echo("输入包已准备完成，开始运行 MSDT-Converter Docker...")
+    from agent.msdt_converter.docker_runner import DockerMSDTConverterRunner
+    runner = DockerMSDTConverterRunner(image=image, report=service.reporter)
+    docker_result = runner.run(bundle)
+    if docker_result.returncode == 0:
+        typer.echo("MSDT-Converter Docker 运行完成。")
+    else:
+        typer.echo(f"MSDT-Converter Docker 运行失败，返回码：{docker_result.returncode}", err=True)
+        typer.echo(docker_result.stderr, err=True)
+        raise typer.Exit(1)
 
 
 def _format_review_value(value: Any) -> str:
