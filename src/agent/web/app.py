@@ -6,7 +6,6 @@ import json
 import os
 import re
 import shutil
-import tempfile
 import threading
 import time
 import uuid
@@ -21,8 +20,6 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
-from starlette.background import BackgroundTask
-
 from agent.input.normalizer import safe_output_stem
 from agent.progress import render_download_progress
 
@@ -45,6 +42,10 @@ _TERMINAL_STATUSES = {"completed", "failed", "blocked"}
 _cleanup_thread_started = False
 _PUBLIC_HISTORY_FILE = "task_history.json"
 _HISTORY_INDEX_FILE = "project_history.json"
+_DOWNLOAD_CACHE_DIR = ".download_cache"
+_DOWNLOAD_ZIP_NAME = "results.zip"
+_DOWNLOAD_RESULT_DIRS = {"ai_ready", "msdt", "rawspectrum", "logs"}
+_DOWNLOAD_ROOT_SUFFIXES = {".json", ".txt", ".log", ".tsv", ".csv"}
 
 # 默认配置（不从 .env 加载，由用户在页面填写）
 _DEFAULT_CONFIG = {
@@ -73,13 +74,6 @@ def _strip_ansi(value: Any) -> str:
     return _ANSI_RE.sub("", str(value)).replace("\r", "")
 
 
-def _remove_file(path: str | Path) -> None:
-    try:
-        Path(path).unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
 def _positive_float(value: str, default: float) -> float:
     try:
         parsed = float(value)
@@ -97,11 +91,11 @@ def _max_concurrent_tasks() -> int:
 
 
 def _result_retention_seconds() -> int:
-    raw = os.getenv("AGENT_RESULT_RETENTION_SECONDS", "7200")
+    raw = os.getenv("AGENT_RESULT_RETENTION_SECONDS", "1800")
     try:
         parsed = int(float(raw))
     except (TypeError, ValueError):
-        return 7200
+        return 1800
     return max(1, parsed)
 
 
@@ -114,8 +108,16 @@ def _max_result_projects() -> int:
     return max(1, parsed)
 
 
-def _path_file_stats(path: Path, excluded_names: set[str] | None = None) -> tuple[int, int, float]:
+def _pride_cache_dir() -> Path:
+    configured = os.getenv("AGENT_PRIDE_CACHE_DIR")
+    if configured:
+        return Path(configured)
+    return Path.cwd() / ".agent_cache" / "pride"
+
+
+def _path_file_stats(path: Path, excluded_names: set[str] | None = None, excluded_dir_names: set[str] | None = None) -> tuple[int, int, float]:
     excluded_names = excluded_names or set()
+    excluded_dir_names = excluded_dir_names or set()
     file_count = 0
     size_bytes = 0
     latest_mtime = 0.0
@@ -124,6 +126,12 @@ def _path_file_stats(path: Path, excluded_names: set[str] | None = None) -> tupl
     except OSError:
         return 0, 0, 0.0
     for file in path.rglob("*"):
+        try:
+            relative = file.relative_to(path)
+        except ValueError:
+            continue
+        if any(part in excluded_dir_names for part in relative.parts[:-1]):
+            continue
         if file.is_file() and file.name in excluded_names:
             continue
         try:
@@ -179,7 +187,7 @@ def _public_task_record_locked(task_id: str, task: dict[str, Any]) -> dict[str, 
         task.get("status") == "completed"
         and output_dir
         and output_dir.exists()
-        and any(path.is_file() and path.name not in {_PUBLIC_HISTORY_FILE, _HISTORY_INDEX_FILE} for path in output_dir.rglob("*"))
+        and _has_downloadable_result_file(output_dir)
     )
     return {
         "task_id": task_id,
@@ -269,7 +277,11 @@ def _list_public_results() -> list[dict[str, Any]]:
             continue
         if run_dir.resolve() in active_dirs:
             continue
-        file_count, size_bytes, latest_mtime = _path_file_stats(run_dir, excluded_names={_PUBLIC_HISTORY_FILE})
+        file_count, size_bytes, latest_mtime = _path_file_stats(
+            run_dir,
+            excluded_names={_PUBLIC_HISTORY_FILE, _HISTORY_INDEX_FILE},
+            excluded_dir_names={_DOWNLOAD_CACHE_DIR},
+        )
         if file_count == 0 or latest_mtime <= 0:
             continue
         history = _read_public_history(run_dir)
@@ -289,7 +301,7 @@ def _list_public_results() -> list[dict[str, Any]]:
                 "updated_at": datetime.fromtimestamp(latest_mtime, UTC).isoformat(),
                 "expires_at": datetime.fromtimestamp(expires_at_ts, UTC).isoformat(),
                 "expires_in_seconds": max(0, int(expires_at_ts - now)),
-                "can_download": status == "completed",
+                "can_download": status == "completed" and _has_downloadable_result_file(run_dir),
             }
         )
     results.sort(key=lambda item: item["updated_at"], reverse=True)
@@ -310,11 +322,12 @@ def _list_project_history_records() -> list[dict[str, Any]]:
                 file_count, size_bytes, latest_mtime = _path_file_stats(
                     output_dir,
                     excluded_names={_PUBLIC_HISTORY_FILE, _HISTORY_INDEX_FILE},
+                    excluded_dir_names={_DOWNLOAD_CACHE_DIR},
                 )
                 item["updated_at"] = datetime.fromtimestamp(latest_mtime, UTC).isoformat() if latest_mtime else item.get("updated_at")
             item["file_count"] = file_count
             item["size_bytes"] = size_bytes
-            item["can_download"] = item.get("status") == "completed" and file_count > 0
+            item["can_download"] = bool(item.get("status") == "completed" and output_dir and output_dir.exists() and _has_downloadable_result_file(output_dir))
             records[key] = item
 
     for result in _list_public_results():
@@ -338,7 +351,11 @@ def _cleanup_expired_results() -> list[str]:
         return []
     with _tasks_lock:
         active_dirs = _active_output_dirs_locked()
+        has_active_tasks = any(task.get("status") in _ACTIVE_STATUSES for task in _tasks.values())
+    now = time.time()
+    retention = _result_retention_seconds()
     candidates: list[tuple[float, Path]] = []
+    removed: list[str] = []
     for run_dir in _runs_dir.iterdir():
         if not run_dir.is_dir():
             continue
@@ -347,17 +364,59 @@ def _cleanup_expired_results() -> list[str]:
             continue
         history = _read_public_history(run_dir)
         status = history.get("status", "completed")
-        file_count, _size_bytes, latest_mtime = _path_file_stats(run_dir, excluded_names={_PUBLIC_HISTORY_FILE, _HISTORY_INDEX_FILE})
-        if status != "completed" or file_count == 0:
+        file_count, _size_bytes, latest_mtime = _path_file_stats(
+            run_dir,
+            excluded_names={_PUBLIC_HISTORY_FILE, _HISTORY_INDEX_FILE},
+            excluded_dir_names={_DOWNLOAD_CACHE_DIR},
+        )
+        if latest_mtime <= 0:
+            continue
+        if now - latest_mtime >= retention:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            removed.append(run_dir.name)
+            continue
+        if status != "completed" or file_count == 0 or not _has_downloadable_result_file(run_dir):
             continue
         candidates.append((latest_mtime, run_dir))
     max_projects = _max_result_projects()
     candidates.sort(key=lambda item: item[0], reverse=True)
     to_remove = sorted(candidates[max_projects:], key=lambda item: item[0])
-    removed: list[str] = []
     for _mtime, run_dir in to_remove:
         shutil.rmtree(run_dir, ignore_errors=True)
         removed.append(run_dir.name)
+    if not has_active_tasks:
+        removed.extend(_cleanup_pride_cache(now, retention))
+    return removed
+
+
+def _cleanup_pride_cache(now: float, retention: int) -> list[str]:
+    cache_root = _pride_cache_dir()
+    if not cache_root.exists() or not cache_root.is_dir():
+        return []
+    removed: list[str] = []
+    for file in cache_root.rglob("*"):
+        if not file.is_file():
+            continue
+        try:
+            stat = file.stat()
+        except OSError:
+            continue
+        if now - stat.st_mtime < retention:
+            continue
+        try:
+            relative = file.relative_to(cache_root)
+        except ValueError:
+            relative = file.name
+        try:
+            file.unlink()
+            removed.append(f"pride-cache/{relative}")
+        except OSError:
+            continue
+    for directory in sorted((path for path in cache_root.rglob("*") if path.is_dir()), key=lambda path: len(path.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
     return removed
 
 
@@ -370,13 +429,64 @@ def _cleanup_loop() -> None:
         time.sleep(120)
 
 
+def _is_download_result_file(output_dir: Path, file: Path) -> bool:
+    if not file.is_file() or file.name in {_PUBLIC_HISTORY_FILE, _HISTORY_INDEX_FILE}:
+        return False
+    try:
+        relative = file.relative_to(output_dir)
+    except ValueError:
+        return False
+    if not relative.parts:
+        return False
+    first = relative.parts[0]
+    if first == _DOWNLOAD_CACHE_DIR:
+        return False
+    if first in _DOWNLOAD_RESULT_DIRS:
+        return True
+    if len(relative.parts) == 1 and file.suffix.lower() in _DOWNLOAD_ROOT_SUFFIXES:
+        return True
+    return False
+
+
+def _has_downloadable_result_file(output_dir: Path) -> bool:
+    return any(_is_download_result_file(output_dir, path) for path in output_dir.rglob("*"))
+
+
+def _download_zip_path(output_dir: Path) -> Path:
+    return output_dir / _DOWNLOAD_CACHE_DIR / _DOWNLOAD_ZIP_NAME
+
+
+def _download_source_mtime(output_dir: Path) -> float:
+    latest_mtime = 0.0
+    for path in output_dir.rglob("*"):
+        if not _is_download_result_file(output_dir, path):
+            continue
+        try:
+            latest_mtime = max(latest_mtime, path.stat().st_mtime)
+        except OSError:
+            continue
+    return latest_mtime
+
+
 def _zip_output_dir(output_dir: Path) -> Path:
-    with tempfile.NamedTemporaryFile(prefix="pride-agent-", suffix=".zip", delete=False) as temp_file:
-        zip_path = Path(temp_file.name)
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file in output_dir.rglob("*"):
-            if file.is_file() and file.name not in {_PUBLIC_HISTORY_FILE, _HISTORY_INDEX_FILE}:
-                zf.write(file, file.relative_to(output_dir))
+    source_mtime = _download_source_mtime(output_dir)
+    zip_path = _download_zip_path(output_dir)
+    try:
+        if source_mtime > 0 and zip_path.exists() and zip_path.stat().st_mtime >= source_mtime:
+            return zip_path
+    except OSError:
+        pass
+
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = zip_path.parent / f".{uuid.uuid4().hex}.zip.tmp"
+    try:
+        with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_STORED) as zf:
+            for file in output_dir.rglob("*"):
+                if _is_download_result_file(output_dir, file):
+                    zf.write(file, file.relative_to(output_dir))
+        temp_path.replace(zip_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
     return zip_path
 
 
@@ -763,7 +873,7 @@ async def download_public_result(result_id: str):
     history = _read_public_history(output_dir)
     if history.get("status", "completed") != "completed":
         return {"error": "任务未完成，不能下载结果。"}
-    if not any(path.is_file() and path.name not in {_PUBLIC_HISTORY_FILE, _HISTORY_INDEX_FILE} for path in output_dir.rglob("*")):
+    if not _has_downloadable_result_file(output_dir):
         return {"error": "结果目录没有可下载文件。"}
 
     zip_path = _zip_output_dir(output_dir)
@@ -771,7 +881,6 @@ async def download_public_result(result_id: str):
         path=str(zip_path),
         filename=f"{result_id}_results.zip",
         media_type="application/zip",
-        background=BackgroundTask(_remove_file, zip_path),
     )
 
 
@@ -1102,6 +1211,19 @@ def _run_pipeline(task_id: str):
                         _log(task_id, "info", f"  {f.relative_to(output_dir)}  ({size_str})")
             _log(task_id, "info", "=" * 50)
             _log(task_id, "info", "点击【下载结果文件】按钮获取 ZIP 压缩包")
+            if _has_downloadable_result_file(output_dir):
+                try:
+                    zip_path = _zip_output_dir(output_dir)
+                    zip_size = zip_path.stat().st_size
+                    if zip_size > 1024 * 1024:
+                        zip_size_text = f"{zip_size / 1024 / 1024:.1f} MB"
+                    elif zip_size > 1024:
+                        zip_size_text = f"{zip_size / 1024:.1f} KB"
+                    else:
+                        zip_size_text = f"{zip_size} B"
+                    _log(task_id, "info", f"Download ZIP prepared: {zip_path.name} ({zip_size_text})")
+                except OSError as exc:
+                    _log(task_id, "info", f"Download ZIP will be built on demand: {exc}")
             _set_task_terminal_status(task_id, "completed")
         else:
             _log(task_id, "error", f"Docker 运行失败，返回码：{docker_result.returncode}")
@@ -1134,7 +1256,7 @@ async def get_task(task_id: str):
         task.get("status") == "completed"
         and output_dir
         and output_dir.exists()
-        and any(path.is_file() and path.name not in {_PUBLIC_HISTORY_FILE, _HISTORY_INDEX_FILE} for path in output_dir.rglob("*"))
+        and _has_downloadable_result_file(output_dir)
     )
     return {
         "task_id": task["task_id"],
@@ -1161,7 +1283,7 @@ async def download_results(task_id: str):
     output_dir = Path(task["output_dir"])
     if not output_dir.exists():
         return {"error": "结果目录不存在"}
-    if not any(path.is_file() and path.name not in {_PUBLIC_HISTORY_FILE, _HISTORY_INDEX_FILE} for path in output_dir.rglob("*")):
+    if not _has_downloadable_result_file(output_dir):
         return {"error": "结果目录没有可下载文件"}
 
     zip_path = _zip_output_dir(output_dir)
@@ -1170,7 +1292,6 @@ async def download_results(task_id: str):
         path=str(zip_path),
         filename=f"{stem}_results.zip",
         media_type="application/zip",
-        background=BackgroundTask(_remove_file, zip_path),
     )
 
 

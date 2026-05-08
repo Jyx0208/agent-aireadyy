@@ -215,6 +215,7 @@ function fill(v){document.getElementById('inputValue').value=v}
 function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function now(){const d=new Date();return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0')}
 function formatSize(n){if(n>1024*1024*1024)return(n/1024/1024/1024).toFixed(1)+' GB';if(n>1024*1024)return(n/1024/1024).toFixed(1)+' MB';if(n>1024)return(n/1024).toFixed(1)+' KB';return(n||0)+' B'}
+function retentionMinutes(d){return Math.max(1,Math.round((d.retention_seconds||1800)/60))}
 function formatRetention(sec){const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60);return h>0?h+' 小时 '+m+' 分钟':m+' 分钟'}
 function statusText(s){return {queued:'排队中',running:'运行中',completed:'已完成',failed:'失败',blocked:'需要复核'}[s]||s||'未知'}
 function toggleConfig(){document.getElementById('configBody').classList.toggle('open')}
@@ -230,6 +231,7 @@ async function loadConfig(){
     document.getElementById('configStatus').textContent='每次任务单独填写';
     document.getElementById('resultRetention').textContent='最多保存 '+(d.max_result_projects||4)+' 个项目下载文件';
     updateServerStatus(d);
+    document.getElementById('resultRetention').textContent='结果和过程文件约 '+retentionMinutes(d)+' 分钟后清理；最多保留 '+(d.max_result_projects||4)+' 个可下载项目';
   }catch(e){}
 }
 
@@ -250,7 +252,9 @@ async function loadResults(){
   try{
     const r=await fetch('/api/history');
     const d=await r.json();
+    document.getElementById('publicResultsMeta').textContent='处理队列和历史状态所有人可见；结果和过程文件约 '+retentionMinutes(d)+' 分钟后清理；最多保留 '+(d.max_result_projects||4)+' 个可下载项目；API Key 不共享。';
     document.getElementById('publicResultsMeta').textContent='处理队列和历史状态所有人可见；最多保存 '+(d.max_result_projects||4)+' 个项目下载文件；API Key 不共享。';
+    document.getElementById('publicResultsMeta').textContent='处理队列和历史状态所有人可见；结果和过程文件约 '+retentionMinutes(d)+' 分钟后清理；最多保留 '+(d.max_result_projects||4)+' 个可下载项目；API Key 不共享。';
     const active=d.active_tasks||[];
     const results=d.results||[];
     if(active.length===0&&results.length===0){
