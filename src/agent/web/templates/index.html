@@ -5,233 +5,218 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PRIDE AI-ready Agent</title>
 <style>
-:root{--bg:#0f1117;--card:#1a1d27;--border:#2a2d3a;--text:#e4e4e7;--muted:#71717a;--accent:#6366f1;--accent-hover:#818cf8;--green:#22c55e;--red:#ef4444;--yellow:#f59e0b;--blue:#3b82f6;--cyan:#06b6d4;--radius:10px}
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;background:var(--bg);color:var(--text);min-height:100vh;line-height:1.6}
-.container{max-width:1240px;margin:0 auto;padding:20px}
-header{text-align:center;padding:28px 0 20px;border-bottom:1px solid var(--border);margin-bottom:24px}
-header h1{font-size:1.5rem;font-weight:700;background:linear-gradient(135deg,var(--accent),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-header p{color:var(--muted);font-size:0.85rem;margin-top:4px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
-.form-row{display:flex;gap:12px;margin-bottom:12px;align-items:center}
-.form-row label{min-width:80px;font-size:0.82rem;color:var(--muted);text-align:right}
-.form-row input{flex:1;padding:9px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.88rem;transition:border-color .2s}
-.form-row input:focus{outline:none;border-color:var(--accent)}
-.form-row input::placeholder{color:#4a4a5a}
-.form-row input.error{border-color:var(--red);background:#1a0a0a}
+:root{--bg:#101114;--surface:#191b20;--panel:#111318;--line:#2a2e36;--text:#e8e8ea;--muted:#8b909a;--soft:#5f6673;--accent:#2dd4bf;--accent2:#60a5fa;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--radius:8px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{min-height:100vh;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;line-height:1.55}
+button,input{font:inherit}
+.container{max-width:1280px;margin:0 auto;padding:22px}
+header{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;padding:8px 0 18px;border-bottom:1px solid var(--line);margin-bottom:18px}
+h1{font-size:1.35rem;letter-spacing:0}
+.subtitle{font-size:.82rem;color:var(--muted);margin-top:3px}
+.server-status{font-size:.8rem;color:var(--muted);white-space:nowrap}
+.grid{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:14px;align-items:start}
+.surface{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:18px}
+.surface h2{font-size:.92rem;margin-bottom:12px}
 .main-input{display:flex;gap:10px;margin-bottom:10px}
-.main-input input{flex:1;padding:12px 16px;background:var(--bg);border:2px solid var(--border);border-radius:8px;color:var(--text);font-size:1rem;transition:border-color .2s}
-.main-input input:focus{outline:none;border-color:var(--accent)}
-.btn{padding:12px 24px;border:none;border-radius:8px;font-size:0.9rem;font-weight:600;cursor:pointer;transition:all .15s}
-.btn-primary{background:var(--accent);color:#fff}
-.btn-primary:hover{background:var(--accent-hover)}
-.btn-primary:disabled{background:#3a3a5a;cursor:not-allowed}
-.btn-green{background:var(--green);color:#fff}
-.btn-green:hover{background:#16a34a}
-.btn-secondary{background:transparent;color:var(--text);border:1px solid var(--border)}
+.main-input input{flex:1;min-width:0;padding:12px 14px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);color:var(--text)}
+.main-input input:focus,.form-row input:focus{outline:none;border-color:var(--accent)}
+.examples{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:.78rem;color:var(--muted);margin-bottom:14px}
+.examples button{padding:3px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--accent);cursor:pointer}
+.btn{border:0;border-radius:var(--radius);padding:11px 16px;font-size:.86rem;font-weight:650;cursor:pointer;transition:.15s background,.15s border-color,.15s color}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+.btn-primary{background:var(--accent);color:#06201d}
+.btn-primary:hover{background:#5eead4}
+.btn-secondary{background:transparent;color:var(--text);border:1px solid var(--line)}
 .btn-secondary:hover{border-color:var(--accent);color:var(--accent)}
-.btn-secondary:disabled{color:var(--muted);border-color:var(--border);cursor:not-allowed}
-.btn-small{padding:7px 12px;font-size:0.78rem;border-radius:6px}
-.config-actions{display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap;padding-left:92px}
-.inline-status{font-size:0.78rem;color:var(--muted)}
+.btn-green{background:var(--green);color:#06140a}
+.btn-small{padding:7px 10px;font-size:.78rem}
+.config-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:8px;padding-top:12px;border-top:1px solid var(--line)}
+.config-toggle{background:transparent;border:0;color:var(--muted);cursor:pointer;font-size:.82rem}
+.config-body{display:none;margin-top:12px}
+.config-body.open{display:block}
+.form-row{display:grid;grid-template-columns:86px minmax(0,1fr);gap:10px;align-items:center;margin-bottom:9px}
+.form-row label{text-align:right;color:var(--muted);font-size:.8rem}
+.form-row input{width:100%;padding:9px 11px;background:var(--panel);border:1px solid var(--line);border-radius:6px;color:var(--text)}
+.form-row input.error{border-color:var(--red);background:#231215}
+.config-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-left:96px}
+.inline-status{font-size:.78rem;color:var(--muted)}
 .inline-status.ok{color:var(--green)}
 .inline-status.error{color:var(--red)}
-.server-status{margin-left:auto;font-size:0.78rem;color:var(--muted)}
-.examples{margin-top:6px;display:flex;gap:6px;flex-wrap:wrap}
-.examples span{background:#1e1e30;color:var(--accent);padding:3px 10px;border-radius:5px;font-size:0.78rem;cursor:pointer;border:1px solid var(--border);transition:all .15s}
-.examples span:hover{background:#252540;border-color:var(--accent)}
-.config-toggle{cursor:pointer;display:flex;align-items:center;gap:6px;font-size:0.82rem;color:var(--muted);margin-bottom:10px;user-select:none}
-.config-toggle .arrow{transition:transform .2s;display:inline-block}
-.config-toggle .arrow.open{transform:rotate(90deg)}
-.config-body{display:none;overflow:hidden}
-.config-body.open{display:block}
-.warn-banner{background:#1a1500;border:1px solid var(--yellow);border-radius:8px;padding:12px 16px;margin-bottom:14px;font-size:0.82rem;color:#fbbf24;display:none}
-.warn-banner.show{display:block}
-.steps{display:flex;gap:4px;margin-bottom:16px}
-.step-item{flex:1;text-align:center;padding:8px 4px;border-radius:6px;font-size:0.75rem;font-weight:500;background:var(--bg);border:1px solid var(--border);color:var(--muted);transition:all .2s}
-.step-item.active{border-color:var(--accent);color:var(--accent);background:#1a1a30}
-.step-item.done{border-color:var(--green);color:var(--green);background:#0a1a0f}
-.step-item.error{border-color:var(--red);color:var(--red);background:#1a0a0a}
-.log-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
-.log-header span{font-size:0.8rem;color:var(--muted)}
-.log-filters{display:flex;gap:4px}
-.log-filters button{padding:2px 8px;border:1px solid var(--border);background:transparent;color:var(--muted);border-radius:4px;font-size:0.72rem;cursor:pointer;transition:all .15s}
-.log-filters button.active{border-color:var(--accent);color:var(--accent);background:#1a1a30}
-.log-filters button:hover{border-color:var(--accent)}
-.log-box{background:#0d0e12;border:1px solid var(--border);border-radius:8px;padding:14px;height:480px;overflow-y:auto;font-family:"JetBrains Mono","Fira Code","Cascadia Code","Consolas",monospace;font-size:0.78rem;line-height:1.7}
-.log-box::-webkit-scrollbar{width:6px}
-.log-box::-webkit-scrollbar-track{background:transparent}
-.log-box::-webkit-scrollbar-thumb{background:#333;border-radius:3px}
-.log-line{display:flex;gap:8px;padding:1px 0}
-.log-line .ts{color:#4a4a5a;min-width:65px;flex-shrink:0}
-.log-line .badge{min-width:36px;text-align:center;padding:0 4px;border-radius:3px;font-size:0.68rem;font-weight:600;flex-shrink:0}
-.log-line .badge.info{color:var(--blue);background:#1a2040}
-.log-line .badge.llm{color:var(--cyan);background:#0a2030}
-.log-line .badge.debug{color:#8b5cf6;background:#1a1030}
-.log-line .badge.error{color:var(--red);background:#2a0a0a}
-.log-line .badge.step{color:var(--yellow);background:#2a200a}
-.log-line .msg{flex:1;word-break:normal;overflow-wrap:anywhere;white-space:pre-wrap}
-.log-line .msg.error{color:var(--red)}
-.log-line .msg.llm{color:#67e8f9}
-.log-line .msg.step{color:var(--yellow);font-weight:600}
-.log-line .msg.debug{color:#a78bfa}
-.log-line .msg.info{color:var(--text)}
-.status-bar{display:flex;align-items:center;gap:10px;margin-bottom:14px;padding:10px 14px;background:var(--bg);border-radius:8px;border:1px solid var(--border)}
-.status-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
-.status-dot.pending{background:var(--yellow)}
-.status-dot.queued{background:var(--yellow)}
+.warn{display:none;margin-top:10px;padding:10px 12px;border:1px solid #5d430f;background:#191407;color:#fbbf24;border-radius:var(--radius);font-size:.8rem}
+.warn.show{display:block}
+.public-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}
+.public-meta{font-size:.76rem;color:var(--muted)}
+.result-list{display:flex;flex-direction:column;gap:8px}
+.empty{font-size:.8rem;color:var(--muted)}
+.result-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel)}
+.result-title{font-size:.84rem;font-weight:650;overflow-wrap:anywhere}
+.result-sub{font-size:.74rem;color:var(--muted);margin-top:2px}
+.run-card{display:none;margin-top:14px}
+.steps{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:5px;margin-bottom:14px}
+.step-item{padding:8px 5px;text-align:center;font-size:.74rem;color:var(--muted);background:var(--panel);border:1px solid var(--line);border-radius:6px}
+.step-item.active{color:var(--accent);border-color:var(--accent)}
+.step-item.done{color:var(--green);border-color:var(--green)}
+.step-item.error{color:var(--red);border-color:var(--red)}
+.status-bar{display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);margin-bottom:10px}
+.status-dot{width:9px;height:9px;border-radius:50%;background:var(--amber)}
+.status-dot.queued{background:var(--amber)}
 .status-dot.running{background:var(--accent);animation:pulse 1.2s infinite}
 .status-dot.completed{background:var(--green)}
 .status-dot.failed{background:var(--red)}
-.status-dot.blocked{background:var(--yellow)}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.status-text{font-size:0.85rem;font-weight:500}
-.status-time{margin-left:auto;font-size:0.78rem;color:var(--muted)}
-.queue-panel{display:none;margin-bottom:14px;padding:10px 14px;background:#17130a;border:1px solid #3a2a0a;border-radius:8px;color:#fbbf24;font-size:0.82rem}
+.status-dot.blocked{background:var(--amber)}
+@keyframes pulse{50%{opacity:.3}}
+.status-text{font-size:.86rem;font-weight:650}
+.status-time{margin-left:auto;color:var(--muted);font-size:.78rem}
+.queue-panel{display:none;margin-bottom:12px;padding:10px 12px;background:#191407;border:1px solid #5d430f;color:#fbbf24;border-radius:var(--radius);font-size:.8rem}
 .queue-panel.show{display:block}
-.run-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:14px;align-items:start}
-.run-main{min-width:0}
-.review-panel{position:sticky;top:16px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;max-height:680px;overflow:auto}
-.review-panel h4{font-size:0.86rem;color:var(--text);margin-bottom:8px}
-.review-updated{font-size:0.72rem;color:var(--muted);margin-bottom:10px}
-.review-empty{font-size:0.78rem;color:var(--muted)}
-.review-item{padding:7px 0;border-top:1px solid var(--border)}
-.review-item:first-of-type{border-top:none}
-.review-label{font-size:0.72rem;color:var(--muted);line-height:1.3}
-.review-value{font-size:0.8rem;color:var(--text);overflow-wrap:anywhere;line-height:1.45}
-.review-meta{font-size:0.68rem;color:#52525b;margin-top:2px}
+.run-grid{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:14px;align-items:start}
+.log-header{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:9px}
+.log-count{font-size:.78rem;color:var(--muted)}
+.log-filters{display:flex;gap:4px;flex-wrap:wrap}
+.log-filters button{padding:3px 8px;border:1px solid var(--line);border-radius:5px;background:transparent;color:var(--muted);font-size:.72rem;cursor:pointer}
+.log-filters button.active{border-color:var(--accent);color:var(--accent)}
+.log-box{height:500px;overflow-y:auto;background:#0b0d10;border:1px solid var(--line);border-radius:var(--radius);padding:12px;font-family:"Cascadia Code","JetBrains Mono",Consolas,monospace;font-size:.76rem}
+.log-line{display:flex;gap:8px;padding:1px 0}
+.log-line .ts{color:#59606b;min-width:64px;flex-shrink:0}
+.log-line .badge{min-width:42px;text-align:center;border-radius:4px;font-size:.66rem;font-weight:700;flex-shrink:0}
+.badge.info{color:var(--accent2);background:#101a27}
+.badge.llm{color:var(--accent);background:#0c1e1b}
+.badge.debug{color:#c084fc;background:#1b1026}
+.badge.error{color:#fca5a5;background:#2a1114}
+.badge.step{color:#fbbf24;background:#261b07}
+.msg{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text)}
+.msg.llm{color:#99f6e4}
+.msg.error{color:#fca5a5}
+.msg.step{color:#fbbf24;font-weight:650}
+.review-panel{position:sticky;top:16px;max-height:720px;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px}
+.review-panel h3{font-size:.88rem;margin-bottom:8px}
+.review-empty,.review-updated{font-size:.76rem;color:var(--muted)}
+.review-item{border-top:1px solid var(--line);padding:8px 0}
+.review-label{font-size:.72rem;color:var(--muted)}
+.review-value{font-size:.8rem;overflow-wrap:anywhere}
+.review-meta{font-size:.68rem;color:var(--soft)}
 .review-item.conflict .review-value{color:#fca5a5}
-.review-issues{margin-top:10px;padding-top:10px;border-top:1px solid #3a2a0a;color:#fbbf24;font-size:0.78rem}
-.review-issues li{margin-left:16px;line-height:1.5}
-.result-panel{margin-top:14px;padding:14px;background:var(--bg);border:1px solid var(--border);border-radius:8px}
-.result-panel h4{font-size:0.85rem;color:var(--green);margin-bottom:8px}
-.result-panel .file-list{font-size:0.78rem;color:var(--muted);font-family:monospace;line-height:1.8;max-height:200px;overflow-y:auto}
-.download-status{display:block;margin-top:8px;font-size:0.78rem;color:var(--muted)}
+.review-issues{margin-top:10px;padding-top:10px;border-top:1px solid #5d430f;color:#fbbf24;font-size:.78rem}
+.review-issues li,.blocked-panel li{margin-left:16px}
+.result-panel,.blocked-panel{display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+.result-panel h3,.blocked-panel h3{font-size:.88rem;margin-bottom:8px}
+.file-list{max-height:180px;overflow:auto;font-family:"Cascadia Code",Consolas,monospace;font-size:.76rem;color:var(--muted);line-height:1.7}
+.download-status{display:block;margin-top:8px;font-size:.78rem;color:var(--muted)}
 .download-status.error{color:var(--red)}
-.blocked-panel{margin-top:14px;padding:14px;background:#1a0f0a;border:1px solid var(--red);border-radius:8px}
-.blocked-panel h4{color:var(--red);font-size:0.85rem;margin-bottom:6px}
-.blocked-panel li{color:#fca5a5;font-size:0.8rem;margin-left:16px;line-height:1.6}
-.footer{text-align:center;padding:20px 0;color:#3a3a4a;font-size:0.75rem;border-top:1px solid var(--border);margin-top:20px}
-@media(max-width:980px){.run-layout{grid-template-columns:1fr}.review-panel{position:static;max-height:none}}
+footer{padding:20px 0 4px;color:#575d68;font-size:.74rem;text-align:center}
+@media(max-width:980px){.grid,.run-grid{grid-template-columns:1fr}.review-panel{position:static;max-height:none}header{align-items:flex-start;flex-direction:column}.main-input{flex-direction:column}.steps{grid-template-columns:1fr 1fr}.config-actions{margin-left:0}.form-row{grid-template-columns:1fr}.form-row label{text-align:left}}
 </style>
 </head>
 <body>
 <div class="container">
-<header>
-<h1>PRIDE AI-ready Agent</h1>
-<p>蛋白质组学自动化数据处理 — 输入 PRIDE 文件名，自动推断参数、下载数据、运行 MSDT-Converter</p>
-</header>
+  <header>
+    <div>
+      <h1>PRIDE AI-ready Agent</h1>
+      <div class="subtitle">PRIDE 文件解析、RAW 转换、搜库参数推断与 MSDT-Converter 结果生成</div>
+    </div>
+    <div class="server-status" id="serverStatus">服务器状态读取中...</div>
+  </header>
 
-<!-- 配置警告 -->
-<div class="warn-banner" id="warnBanner">
-请先配置大模型 API Key，否则无法运行。
-</div>
+  <div class="grid">
+    <section class="surface">
+      <h2>创建任务</h2>
+      <div class="main-input">
+        <input type="text" id="inputValue" placeholder="例如 P17_severe_NoPOTS.raw">
+        <button class="btn btn-primary" id="startBtn" onclick="startTask()">启动</button>
+      </div>
+      <div class="form-row"><label>提交人 *</label><input type="text" id="submitter" placeholder="例如 张三 / Alice / 课题组成员名"></div>
+      <div class="examples">
+        示例
+        <button onclick="fill('P17_severe_NoPOTS.raw')">P17_severe_NoPOTS.raw</button>
+        <button onclick="fill('junge_jo000024_20210119_17951_BioID_FZD4_2.raw')">BioID_FZD4_2.raw</button>
+        <button onclick="fill('TOTALRAW_AF_CTRLs.raw')">TOTALRAW_AF_CTRLs.raw</button>
+      </div>
+      <div class="config-head">
+        <button class="config-toggle" onclick="toggleConfig()">API 配置 <span id="configStatus"></span></button>
+        <span class="inline-status" id="apiCheckStatus"></span>
+      </div>
+      <div class="config-body" id="configBody">
+        <div class="form-row"><label>API Key *</label><input type="password" id="cfgApiKey" placeholder="每个用户填写自己的 API Key"></div>
+        <div class="form-row"><label>Base URL</label><input type="text" id="cfgBaseUrl" placeholder="https://api.deepseek.com"></div>
+        <div class="form-row"><label>模型</label><input type="text" id="cfgModel" placeholder="deepseek-v4-flash"></div>
+        <div class="form-row"><label>超时秒数</label><input type="number" id="cfgTimeout" placeholder="1200"></div>
+        <div class="config-actions">
+          <button class="btn btn-secondary btn-small" id="checkApiBtn" onclick="checkLLMConfig()">检查 API Key</button>
+          <span class="inline-status" id="resultRetention"></span>
+        </div>
+      </div>
+      <div class="warn show" id="warnBanner">任务启动前会先检查本次填写的 API Key；服务器不会使用固定公共 Key。</div>
+    </section>
 
-<!-- 输入区 -->
-<div class="card">
-<div class="main-input">
-<input type="text" id="inputValue" placeholder="输入 PRIDE 原始文件名，例如 P17_severe_NoPOTS.raw" />
-<button class="btn btn-primary" id="startBtn" onclick="startTask()">开始运行</button>
-</div>
-<div class="examples">
-示例：
-<span onclick="fill('P17_severe_NoPOTS.raw')">P17_severe_NoPOTS.raw</span>
-<span onclick="fill('junge_jo000024_20210119_17951_BioID_FZD4_2.raw')">BioID_FZD4_2.raw</span>
-<span onclick="fill('TOTALRAW_AF_CTRLs.raw')">TOTALRAW_AF_CTRLs.raw</span>
-</div>
+    <section class="surface">
+      <div class="public-head">
+        <h2>项目历史</h2>
+        <button class="btn btn-secondary btn-small" onclick="loadResults()">刷新</button>
+      </div>
+      <div class="public-meta" id="publicResultsMeta">处理队列和可下载结果所有人可见；API Key 不共享。</div>
+      <div class="result-list" id="publicResults"><div class="empty">正在读取结果...</div></div>
+    </section>
+  </div>
 
-<!-- 配置面板 -->
-<div style="margin-top:14px">
-<div class="config-toggle" onclick="toggleConfig()">
-<span class="arrow" id="configArrow">&#9654;</span> 大模型 API 配置 <span id="configStatus"></span>
-</div>
-<div class="config-body" id="configBody">
-<div class="form-row">
-<label>API Key <span style="color:var(--red)">*</span></label>
-<input type="password" id="cfgApiKey" placeholder="sk-..." />
-</div>
-<div class="form-row">
-<label>Base URL</label>
-<input type="text" id="cfgBaseUrl" placeholder="https://api.deepseek.com" />
-</div>
-<div class="form-row">
-<label>模型</label>
-<input type="text" id="cfgModel" placeholder="deepseek-v4-flash" />
-</div>
-<div class="form-row">
-<label>超时(秒)</label>
-<input type="number" id="cfgTimeout" placeholder="1200" />
-</div>
-<div class="config-actions">
-<button class="btn btn-secondary btn-small" id="checkApiBtn" onclick="checkLLMConfig()">检查 API Key</button>
-<span class="inline-status" id="apiCheckStatus"></span>
-<span class="server-status" id="serverStatus"></span>
-</div>
-</div>
-</div>
-</div>
+  <section class="surface run-card" id="runCard">
+    <div class="steps" id="steps">
+      <div class="step-item" data-step="1">1 解析项目</div>
+      <div class="step-item" data-step="2">2 下载/转换</div>
+      <div class="step-item" data-step="3">3 生成配置</div>
+      <div class="step-item" data-step="4">4 Docker 执行</div>
+      <div class="step-item" data-step="5">5 完成</div>
+    </div>
+    <div class="status-bar">
+      <span class="status-dot" id="statusDot"></span>
+      <span class="status-text" id="statusText">等待中</span>
+      <span class="status-time" id="statusTime"></span>
+    </div>
+    <div class="queue-panel" id="queuePanel"></div>
+    <div class="run-grid">
+      <div>
+        <div class="log-header">
+          <span class="log-count" id="logCount">0 条日志</span>
+          <div class="log-filters">
+            <button class="active" data-filter="all" onclick="setFilter('all',this)">全部</button>
+            <button data-filter="info" onclick="setFilter('info',this)">INFO</button>
+            <button data-filter="llm" onclick="setFilter('llm',this)">LLM</button>
+            <button data-filter="debug" onclick="setFilter('debug',this)">DEBUG</button>
+            <button data-filter="error" onclick="setFilter('error',this)">ERROR</button>
+            <button data-filter="step" onclick="setFilter('step',this)">STEP</button>
+          </div>
+        </div>
+        <div class="log-box" id="logBox"></div>
+        <div class="result-panel" id="resultPanel">
+          <h3>结果文件</h3>
+          <div class="file-list" id="fileList"></div>
+          <button class="btn btn-green" id="downloadBtn" style="margin-top:12px" onclick="downloadResults()">下载 ZIP</button>
+          <span class="download-status" id="downloadStatus"></span>
+        </div>
+        <div class="blocked-panel" id="blockedPanel">
+          <h3>需要人工处理</h3>
+          <ul id="issuesList"></ul>
+        </div>
+      </div>
+      <aside class="review-panel" id="reviewPanel">
+        <h3>人工复核参数</h3>
+        <div class="review-empty">任务运行后会固定显示 workflow、FASTA、搜库参数、修饰和需要复核的问题。</div>
+      </aside>
+    </div>
+  </section>
 
-<!-- 进度 + 日志 -->
-<div class="card" id="runCard" style="display:none">
-<div class="steps" id="steps">
-<div class="step-item" data-step="1">1 解析项目</div>
-<div class="step-item" data-step="2">2 下载数据</div>
-<div class="step-item" data-step="3">3 生成输入</div>
-<div class="step-item" data-step="4">4 Docker运行</div>
-<div class="step-item" data-step="5">5 完成</div>
-</div>
-<div class="status-bar">
-<span class="status-dot" id="statusDot"></span>
-<span class="status-text" id="statusText">等待中...</span>
-<span class="status-time" id="statusTime"></span>
-</div>
-<div class="queue-panel" id="queuePanel"></div>
-<div class="run-layout">
-<div class="run-main">
-<div class="log-header">
-<span id="logCount">0 条日志</span>
-<div class="log-filters">
-<button class="active" data-filter="all" onclick="setFilter('all',this)">全部</button>
-<button data-filter="info" onclick="setFilter('info',this)">信息</button>
-<button data-filter="llm" onclick="setFilter('llm',this)">大模型</button>
-<button data-filter="debug" onclick="setFilter('debug',this)">调试</button>
-<button data-filter="error" onclick="setFilter('error',this)">错误</button>
-<button data-filter="step" onclick="setFilter('step',this)">步骤</button>
-</div>
-</div>
-<div class="log-box" id="logBox"></div>
-<div class="result-panel" id="resultPanel" style="display:none">
-<h4>运行完成 — 输出文件</h4>
-<div class="file-list" id="fileList"></div>
-<button class="btn btn-green" id="downloadBtn" style="margin-top:12px" onclick="downloadResults()">下载结果文件 (ZIP)</button>
-<span class="download-status" id="downloadStatus"></span>
-</div>
-<div class="blocked-panel" id="blockedPanel" style="display:none">
-<h4>运行被阻断</h4>
-<ul id="issuesList"></ul>
-</div>
-</div>
-<aside class="review-panel" id="reviewPanel">
-<h4>待复核参数</h4>
-<div class="review-empty">任务开始后会固定显示 workflow、FASTA、搜库参数和需要人工复核的问题。</div>
-</aside>
-</div>
-</div>
-
-<div class="footer">PRIDE AI-ready Agent v0.3.1 &middot; FastAPI + FragPipe + MSDT-Converter + LLM</div>
+  <footer>PRIDE AI-ready Agent v0.3.1</footer>
 </div>
 
 <script>
 let taskId=null,ws=null,currentFilter='all',allLogs=[],startTime=null,timerInterval=null;
 
 function fill(v){document.getElementById('inputValue').value=v}
+function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function now(){const d=new Date();return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0')}
+function formatSize(n){if(n>1024*1024*1024)return(n/1024/1024/1024).toFixed(1)+' GB';if(n>1024*1024)return(n/1024/1024).toFixed(1)+' MB';if(n>1024)return(n/1024).toFixed(1)+' KB';return(n||0)+' B'}
+function formatRetention(sec){const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60);return h>0?h+' 小时 '+m+' 分钟':m+' 分钟'}
+function toggleConfig(){document.getElementById('configBody').classList.toggle('open')}
 
-function toggleConfig(){
-  document.getElementById('configBody').classList.toggle('open');
-  document.getElementById('configArrow').classList.toggle('open');
-}
-
-// 加载配置
 async function loadConfig(){
   try{
     const r=await fetch('/api/config');
@@ -239,13 +224,9 @@ async function loadConfig(){
     document.getElementById('cfgBaseUrl').value=d.base_url||'';
     document.getElementById('cfgModel').value=d.model||'';
     document.getElementById('cfgTimeout').value=d.timeout||'';
-    document.getElementById('cfgApiKey').placeholder='请填写本次任务使用的 API Key（必填）';
-    document.getElementById('configStatus').textContent='(每个用户单独填写)';
-    document.getElementById('configStatus').style.color='#f59e0b';
-    document.getElementById('warnBanner').classList.add('show');
-    // 自动展开配置面板
     document.getElementById('configBody').classList.add('open');
-    document.getElementById('configArrow').classList.add('open');
+    document.getElementById('configStatus').textContent='每次任务单独填写';
+    document.getElementById('resultRetention').textContent='结果保存 '+formatRetention(d.result_retention_seconds||7200);
     updateServerStatus(d);
   }catch(e){}
 }
@@ -253,43 +234,71 @@ async function loadConfig(){
 async function loadHealth(){
   try{
     const r=await fetch('/api/health');
-    const d=await r.json();
-    updateServerStatus(d);
+    updateServerStatus(await r.json());
   }catch(e){}
 }
 
 function updateServerStatus(d){
-  const running=d.running_tasks||0;
-  const queued=d.queued_tasks||0;
-  const max=d.max_concurrent_tasks||1;
-  document.getElementById('serverStatus').textContent='运行 '+running+'/'+max+' · 排队 '+queued;
+  const running=d.running_tasks||0,queued=d.queued_tasks||0,max=d.max_concurrent_tasks||1;
+  document.getElementById('serverStatus').textContent='运行 '+running+'/'+max+'，排队 '+queued;
 }
 
-// 校验配置
+async function loadResults(){
+  const box=document.getElementById('publicResults');
+  try{
+    const r=await fetch('/api/history');
+    const d=await r.json();
+    document.getElementById('publicResultsMeta').textContent='处理队列和可下载结果所有人可见；结果保存 '+formatRetention(d.retention_seconds||7200)+'；API Key 不共享。';
+    const active=d.active_tasks||[];
+    const results=d.results||[];
+    if(active.length===0&&results.length===0){
+      box.innerHTML='<div class="empty">暂无处理中的任务或可下载结果。</div>';
+      return;
+    }
+    const activeHtml=active.map(item=>{
+      const pos=item.queue_position?(' · 队列 '+item.queue_position):'';
+      return '<div class="result-row"><div><div class="result-title">'+esc(item.input_value||item.output_dir||item.task_id)+'</div><div class="result-sub">'+
+        esc(item.submitter||'未填写')+' · '+esc(item.status||'unknown')+pos+
+        '</div></div><span class="public-meta">处理中</span></div>';
+    }).join('');
+    const resultHtml=results.map(item=>{
+      const left=Math.max(0,item.expires_in_seconds||0);
+      return '<div class="result-row"><div><div class="result-title">'+esc(item.input_value||item.name)+'</div><div class="result-sub">'+
+        esc(item.submitter||'未填写')+' · '+esc(item.file_count)+' 个文件 · '+formatSize(item.size_bytes)+' · 剩余 '+formatRetention(left)+
+        '</div></div><button class="btn btn-secondary btn-small" onclick="downloadPublicResult(\''+esc(item.result_id).replace(/'/g,'&#39;')+'\')">下载</button></div>';
+    }).join('');
+    box.innerHTML=activeHtml+resultHtml;
+  }catch(e){
+    box.innerHTML='<div class="empty">项目历史读取失败。</div>';
+  }
+}
+
+function downloadPublicResult(id){window.location.href='/api/results/'+encodeURIComponent(id)+'/download'}
+
 function validateConfig(){
   const key=document.getElementById('cfgApiKey').value.trim();
-  if(!key){
-    document.getElementById('cfgApiKey').classList.add('error');
-    document.getElementById('cfgApiKey').focus();
-    // 展开配置面板
-    document.getElementById('configBody').classList.add('open');
-    document.getElementById('configArrow').classList.add('open');
-    return false;
-  }
-  document.getElementById('cfgApiKey').classList.remove('error');
+  const input=document.getElementById('cfgApiKey');
+  if(!key){input.classList.add('error');input.focus();document.getElementById('configBody').classList.add('open');return false}
+  input.classList.remove('error');
   return true;
 }
 
-// 输入时移除错误样式
-document.getElementById('cfgApiKey').addEventListener('input',function(){
-  this.classList.remove('error');
-  const status=document.getElementById('apiCheckStatus');
-  status.textContent='';
-  status.className='inline-status';
-  if(this.value.trim()){
-    document.getElementById('warnBanner').classList.remove('show');
-    document.getElementById('configStatus').textContent='';
+function validateSubmitter(){
+  const input=document.getElementById('submitter');
+  const value=input.value.trim();
+  if(!value){input.classList.add('error');input.focus();return false}
+  input.classList.remove('error');
+  return true;
+}
+
+document.addEventListener('input',e=>{
+  if(e.target&&e.target.id==='cfgApiKey'){
+    e.target.classList.remove('error');
+    const status=document.getElementById('apiCheckStatus');
+    status.textContent='';
+    status.className='inline-status';
   }
+  if(e.target&&e.target.id==='submitter')e.target.classList.remove('error');
 });
 
 function collectConfig(){
@@ -301,45 +310,22 @@ function collectConfig(){
   if(ak)cfg.api_key=ak;
   if(bu)cfg.base_url=bu;
   if(mo)cfg.model=mo;
-  if(to)cfg.timeout=parseInt(to);
+  if(to)cfg.timeout=to;
   return cfg;
 }
 
 async function checkLLMConfig(){
-  if(!validateConfig()){
-    alert('请先填写大模型 API Key');
-    return false;
-  }
-  const btn=document.getElementById('checkApiBtn');
-  const status=document.getElementById('apiCheckStatus');
-  btn.disabled=true;
-  status.textContent='检查中...';
-  status.className='inline-status';
+  if(!validateConfig()){alert('请先填写 API Key');return false}
+  const btn=document.getElementById('checkApiBtn'),status=document.getElementById('apiCheckStatus');
+  btn.disabled=true;status.textContent='检查中...';status.className='inline-status';
   try{
-    const resp=await fetch('/api/llm/check',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({llm_config:collectConfig()})
-    });
+    const resp=await fetch('/api/llm/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({llm_config:collectConfig()})});
     const data=await resp.json();
-    if(data.ok){
-      status.textContent='API Key 可用';
-      status.className='inline-status ok';
-      document.getElementById('cfgApiKey').classList.remove('error');
-      return true;
-    }
-    status.textContent=data.error||'API Key 检查失败';
-    status.className='inline-status error';
-    document.getElementById('cfgApiKey').classList.add('error');
-    return false;
+    if(data.ok){status.textContent='API Key 可用';status.className='inline-status ok';return true}
+    status.textContent=data.error||'API Key 检查失败';status.className='inline-status error';document.getElementById('cfgApiKey').classList.add('error');return false;
   }catch(e){
-    status.textContent='检查请求失败';
-    status.className='inline-status error';
-    return false;
-  }finally{
-    btn.disabled=false;
-    loadHealth();
-  }
+    status.textContent='检查请求失败';status.className='inline-status error';return false;
+  }finally{btn.disabled=false;loadHealth()}
 }
 
 function setFilter(f,btn){
@@ -354,10 +340,10 @@ function renderLogs(){
   box.innerHTML='';
   allLogs.forEach(log=>{
     if(currentFilter!=='all'&&log.level&&log.level!==currentFilter)return;
+    const lvl=log.level||'info';
     const div=document.createElement('div');
     div.className='log-line';
-    const lvl=log.level||'info';
-    div.innerHTML=`<span class="ts">${log.ts||''}</span><span class="badge ${lvl}">${lvl.toUpperCase()}</span><span class="msg ${lvl}">${esc(log.message||'')}</span>`;
+    div.innerHTML='<span class="ts">'+esc(log.ts||'')+'</span><span class="badge '+lvl+'">'+lvl.toUpperCase()+'</span><span class="msg '+lvl+'">'+esc(log.message||'')+'</span>';
     box.appendChild(div);
   });
   box.scrollTop=box.scrollHeight;
@@ -367,229 +353,124 @@ function renderLogs(){
 function receiveLog(msg){
   if(msg.replace&&msg.key){
     const idx=allLogs.findIndex(log=>log.key===msg.key);
-    if(idx>=0)allLogs[idx]=msg;
-    else allLogs.push(msg);
-    renderLogs();
-    return;
-  }
-  allLogs.push(msg);
+    if(idx>=0)allLogs[idx]=msg;else allLogs.push(msg);
+  }else{allLogs.push(msg)}
   renderLogs();
 }
-
-function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 
 function setStep(n,status){
   document.querySelectorAll('.step-item').forEach(el=>{
     const s=parseInt(el.dataset.step);
     el.classList.remove('active','done','error');
     if(s<n)el.classList.add('done');
-    else if(s===n){
-      if(status==='error')el.classList.add('error');
-      else el.classList.add('active');
-    }
+    else if(s===n)el.classList.add(status==='error'?'error':'active');
   });
 }
 
 function setStatus(s){
-  const dot=document.getElementById('statusDot');
-  const txt=document.getElementById('statusText');
+  const dot=document.getElementById('statusDot'),txt=document.getElementById('statusText');
   dot.className='status-dot '+s;
-  const m={pending:'等待中...',queued:'排队中...',running:'运行中...',completed:'运行完成',failed:'运行失败',blocked:'已阻断'};
+  const m={pending:'等待中',queued:'排队中',running:'运行中',completed:'运行完成',failed:'运行失败',blocked:'需要复核'};
   txt.textContent=m[s]||s;
 }
 
 function updateQueuePanel(data){
   const panel=document.getElementById('queuePanel');
-  if(!data||data.status!=='queued'){
-    panel.classList.remove('show');
-    panel.textContent='';
-    return;
-  }
-  const pos=data.queue_position||0;
-  const len=data.queue_length||data.queued_tasks||0;
-  const running=data.running_tasks||0;
-  const max=data.max_concurrent_tasks||1;
-  panel.textContent='任务已进入队列：当前位置 '+pos+'/'+len+'；正在运行 '+running+'/'+max+'。页面保持打开后会自动开始。';
+  if(!data||data.status!=='queued'){panel.classList.remove('show');panel.textContent='';return}
+  const pos=data.queue_position||0,len=data.queue_length||data.queued_tasks||0,running=data.running_tasks||0,max=data.max_concurrent_tasks||1;
+  panel.textContent='任务已进入队列，当前位置 '+pos+'/'+len+'。服务器正在运行 '+running+'/'+max+' 个任务，空位释放后会自动启动。';
   panel.classList.add('show');
 }
 
 function startTimer(){
   startTime=Date.now();
+  clearInterval(timerInterval);
   timerInterval=setInterval(()=>{
-    if(!startTime)return;
     const sec=Math.floor((Date.now()-startTime)/1000);
     document.getElementById('statusTime').textContent=Math.floor(sec/60)+':'+String(sec%60).padStart(2,'0');
   },1000);
 }
-
-function stopTimer(){if(timerInterval)clearInterval(timerInterval)}
-
-function now(){
-  const d=new Date();
-  return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0');
-}
-
-function addLog(msg){
-  const box=document.getElementById('logBox');
-  const div=document.createElement('div');
-  div.className='log-line';
-  const lvl=msg.level||'info';
-  div.innerHTML=`<span class="ts">${msg.ts||''}</span><span class="badge ${lvl}">${lvl.toUpperCase()}</span><span class="msg ${lvl}">${esc(msg.message||'')}</span>`;
-  box.appendChild(div);
-  box.scrollTop=box.scrollHeight;
-}
+function stopTimer(){clearInterval(timerInterval)}
 
 function renderReview(summary){
   const panel=document.getElementById('reviewPanel');
   if(!summary||!summary.items){
-    panel.innerHTML='<h4>待复核参数</h4><div class="review-empty">任务开始后会固定显示 workflow、FASTA、搜库参数和需要人工复核的问题。</div>';
+    panel.innerHTML='<h3>人工复核参数</h3><div class="review-empty">任务运行后会固定显示 workflow、FASTA、搜库参数、修饰和需要复核的问题。</div>';
     return;
   }
-  let html='<h4>待复核参数</h4>';
-  html+='<div class="review-updated">更新：'+esc(summary.updated_at||'')+(summary.needs_review?' · 需要复核':' · 当前可用')+'</div>';
-  if(summary.items.length===0){
-    html+='<div class="review-empty">暂无可显示参数。</div>';
-  }else{
-    summary.items.forEach(item=>{
-      const cls=item.conflict?'review-item conflict':'review-item';
-      const meta=[];
-      if(item.source)meta.push(item.source);
-      if(typeof item.confidence==='number')meta.push('confidence '+item.confidence.toFixed(2));
-      html+='<div class="'+cls+'"><div class="review-label">'+esc(item.label||'')+'</div><div class="review-value">'+esc(item.value||'')+'</div>';
-      if(meta.length)html+='<div class="review-meta">'+esc(meta.join(' · '))+'</div>';
-      html+='</div>';
-    });
-  }
+  let html='<h3>人工复核参数</h3><div class="review-updated">更新时间 '+esc(summary.updated_at||'')+(summary.needs_review?' · 需要人工复核':' · 自动推断')+'</div>';
+  if(summary.items.length===0){html+='<div class="review-empty">暂无参数。</div>'}
+  summary.items.forEach(item=>{
+    const meta=[];
+    if(item.source)meta.push(item.source);
+    if(typeof item.confidence==='number')meta.push('confidence '+item.confidence.toFixed(2));
+    html+='<div class="review-item '+(item.conflict?'conflict':'')+'"><div class="review-label">'+esc(item.label)+'</div><div class="review-value">'+esc(item.value)+'</div>';
+    if(meta.length)html+='<div class="review-meta">'+esc(meta.join(' · '))+'</div>';
+    html+='</div>';
+  });
   if(summary.issues&&summary.issues.length){
-    html+='<div class="review-issues"><strong>需要人工复核</strong><ul>';
-    summary.issues.forEach(issue=>{html+='<li>'+esc(issue)+'</li>';});
-    html+='</ul></div>';
+    html+='<div class="review-issues"><strong>问题</strong><ul>'+summary.issues.map(i=>'<li>'+esc(i)+'</li>').join('')+'</ul></div>';
   }
   panel.innerHTML=html;
 }
 
 async function startTask(){
-  // 校验文件名
   const input=document.getElementById('inputValue').value.trim();
-  if(!input){alert('请输入 PRIDE 文件名');return;}
-
-  // 校验 API Key
-  if(!validateConfig()){
-    alert('请先填写大模型 API Key');
-    return;
-  }
-
+  if(!input){alert('请输入 PRIDE 文件名');return}
+  if(!validateSubmitter()){alert('请填写提交人');return}
+  if(!validateConfig()){alert('请先填写 API Key');return}
   const btn=document.getElementById('startBtn');
-  btn.disabled=true;
-  btn.textContent='检查中...';
-
+  btn.disabled=true;btn.textContent='创建中...';
   document.getElementById('runCard').style.display='block';
   document.getElementById('resultPanel').style.display='none';
   document.getElementById('blockedPanel').style.display='none';
-  updateQueuePanel(null);
-  document.getElementById('logBox').innerHTML='';
-  allLogs=[];
-  renderReview(null);
   document.getElementById('downloadStatus').textContent='';
-  document.getElementById('downloadStatus').className='download-status';
-  setStep(0);
-  setStatus('running');
-  startTimer();
-  addLog({level:'info',message:'正在检查 API Key 和服务器并发限制...',ts:now()});
+  allLogs=[];renderLogs();renderReview(null);setStep(0);setStatus('running');updateQueuePanel(null);startTimer();
+  receiveLog({type:'log',level:'info',message:'正在检查 API Key 并创建任务...',ts:now()});
 
-  // 收集配置
-  const cfg=collectConfig();
-
-  // 创建任务
   let data;
   try{
-    const resp=await fetch('/api/tasks',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({input_value:input,llm_config:cfg})
-    });
+    const resp=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({input_value:input,submitter:document.getElementById('submitter').value.trim(),llm_config:collectConfig()})});
     data=await resp.json();
   }catch(e){
-    addLog({level:'error',message:'请求失败：'+e,ts:now()});
-    setStatus('failed');stopTimer();btn.disabled=false;btn.textContent='开始运行';return;
+    receiveLog({type:'log',level:'error',message:'创建任务请求失败：'+e,ts:now()});
+    setStatus('failed');stopTimer();btn.disabled=false;btn.textContent='启动';return;
   }
-
   if(data.error){
-    addLog({level:'error',message:data.error,ts:now()});
-    setStatus('failed');stopTimer();btn.disabled=false;btn.textContent='开始运行';
-    // 如果是配置问题，展开配置面板并高亮
-    if(data.error.includes('API Key')||data.error.includes('配置')){
-      document.getElementById('configBody').classList.add('open');
-      document.getElementById('configArrow').classList.add('open');
-      document.getElementById('cfgApiKey').classList.add('error');
-      document.getElementById('cfgApiKey').focus();
-    }
-    loadHealth();
-    return;
+    receiveLog({type:'log',level:'error',message:data.error,ts:now()});
+    setStatus('failed');stopTimer();btn.disabled=false;btn.textContent='启动';loadHealth();return;
   }
-
   taskId=data.task_id;
-  addLog({level:'info',message:'任务已创建：'+taskId,ts:now()});
-  if(data.status==='queued'){
-    setStatus('queued');
-    updateQueuePanel(data);
-    btn.textContent='排队中...';
-  }else{
-    btn.textContent='运行中...';
-  }
+  receiveLog({type:'log',level:'info',message:'任务已创建：'+taskId,ts:now()});
+  if(data.status==='queued'){setStatus('queued');updateQueuePanel(data);btn.textContent='排队中...'}else{btn.textContent='运行中...'}
   loadHealth();
 
-  // WebSocket
   const proto=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(proto+'//'+location.host+'/ws/tasks/'+taskId);
-
-  ws.onmessage=function(e){
+  ws.onmessage=e=>{
     const msg=JSON.parse(e.data);
-    if(msg.type==='log'){
-      receiveLog(msg);
-    }else if(msg.type==='step'){
-      setStatus('running');
-      updateQueuePanel(null);
-      btn.textContent='运行中...';
-      setStep(msg.step,'active');
-      allLogs.push({type:'log',level:'step',message:msg.message,ts:msg.ts});
-      if(currentFilter==='all'||currentFilter==='step')addLog({level:'step',message:msg.message,ts:msg.ts});
-    }else if(msg.type==='queue'){
-      setStatus('queued');
-      updateQueuePanel(msg);
-      loadHealth();
-    }else if(msg.type==='review'){
-      renderReview(msg.summary);
-    }else if(msg.type==='done'){
-      updateQueuePanel(null);
-      setStatus(msg.status);stopTimer();btn.disabled=false;btn.textContent='开始运行';
+    if(msg.type==='log')receiveLog(msg);
+    else if(msg.type==='step'){setStatus('running');updateQueuePanel(null);btn.textContent='运行中...';setStep(msg.step,'active');receiveLog({type:'log',level:'step',message:msg.message,ts:msg.ts})}
+    else if(msg.type==='queue'){setStatus('queued');updateQueuePanel(msg);loadHealth()}
+    else if(msg.type==='review')renderReview(msg.summary);
+    else if(msg.type==='done'){
+      updateQueuePanel(null);setStatus(msg.status);stopTimer();btn.disabled=false;btn.textContent='启动';
       if(msg.status==='completed')showResults();
       if(msg.status==='blocked')loadIssues();
-      loadHealth();
+      loadHealth();loadResults();
     }
   };
-
-  ws.onerror=function(){
-    addLog({level:'error',message:'WebSocket 连接错误',ts:now()});
-    setStatus('failed');stopTimer();btn.disabled=false;btn.textContent='开始运行';
-  };
-
-  ws.onclose=function(){
-    if(document.getElementById('statusDot').classList.contains('running')){
-      setStatus('failed');stopTimer();btn.disabled=false;btn.textContent='开始运行';
-    }
-  };
+  ws.onerror=()=>{receiveLog({type:'log',level:'error',message:'WebSocket 连接错误',ts:now()});setStatus('failed');stopTimer();btn.disabled=false;btn.textContent='启动'};
 }
 
 async function showResults(){
   const r=await fetch('/api/tasks/'+taskId);
   const d=await r.json();
   renderReview(d.review_summary);
-  const fileList=document.getElementById('fileList');
   const fileLines=allLogs.filter(l=>l.message&&l.message.includes('  (')&&l.message.includes(')')).map(l=>l.message);
-  fileList.innerHTML=fileLines.length>0?fileLines.map(f=>'<div>'+esc(f)+'</div>').join(''):'<div>结果文件已生成，请下载查看。</div>';
+  document.getElementById('fileList').innerHTML=fileLines.length?fileLines.map(f=>'<div>'+esc(f)+'</div>').join(''):'<div>结果目录已生成，可下载 ZIP。</div>';
   const status=document.getElementById('downloadStatus');
-  status.textContent=d.can_download?'可以下载 ZIP 结果文件。':'还没有可下载文件，请查看日志确认任务是否已生成输出。';
+  status.textContent=d.can_download?'可下载 ZIP 结果文件。':'当前没有可下载文件。';
   status.className=d.can_download?'download-status':'download-status error';
   document.getElementById('resultPanel').style.display='block';
   setStep(5,'done');
@@ -599,43 +480,32 @@ async function loadIssues(){
   const r=await fetch('/api/tasks/'+taskId);
   const d=await r.json();
   renderReview(d.review_summary);
-  if(d.blocking_issues&&d.blocking_issues.length>0){
-    const list=document.getElementById('issuesList');
-    list.innerHTML='';
-    d.blocking_issues.forEach(issue=>{const li=document.createElement('li');li.textContent=issue;list.appendChild(li);});
-    document.getElementById('blockedPanel').style.display='block';
-  }
+  const list=document.getElementById('issuesList');
+  list.innerHTML=(d.blocking_issues||[]).map(i=>'<li>'+esc(i)+'</li>').join('');
+  document.getElementById('blockedPanel').style.display='block';
   setStep(4,'error');
 }
 
 async function downloadResults(){
   if(!taskId)return;
   const status=document.getElementById('downloadStatus');
-  status.textContent='正在检查结果文件...';
-  status.className='download-status';
+  status.textContent='正在准备下载...';status.className='download-status';
   try{
     const r=await fetch('/api/tasks/'+taskId);
     const d=await r.json();
-    if(!d.can_download){
-      status.textContent='没有可下载文件：任务输出目录为空或尚未生成结果。';
-      status.className='download-status error';
-      return;
-    }
-    const a=document.createElement('a');
-    a.href='/api/tasks/'+taskId+'/download';
-    a.download='';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
+    if(!d.can_download){status.textContent='没有可下载文件。';status.className='download-status error';return}
+    window.location.href='/api/tasks/'+taskId+'/download';
     status.textContent='下载已开始。';
   }catch(e){
-    status.textContent='下载失败：'+e;
-    status.className='download-status error';
+    status.textContent='下载失败：'+e;status.className='download-status error';
   }
 }
 
 loadConfig();
 loadHealth();
+loadResults();
+setInterval(loadHealth,5000);
+setInterval(loadResults,30000);
 </script>
 </body>
 </html>

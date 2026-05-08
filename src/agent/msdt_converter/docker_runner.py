@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable
 
+from agent.docker_paths import docker_host_mount_path
 from agent.models import MaterializedTaskBundle
 from agent.utils import emit, run_command_streaming
 
@@ -118,7 +119,7 @@ class DockerMSDTConverterRunner:
         return bundle.converter_config_path
 
     def build_command(self, bundle: MaterializedTaskBundle) -> list[str]:
-        task_root = bundle.task_root.resolve()
+        task_root = docker_host_mount_path(bundle.task_root)
         container_config_path = f"/workspace/{bundle.converter_config_path.name}"
         return [
             "docker",

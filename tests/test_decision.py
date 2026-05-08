@@ -253,6 +253,32 @@ def test_plan_dda_execution_rejects_dia_for_strict_msdt(tmp_path: Path):
 
     assert plan.needs_review is True
     assert "DIA" in plan.blocking_issues[0]
+    assert "仅支持 DDA" in plan.blocking_issues[0]
+    assert "Spectronaut" in plan.blocking_issues[0] or "DIA-NN" in plan.blocking_issues[0]
+
+
+def test_plan_dda_execution_rejects_swath_as_dia(tmp_path: Path):
+    """SWATH 是 DIA 的另一种名称，也应被阻断。"""
+    attributes = _dda_attributes()
+    attributes.acquisition_mode = AttributeValue(
+        value="SWATH-MS",
+        confidence=1.0,
+        source="sdrf",
+        evidence_excerpt="SWATH-MS acquisition",
+        conflict_flag=False,
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-swath",
+        source_file_name="swath_sample.raw",
+        source_data_path="/data/swath_sample.mzML",
+        project_resolution=ProjectResolution.empty(),
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is True
+    assert "DIA" in plan.blocking_issues[0]
 
 
 def test_plan_dda_execution_accepts_dda_pasef_as_dda(tmp_path: Path):

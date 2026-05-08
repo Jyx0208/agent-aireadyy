@@ -5,11 +5,14 @@ import inspect
 import json
 import os
 import re
+import shutil
 import tempfile
 import threading
+import time
 import uuid
 import zipfile
 from collections import deque
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -22,7 +25,14 @@ from starlette.background import BackgroundTask
 from agent.input.normalizer import safe_output_stem
 from agent.progress import render_download_progress
 
-app = FastAPI(title="PRIDE AI-ready Agent", version="0.3.1")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _start_result_cleanup_worker()
+    yield
+
+
+app = FastAPI(title="PRIDE AI-ready Agent", version="0.3.1", lifespan=lifespan)
 
 _tasks: dict[str, dict[str, Any]] = {}
 _tasks_lock = threading.Lock()
@@ -31,6 +41,8 @@ _runs_dir.mkdir(exist_ok=True)
 _templates_dir = Path(__file__).parent / "templates"
 _ACTIVE_STATUSES = {"queued", "running"}
 _TERMINAL_STATUSES = {"completed", "failed", "blocked"}
+_cleanup_thread_started = False
+_PUBLIC_HISTORY_FILE = "task_history.json"
 
 # 默认配置（不从 .env 加载，由用户在页面填写）
 _DEFAULT_CONFIG = {
@@ -45,6 +57,14 @@ def _clean_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _clean_submitter(value: Any) -> str:
+    submitter = _clean_text(value)
+    submitter = re.sub(r"[\x00-\x1f\x7f]+", " ", submitter).strip()
+    if not submitter:
+        return "未填写"
+    return submitter[:80]
 
 
 def _strip_ansi(value: Any) -> str:
@@ -72,6 +92,192 @@ def _max_concurrent_tasks() -> int:
         return max(1, int(raw))
     except ValueError:
         return 1
+
+
+def _result_retention_seconds() -> int:
+    raw = os.getenv("AGENT_RESULT_RETENTION_SECONDS", "7200")
+    try:
+        parsed = int(float(raw))
+    except (TypeError, ValueError):
+        return 7200
+    return max(1, parsed)
+
+
+def _path_file_stats(path: Path, excluded_names: set[str] | None = None) -> tuple[int, int, float]:
+    excluded_names = excluded_names or set()
+    file_count = 0
+    size_bytes = 0
+    latest_mtime = 0.0
+    try:
+        latest_mtime = path.stat().st_mtime
+    except OSError:
+        return 0, 0, 0.0
+    for file in path.rglob("*"):
+        try:
+            stat = file.stat()
+        except OSError:
+            continue
+        latest_mtime = max(latest_mtime, stat.st_mtime)
+        if file.is_file() and file.name not in excluded_names:
+            file_count += 1
+            size_bytes += stat.st_size
+    return file_count, size_bytes, latest_mtime
+
+
+def _active_output_dirs_locked() -> set[Path]:
+    active_dirs: set[Path] = set()
+    for task in _tasks.values():
+        if task.get("status") not in _ACTIVE_STATUSES:
+            continue
+        output_dir = task.get("output_dir")
+        if not output_dir:
+            continue
+        active_dirs.add(Path(output_dir).resolve())
+    return active_dirs
+
+
+def _safe_run_dir(result_id: str) -> Path | None:
+    if not result_id or safe_output_stem(result_id) != result_id:
+        return None
+    root = _runs_dir.resolve()
+    candidate = (_runs_dir / result_id).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    return candidate
+
+
+def _read_public_history(run_dir: Path) -> dict[str, Any]:
+    history_path = run_dir / _PUBLIC_HISTORY_FILE
+    if not history_path.exists():
+        return {}
+    try:
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _public_task_record_locked(task_id: str, task: dict[str, Any]) -> dict[str, Any]:
+    output_dir_raw = task.get("output_dir")
+    output_dir = Path(output_dir_raw) if output_dir_raw else None
+    can_download = bool(output_dir and output_dir.exists() and any(path.is_file() and path.name != _PUBLIC_HISTORY_FILE for path in output_dir.rglob("*")))
+    return {
+        "task_id": task_id,
+        "input_value": task.get("input_value", ""),
+        "submitter": task.get("submitter", "未填写"),
+        "status": task.get("status", "unknown"),
+        "created_at": task.get("created_at"),
+        "started_at": task.get("started_at"),
+        "finished_at": task.get("finished_at"),
+        "step": task.get("step", 0),
+        "total_steps": task.get("total_steps", 5),
+        "queue_position": _queue_position_locked(task_id),
+        "output_dir": Path(output_dir).name if output_dir else "",
+        "can_download": can_download,
+    }
+
+
+def _write_task_history(task_id: str) -> None:
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            return
+        output_dir_raw = task.get("output_dir")
+        if not output_dir_raw:
+            return
+        record = _public_task_record_locked(task_id, task)
+    output_dir = Path(output_dir_raw)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / _PUBLIC_HISTORY_FILE).write_text(
+            json.dumps(record, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        return
+
+
+def _list_public_results() -> list[dict[str, Any]]:
+    if not _runs_dir.exists():
+        return []
+    retention = _result_retention_seconds()
+    now = time.time()
+    results: list[dict[str, Any]] = []
+    with _tasks_lock:
+        active_dirs = _active_output_dirs_locked()
+    for run_dir in _runs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        if run_dir.resolve() in active_dirs:
+            continue
+        file_count, size_bytes, latest_mtime = _path_file_stats(run_dir, excluded_names={_PUBLIC_HISTORY_FILE})
+        if file_count == 0 or latest_mtime <= 0:
+            continue
+        history = _read_public_history(run_dir)
+        expires_at_ts = latest_mtime + retention
+        results.append(
+            {
+                "result_id": run_dir.name,
+                "task_id": history.get("task_id", ""),
+                "name": run_dir.name,
+                "input_value": history.get("input_value", run_dir.name),
+                "submitter": history.get("submitter", "未填写"),
+                "status": history.get("status", "completed"),
+                "path": str(run_dir),
+                "file_count": file_count,
+                "size_bytes": size_bytes,
+                "updated_at": datetime.fromtimestamp(latest_mtime, UTC).isoformat(),
+                "expires_at": datetime.fromtimestamp(expires_at_ts, UTC).isoformat(),
+                "expires_in_seconds": max(0, int(expires_at_ts - now)),
+                "can_download": True,
+            }
+        )
+    results.sort(key=lambda item: item["updated_at"], reverse=True)
+    return results
+
+
+def _cleanup_expired_results() -> list[str]:
+    if not _runs_dir.exists():
+        return []
+    retention = _result_retention_seconds()
+    cutoff = time.time() - retention
+    removed: list[str] = []
+    with _tasks_lock:
+        active_dirs = _active_output_dirs_locked()
+    for run_dir in _runs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        resolved = run_dir.resolve()
+        if resolved in active_dirs:
+            continue
+        file_count, _size_bytes, latest_mtime = _path_file_stats(run_dir)
+        if file_count == 0:
+            continue
+        if latest_mtime > 0 and latest_mtime < cutoff:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            removed.append(run_dir.name)
+    return removed
+
+
+def _cleanup_loop() -> None:
+    while True:
+        try:
+            _cleanup_expired_results()
+        except Exception:
+            pass
+        time.sleep(300)
+
+
+def _zip_output_dir(output_dir: Path) -> Path:
+    with tempfile.NamedTemporaryFile(prefix="pride-agent-", suffix=".zip", delete=False) as temp_file:
+        zip_path = Path(temp_file.name)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file in output_dir.rglob("*"):
+            if file.is_file():
+                zf.write(file, file.relative_to(output_dir))
+    return zip_path
 
 
 def _active_task_count_locked() -> int:
@@ -159,6 +365,7 @@ def _start_ready_queued_tasks() -> list[str]:
                 break
             started.append(task_id)
     for task_id in started:
+        _write_task_history(task_id)
         _start_pipeline_thread(task_id)
     return started
 
@@ -300,6 +507,15 @@ def _set_review_summary(task_id: str, result: Any) -> None:
     _emit(task_id, "review", summary=summary)
 
 
+def _set_task_terminal_status(task_id: str, status: str) -> None:
+    task = _tasks.get(task_id)
+    if task is None:
+        return
+    task["status"] = status
+    task["finished_at"] = datetime.now(UTC).isoformat()
+    _write_task_history(task_id)
+
+
 def _llm_check_error(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         status_code = exc.response.status_code
@@ -349,6 +565,14 @@ async def _run_llm_check(config: dict[str, str]) -> tuple[bool, str]:
 
 
 # ── 页面 ──────────────────────────────────────────────────────────
+def _start_result_cleanup_worker() -> None:
+    global _cleanup_thread_started
+    if _cleanup_thread_started:
+        return
+    _cleanup_thread_started = True
+    threading.Thread(target=_cleanup_loop, name="result-cleanup", daemon=True).start()
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return (_templates_dir / "index.html").read_text(encoding="utf-8")
@@ -363,6 +587,7 @@ async def health():
         "status": "ok",
         "llm_configured": False,
         "per_task_api_keys": True,
+        "result_retention_seconds": _result_retention_seconds(),
         **queue_state,
     }
 
@@ -379,6 +604,7 @@ async def get_config():
         "base_url": os.getenv("AGENT_LLM_BASE_URL") or _DEFAULT_CONFIG["base_url"],
         "model": os.getenv("AGENT_LLM_MODEL") or _DEFAULT_CONFIG["model"],
         "timeout": os.getenv("AGENT_LLM_TIMEOUT") or _DEFAULT_CONFIG["timeout"],
+        "result_retention_seconds": _result_retention_seconds(),
         **queue_state,
     }
 
@@ -397,6 +623,51 @@ async def check_llm(body: dict[str, Any]):
     return {"ok": True, "message": message, "base_url": config["base_url"], "model": config["model"]}
 
 
+@app.get("/api/results")
+async def list_public_results():
+    removed = _cleanup_expired_results()
+    return {
+        "retention_seconds": _result_retention_seconds(),
+        "removed": removed,
+        "results": _list_public_results(),
+    }
+
+
+@app.get("/api/history")
+async def list_project_history():
+    removed = _cleanup_expired_results()
+    with _tasks_lock:
+        active_tasks = [
+            _public_task_record_locked(task_id, task)
+            for task_id, task in _tasks.items()
+            if task.get("status") in _ACTIVE_STATUSES
+        ]
+    active_tasks.sort(key=lambda item: str(item.get("created_at") or ""))
+    return {
+        "retention_seconds": _result_retention_seconds(),
+        "removed": removed,
+        "active_tasks": active_tasks,
+        "results": _list_public_results(),
+    }
+
+
+@app.get("/api/results/{result_id}/download")
+async def download_public_result(result_id: str):
+    output_dir = _safe_run_dir(result_id)
+    if output_dir is None or not output_dir.exists():
+        return {"error": "结果目录不存在。"}
+    if not any(path.is_file() and path.name != _PUBLIC_HISTORY_FILE for path in output_dir.rglob("*")):
+        return {"error": "结果目录没有可下载文件。"}
+
+    zip_path = _zip_output_dir(output_dir)
+    return FileResponse(
+        path=str(zip_path),
+        filename=f"{result_id}_results.zip",
+        media_type="application/zip",
+        background=BackgroundTask(_remove_file, zip_path),
+    )
+
+
 # ── 创建任务 ──────────────────────────────────────────────────────
 @app.post("/api/tasks")
 async def create_task(body: dict[str, Any]):
@@ -410,6 +681,7 @@ async def _create_task_inner(body: dict[str, Any]):
     input_value = _clean_text(body.get("input_value"))
     if not input_value:
         return {"error": "请输入 PRIDE 文件名"}
+    submitter = _clean_submitter(body.get("submitter"))
 
     # 应用用户填写的 LLM 配置
     llm_config = body.get("llm_config", {})
@@ -430,6 +702,7 @@ async def _create_task_inner(body: dict[str, Any]):
         _tasks[task_id] = {
             "task_id": task_id,
             "input_value": input_value,
+            "submitter": submitter,
             "output_dir": str(output_dir),
             "status": "queued",
             "created_at": datetime.now(UTC).isoformat(),
@@ -448,11 +721,12 @@ async def _create_task_inner(body: dict[str, Any]):
                 "message": f"任务已进入队列，当前位置 {queue_state['queue_position']}/{queue_state['queue_length']}。",
             }
         )
+    _write_task_history(task_id)
     _start_ready_queued_tasks()
     with _tasks_lock:
         status = _tasks[task_id]["status"]
         queue_state = _queue_state_locked(task_id)
-    return {"task_id": task_id, "output_dir": str(output_dir), "status": status, **queue_state}
+    return {"task_id": task_id, "submitter": submitter, "output_dir": str(output_dir), "status": status, **queue_state}
 
 
 # ── WebSocket 实时日志 ────────────────────────────────────────────
@@ -613,7 +887,7 @@ def _run_pipeline(task_id: str):
     output_dir = Path(task["output_dir"])
     llm_config = task.get("llm_config")
     if not isinstance(llm_config, dict):
-        task["status"] = "failed"
+        _set_task_terminal_status(task_id, "failed")
         _log(task_id, "error", "缺少本次任务的 API Key 配置。")
         _start_ready_queued_tasks()
         return
@@ -655,11 +929,11 @@ def _run_pipeline(task_id: str):
             _log(task_id, "info", f"推荐 FASTA：{hints.get('recommended_fasta_name', '无')}")
 
         if result.plan.needs_review:
-            task["status"] = "blocked"
             task["blocking_issues"] = result.plan.blocking_issues
             for issue in result.plan.blocking_issues:
                 _log(task_id, "error", f"[阻断] {issue}")
             service.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
+            _set_task_terminal_status(task_id, "blocked")
             return
 
         _log(task_id, "info", f"workflow：{result.plan.fragpipe_workflow_path.name}  FASTA：{result.plan.fasta_path.name}（{result.plan.fasta_selection_mode}）")
@@ -699,7 +973,6 @@ def _run_pipeline(task_id: str):
         # ── 步骤 5 ──
         _step(task_id, 5, "[5/5] 处理结果")
         if docker_result.returncode == 0:
-            task["status"] = "completed"
             _log(task_id, "info", "=" * 50)
             _log(task_id, "info", "全部运行完成！")
             if output_dir.exists():
@@ -715,19 +988,20 @@ def _run_pipeline(task_id: str):
                         _log(task_id, "info", f"  {f.relative_to(output_dir)}  ({size_str})")
             _log(task_id, "info", "=" * 50)
             _log(task_id, "info", "点击【下载结果文件】按钮获取 ZIP 压缩包")
+            _set_task_terminal_status(task_id, "completed")
         else:
-            task["status"] = "failed"
             _log(task_id, "error", f"Docker 运行失败，返回码：{docker_result.returncode}")
             if docker_result.stdout:
                 _log(task_id, "error", f"[stdout]\n{docker_result.stdout[-2000:]}")
             if docker_result.stderr:
                 _log(task_id, "error", f"[stderr]\n{docker_result.stderr[-2000:]}")
+            _set_task_terminal_status(task_id, "failed")
 
     except Exception as exc:
         import traceback
-        task["status"] = "failed"
         _log(task_id, "error", f"运行出错：{exc}")
         _log(task_id, "debug", traceback.format_exc())
+        _set_task_terminal_status(task_id, "failed")
     finally:
         _start_ready_queued_tasks()
 
@@ -745,13 +1019,14 @@ async def get_task(task_id: str):
     return {
         "task_id": task["task_id"],
         "input_value": task["input_value"],
+        "submitter": task.get("submitter", "未填写"),
         "status": task["status"],
         "step": task.get("step", 0),
         "total_steps": task.get("total_steps", 5),
         "log_count": len(task["logs"]),
         "blocking_issues": task.get("blocking_issues", []),
         "review_summary": task.get("review_summary"),
-        "can_download": bool(output_dir and output_dir.exists() and any(path.is_file() for path in output_dir.rglob("*"))),
+        "can_download": bool(output_dir and output_dir.exists() and any(path.is_file() and path.name != _PUBLIC_HISTORY_FILE for path in output_dir.rglob("*"))),
         **queue_state,
     }
 
@@ -764,14 +1039,10 @@ async def download_results(task_id: str):
     output_dir = Path(task["output_dir"])
     if not output_dir.exists():
         return {"error": "结果目录不存在"}
+    if not any(path.is_file() and path.name != _PUBLIC_HISTORY_FILE for path in output_dir.rglob("*")):
+        return {"error": "结果目录没有可下载文件"}
 
-    with tempfile.NamedTemporaryFile(prefix="pride-agent-", suffix=".zip", delete=False) as temp_file:
-        zip_path = Path(temp_file.name)
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file in output_dir.rglob("*"):
-            if file.is_file():
-                zf.write(file, file.relative_to(output_dir))
-
+    zip_path = _zip_output_dir(output_dir)
     stem = safe_output_stem(task["input_value"])
     return FileResponse(
         path=str(zip_path),

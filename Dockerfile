@@ -1,0 +1,24 @@
+FROM python:3.13-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    docker.io \
+    && rm -rf /var/lib/apt/lists/* \
+    && command -v docker
+
+COPY pyproject.toml ./
+COPY README.md ./
+COPY src/ src/
+COPY profiles/ profiles/
+
+RUN pip install --no-cache-dir -e ".[web]" fastapi "uvicorn[standard]" python-dotenv
+
+RUN useradd -m agent
+USER agent
+
+EXPOSE 8000
+
+CMD ["python", "-m", "uvicorn", "agent.web.app:app", "--host", "0.0.0.0", "--port", "8000"]

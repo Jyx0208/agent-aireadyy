@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from agent.msdt_converter.docker_runner import DockerMSDTConverterRunner
 from agent.models import DdaExecutionPlan, MaterializedTaskBundle
@@ -52,6 +53,22 @@ def test_docker_runner_builds_expected_command(tmp_path: Path):
     assert cmd[:4] == ["docker", "run", "--rm", "-v"]
     assert "guomics2017/msdt-converter:v1.3" in cmd
     assert "/workspace/converter_config.docker.json" in cmd
+
+
+def test_docker_runner_maps_container_runs_path_for_host_docker(monkeypatch, tmp_path: Path):
+    container_runs = tmp_path / "container_runs"
+    host_runs = tmp_path / "host_runs"
+    task_root = container_runs / "task_out"
+    task_root.mkdir(parents=True)
+    config_path = task_root / "converter_config.docker.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("AGENT_CONTAINER_RUNS_DIR", str(container_runs))
+    monkeypatch.setenv("AGENT_HOST_RUNS_DIR", str(host_runs))
+
+    runner = DockerMSDTConverterRunner(image="guomics2017/msdt-converter:v1.3")
+    cmd = runner.build_command(SimpleNamespace(task_root=task_root, converter_config_path=config_path))
+
+    assert f"{host_runs.resolve() / 'task_out'}:/workspace" in cmd
 
 
 def test_docker_runner_writes_container_compatible_config(tmp_path: Path):

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from agent.assets.downloader import download_file_asset, invalidate_file_asset_cache
+from agent.docker_paths import docker_host_mount_path
 from agent.models import FileAsset
 from agent.utils import emit, run_command_streaming
 
@@ -56,8 +57,8 @@ class DockerPwizConverter:
         self.report = report
 
     def build_command(self, source: Path, target: Path) -> list[str]:
-        work_dir = source.parent.resolve()
-        output_dir = target.parent.resolve()
+        work_dir = docker_host_mount_path(source.parent)
+        output_dir = docker_host_mount_path(target.parent)
         return [
             "docker",
             "run",

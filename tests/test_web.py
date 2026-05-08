@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import zipfile
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 
+import agent.web.app as web_app
 from agent.web.app import StderrCapture, WebReporter, _create_task_inner, _tasks
-from agent.web.app import _build_review_summary, _start_ready_queued_tasks, _strip_ansi
-from agent.web.app import _try_start_queued_task, download_results, get_task, health
+from agent.web.app import _build_review_summary, _cleanup_expired_results, _list_public_results
+from agent.web.app import _start_ready_queued_tasks, _strip_ansi
+from agent.web.app import _try_start_queued_task, download_results, get_task, health, list_project_history
 
 
 async def _llm_ok(_config):
@@ -108,6 +111,47 @@ def test_build_review_summary_extracts_fixed_sidebar_parameters(tmp_path):
     assert summary["issues"] == ["搜库参数需要人工复核"]
 
 
+def test_list_public_results_discovers_existing_run_directories(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    project = tmp_path / "public-project"
+    project.mkdir()
+    (project / "result.txt").write_text("ok", encoding="utf-8")
+
+    results = _list_public_results()
+
+    assert len(results) == 1
+    assert results[0]["result_id"] == "public-project"
+    assert results[0]["can_download"] is True
+    assert results[0]["file_count"] == 1
+    assert results[0]["expires_in_seconds"] <= 7200
+
+
+def test_cleanup_expired_results_deletes_old_runs_but_skips_active_tasks(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setenv("AGENT_RESULT_RETENTION_SECONDS", "7200")
+    old_project = tmp_path / "old-project"
+    active_project = tmp_path / "active-project"
+    old_project.mkdir()
+    active_project.mkdir()
+    (old_project / "result.txt").write_text("old", encoding="utf-8")
+    (active_project / "result.txt").write_text("active", encoding="utf-8")
+    old_time = time.time() - 7300
+    os.utime(old_project / "result.txt", (old_time, old_time))
+    os.utime(old_project, (old_time, old_time))
+    os.utime(active_project / "result.txt", (old_time, old_time))
+    os.utime(active_project, (old_time, old_time))
+    _tasks["active"] = {"status": "running", "output_dir": str(active_project), "logs": deque(maxlen=10)}
+
+    try:
+        removed = _cleanup_expired_results()
+    finally:
+        _tasks.pop("active", None)
+
+    assert removed == ["old-project"]
+    assert not old_project.exists()
+    assert active_project.exists()
+
+
 def test_create_task_accepts_numeric_timeout_from_browser_payload(monkeypatch):
     monkeypatch.setattr("agent.web.app._check_llm_api", _llm_ok, raising=False)
     monkeypatch.setattr("agent.web.app._start_pipeline_thread", lambda _task_id: None)
@@ -146,6 +190,73 @@ def test_create_task_accepts_numeric_timeout_from_browser_payload(monkeypatch):
     finally:
         if task_id:
             _tasks.pop(task_id, None)
+
+
+def test_create_task_persists_submitter_history_without_api_key(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr("agent.web.app._check_llm_api", _llm_ok, raising=False)
+    monkeypatch.setattr("agent.web.app._start_pipeline_thread", lambda _task_id: None)
+    monkeypatch.delenv("AGENT_LLM_API_KEY", raising=False)
+
+    result = asyncio.run(
+        _create_task_inner(
+            {
+                "input_value": "sample.raw",
+                "submitter": "Alice",
+                "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
+            }
+        )
+    )
+
+    task_id = result.get("task_id")
+    try:
+        assert result["submitter"] == "Alice"
+        detail = asyncio.run(get_task(task_id))
+        assert detail["submitter"] == "Alice"
+        history_path = tmp_path / "sample" / "task_history.json"
+        data = history_path.read_text(encoding="utf-8")
+        assert "Alice" in data
+        assert "sk-secret" not in data
+        assert "api_key" not in data
+        assert "llm_config" not in data
+    finally:
+        if task_id:
+            _tasks.pop(task_id, None)
+
+
+def test_project_history_lists_active_submitters_and_results_without_secrets(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    active_dir = tmp_path / "active-project"
+    result_dir = tmp_path / "finished-project"
+    active_dir.mkdir()
+    result_dir.mkdir()
+    (result_dir / "result.txt").write_text("ok", encoding="utf-8")
+    (result_dir / "task_history.json").write_text(
+        '{"task_id":"finished","input_value":"done.raw","submitter":"Bob","status":"completed"}',
+        encoding="utf-8",
+    )
+    _tasks["active"] = {
+        "task_id": "active",
+        "input_value": "active.raw",
+        "submitter": "Alice",
+        "status": "queued",
+        "created_at": "2026-05-08T00:00:00+00:00",
+        "output_dir": str(active_dir),
+        "logs": deque(maxlen=10),
+        "llm_config": {"api_key": "sk-active-secret"},
+    }
+
+    try:
+        history = asyncio.run(list_project_history())
+    finally:
+        _tasks.pop("active", None)
+
+    serialized = str(history)
+    assert history["active_tasks"][0]["submitter"] == "Alice"
+    assert history["results"][0]["submitter"] == "Bob"
+    assert "sk-active-secret" not in serialized
+    assert "api_key" not in serialized
+    assert "llm_config" not in serialized
 
 
 def test_web_task_requires_each_user_api_key_in_request(monkeypatch):
