@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -43,7 +43,7 @@ _cleanup_thread_started = False
 _PUBLIC_HISTORY_FILE = "task_history.json"
 _HISTORY_INDEX_FILE = "project_history.json"
 _DOWNLOAD_CACHE_DIR = ".download_cache"
-_DOWNLOAD_ZIP_NAME = "results.zip"
+_DOWNLOAD_ZIP_NAME = "results-compressed.zip"
 _DOWNLOAD_RESULT_DIRS = {"ai_ready", "msdt", "rawspectrum", "logs"}
 _DOWNLOAD_ROOT_SUFFIXES = {".json", ".txt", ".log", ".tsv", ".csv"}
 
@@ -106,6 +106,26 @@ def _max_result_projects() -> int:
     except (TypeError, ValueError):
         return 4
     return max(1, parsed)
+
+
+def _zip_compress_level() -> int:
+    raw = os.getenv("AGENT_ZIP_COMPRESS_LEVEL", "6")
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return 6
+    return min(9, max(1, parsed))
+
+
+def _format_bytes(size: int | float) -> str:
+    size = float(size)
+    if size >= 1024 * 1024 * 1024:
+        return f"{size / 1024 / 1024 / 1024:.1f} GB"
+    if size >= 1024 * 1024:
+        return f"{size / 1024 / 1024:.1f} MB"
+    if size >= 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{int(size)} B"
 
 
 def _pride_cache_dir() -> Path:
@@ -187,7 +207,7 @@ def _public_task_record_locked(task_id: str, task: dict[str, Any]) -> dict[str, 
         task.get("status") == "completed"
         and output_dir
         and output_dir.exists()
-        and _has_downloadable_result_file(output_dir)
+        and _is_download_zip_ready(output_dir)
     )
     return {
         "task_id": task_id,
@@ -301,7 +321,7 @@ def _list_public_results() -> list[dict[str, Any]]:
                 "updated_at": datetime.fromtimestamp(latest_mtime, UTC).isoformat(),
                 "expires_at": datetime.fromtimestamp(expires_at_ts, UTC).isoformat(),
                 "expires_in_seconds": max(0, int(expires_at_ts - now)),
-                "can_download": status == "completed" and _has_downloadable_result_file(run_dir),
+                "can_download": status == "completed" and _is_download_zip_ready(run_dir),
             }
         )
     results.sort(key=lambda item: item["updated_at"], reverse=True)
@@ -327,7 +347,7 @@ def _list_project_history_records() -> list[dict[str, Any]]:
                 item["updated_at"] = datetime.fromtimestamp(latest_mtime, UTC).isoformat() if latest_mtime else item.get("updated_at")
             item["file_count"] = file_count
             item["size_bytes"] = size_bytes
-            item["can_download"] = bool(item.get("status") == "completed" and output_dir and output_dir.exists() and _has_downloadable_result_file(output_dir))
+            item["can_download"] = bool(item.get("status") == "completed" and output_dir and output_dir.exists() and _is_download_zip_ready(output_dir))
             records[key] = item
 
     for result in _list_public_results():
@@ -456,11 +476,13 @@ def _download_zip_path(output_dir: Path) -> Path:
     return output_dir / _DOWNLOAD_CACHE_DIR / _DOWNLOAD_ZIP_NAME
 
 
-def _download_source_mtime(output_dir: Path) -> float:
+def _download_result_files(output_dir: Path) -> list[Path]:
+    return sorted(path for path in output_dir.rglob("*") if _is_download_result_file(output_dir, path))
+
+
+def _download_source_mtime(output_dir: Path, files: list[Path] | None = None) -> float:
     latest_mtime = 0.0
-    for path in output_dir.rglob("*"):
-        if not _is_download_result_file(output_dir, path):
-            continue
+    for path in files if files is not None else _download_result_files(output_dir):
         try:
             latest_mtime = max(latest_mtime, path.stat().st_mtime)
         except OSError:
@@ -468,23 +490,59 @@ def _download_source_mtime(output_dir: Path) -> float:
     return latest_mtime
 
 
-def _zip_output_dir(output_dir: Path) -> Path:
-    source_mtime = _download_source_mtime(output_dir)
+def _is_download_zip_ready(output_dir: Path) -> bool:
     zip_path = _download_zip_path(output_dir)
     try:
-        if source_mtime > 0 and zip_path.exists() and zip_path.stat().st_mtime >= source_mtime:
+        source_mtime = _download_source_mtime(output_dir)
+        return source_mtime > 0 and zip_path.exists() and zip_path.is_file() and zip_path.stat().st_size > 0 and zip_path.stat().st_mtime >= source_mtime
+    except OSError:
+        return False
+
+
+def _zip_output_dir(output_dir: Path, report: Callable[[str], None] | None = None) -> Path:
+    files = _download_result_files(output_dir)
+    source_mtime = _download_source_mtime(output_dir, files)
+    zip_path = _download_zip_path(output_dir)
+    try:
+        if files and zip_path.exists() and zip_path.stat().st_mtime >= source_mtime:
+            if report:
+                report(f"结果 ZIP 已存在，复用缓存：{zip_path.name} ({_format_bytes(zip_path.stat().st_size)})")
             return zip_path
     except OSError:
         pass
+    if not files:
+        raise FileNotFoundError("No result files available for ZIP packaging.")
 
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = zip_path.parent / f".{uuid.uuid4().hex}.zip.tmp"
+    total_size = 0
+    for file in files:
+        try:
+            total_size += file.stat().st_size
+        except OSError:
+            continue
+    if report:
+        report(
+            f"开始打包下载 ZIP：{len(files)} 个结果文件，源文件合计 {_format_bytes(total_size)}，"
+            f"压缩等级 {_zip_compress_level()}"
+        )
+    packed_size = 0
+    last_report = monotonic()
     try:
-        with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_STORED) as zf:
-            for file in output_dir.rglob("*"):
-                if _is_download_result_file(output_dir, file):
-                    zf.write(file, file.relative_to(output_dir))
+        with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=_zip_compress_level()) as zf:
+            for index, file in enumerate(files, start=1):
+                zf.write(file, file.relative_to(output_dir))
+                try:
+                    packed_size += file.stat().st_size
+                except OSError:
+                    pass
+                now = monotonic()
+                if report and (index == 1 or index == len(files) or now - last_report >= 1.0):
+                    report(f"ZIP 打包进度：{index}/{len(files)}，已处理 {_format_bytes(packed_size)} / {_format_bytes(total_size)}")
+                    last_report = now
         temp_path.replace(zip_path)
+        if report:
+            report(f"结果 ZIP 打包完成：{zip_path.name} ({_format_bytes(zip_path.stat().st_size)})")
     finally:
         temp_path.unlink(missing_ok=True)
     return zip_path
@@ -876,7 +934,9 @@ async def download_public_result(result_id: str):
     if not _has_downloadable_result_file(output_dir):
         return {"error": "结果目录没有可下载文件。"}
 
-    zip_path = _zip_output_dir(output_dir)
+    if not _is_download_zip_ready(output_dir):
+        return {"error": "ZIP package is not ready. Wait for packaging to finish before downloading."}
+    zip_path = _download_zip_path(output_dir)
     return FileResponse(
         path=str(zip_path),
         filename=f"{result_id}_results.zip",
@@ -1210,20 +1270,11 @@ def _run_pipeline(task_id: str):
                             size_str = f"{size} B"
                         _log(task_id, "info", f"  {f.relative_to(output_dir)}  ({size_str})")
             _log(task_id, "info", "=" * 50)
-            _log(task_id, "info", "点击【下载结果文件】按钮获取 ZIP 压缩包")
-            if _has_downloadable_result_file(output_dir):
-                try:
-                    zip_path = _zip_output_dir(output_dir)
-                    zip_size = zip_path.stat().st_size
-                    if zip_size > 1024 * 1024:
-                        zip_size_text = f"{zip_size / 1024 / 1024:.1f} MB"
-                    elif zip_size > 1024:
-                        zip_size_text = f"{zip_size / 1024:.1f} KB"
-                    else:
-                        zip_size_text = f"{zip_size} B"
-                    _log(task_id, "info", f"Download ZIP prepared: {zip_path.name} ({zip_size_text})")
-                except OSError as exc:
-                    _log(task_id, "info", f"Download ZIP will be built on demand: {exc}")
+            if not _has_downloadable_result_file(output_dir):
+                raise RuntimeError("No downloadable result files were produced.")
+            _log(task_id, "info", "Start packaging compressed ZIP. The download button appears after packaging finishes.")
+            _zip_output_dir(output_dir, report=lambda message: _log(task_id, "info", message))
+            _log(task_id, "info", "ZIP packaging finished. The result ZIP is ready to download.")
             _set_task_terminal_status(task_id, "completed")
         else:
             _log(task_id, "error", f"Docker 运行失败，返回码：{docker_result.returncode}")
@@ -1256,7 +1307,7 @@ async def get_task(task_id: str):
         task.get("status") == "completed"
         and output_dir
         and output_dir.exists()
-        and _has_downloadable_result_file(output_dir)
+        and _is_download_zip_ready(output_dir)
     )
     return {
         "task_id": task["task_id"],
@@ -1286,7 +1337,9 @@ async def download_results(task_id: str):
     if not _has_downloadable_result_file(output_dir):
         return {"error": "结果目录没有可下载文件"}
 
-    zip_path = _zip_output_dir(output_dir)
+    if not _is_download_zip_ready(output_dir):
+        return {"error": "ZIP package is not ready. Wait for packaging to finish before downloading."}
+    zip_path = _download_zip_path(output_dir)
     stem = safe_output_stem(task["input_value"])
     return FileResponse(
         path=str(zip_path),

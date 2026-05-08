@@ -435,6 +435,8 @@ function resetRunView(){
   document.getElementById('resultPanel').style.display='none';
   document.getElementById('blockedPanel').style.display='none';
   document.getElementById('downloadStatus').textContent='';
+  document.getElementById('downloadBtn').style.display='none';
+  document.getElementById('downloadBtn').disabled=true;
   allLogs=[];
   renderLogs();
   renderReview(null);
@@ -518,8 +520,12 @@ async function showResults(){
   const fileLines=allLogs.filter(l=>l.message&&l.message.includes('  (')&&l.message.includes(')')).map(l=>l.message);
   document.getElementById('fileList').innerHTML=fileLines.length?fileLines.map(f=>'<div>'+esc(f)+'</div>').join(''):'<div>结果目录已生成，可下载 ZIP。</div>';
   const status=document.getElementById('downloadStatus');
+  const btn=document.getElementById('downloadBtn');
+  btn.style.display=d.can_download?'inline-block':'none';
+  btn.disabled=!d.can_download;
   status.textContent=d.can_download?'可下载 ZIP 结果文件。':'当前没有可下载文件。';
   status.className=d.can_download?'download-status':'download-status error';
+  status.textContent=d.can_download?'ZIP 已压缩打包完成，可下载。':'结果 ZIP 正在打包或没有可下载文件。';
   document.getElementById('resultPanel').style.display='block';
   setStep(5,'done');
 }

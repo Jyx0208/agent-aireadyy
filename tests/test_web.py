@@ -9,15 +9,22 @@ from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import agent.web.app as web_app
 from agent.web.app import StderrCapture, WebReporter, _create_task_inner, _tasks
-from agent.web.app import _build_review_summary, _cleanup_expired_results, _list_public_results
+from agent.web.app import _build_review_summary, _cleanup_expired_results, _list_public_results, _zip_output_dir
 from agent.web.app import _start_ready_queued_tasks, _strip_ansi
 from agent.web.app import _try_start_queued_task, download_results, get_task, health, list_project_history
 
 
 async def _llm_ok(_config):
     return True, "ok"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pride_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_PRIDE_CACHE_DIR", str(tmp_path / "pride-cache"))
 
 
 def _value(value, confidence=0.9, source="test", conflict_flag=False):
@@ -130,6 +137,7 @@ def test_list_public_results_discovers_existing_run_directories(monkeypatch, tmp
     project = tmp_path / "public-project"
     project.mkdir()
     (project / "result.txt").write_text("ok", encoding="utf-8")
+    _zip_output_dir(project)
 
     results = _list_public_results()
 
@@ -137,12 +145,13 @@ def test_list_public_results_discovers_existing_run_directories(monkeypatch, tmp
     assert results[0]["result_id"] == "public-project"
     assert results[0]["can_download"] is True
     assert results[0]["file_count"] == 1
-    assert results[0]["expires_in_seconds"] <= 7200
+    assert results[0]["expires_in_seconds"] <= 1800
 
 
 def test_cleanup_results_keeps_only_four_latest_downloadable_runs(monkeypatch, tmp_path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setenv("AGENT_MAX_RESULT_PROJECTS", "4")
+    monkeypatch.setenv("AGENT_RESULT_RETENTION_SECONDS", "1800")
     active_project = tmp_path / "active-project"
     active_project.mkdir()
     (active_project / "result.txt").write_text("active", encoding="utf-8")
@@ -171,6 +180,56 @@ def test_cleanup_results_keeps_only_four_latest_downloadable_runs(monkeypatch, t
     assert (tmp_path / "done-2").exists()
     assert (tmp_path / "done-5").exists()
     assert active_project.exists()
+
+
+def test_cleanup_results_removes_expired_process_directories(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setenv("AGENT_RESULT_RETENTION_SECONDS", "1800")
+    old_stamp = time.time() - 1900
+    for name, status in [("failed-process", "failed"), ("completed-process", "completed")]:
+        project = tmp_path / name
+        (project / "assets" / "downloads").mkdir(parents=True)
+        (project / "assets" / "downloads" / "sample.raw").write_text("raw", encoding="utf-8")
+        (project / "task_history.json").write_text(
+            json.dumps({"task_id": name, "status": status, "input_value": f"{name}.raw"}),
+            encoding="utf-8",
+        )
+        for path in project.rglob("*"):
+            os.utime(path, (old_stamp, old_stamp))
+        os.utime(project, (old_stamp, old_stamp))
+
+    removed = _cleanup_expired_results()
+
+    assert set(removed) == {"failed-process", "completed-process"}
+    assert not (tmp_path / "failed-process").exists()
+    assert not (tmp_path / "completed-process").exists()
+
+
+def test_cleanup_pride_cache_removes_old_files_only_when_idle(monkeypatch, tmp_path):
+    runs_dir = tmp_path / "runs"
+    cache_dir = tmp_path / "cache"
+    runs_dir.mkdir()
+    (cache_dir / "PXD123456").mkdir(parents=True)
+    cache_file = cache_dir / "PXD123456" / "sample.raw"
+    cache_file.write_text("raw", encoding="utf-8")
+    old_stamp = time.time() - 1900
+    os.utime(cache_file, (old_stamp, old_stamp))
+    os.utime(cache_file.parent, (old_stamp, old_stamp))
+    monkeypatch.setattr(web_app, "_runs_dir", runs_dir)
+    monkeypatch.setenv("AGENT_PRIDE_CACHE_DIR", str(cache_dir))
+    monkeypatch.setenv("AGENT_RESULT_RETENTION_SECONDS", "1800")
+
+    _tasks["active-cache"] = {"task_id": "active-cache", "status": "running", "logs": deque(maxlen=10)}
+    try:
+        assert _cleanup_expired_results() == []
+        assert cache_file.exists()
+    finally:
+        _tasks.pop("active-cache", None)
+
+    removed = _cleanup_expired_results()
+
+    assert any(item.startswith("pride-cache/") for item in removed)
+    assert not cache_file.exists()
 
 
 def test_create_task_accepts_numeric_timeout_from_browser_payload(monkeypatch):
@@ -574,7 +633,7 @@ def test_stderr_capture_does_not_log_each_streaming_token_on_flush():
         _tasks.pop(task_id, None)
 
 
-def test_download_results_attaches_temp_zip_cleanup(tmp_path):
+def test_download_results_uses_cached_zip(tmp_path):
     task_id = "download-test"
     output_dir = tmp_path / "result"
     output_dir.mkdir()
@@ -584,16 +643,58 @@ def test_download_results_attaches_temp_zip_cleanup(tmp_path):
         "input_value": "../sample.raw",
         "output_dir": str(output_dir),
         "status": "completed",
+        "logs": deque(maxlen=10),
     }
     response = None
     try:
+        before_pack = asyncio.run(get_task(task_id))
+        not_ready = asyncio.run(download_results(task_id))
+        assert before_pack["can_download"] is False
+        assert not_ready == {"error": "ZIP package is not ready. Wait for packaging to finish before downloading."}
+        zip_path = _zip_output_dir(output_dir)
+        assert zip_path.name == "results-compressed.zip"
         response = asyncio.run(download_results(task_id))
 
-        assert response.background is not None
         assert "sample_results.zip" in response.headers["content-disposition"]
+        assert Path(response.path).parent.name == ".download_cache"
         with zipfile.ZipFile(response.path) as archive:
             assert archive.read("result.txt") == b"ok"
+            assert archive.getinfo("result.txt").compress_type == zipfile.ZIP_DEFLATED
+        cached_path = Path(response.path)
+        second = asyncio.run(download_results(task_id))
+        assert Path(second.path) == cached_path
     finally:
         _tasks.pop(task_id, None)
-        if response is not None and hasattr(response, "path"):
-            Path(response.path).unlink(missing_ok=True)
+
+
+def test_download_results_excludes_large_intermediate_assets(tmp_path):
+    task_id = "download-filter-test"
+    output_dir = tmp_path / "result"
+    (output_dir / "ai_ready").mkdir(parents=True)
+    (output_dir / "msdt").mkdir()
+    (output_dir / "assets" / "downloads").mkdir(parents=True)
+    (output_dir / "fragpipe" / "exp").mkdir(parents=True)
+    (output_dir / "ai_ready" / "sample_ai_ready.parquet").write_text("ai", encoding="utf-8")
+    (output_dir / "msdt" / "sample_fp_msdt.parquet").write_text("msdt", encoding="utf-8")
+    (output_dir / "assets" / "downloads" / "sample.raw").write_text("raw", encoding="utf-8")
+    (output_dir / "fragpipe" / "exp" / "sample.pin").write_text("pin", encoding="utf-8")
+    _tasks[task_id] = {
+        "task_id": task_id,
+        "input_value": "sample.raw",
+        "output_dir": str(output_dir),
+        "status": "completed",
+    }
+    response = None
+    try:
+        _zip_output_dir(output_dir)
+        response = asyncio.run(download_results(task_id))
+
+        with zipfile.ZipFile(response.path) as archive:
+            names = set(archive.namelist())
+        assert "ai_ready/sample_ai_ready.parquet" in names
+        assert "msdt/sample_fp_msdt.parquet" in names
+        assert ".download_cache/results-compressed.zip" not in names
+        assert "assets/downloads/sample.raw" not in names
+        assert "fragpipe/exp/sample.pin" not in names
+    finally:
+        _tasks.pop(task_id, None)
