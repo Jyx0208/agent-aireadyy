@@ -1447,7 +1447,9 @@ def _run_pipeline(task_id: str):
         hints = result.attributes.search_parameter_hints.value
         if isinstance(hints, dict):
             _log(task_id, "info", f"推荐 workflow：{hints.get('recommended_workflow_name', '无')}")
-            _log(task_id, "info", f"推荐 FASTA：{hints.get('recommended_fasta_name', '无')}")
+            _log(task_id, "info", f"推荐 FASTA：{result.plan.fasta_path.name}")
+            if result.plan.fasta_download_url:
+                _log(task_id, "info", f"FASTA 下载源：{result.plan.fasta_download_url}")
 
         prepared_path = None
         if result.plan.needs_review and service._can_retry_with_mzml_instrument(result.plan):

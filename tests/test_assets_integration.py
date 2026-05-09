@@ -385,7 +385,7 @@ def test_prepare_pride_msdt_docker_input_confirms_llm_proteome_id_fasta(tmp_path
     assert recommendations
     assert len(resolve_calls) == 1
     assert "UP000000589" in recommendations[0]["url"]
-    assert bundle.materialized_fasta_path.name == "UP000000589_M_musculus.fasta"
+    assert bundle.materialized_fasta_path.name == "uniprot_mouse_UP000000589.fasta"
 
 
 def test_prepare_pride_msdt_docker_input_uses_mzml_instrument_for_multi_instrument_project(tmp_path: Path, monkeypatch):

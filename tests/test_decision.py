@@ -36,6 +36,12 @@ def test_packaged_fragpipe_workflows_are_not_placeholder_stubs() -> None:
         assert "msfragger." in text
 
 
+def test_packaged_fasta_profiles_do_not_ship_placeholder_fastas() -> None:
+    fasta_dir = dda._workspace_root() / "profiles" / "fasta"
+
+    assert not list(fasta_dir.glob("*.fasta"))
+
+
 def _dda_attributes() -> AttributeSet:
     return AttributeSet(
         acquisition_mode=AttributeValue(
@@ -163,6 +169,32 @@ def test_plan_dda_execution_maps_mouse_species_alias_to_mouse_fasta(tmp_path: Pa
     assert "UP000000589" in plan.fasta_download_url
 
 
+def test_plan_dda_execution_maps_rat_species_to_uniprot_download_target(tmp_path: Path):
+    attributes = _dda_attributes()
+    attributes.species = AttributeValue(
+        value="Rattus norvegicus",
+        confidence=0.95,
+        source="llm_confirmed",
+        evidence_excerpt="Rattus norvegicus",
+        conflict_flag=False,
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-rat",
+        source_file_name="sample.raw",
+        source_data_path="/data/sample.mzML",
+        project_resolution=ProjectResolution.empty(),
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is False
+    assert plan.fasta_path == tmp_path / "fasta" / "uniprot_rat_UP000002494.fasta"
+    assert plan.fasta_selection_mode == "inferred"
+    assert plan.fasta_download_url is not None
+    assert "UP000002494" in plan.fasta_download_url
+
+
 def test_plan_dda_execution_uses_generic_fasta_for_multi_species_mixture(tmp_path: Path):
     attributes = _dda_attributes()
     attributes.species = AttributeValue(
@@ -182,8 +214,9 @@ def test_plan_dda_execution_uses_generic_fasta_for_multi_species_mixture(tmp_pat
         output_dir=tmp_path,
     )
 
-    assert plan.fasta_path.name == "generic_reference_with_contaminants.fasta"
+    assert plan.fasta_path.name == "reference_requires_review.fasta"
     assert plan.fasta_selection_mode == "defaulted"
+    assert plan.needs_review is True
 
 
 def test_plan_dda_execution_uses_wiff2mzml_mode_for_converted_sciex_input(tmp_path: Path):
@@ -690,6 +723,75 @@ def test_plan_dda_execution_requires_review_for_multi_metadata_without_sdrf(tmp_
     assert plan.needs_review is True
     assert any("多个物种" in issue for issue in plan.blocking_issues)
     assert any("多个仪器" in issue for issue in plan.blocking_issues)
+
+
+def test_plan_dda_execution_trusts_high_confidence_llm_species_for_multi_species_project_without_sdrf(
+    tmp_path: Path,
+):
+    attributes = _dda_attributes()
+    attributes.species = AttributeValue(
+        value="Rattus norvegicus",
+        confidence=0.95,
+        source="llm_confirmed",
+        evidence_excerpt="LLM resolved the target file as rat",
+        conflict_flag=True,
+    )
+    attributes.instrument_name = AttributeValue(
+        value="Orbitrap Exploris 480",
+        confidence=0.95,
+        source="mzml",
+        evidence_excerpt="mzML instrumentConfiguration Orbitrap Exploris 480",
+        conflict_flag=False,
+    )
+    attributes.instrument_family = AttributeValue(
+        value="orbitrap",
+        confidence=0.95,
+        source="mzml",
+        evidence_excerpt="mzML analyzer orbitrap",
+        conflict_flag=False,
+    )
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "recommended_workflow_name": "Default.workflow",
+            "recommended_fasta_name": "uniprot-rat-reviewed.fasta",
+            "recommended_fasta_url": "https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/reference_proteomes/Rodentia/UP000002494/UP000002494_10116.fasta.gz",
+            "recommended_fasta_source": "UniProt",
+        },
+        confidence=0.95,
+        source="llm_confirmed",
+        evidence_excerpt="LLM recommended rat UniProt reference proteome",
+        conflict_flag=False,
+    )
+    context = ProjectContext(
+        project_accession="PXD016662",
+        file_name="20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.raw",
+        metadata={
+            "organisms": MetadataValue(
+                value=["Rattus norvegicus", "Homo sapiens"],
+                source="pride.organisms",
+                source_level="project",
+                completeness=1.0,
+            )
+        },
+        sdrf_rows=[],
+        project_files=[],
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-rat-multi-species",
+        source_file_name="20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.raw",
+        source_data_path=tmp_path / "20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.mzML",
+        project_resolution=ProjectResolution.empty(),
+        project_context=context,
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is False
+    assert plan.blocking_issues == []
+    assert plan.fasta_path == tmp_path / "fasta" / "uniprot_rat_UP000002494.fasta"
+    assert plan.fasta_download_url is not None
+    assert "UP000002494" in plan.fasta_download_url
 
 
 def test_plan_dda_execution_allows_multi_metadata_when_file_level_values_are_resolved(tmp_path: Path):

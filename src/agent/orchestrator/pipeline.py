@@ -143,7 +143,7 @@ class AgentService:
         if not url:
             return None
         return {
-            "name": hints.get("recommended_fasta_name") or result.plan.fasta_path.name,
+            "name": result.plan.fasta_path.name,
             "url": url,
             "source": hints.get("recommended_fasta_source") or ("LLM/agent 根据物种或 UniProt proteome ID 推断"),
             "database": hints.get("database"),
