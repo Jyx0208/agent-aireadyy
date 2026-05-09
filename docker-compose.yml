@@ -5,6 +5,7 @@ services:
     ports:
       - "8000:8000"
     environment:
+      - TZ=${TZ:-Asia/Shanghai}
       - AGENT_LLM_BASE_URL=${AGENT_LLM_BASE_URL:-https://api.deepseek.com}
       - AGENT_LLM_MODEL=${AGENT_LLM_MODEL:-deepseek-v4-flash}
       - AGENT_LLM_TIMEOUT=${AGENT_LLM_TIMEOUT:-1200}

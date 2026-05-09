@@ -12,10 +12,11 @@ import uuid
 import zipfile
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -55,6 +56,19 @@ _DEFAULT_CONFIG = {
     "timeout": "1200",
 }
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\[(?:\d{1,3};?)*m")
+_APP_TZ = ZoneInfo(os.getenv("TZ", "Asia/Shanghai"))
+
+
+def _now() -> datetime:
+    return datetime.now(_APP_TZ)
+
+
+def _now_iso() -> str:
+    return _now().isoformat()
+
+
+def _now_time() -> str:
+    return _now().strftime("%H:%M:%S")
 
 
 def _clean_text(value: Any) -> str:
@@ -128,7 +142,7 @@ def _parse_history_timestamp(value: Any) -> float | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
+        dt = dt.replace(tzinfo=_APP_TZ)
     return dt.timestamp()
 
 
@@ -473,8 +487,8 @@ def _list_public_results() -> list[dict[str, Any]]:
                 "path": str(run_dir),
                 "file_count": file_count,
                 "size_bytes": size_bytes,
-                "updated_at": datetime.fromtimestamp(updated_at_ts, UTC).isoformat(),
-                "expires_at": datetime.fromtimestamp(expires_at_ts, UTC).isoformat(),
+                "updated_at": datetime.fromtimestamp(updated_at_ts, _APP_TZ).isoformat(),
+                "expires_at": datetime.fromtimestamp(expires_at_ts, _APP_TZ).isoformat(),
                 "expires_in_seconds": max(0, int(expires_at_ts - now)),
                 "can_download": status == "completed" and _is_download_zip_ready(run_dir),
             }
@@ -500,7 +514,7 @@ def _list_project_history_records() -> list[dict[str, Any]]:
                     excluded_names={_PUBLIC_HISTORY_FILE, _HISTORY_INDEX_FILE},
                     excluded_dir_names={_DOWNLOAD_CACHE_DIR},
                 )
-                item["updated_at"] = datetime.fromtimestamp(latest_mtime, UTC).isoformat() if latest_mtime else item.get("updated_at")
+                item["updated_at"] = datetime.fromtimestamp(latest_mtime, _APP_TZ).isoformat() if latest_mtime else item.get("updated_at")
             item["file_count"] = file_count
             item["size_bytes"] = size_bytes
             item["can_download"] = bool(item.get("status") == "completed" and output_dir and output_dir.exists() and _is_download_zip_ready(output_dir))
@@ -753,11 +767,11 @@ def _try_start_queued_task_locked(task_id: str) -> bool:
     if task_id not in _queued_task_ids_locked()[:available_slots]:
         return False
     task["status"] = "running"
-    task["started_at"] = datetime.now(UTC).isoformat()
+    task["started_at"] = _now_iso()
     task["logs"].append(
         {
             "type": "log",
-            "ts": datetime.now(UTC).strftime("%H:%M:%S"),
+            "ts": _now_time(),
             "level": "info",
             "message": "任务已从队列启动。",
         }
@@ -978,7 +992,7 @@ def _build_review_summary(result: Any) -> dict[str, Any]:
 
     issues = list(getattr(plan, "blocking_issues", []) or [])
     return {
-        "updated_at": datetime.now(UTC).strftime("%H:%M:%S"),
+        "updated_at": _now_time(),
         "needs_review": bool(getattr(plan, "needs_review", False)),
         "issues": issues,
         "review_options": _review_options(result, issues),
@@ -1000,7 +1014,7 @@ def _set_task_terminal_status(task_id: str, status: str) -> None:
     if task is None:
         return
     task["status"] = status
-    task["finished_at"] = datetime.now(UTC).isoformat()
+    task["finished_at"] = _now_iso()
     _write_task_history(task_id)
 
 
@@ -1203,7 +1217,7 @@ async def _create_task_inner(body: dict[str, Any]):
             "submitter": submitter,
             "output_dir": str(output_dir),
             "status": "queued",
-            "created_at": datetime.now(UTC).isoformat(),
+            "created_at": _now_iso(),
             "logs": deque(maxlen=5000),
             "step": 0,
             "total_steps": 5,
@@ -1215,7 +1229,7 @@ async def _create_task_inner(body: dict[str, Any]):
         _tasks[task_id]["logs"].append(
             {
                 "type": "log",
-                "ts": datetime.now(UTC).strftime("%H:%M:%S"),
+                "ts": _now_time(),
                 "level": "info",
                 "message": f"任务已进入队列，当前位置 {queue_state['queue_position']}/{queue_state['queue_length']}。",
             }
@@ -1278,7 +1292,7 @@ def _emit(task_id: str, msg_type: str, data: Any = None, **kwargs):
         return
     if "message" in kwargs:
         kwargs["message"] = _strip_ansi(kwargs["message"]).strip()
-    entry = {"type": msg_type, "ts": datetime.now(UTC).strftime("%H:%M:%S"), **kwargs}
+    entry = {"type": msg_type, "ts": _now_time(), **kwargs}
     if data is not None:
         entry["data"] = data
     task["logs"].append(entry)
@@ -1624,7 +1638,7 @@ async def submit_task_review(task_id: str, body: dict[str, Any]):
         task["logs"].append(
             {
                 "type": "log",
-                "ts": datetime.now(UTC).strftime("%H:%M:%S"),
+                "ts": _now_time(),
                 "level": "info",
                 "message": "已提交人工复核选择，任务重新进入队列。",
             }

@@ -83,18 +83,32 @@ $RemoteCommandLines = @(
     "git checkout $QuotedBranch",
     "git pull --ff-only $QuotedRemote $QuotedBranch",
     'if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi',
+    'if command -v timedatectl >/dev/null 2>&1; then ${SUDO} timedatectl set-timezone Asia/Shanghai || true; fi',
+    'date "+server time: %F %T %Z %z"',
     $BuildCommand,
     '${SUDO} docker compose up -d',
-    '${SUDO} docker compose ps'
+    '${SUDO} docker compose ps',
+    '${SUDO} docker compose exec -T web date "+container time: %F %T %Z %z" || true'
 )
-$RemoteCommand = $RemoteCommandLines -join "; "
-$QuotedRemoteCommand = ConvertTo-BashSingleQuoted $RemoteCommand
+$RemoteScript = ($RemoteCommandLines -join "`n") + "`n"
+$LocalRemoteScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("pride-agent-deploy-{0}.sh" -f ([System.Guid]::NewGuid().ToString("N")))
+[System.IO.File]::WriteAllText(
+    $LocalRemoteScriptPath,
+    $RemoteScript,
+    [System.Text.UTF8Encoding]::new($false)
+)
 
 $Target = "$ServerUser@$ServerHost"
 Write-Host ""
 Write-Host "==> Deploying ${Remote}/${Branch} to ${Target}:${ServerPath}"
-ssh $Target "bash -lc $QuotedRemoteCommand"
-if ($LASTEXITCODE -ne 0) {
+try {
+    $SshCommand = 'ssh {0} "bash -s" < "{1}"' -f $Target, $LocalRemoteScriptPath
+    cmd.exe /d /c $SshCommand
+    $DeployExitCode = $LASTEXITCODE
+} finally {
+    Remove-Item -LiteralPath $LocalRemoteScriptPath -Force -ErrorAction SilentlyContinue
+}
+if ($DeployExitCode -ne 0) {
     throw "Remote deploy failed."
 }
 
