@@ -91,6 +91,8 @@ $RemoteScript = $RemoteScript.Replace("__SERVER_PATH__", $ServerPath.Replace("'"
 $RemoteScript = $RemoteScript.Replace("__REMOTE__", $Remote.Replace("'", "'\''"))
 $RemoteScript = $RemoteScript.Replace("__BRANCH__", $Branch.Replace("'", "'\''"))
 $RemoteScript = $RemoteScript.Replace("__BUILD_COMMAND__", $BuildCommand)
+# Normalize remote script newlines before piping from Windows PowerShell to bash.
+$RemoteScript = $RemoteScript.Replace("`r`n", "`n").Replace("`r", "`n")
 
 $Target = "$ServerUser@$ServerHost"
 Write-Host ""

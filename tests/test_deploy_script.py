@@ -13,6 +13,8 @@ def test_deploy_script_pushes_main_and_rebuilds_remote_service():
     assert "$SUDO docker compose up -d" in text
     assert "safe.directory" in text
     assert 'id -u' in text
+    assert 'Normalize remote script newlines' in text
+    assert '`r`n' in text
     assert "/opt/pride-agent" in text
     assert "47.253.243.164" in text
     assert '"root"' in text
