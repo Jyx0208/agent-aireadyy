@@ -137,6 +137,50 @@ def test_build_review_summary_extracts_fixed_sidebar_parameters(tmp_path):
     assert summary["issues"] == ["搜库参数需要人工复核"]
 
 
+def test_build_review_summary_shows_normalized_plan_fasta_over_raw_llm_name(tmp_path):
+    result = SimpleNamespace(
+        attributes=SimpleNamespace(
+            acquisition_mode=_value("DDA"),
+            species=_value("Rattus norvegicus"),
+            instrument_name=_value("Orbitrap Exploris 480"),
+            enzyme=_value("Trypsin"),
+            fixed_mods=_value(["Carbamidomethyl C"]),
+            variable_mods=_value(["Oxidation M"]),
+            search_parameter_hints=_value(
+                {
+                    "recommended_workflow_name": "Default.workflow",
+                    "recommended_fasta_name": "uniprot-rat-reviewed.fasta",
+                    "recommended_fasta_url": "https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/reference_proteomes/Rodentia/UP000002494/UP000002494_10116.fasta.gz",
+                    "recommended_fasta_source": "UniProt",
+                },
+                confidence=0.8,
+                source="llm_confirmed",
+            ),
+        ),
+        plan=SimpleNamespace(
+            fragpipe_workflow_path=tmp_path / "Default.workflow",
+            fasta_path=tmp_path / "uniprot_rat_UP000002494.fasta",
+            fasta_selection_mode="inferred",
+            fasta_download_url="https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/reference_proteomes/Rodentia/UP000002494/UP000002494_10116.fasta.gz",
+            raw_data_type="mzml",
+            thread_num=1,
+            needs_review=False,
+            blocking_issues=[],
+        ),
+    )
+
+    summary = _build_review_summary(result)
+    items = {item["label"]: item for item in summary["items"]}
+
+    assert items["recommended_fasta_name"]["value"] == "uniprot_rat_UP000002494.fasta"
+    assert items["recommended_fasta_name"]["source"] == "plan"
+    assert "confidence" not in items["recommended_fasta_name"]
+    assert items["recommended_fasta_url"]["value"] == result.plan.fasta_download_url
+    assert items["recommended_fasta_url"]["source"] == "plan"
+    assert items["recommended_fasta_source"]["value"] == "UniProt"
+    assert items["recommended_fasta_source"]["source"] == "plan"
+
+
 def test_build_review_summary_includes_user_choices_for_multi_species_and_instruments(tmp_path):
     result = SimpleNamespace(
         attributes=SimpleNamespace(

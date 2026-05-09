@@ -12,11 +12,11 @@ import uuid
 import zipfile
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -56,7 +56,15 @@ _DEFAULT_CONFIG = {
     "timeout": "1200",
 }
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\[(?:\d{1,3};?)*m")
-_APP_TZ = ZoneInfo(os.getenv("TZ", "Asia/Shanghai"))
+def _app_timezone():
+    timezone_name = os.getenv("TZ", "Asia/Shanghai")
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        return timezone(timedelta(hours=8), "CST")
+
+
+_APP_TZ = _app_timezone()
 
 
 def _now() -> datetime:
@@ -889,6 +897,20 @@ def _append_attribute_item(items: list[dict[str, Any]], label: str, attribute: A
     )
 
 
+def _normalized_fasta_hint_item(key: str, plan: Any) -> tuple[Any, str, float | None] | None:
+    if key == "recommended_fasta_name":
+        fasta_name = _path_name(getattr(plan, "fasta_path", None))
+        return (fasta_name, "plan", None) if fasta_name else None
+    if key == "recommended_fasta_url":
+        fasta_url = getattr(plan, "fasta_download_url", None)
+        return (fasta_url, "plan", None) if fasta_url else None
+    if key == "recommended_fasta_source":
+        fasta_url = str(getattr(plan, "fasta_download_url", "") or "")
+        if "uniprot.org" in fasta_url.lower():
+            return "UniProt", "plan", None
+    return None
+
+
 def _choice_values_from_metadata(result: Any, key: str) -> list[str]:
     context = getattr(result, "context", None)
     metadata = getattr(context, "metadata", {}) or {}
@@ -988,7 +1010,12 @@ def _build_review_summary(result: Any) -> dict[str, Any]:
             "recommended_fasta_source",
         ):
             if key in hints:
-                _append_review_item(items, key, hints[key], source=hint_source, confidence=hint_confidence)
+                normalized = _normalized_fasta_hint_item(key, plan)
+                if normalized is None:
+                    value, source, confidence = hints[key], hint_source, hint_confidence
+                else:
+                    value, source, confidence = normalized
+                _append_review_item(items, key, value, source=source, confidence=confidence)
 
     issues = list(getattr(plan, "blocking_issues", []) or [])
     return {

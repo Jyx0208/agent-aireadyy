@@ -38,7 +38,9 @@ def test_container_and_web_app_use_china_timezone():
     assert "TZ=${TZ:-Asia/Shanghai}" in compose
     assert "ENV TZ=Asia/Shanghai" in dockerfile
     assert "tzdata" in dockerfile
-    assert 'ZoneInfo(os.getenv("TZ", "Asia/Shanghai"))' in web_app
+    assert 'os.getenv("TZ", "Asia/Shanghai")' in web_app
+    assert "ZoneInfoNotFoundError" in web_app
+    assert 'timezone(timedelta(hours=8), "CST")' in web_app
     assert "datetime.now(UTC).strftime" not in web_app
     assert "datetime.now(UTC).isoformat" not in web_app
 
