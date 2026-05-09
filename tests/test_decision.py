@@ -796,6 +796,75 @@ def test_plan_dda_execution_trusts_high_confidence_llm_species_for_multi_species
     assert "ftp.uniprot.org" not in plan.fasta_download_url
 
 
+def test_plan_dda_execution_uses_species_uniprot_url_for_rat_taxonomy_hint_without_sdrf(
+    tmp_path: Path,
+):
+    attributes = _dda_attributes()
+    attributes.species = AttributeValue(
+        value="Rattus norvegicus",
+        confidence=0.8,
+        source="llm_confirmed",
+        evidence_excerpt="Organisms include rat and human; target file likely rat",
+        conflict_flag=True,
+    )
+    attributes.instrument_name = AttributeValue(
+        value="Orbitrap Exploris 480",
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="PRIDE instrument field: Orbitrap Exploris 480",
+        conflict_flag=False,
+    )
+    attributes.instrument_family = AttributeValue(
+        value="orbitrap",
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="Orbitrap Exploris 480",
+        conflict_flag=False,
+    )
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "recommended_workflow_name": "Default.workflow",
+            "recommended_fasta_name": "uniprot_rat_2024.fasta",
+            "recommended_fasta_url": "https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/taxonomic_divisions/uniprot_taxonomy_10116.fasta",
+            "recommended_fasta_source": "UniProt",
+        },
+        confidence=0.6,
+        source="rule",
+        evidence_excerpt="Default parameters for Orbitrap DDA",
+        conflict_flag=False,
+    )
+    context = ProjectContext(
+        project_accession="PXD016662",
+        file_name="20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.raw",
+        metadata={
+            "organisms": MetadataValue(
+                value=["Rattus norvegicus", "Homo sapiens"],
+                source="pride.organisms",
+                source_level="project",
+                completeness=1.0,
+            )
+        },
+        sdrf_rows=[],
+        project_files=[],
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-rat-taxonomy-url",
+        source_file_name="20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.raw",
+        source_data_path=tmp_path / "20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.mzML",
+        project_resolution=ProjectResolution.empty(),
+        project_context=context,
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is False
+    assert plan.blocking_issues == []
+    assert plan.fasta_path == tmp_path / "fasta" / "uniprot_rat_UP000002494.fasta"
+    assert plan.fasta_download_url is not None
+    assert plan.fasta_download_url == "https://rest.uniprot.org/uniprotkb/stream?compressed=false&format=fasta&query=%28proteome%3AUP000002494%29"
+
+
 def test_plan_dda_execution_allows_multi_metadata_when_file_level_values_are_resolved(tmp_path: Path):
     attributes = _dda_attributes()
     attributes.species = AttributeValue(

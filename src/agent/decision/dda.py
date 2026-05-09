@@ -163,6 +163,9 @@ def _llm_recommended_fasta_choice(attributes: AttributeSet, output_dir: Path) ->
         if proteome_id:
             fasta_name = _canonical_uniprot_fasta_name(proteome_id, species_file_name)
             fasta_url = _uniprot_proteome_url(proteome_id)
+        elif species_url:
+            fasta_name = species_file_name
+            fasta_url = species_url
         else:
             fasta_name = species_file_name
         return _reviewed_fasta_choice(output_dir, reviewed_fasta_url=fasta_url, reviewed_fasta_name=fasta_name)
@@ -304,7 +307,7 @@ def _is_resolved_attribute(value: AttributeValue) -> bool:
 
     source = str(value.source or "").strip().lower()
     trusted_sources = ("llm_confirmed", "sdrf", "mzml", "user_review")
-    return value.confidence >= 0.85 and any(source.startswith(trusted) for trusted in trusted_sources)
+    return value.confidence >= 0.8 and any(source.startswith(trusted) for trusted in trusted_sources)
 
 
 def _context_blocking_issues(project_context: ProjectContext | None, attributes: AttributeSet) -> list[str]:
