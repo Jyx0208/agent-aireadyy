@@ -324,7 +324,7 @@ def test_prepare_pride_msdt_docker_input_auto_downloads_species_fasta(tmp_path: 
 
     assert result.plan.fasta_download_url is not None
     assert "UP000000589" in result.plan.fasta_download_url
-    assert bundle.materialized_fasta_path.name == "Mus_musculus_reviewed.fasta"
+    assert bundle.materialized_fasta_path.name == "uniprot_mouse_UP000000589.fasta"
     assert bundle.materialized_fasta_path.exists()
 
 
@@ -386,6 +386,111 @@ def test_prepare_pride_msdt_docker_input_confirms_llm_proteome_id_fasta(tmp_path
     assert len(resolve_calls) == 1
     assert "UP000000589" in recommendations[0]["url"]
     assert bundle.materialized_fasta_path.name == "UP000000589_M_musculus.fasta"
+
+
+def test_prepare_pride_msdt_docker_input_uses_mzml_instrument_for_multi_instrument_project(tmp_path: Path, monkeypatch):
+    service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
+    task = normalize_input("PRF_Q_2024_D_KLIO_1166_65810.raw")
+    resolution = ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession="PXD_MULTI_INST",
+            matched_file=task.file_name,
+            match_type="exact",
+            match_score=100,
+            evidence=["exact"],
+            metadata_consistency=1.0,
+        ),
+        alternative_projects=[],
+        resolution_reason="exact",
+        resolution_confidence=1.0,
+        needs_review=False,
+    )
+    context = ProjectContext(
+        project_accession="PXD_MULTI_INST",
+        file_name=task.file_name,
+        metadata={
+            "instruments": MetadataValue(
+                value=["Orbitrap Fusion Lumos", "Q Exactive HF"],
+                source="pride.instruments",
+                source_level="project",
+                completeness=1.0,
+            )
+        },
+        project_files=[],
+    )
+    attrs = _attributes().model_copy(
+        update={
+            "instrument_name": AttributeValue(
+                value="Orbitrap Fusion Lumos; Q Exactive HF",
+                confidence=0.5,
+                source="pride.instruments",
+                evidence_excerpt="multiple instruments",
+                conflict_flag=True,
+            ),
+            "instrument_family": AttributeValue(
+                value="unknown",
+                confidence=0.4,
+                source="pride.instruments",
+                evidence_excerpt="multiple instruments",
+                conflict_flag=True,
+            ),
+        }
+    )
+
+    def fake_prepare_asset(asset):
+        prepared = tmp_path / "task_out" / "assets" / "prepared" / "PRF_Q_2024_D_KLIO_1166_65810.mzML"
+        prepared.parent.mkdir(parents=True, exist_ok=True)
+        prepared.write_text(
+            """<mzML xmlns="http://psi.hupo.org/ms/mzml">
+  <instrumentConfigurationList count="1">
+    <instrumentConfiguration id="IC1">
+      <cvParam cvRef="MS" accession="MS:1002523" name="Q Exactive HF" value=""/>
+      <componentList count="1"><analyzer order="1"><cvParam cvRef="MS" accession="MS:1000484" name="orbitrap"/></analyzer></componentList>
+    </instrumentConfiguration>
+  </instrumentConfigurationList>
+</mzML>""",
+            encoding="utf-8",
+        )
+        return prepared
+
+    class FakePrideClient:
+        def download_to_path(self, url, target_path, report=None):
+            assert "UP000005640" in url
+            Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(target_path).write_text(">sp|P1|HUMAN\nMPEPTIDEK\n", encoding="utf-8")
+            return Path(target_path)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(service, "resolve_project", lambda _: resolution)
+    monkeypatch.setattr(service, "build_context", lambda *args, **kwargs: context)
+    monkeypatch.setattr(service, "infer_attributes", lambda *_: attrs)
+    monkeypatch.setattr(
+        service,
+        "resolve_asset",
+        lambda *args, **kwargs: FileAsset(
+            original_file_name=task.file_name,
+            resolved_asset_type="raw",
+            matched_project_file=task.file_name,
+            download_url="https://ftp.pride.ebi.ac.uk/pride/data/archive/PRF_Q_2024_D_KLIO_1166_65810.raw",
+            local_path=tmp_path / "task_out" / "assets" / "downloads" / task.file_name,
+            prepared_path=tmp_path / "task_out" / "assets" / "prepared" / "PRF_Q_2024_D_KLIO_1166_65810.mzML",
+            requires_conversion=True,
+            asset_confidence=1.0,
+            match_type="exact",
+        ),
+    )
+    monkeypatch.setattr(service, "prepare_asset", fake_prepare_asset)
+    monkeypatch.setattr("agent.execution.bundle.PrideClient", FakePrideClient)
+
+    bundle, result, prepared_path = service.prepare_pride_msdt_docker_input(task=task, output_dir=tmp_path / "task_out")
+
+    assert prepared_path.name == "PRF_Q_2024_D_KLIO_1166_65810.mzML"
+    assert result.attributes.instrument_name.value == "Q Exactive HF"
+    assert result.attributes.instrument_name.source == "mzml"
+    assert result.plan.needs_review is False
+    assert bundle.plan.needs_review is False
 
 
 def test_prepare_pride_msdt_docker_input_stops_before_download_when_plan_needs_review(tmp_path: Path, monkeypatch):

@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.parse import urlparse
@@ -52,13 +53,13 @@ def _species_fasta_choice(species: str) -> tuple[str, str, str | None]:
     if sum(1 for aliases in multi_species_groups if any(alias in normalized for alias in aliases)) > 1:
         return "generic_reference_with_contaminants.fasta", "defaulted", None
     if "homo sapiens" in normalized or "human" in normalized:
-        return "Homo_sapiens_reviewed.fasta", "inferred", _uniprot_proteome_url("UP000005640")
+        return "uniprot_human_UP000005640.fasta", "inferred", _uniprot_proteome_url("UP000005640")
     if "mus musculus" in normalized or "mouse" in normalized:
-        return "Mus_musculus_reviewed.fasta", "inferred", _uniprot_proteome_url("UP000000589")
+        return "uniprot_mouse_UP000000589.fasta", "inferred", _uniprot_proteome_url("UP000000589")
     if "saccharomyces cerevisiae" in normalized or "yeast" in normalized:
-        return "Saccharomyces_cerevisiae_reviewed.fasta", "inferred", _uniprot_proteome_url("UP000002311")
+        return "uniprot_yeast_UP000002311.fasta", "inferred", _uniprot_proteome_url("UP000002311")
     if "escherichia coli" in normalized or "e. coli" in normalized:
-        return "Escherichia_coli_K12_reviewed.fasta", "inferred", _uniprot_proteome_url("UP000000625")
+        return "uniprot_ecoli_k12_UP000000625.fasta", "inferred", _uniprot_proteome_url("UP000000625")
     return "generic_reference_with_contaminants.fasta", "defaulted", None
 
 
@@ -125,6 +126,46 @@ def _reviewed_fasta_choice(
         if not file_name.lower().endswith((".fasta", ".fa", ".faa")):
             file_name = "reviewed_reference.fasta"
         return output_dir / "fasta" / file_name, reviewed_fasta_url
+    return None, None
+
+
+def _is_uniprot_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "uniprot.org" or host.endswith(".uniprot.org")
+
+
+def _llm_recommended_fasta_choice(attributes: AttributeSet, output_dir: Path) -> tuple[Path | None, str | None]:
+    hints = _hint_mapping(attributes)
+    species_file_name, _species_mode, species_url = _species_fasta_choice(str(attributes.species.value))
+    fasta_url = PrideClient._normalize_download_url(str(hints.get("recommended_fasta_url") or "").strip()) or ""
+    if fasta_url and _is_uniprot_url(fasta_url):
+        fasta_name = str(hints.get("recommended_fasta_name") or "").strip() or species_file_name
+        if not fasta_name.lower().endswith((".fasta", ".fa", ".faa", ".fasta.gz", ".fa.gz", ".faa.gz")):
+            fasta_name = species_file_name
+        return _reviewed_fasta_choice(output_dir, reviewed_fasta_url=fasta_url, reviewed_fasta_name=fasta_name)
+
+    hint_text = " ".join(
+        str(value)
+        for value in (
+            hints.get("recommended_fasta_name"),
+            hints.get("recommended_fasta_source"),
+            hints.get("database"),
+            attributes.species.value,
+        )
+        if value
+    )
+    proteome_match = re.search(r"\bUP\d{9}\b", hint_text, re.IGNORECASE)
+    if proteome_match:
+        proteome_id = proteome_match.group(0).upper()
+        fasta_name = species_file_name if species_url and proteome_id in species_url else f"uniprot_{proteome_id}.fasta"
+        return _reviewed_fasta_choice(
+            output_dir,
+            reviewed_fasta_url=_uniprot_proteome_url(proteome_id),
+            reviewed_fasta_name=fasta_name,
+        )
+
+    if species_url:
+        return _reviewed_fasta_choice(output_dir, reviewed_fasta_url=species_url, reviewed_fasta_name=species_file_name)
     return None, None
 
 
@@ -226,7 +267,11 @@ def _metadata_values(project_context: ProjectContext | None, key: str) -> list[s
     return [str(metadata.value)]
 
 
-def _context_blocking_issues(project_context: ProjectContext | None) -> list[str]:
+def _is_resolved_attribute(value: AttributeValue) -> bool:
+    return value.value not in (None, "", "unknown") and not value.conflict_flag
+
+
+def _context_blocking_issues(project_context: ProjectContext | None, attributes: AttributeSet) -> list[str]:
     issues: list[str] = []
     experiment_types = " | ".join(_metadata_values(project_context, "experimentTypes")).lower()
     if "top-down" in experiment_types or "top down" in experiment_types:
@@ -234,9 +279,11 @@ def _context_blocking_issues(project_context: ProjectContext | None) -> list[str
     if project_context is not None and not project_context.sdrf_rows:
         organisms = set(_metadata_values(project_context, "organisms"))
         instruments = set(_metadata_values(project_context, "instruments"))
-        if len(organisms) > 1:
+        if len(organisms) > 1 and not _is_resolved_attribute(attributes.species):
             issues.append("未找到匹配的 SDRF 行，且项目包含多个物种；无法确定文件级物种信息。")
-        if len(instruments) > 1:
+        if len(instruments) > 1 and not (
+            _is_resolved_attribute(attributes.instrument_name) and _is_resolved_attribute(attributes.instrument_family)
+        ):
             issues.append("未找到匹配的 SDRF 行，且项目包含多个仪器；无法确定文件级仪器信息。")
     return issues
 
@@ -251,6 +298,13 @@ def _fasta_blocking_issues(
 ) -> list[str]:
     if raw_data_type in {"mgf", "mzid"}:
         return []
+    if fasta_mode == "defaulted" and not fasta_download_url:
+        species = str(attributes.species.value or "").strip() or "unknown"
+        return [
+            f"未找到可从 UniProt 下载的真实 FASTA（物种：{species}）。"
+            "默认占位 FASTA 不能用于真实搜库；请让 LLM 给出 UniProt proteome ID，"
+            "或勾选/指定 PRIDE 项目 FASTA。"
+        ]
     if is_placeholder_fasta(fasta_path) and not fasta_download_url:
         return [
             f"FASTA 文件 {fasta_path.name} 是占位文件，不能用于真实搜库。"
@@ -293,6 +347,7 @@ def plan_dda_execution(
     reviewed_fasta_path: str | Path | None = None,
     reviewed_fasta_url: str | None = None,
     reviewed_fasta_name: str | None = None,
+    prefer_project_fasta: bool = False,
     accept_search_parameter_review: bool = False,
 ) -> DdaExecutionPlan:
     source_data_path = Path(source_data_path)
@@ -305,21 +360,39 @@ def plan_dda_execution(
         reviewed_fasta_url=reviewed_fasta_url,
         reviewed_fasta_name=reviewed_fasta_name,
     )
+    llm_fasta_path, llm_fasta_url = _llm_recommended_fasta_choice(attributes, output_dir)
     if reviewed_path is not None:
         fasta_path = reviewed_path
         fasta_mode = "reviewed"
         project_fasta_url = reviewed_url
         fasta_issues = []
+    elif prefer_project_fasta:
+        project_fasta_path, project_fasta_url, fasta_issues = _project_fasta_choice(project_context, output_dir)
+        if project_fasta_path is not None:
+            fasta_path = project_fasta_path
+            fasta_mode = "reproduced"
+        elif not fasta_issues and llm_fasta_path is not None:
+            fasta_path = llm_fasta_path
+            fasta_mode = "inferred"
+            project_fasta_url = llm_fasta_url
+        else:
+            fasta_file_name, fasta_mode, inferred_fasta_url = _species_fasta_choice(str(attributes.species.value))
+            fasta_path = workspace_root / "profiles" / "fasta" / fasta_file_name
+            project_fasta_url = inferred_fasta_url
+    elif llm_fasta_path is not None:
+        fasta_path = llm_fasta_path
+        fasta_mode = "inferred"
+        project_fasta_url = llm_fasta_url
+        fasta_issues = []
     else:
         project_fasta_path, project_fasta_url, fasta_issues = _project_fasta_choice(project_context, output_dir)
-    if reviewed_path is None and project_fasta_path is not None:
-        fasta_path = project_fasta_path
-        fasta_mode = "reproduced"
-    elif reviewed_path is None:
-        fasta_file_name, fasta_mode, inferred_fasta_url = _species_fasta_choice(str(attributes.species.value))
-        fasta_path = workspace_root / "profiles" / "fasta" / fasta_file_name
-        project_fasta_url = inferred_fasta_url
-
+        if project_fasta_path is not None:
+            fasta_path = project_fasta_path
+            fasta_mode = "reproduced"
+        else:
+            fasta_file_name, fasta_mode, inferred_fasta_url = _species_fasta_choice(str(attributes.species.value))
+            fasta_path = workspace_root / "profiles" / "fasta" / fasta_file_name
+            project_fasta_url = inferred_fasta_url
     # 必须由大模型推荐 workflow，不使用规则推断
     workflow_name = _llm_confirmed_workflow_name(attributes, workspace_root)
     if not workflow_name:
@@ -332,7 +405,7 @@ def plan_dda_execution(
     else:
         blocking_issues = _blocking_issues(attributes, workflow_name, raw_data_type)
     blocking_issues.extend(fasta_issues)
-    blocking_issues.extend(_context_blocking_issues(project_context))
+    blocking_issues.extend(_context_blocking_issues(project_context, attributes))
     blocking_issues.extend(
         _fasta_blocking_issues(
             project_context,

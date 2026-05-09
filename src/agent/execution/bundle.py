@@ -72,6 +72,7 @@ def materialize_dda_task_bundle(
     reviewed_fasta_path: str | Path | None = None,
     reviewed_fasta_url: str | None = None,
     reviewed_fasta_name: str | None = None,
+    prefer_project_fasta: bool = False,
     accept_search_parameter_review: bool = False,
     report: Callable[[Any], None] | None = None,
 ) -> MaterializedTaskBundle:
@@ -90,6 +91,7 @@ def materialize_dda_task_bundle(
         reviewed_fasta_path=reviewed_fasta_path,
         reviewed_fasta_url=reviewed_fasta_url,
         reviewed_fasta_name=reviewed_fasta_name,
+        prefer_project_fasta=prefer_project_fasta,
         accept_search_parameter_review=accept_search_parameter_review,
     )
     if plan.needs_review:

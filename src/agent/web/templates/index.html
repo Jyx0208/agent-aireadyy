@@ -38,6 +38,8 @@ h1{font-size:1.35rem;letter-spacing:0}
 .form-row label{text-align:right;color:var(--muted);font-size:.8rem}
 .form-row input{width:100%;padding:9px 11px;background:var(--panel);border:1px solid var(--line);border-radius:6px;color:var(--text)}
 .form-row input.error{border-color:var(--red);background:#231215}
+.option-row{display:flex;align-items:flex-start;gap:8px;margin:8px 0 12px 96px;color:var(--muted);font-size:.78rem}
+.option-row input{margin-top:3px;accent-color:var(--accent)}
 .config-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-left:96px}
 .inline-status{font-size:.78rem;color:var(--muted)}
 .inline-status.ok{color:var(--green)}
@@ -46,6 +48,8 @@ h1{font-size:1.35rem;letter-spacing:0}
 .warn.show{display:block}
 .public-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}
 .public-meta{font-size:.76rem;color:var(--muted)}
+.history-card{max-height:560px;display:flex;flex-direction:column;min-height:0}
+.history-card .result-list{max-height:430px;overflow-y:auto;padding-right:4px}
 .result-list{display:flex;flex-direction:column;gap:8px}
 .empty{font-size:.8rem;color:var(--muted)}
 .result-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel)}
@@ -98,6 +102,9 @@ h1{font-size:1.35rem;letter-spacing:0}
 .review-meta{font-size:.68rem;color:var(--soft)}
 .review-item.conflict .review-value{color:#fca5a5}
 .review-issues{margin-top:10px;padding-top:10px;border-top:1px solid #5d430f;color:#fbbf24;font-size:.78rem}
+.review-actions{margin-top:10px;padding-top:10px;border-top:1px solid var(--line);display:grid;gap:8px}
+.review-actions label{display:grid;gap:4px;color:var(--muted);font-size:.74rem}
+.review-actions select{width:100%;padding:8px;background:var(--panel-2);border:1px solid var(--line);border-radius:6px;color:var(--text)}
 .review-issues li,.blocked-panel li{margin-left:16px}
 .result-panel,.blocked-panel{display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
 .result-panel h3,.blocked-panel h3{font-size:.88rem;margin-bottom:8px}
@@ -105,7 +112,7 @@ h1{font-size:1.35rem;letter-spacing:0}
 .download-status{display:block;margin-top:8px;font-size:.78rem;color:var(--muted)}
 .download-status.error{color:var(--red)}
 footer{padding:20px 0 4px;color:#575d68;font-size:.74rem;text-align:center}
-@media(max-width:980px){.grid,.run-grid{grid-template-columns:1fr}.review-panel{position:static;max-height:none}header{align-items:flex-start;flex-direction:column}.main-input{flex-direction:column}.steps{grid-template-columns:1fr 1fr}.config-actions{margin-left:0}.form-row{grid-template-columns:1fr}.form-row label{text-align:left}}
+@media(max-width:980px){.grid,.run-grid{grid-template-columns:1fr}.history-card{max-height:60vh}.history-card .result-list{max-height:calc(60vh - 90px)}.review-panel{position:static;max-height:none}header{align-items:flex-start;flex-direction:column}.main-input{flex-direction:column}.steps{grid-template-columns:1fr 1fr}.config-actions,.option-row{margin-left:0}.form-row{grid-template-columns:1fr}.form-row label{text-align:left}}
 </style>
 </head>
 <body>
@@ -126,6 +133,7 @@ footer{padding:20px 0 4px;color:#575d68;font-size:.74rem;text-align:center}
         <button class="btn btn-primary" id="startBtn" onclick="startTask()">启动</button>
       </div>
       <div class="form-row"><label>提交人 *</label><input type="text" id="submitter" placeholder="例如 张三 / Alice / 课题组成员名"></div>
+      <label class="option-row"><input type="checkbox" id="preferProjectFasta"><span>默认使用大模型/物种推荐的 UniProt FASTA；如 PRIDE 原项目有 FASTA，可勾选改用项目 FASTA。</span></label>
       <div class="examples">
         示例
         <button onclick="fill('P17_severe_NoPOTS.raw')">P17_severe_NoPOTS.raw</button>
@@ -149,7 +157,7 @@ footer{padding:20px 0 4px;color:#575d68;font-size:.74rem;text-align:center}
       <div class="warn show" id="warnBanner">任务启动前会先检查本次填写的 API Key；服务器不会使用固定公共 Key。</div>
     </section>
 
-    <section class="surface">
+    <section class="surface history-card">
       <div class="public-head">
         <h2>项目历史</h2>
         <button class="btn btn-secondary btn-small" onclick="loadResults()">刷新</button>
@@ -212,7 +220,7 @@ footer{padding:20px 0 4px;color:#575d68;font-size:.74rem;text-align:center}
 let taskId=null,ws=null,currentFilter='all',allLogs=[],startTime=null,timerInterval=null,renderScheduled=false;
 
 function fill(v){document.getElementById('inputValue').value=v}
-function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function now(){const d=new Date();return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0')}
 function formatSize(n){if(n>1024*1024*1024)return(n/1024/1024/1024).toFixed(1)+' GB';if(n>1024*1024)return(n/1024/1024).toFixed(1)+' MB';if(n>1024)return(n/1024).toFixed(1)+' KB';return(n||0)+' B'}
 function retentionMinutes(d){return Math.max(1,Math.round((d.retention_seconds||1800)/60))}
@@ -269,10 +277,13 @@ async function loadResults(){
     }).join('');
     const resultHtml=results.map(item=>{
       const fileInfo=(item.file_count||0)>0?(esc(item.file_count)+' 个文件 · '+formatSize(item.size_bytes)):'下载文件已清理';
-      const action=item.can_download?'<button class="btn btn-secondary btn-small" onclick="downloadPublicResult(\''+esc(item.result_id).replace(/'/g,'&#39;')+'\')">下载</button>':'<span class="public-meta">不可下载</span>';
+      const viewId=item.task_id||item.result_id||item.name;
+      const viewBtn=viewId?'<button class="btn btn-secondary btn-small" onclick="attachTask(\''+esc(viewId).replace(/'/g,'&#39;')+'\')">查看</button>':'';
+      const downloadBtn=item.can_download?'<button class="btn btn-secondary btn-small" onclick="downloadPublicResult(\''+esc(item.result_id).replace(/'/g,'&#39;')+'\')">下载</button>':'<span class="public-meta">不可下载</span>';
+      const actionHtml=viewBtn+downloadBtn;
       return '<div class="result-row"><div><div class="result-title">'+esc(item.input_value||item.name)+'</div><div class="result-sub">'+
         esc(item.submitter||'未填写')+' · '+esc(statusText(item.status))+' · '+fileInfo+
-        '</div></div><div class="result-actions">'+action+'</div></div>';
+        '</div></div><div class="result-actions">'+actionHtml+'</div></div>';
     }).join('');
     box.innerHTML=activeHtml+resultHtml;
   }catch(e){
@@ -427,7 +438,40 @@ function renderReview(summary){
   if(summary.issues&&summary.issues.length){
     html+='<div class="review-issues"><strong>问题</strong><ul>'+summary.issues.map(i=>'<li>'+esc(i)+'</li>').join('')+'</ul></div>';
   }
+  if(summary.review_options&&summary.review_options.length){
+    html+='<div class="review-actions"><strong>选择后继续</strong>';
+    summary.review_options.forEach(opt=>{
+      html+='<label>'+esc(opt.label||opt.field)+'<select data-review-field="'+esc(opt.field)+'">';
+      (opt.values||[]).forEach(v=>{html+='<option value="'+esc(v)+'">'+esc(v)+'</option>'});
+      html+='</select></label>';
+    });
+    html+='<button class="btn btn-primary btn-small" onclick="submitReviewSelections()">使用选择继续运行</button></div>';
+  }
   panel.innerHTML=html;
+}
+
+async function submitReviewSelections(){
+  if(!taskId)return;
+  const overrides={};
+  document.querySelectorAll('[data-review-field]').forEach(sel=>{
+    if(sel.value)overrides[sel.dataset.reviewField]=sel.value;
+  });
+  if(Object.keys(overrides).length===0){alert('请选择复核参数');return}
+  try{
+    const r=await fetch('/api/tasks/'+taskId+'/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({overrides})});
+    const d=await r.json();
+    if(d.error){receiveLog({type:'log',level:'error',message:d.error,ts:now()});return}
+    receiveLog({type:'log',level:'info',message:'已提交复核选择，任务继续排队/运行。',ts:now()});
+    document.getElementById('blockedPanel').style.display='none';
+    setStatus(d.status);
+    if(d.status==='queued'){updateQueuePanel(d);document.getElementById('startBtn').textContent='排队中...'}
+    else{updateQueuePanel(null);document.getElementById('startBtn').textContent='运行中...'}
+    document.getElementById('startBtn').disabled=true;
+    connectTaskSocket(taskId);
+    loadHealth();loadResults();
+  }catch(e){
+    receiveLog({type:'log',level:'error',message:'提交复核失败：'+e,ts:now()});
+  }
 }
 
 function resetRunView(){
@@ -473,10 +517,21 @@ async function attachTask(id){
     const r=await fetch('/api/tasks/'+id);
     const d=await r.json();
     if(d.error){receiveLog({type:'log',level:'error',message:d.error,ts:now()});setStatus('failed');stopTimer();return}
+    allLogs=Array.isArray(d.logs)?d.logs:[];
+    renderLogs();
     setStatus(d.status);
     setStep(d.step||0,d.status==='failed'?'error':'active');
     renderReview(d.review_summary);
     updateQueuePanel(d.status==='queued'?d:null);
+    if(d.archived||d.status==='completed'||d.status==='failed'||d.status==='blocked'){
+      updateQueuePanel(null);
+      stopTimer();
+      document.getElementById('startBtn').disabled=false;
+      document.getElementById('startBtn').textContent='启动';
+      if(d.status==='completed')showResults();
+      if(d.status==='blocked'||d.status==='failed')loadIssues();
+      return;
+    }
     connectTaskSocket(id);
   }catch(e){
     receiveLog({type:'log',level:'error',message:'读取任务失败：'+e,ts:now()});
@@ -496,7 +551,8 @@ async function startTask(){
 
   let data;
   try{
-    const resp=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({input_value:input,submitter:document.getElementById('submitter').value.trim(),llm_config:collectConfig()})});
+    const fastaPreference=document.getElementById('preferProjectFasta').checked?'project':'llm';
+    const resp=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({input_value:input,submitter:document.getElementById('submitter').value.trim(),fasta_preference:fastaPreference,llm_config:collectConfig()})});
     data=await resp.json();
   }catch(e){
     receiveLog({type:'log',level:'error',message:'创建任务请求失败：'+e,ts:now()});

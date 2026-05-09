@@ -128,7 +128,10 @@ def test_plan_dda_execution_generates_converter_compatible_paths(tmp_path: Path)
     )
 
     assert plan.raw_data_type == "mzml"
-    assert plan.fasta_path.name == "Homo_sapiens_reviewed.fasta"
+    assert plan.fasta_path.name == "uniprot_human_UP000005640.fasta"
+    assert plan.fasta_download_url is not None
+    assert "rest.uniprot.org" in plan.fasta_download_url
+    assert "UP000005640" in plan.fasta_download_url
     assert plan.fragpipe_workflow_path.name == "Default.workflow"
     assert plan.manifest_path.name == "fragpipe-files.fp-manifest"
     assert plan.expected_pin_glob.endswith("sample_edited.pin")
@@ -154,7 +157,7 @@ def test_plan_dda_execution_maps_mouse_species_alias_to_mouse_fasta(tmp_path: Pa
         output_dir=tmp_path,
     )
 
-    assert plan.fasta_path.name == "Mus_musculus_reviewed.fasta"
+    assert plan.fasta_path.name == "uniprot_mouse_UP000000589.fasta"
     assert plan.fasta_selection_mode == "inferred"
     assert plan.fasta_download_url is not None
     assert "UP000000589" in plan.fasta_download_url
@@ -333,7 +336,7 @@ def test_plan_dda_execution_accepts_dda_pasef_as_dda(tmp_path: Path):
     assert plan.fragpipe_workflow_path.name == "LFQ-MBR.workflow"
 
 
-def test_plan_dda_execution_prefers_project_fasta_over_species_guess(tmp_path: Path):
+def test_plan_dda_execution_defaults_to_uniprot_species_fasta_over_project_fasta(tmp_path: Path):
     attributes = _dda_attributes()
     context = ProjectContext(
         project_accession="PXD000010",
@@ -366,9 +369,11 @@ def test_plan_dda_execution_prefers_project_fasta_over_species_guess(tmp_path: P
         output_dir=tmp_path,
     )
 
-    assert plan.fasta_path.name == "human_project_reference.fasta"
-    assert plan.fasta_selection_mode == "reproduced"
-    assert plan.fasta_download_url == "https://ftp.pride.ebi.ac.uk/pride/data/archive/2024/01/PXD000010/human_project_reference.fasta"
+    assert plan.fasta_path.name == "uniprot_human_UP000005640.fasta"
+    assert plan.fasta_selection_mode == "inferred"
+    assert plan.fasta_download_url is not None
+    assert "rest.uniprot.org" in plan.fasta_download_url
+    assert "UP000005640" in plan.fasta_download_url
 
 
 def test_plan_dda_execution_requires_review_when_multiple_project_fastas_exist(tmp_path: Path):
@@ -400,10 +405,114 @@ def test_plan_dda_execution_requires_review_when_multiple_project_fastas_exist(t
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
+        prefer_project_fasta=True,
     )
 
     assert plan.needs_review is True
     assert any("多个项目 FASTA" in issue for issue in plan.blocking_issues)
+
+
+def test_plan_dda_execution_prefers_uniprot_species_fasta_over_non_uniprot_llm_url_and_project_fastas(tmp_path: Path):
+    attributes = _dda_attributes()
+    attributes.enzyme = AttributeValue(
+        value="Asp-N",
+        confidence=1.0,
+        source="sdrf",
+        evidence_excerpt="NT=Asp-N;AC=MS:1001304",
+        conflict_flag=False,
+    )
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "recommended_workflow_name": "LFQ-MBR.workflow",
+            "recommended_fasta_name": "ensembl_Homo_sapiens.GRCh38.pep.all.fa",
+            "recommended_fasta_url": "ftp://ftp.ensembl.org/pub/release-83/fasta/homo_sapiens/pep/Homo_sapiens.GRCh38.pep.all.fa.gz",
+            "recommended_fasta_source": "Ensembl",
+        },
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="dataProcessingProtocol: Ensembl human proteome database (release-83, GRCh38)",
+        conflict_flag=False,
+    )
+    context = ProjectContext(
+        project_accession="PXD010154",
+        file_name="01753_H12_P018443_S00_N01_R1.raw",
+        sdrf_rows=[{"comment[data file]": "01753_H12_P018443_S00_N01_R1.raw"}],
+        project_files=[
+            {
+                "fileName": "human_reference.fasta",
+                "publicFileLocations": [
+                    {"value": "ftp://ftp.pride.ebi.ac.uk/pride/data/archive/2019/07/PXD010154/human_reference.fasta"}
+                ],
+            },
+            {
+                "fileName": "contaminants.fasta",
+                "publicFileLocations": [
+                    {"value": "ftp://ftp.pride.ebi.ac.uk/pride/data/archive/2019/07/PXD010154/contaminants.fasta"}
+                ],
+            },
+        ],
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-protocol-fasta",
+        source_file_name="01753_H12_P018443_S00_N01_R1.raw",
+        source_data_path=tmp_path / "01753_H12_P018443_S00_N01_R1.mzML",
+        project_resolution=ProjectResolution.empty(),
+        project_context=context,
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is False
+    assert plan.fasta_selection_mode == "inferred"
+    assert plan.fasta_path.name == "uniprot_human_UP000005640.fasta"
+    assert plan.fasta_download_url is not None
+    assert "rest.uniprot.org" in plan.fasta_download_url
+    assert "UP000005640" in plan.fasta_download_url
+    assert not plan.blocking_issues
+
+
+def test_plan_dda_execution_can_prefer_project_fasta_when_user_selects_it(tmp_path: Path):
+    attributes = _dda_attributes()
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "recommended_workflow_name": "Default.workflow",
+            "recommended_fasta_name": "llm_reference.fasta",
+            "recommended_fasta_url": "https://example.org/llm_reference.fasta",
+        },
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="LLM recommended FASTA",
+        conflict_flag=False,
+    )
+    context = ProjectContext(
+        project_accession="PXD000012",
+        file_name="sample.raw",
+        project_files=[
+            {
+                "fileName": "project_reference.fasta",
+                "publicFileLocations": [
+                    {"value": "ftp://ftp.pride.ebi.ac.uk/pride/data/archive/2024/01/PXD000012/project_reference.fasta"}
+                ],
+            }
+        ],
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-project-fasta",
+        source_file_name="sample.raw",
+        source_data_path=tmp_path / "sample.mzML",
+        project_resolution=ProjectResolution.empty(),
+        project_context=context,
+        attributes=attributes,
+        output_dir=tmp_path,
+        prefer_project_fasta=True,
+    )
+
+    assert plan.needs_review is False
+    assert plan.fasta_selection_mode == "reproduced"
+    assert plan.fasta_path == tmp_path / "fasta" / "project_reference.fasta"
+    assert plan.fasta_download_url == "https://ftp.pride.ebi.ac.uk/pride/data/archive/2024/01/PXD000012/project_reference.fasta"
 
 
 def test_plan_dda_execution_requires_review_for_no_sdrf_unsupported_species_default_fasta(tmp_path: Path):
@@ -528,6 +637,27 @@ def test_plan_dda_execution_requires_review_for_top_down_project(tmp_path: Path)
 
 def test_plan_dda_execution_requires_review_for_multi_metadata_without_sdrf(tmp_path: Path):
     attributes = _dda_attributes()
+    attributes.species = AttributeValue(
+        value="Homo sapiens; Mus musculus",
+        confidence=0.5,
+        source="pride.organisms",
+        evidence_excerpt="multiple organisms",
+        conflict_flag=True,
+    )
+    attributes.instrument_name = AttributeValue(
+        value="Orbitrap Fusion Lumos; Q Exactive",
+        confidence=0.5,
+        source="pride.instruments",
+        evidence_excerpt="multiple instruments",
+        conflict_flag=True,
+    )
+    attributes.instrument_family = AttributeValue(
+        value="unknown",
+        confidence=0.4,
+        source="pride.instruments",
+        evidence_excerpt="multiple instruments",
+        conflict_flag=True,
+    )
     context = ProjectContext(
         project_accession="PXD_MULTI",
         file_name="sample.raw",
@@ -560,6 +690,62 @@ def test_plan_dda_execution_requires_review_for_multi_metadata_without_sdrf(tmp_
     assert plan.needs_review is True
     assert any("多个物种" in issue for issue in plan.blocking_issues)
     assert any("多个仪器" in issue for issue in plan.blocking_issues)
+
+
+def test_plan_dda_execution_allows_multi_metadata_when_file_level_values_are_resolved(tmp_path: Path):
+    attributes = _dda_attributes()
+    attributes.species = AttributeValue(
+        value="Homo sapiens",
+        confidence=1.0,
+        source="user_review",
+        evidence_excerpt="用户选择 Homo sapiens",
+        conflict_flag=False,
+    )
+    attributes.instrument_name = AttributeValue(
+        value="Q Exactive HF",
+        confidence=1.0,
+        source="mzml",
+        evidence_excerpt="mzML instrumentConfiguration MS:1002523",
+        conflict_flag=False,
+    )
+    attributes.instrument_family = AttributeValue(
+        value="orbitrap",
+        confidence=1.0,
+        source="mzml",
+        evidence_excerpt="mzML analyzer orbitrap",
+        conflict_flag=False,
+    )
+    context = ProjectContext(
+        project_accession="PXD_MULTI",
+        file_name="sample.raw",
+        metadata={
+            "organisms": MetadataValue(
+                value=["Homo sapiens", "Mus musculus"],
+                source="pride.organisms",
+                source_level="project",
+                completeness=1.0,
+            ),
+            "instruments": MetadataValue(
+                value=["Orbitrap Fusion Lumos", "Q Exactive HF"],
+                source="pride.instruments",
+                source_level="project",
+                completeness=1.0,
+            ),
+        },
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-multi-metadata-resolved",
+        source_file_name="sample.raw",
+        source_data_path=tmp_path / "sample.mzML",
+        project_resolution=ProjectResolution.empty(),
+        project_context=context,
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is False
+    assert not any("多个物种" in issue or "多个仪器" in issue for issue in plan.blocking_issues)
 
 
 def test_plan_dda_execution_names_query_url_reviewed_fasta_with_fasta_suffix(tmp_path: Path):

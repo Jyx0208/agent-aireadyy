@@ -13,9 +13,10 @@ from agent.assets.resolver import resolve_file_asset
 from agent.decision.dda import plan_dda_execution
 from agent.execution.bundle import materialize_dda_task_bundle
 from agent.inference.rules import infer_attributes
+from agent.inference.mzml_metadata import infer_instrument_family_from_name, parse_mzml_instrument
 from agent.llm.reasoner import LLMReasoner, confirm_no_sdrf_parameters, confirm_sdrf_parameters
 from agent.metadata.context import build_project_context
-from agent.models import DdaExecutionPlan, FileAsset, InputTask, PridePlanResult, ProjectContext, ProjectResolution, RunManifest
+from agent.models import AttributeValue, DdaExecutionPlan, FileAsset, InputTask, PridePlanResult, ProjectContext, ProjectResolution, RunManifest
 from agent.msdt_converter.config import build_converter_config
 from agent.msdt_converter.docker_runner import DockerMSDTConverterRunner
 from agent.msdt_converter.runner import MSDTConverterRunner
@@ -82,6 +83,23 @@ class AgentService:
     @staticmethod
     def _search_review_issues(plan: DdaExecutionPlan) -> list[str]:
         return [issue for issue in plan.blocking_issues if "搜库参数需要人工复核" in issue]
+
+    @staticmethod
+    def _can_retry_with_mzml_instrument(plan: DdaExecutionPlan) -> bool:
+        if not plan.needs_review or not any("仪器" in issue for issue in plan.blocking_issues):
+            return False
+        hard_markers = (
+            "DIA",
+            "mzIdentML",
+            "Top-down",
+            "Top down",
+            "workflow",
+            "FASTA",
+            "占位",
+            "缺少必需属性：酶切酶",
+            "无法确认采集模式",
+        )
+        return not any(any(marker in issue for marker in hard_markers) for issue in plan.blocking_issues)
 
     @staticmethod
     def _accept_reviewed_search_parameters(plan: DdaExecutionPlan) -> DdaExecutionPlan:
@@ -179,6 +197,8 @@ class AgentService:
             )
 
     def _report_plan_summary(self, plan: DdaExecutionPlan) -> None:
+        if plan.fasta_download_url:
+            self._report(f"FASTA 下载源：{plan.fasta_download_url}")
         self._report(
             "执行计划："
             f"原始数据类型={plan.raw_data_type}；FASTA={plan.fasta_path.name} ({plan.fasta_selection_mode})；"
@@ -225,6 +245,118 @@ class AgentService:
             report=self._report,
         )
 
+    @staticmethod
+    def _attributes_with_review_overrides(attributes, overrides: dict[str, Any] | None):
+        if not overrides:
+            return attributes
+        updates: dict[str, AttributeValue] = {}
+        species = str(overrides.get("species") or "").strip()
+        if species:
+            updates["species"] = AttributeValue(
+                value=species,
+                confidence=1.0,
+                source="user_review",
+                evidence_excerpt=f"用户复核选择：{species}",
+                conflict_flag=False,
+            )
+        instrument_name = str(overrides.get("instrument_name") or "").strip()
+        if instrument_name:
+            family = infer_instrument_family_from_name(instrument_name)
+            updates["instrument_name"] = AttributeValue(
+                value=instrument_name,
+                confidence=1.0,
+                source="user_review",
+                evidence_excerpt=f"用户复核选择：{instrument_name}",
+                conflict_flag=False,
+            )
+            updates["instrument_family"] = AttributeValue(
+                value=family,
+                confidence=1.0 if family != "unknown" else 0.4,
+                source="user_review",
+                evidence_excerpt=f"用户复核选择：{instrument_name}",
+                conflict_flag=family == "unknown",
+            )
+        return attributes.model_copy(update=updates) if updates else attributes
+
+    def apply_review_overrides_to_result(
+        self,
+        result: PridePlanResult,
+        overrides: dict[str, Any] | None,
+        task: InputTask,
+        output_dir: str | Path,
+        prefer_project_fasta: bool = False,
+    ) -> PridePlanResult:
+        attributes = self._attributes_with_review_overrides(result.attributes, overrides)
+        if attributes is result.attributes:
+            return result
+        source_data_path = (
+            result.asset.prepared_path
+            or result.asset.local_path
+            or Path(output_dir) / "assets" / "prepared" / f"{task.stem}.mzML"
+        )
+        plan = plan_dda_execution(
+            task_id=task.task_id,
+            source_file_name=task.file_name,
+            source_data_path=source_data_path,
+            project_resolution=result.resolution,
+            attributes=attributes,
+            output_dir=output_dir,
+            project_context=result.context,
+            prefer_project_fasta=prefer_project_fasta,
+        )
+        return result.model_copy(update={"attributes": attributes, "plan": plan})
+
+    def replan_with_mzml_instrument(
+        self,
+        result: PridePlanResult,
+        prepared_path: str | Path,
+        task: InputTask,
+        output_dir: str | Path,
+        prefer_project_fasta: bool = False,
+        reviewed_fasta_path: str | Path | None = None,
+        reviewed_fasta_url: str | None = None,
+        reviewed_fasta_name: str | None = None,
+        accept_search_parameter_review: bool = False,
+    ) -> PridePlanResult:
+        metadata = parse_mzml_instrument(prepared_path)
+        if metadata is None:
+            self._report("未能从 mzML 中解析到文件级仪器信息；保留人工复核。")
+            return result
+        self._report(f"已从 mzML 解析文件级仪器：{metadata.name}（{metadata.family}）。")
+        attributes = result.attributes.model_copy(
+            update={
+                "instrument_name": AttributeValue(
+                    value=metadata.name,
+                    confidence=1.0,
+                    source="mzml",
+                    evidence_excerpt=metadata.evidence,
+                    conflict_flag=False,
+                ),
+                "instrument_family": AttributeValue(
+                    value=metadata.family,
+                    confidence=1.0 if metadata.family != "unknown" else 0.4,
+                    source="mzml",
+                    evidence_excerpt=metadata.evidence,
+                    conflict_flag=metadata.family == "unknown",
+                ),
+            }
+        )
+        plan = plan_dda_execution(
+            task_id=task.task_id,
+            source_file_name=task.file_name,
+            source_data_path=prepared_path,
+            project_resolution=result.resolution,
+            attributes=attributes,
+            output_dir=output_dir,
+            project_context=result.context,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+            reviewed_fasta_name=reviewed_fasta_name,
+            prefer_project_fasta=prefer_project_fasta,
+            accept_search_parameter_review=accept_search_parameter_review,
+        )
+        return result.model_copy(update={"attributes": attributes, "plan": plan})
+
     def resolve_asset(self, task: InputTask, context: ProjectContext, output_dir: str | Path) -> FileAsset:
         return resolve_file_asset(task=task, context=context, work_dir=output_dir)
 
@@ -267,6 +399,7 @@ class AgentService:
         reviewed_fasta_path: str | Path | None = None,
         reviewed_fasta_url: str | None = None,
         reviewed_fasta_name: str | None = None,
+        prefer_project_fasta: bool = False,
     ) -> PridePlanResult:
         resolution = self.resolve_project(task.original_input)
         if resolution.primary_project:
@@ -301,6 +434,7 @@ class AgentService:
             reviewed_fasta_path=reviewed_fasta_path,
             reviewed_fasta_url=reviewed_fasta_url,
             reviewed_fasta_name=reviewed_fasta_name,
+            prefer_project_fasta=prefer_project_fasta,
         )
         self._report(f"[5/5] DDA 执行计划已生成。workflow={plan.fragpipe_workflow_path.name}")
         self._report_plan_summary(plan)
@@ -521,6 +655,7 @@ class AgentService:
         reviewed_fasta_path: str | Path | None = None,
         reviewed_fasta_url: str | None = None,
         reviewed_fasta_name: str | None = None,
+        prefer_project_fasta: bool = False,
         confirm_llm_recommended_fasta: Callable[[dict[str, Any]], bool] | None = None,
         confirm_search_parameters: Callable[[PridePlanResult], bool] | None = None,
     ):
@@ -530,6 +665,7 @@ class AgentService:
             reviewed_fasta_path=reviewed_fasta_path,
             reviewed_fasta_url=reviewed_fasta_url,
             reviewed_fasta_name=reviewed_fasta_name,
+            prefer_project_fasta=prefer_project_fasta,
         )
         active_reviewed_fasta_path = reviewed_fasta_path
         active_reviewed_fasta_url = reviewed_fasta_url
@@ -556,6 +692,7 @@ class AgentService:
                     project_context=result.context,
                     reviewed_fasta_url=active_reviewed_fasta_url,
                     reviewed_fasta_name=active_reviewed_fasta_name,
+                    prefer_project_fasta=prefer_project_fasta,
                 )
                 result = result.model_copy(update={"plan": reviewed_plan})
         if result.plan.needs_review and self._search_review_issues(result.plan):
@@ -564,6 +701,21 @@ class AgentService:
                 result = result.model_copy(update={"plan": accepted_plan})
                 search_parameters_reviewed = True
                 self._report("人工已确认搜库参数；继续处理剩余步骤。")
+        prepared_path: Path | None = None
+        if result.plan.needs_review and self._can_retry_with_mzml_instrument(result.plan):
+            self._report("检测到项目级多个仪器；先准备/转换 mzML，并尝试从 mzML 解析文件级仪器。")
+            prepared_path = self.prepare_asset(result.asset)
+            result = self.replan_with_mzml_instrument(
+                result,
+                prepared_path,
+                task,
+                output_dir,
+                prefer_project_fasta=prefer_project_fasta,
+                reviewed_fasta_path=active_reviewed_fasta_path,
+                reviewed_fasta_url=active_reviewed_fasta_url,
+                reviewed_fasta_name=active_reviewed_fasta_name,
+                accept_search_parameter_review=search_parameters_reviewed,
+            )
         if result.plan.needs_review:
             self.write_task_bundle(
                 output_dir,
@@ -577,7 +729,8 @@ class AgentService:
             self._report(message)
             raise ReviewRequiredError(message)
         try:
-            prepared_path = self.prepare_asset(result.asset)
+            if prepared_path is None:
+                prepared_path = self.prepare_asset(result.asset)
         except AssetPreparationError as exc:
             output_dir = Path(output_dir)
             reason = (
@@ -615,6 +768,7 @@ class AgentService:
             reviewed_fasta_path=active_reviewed_fasta_path,
             reviewed_fasta_url=active_reviewed_fasta_url,
             reviewed_fasta_name=active_reviewed_fasta_name,
+            prefer_project_fasta=prefer_project_fasta,
             accept_search_parameter_review=search_parameters_reviewed,
             report=self.reporter,
         )

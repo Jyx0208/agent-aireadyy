@@ -346,6 +346,7 @@ def test_materialize_dda_task_bundle_downloads_reproduced_project_fasta(tmp_path
         project_context=context,
         attributes=_attributes(),
         output_dir=tmp_path / "task_out",
+        prefer_project_fasta=True,
     )
 
     bundle = materialize_dda_task_bundle(
@@ -355,6 +356,7 @@ def test_materialize_dda_task_bundle_downloads_reproduced_project_fasta(tmp_path
         attributes=_attributes(),
         source_data_path=tmp_path / "WT_5_Lys-c.mzML",
         output_dir=tmp_path / "task_out",
+        prefer_project_fasta=True,
     )
 
     assert plan.fasta_selection_mode == "reproduced"
@@ -413,6 +415,7 @@ def test_materialize_dda_task_bundle_decompresses_reproduced_project_fasta_gz(tm
         attributes=_attributes(),
         source_data_path=tmp_path / "WT_5_Lys-c.mzML",
         output_dir=tmp_path / "task_out",
+        prefer_project_fasta=True,
     )
 
     assert bundle.materialized_fasta_path.name == "project_reference.fasta"

@@ -65,6 +65,8 @@ class PrideClient:
             return None
         if url.startswith("ftp://ftp.pride.ebi.ac.uk/"):
             return url.replace("ftp://ftp.pride.ebi.ac.uk/", "https://ftp.pride.ebi.ac.uk/")
+        if url.startswith("ftp://"):
+            return "https://" + url[len("ftp://") :]
         return url
 
     def download_text(self, url: str) -> str:

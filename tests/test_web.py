@@ -6,6 +6,7 @@ import os
 import time
 import zipfile
 from collections import deque
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +15,7 @@ import pytest
 import agent.web.app as web_app
 from agent.web.app import StderrCapture, WebReporter, _create_task_inner, _tasks
 from agent.web.app import _build_review_summary, _cleanup_expired_results, _list_public_results, _zip_output_dir
-from agent.web.app import _start_ready_queued_tasks, _strip_ansi
+from agent.web.app import _start_ready_queued_tasks, _strip_ansi, submit_task_review
 from agent.web.app import _try_start_queued_task, download_results, get_task, health, list_project_history
 
 
@@ -37,6 +38,10 @@ def _value(value, confidence=0.9, source="test", conflict_flag=False):
     )
 
 
+def datetime_from_timestamp(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, UTC).isoformat()
+
+
 def test_strip_ansi_removes_llm_color_codes():
     raw = "\x1b[0m\x1b[90mrecommended\x1b[0m_fasta_url"
 
@@ -54,7 +59,7 @@ def test_download_progress_is_throttled_but_completion_is_logged(monkeypatch):
         reporter(
             {
                 "kind": "download_progress",
-                "label": "Homo_sapiens_reviewed.fasta",
+                "label": "uniprot_human_UP000005640.fasta",
                 "downloaded": 1 * 1024 * 1024,
                 "total": 20 * 1024 * 1024,
                 "speed_bps": 1 * 1024 * 1024,
@@ -64,7 +69,7 @@ def test_download_progress_is_throttled_but_completion_is_logged(monkeypatch):
         reporter(
             {
                 "kind": "download_progress",
-                "label": "Homo_sapiens_reviewed.fasta",
+                "label": "uniprot_human_UP000005640.fasta",
                 "downloaded": 2 * 1024 * 1024,
                 "total": 20 * 1024 * 1024,
                 "speed_bps": 1 * 1024 * 1024,
@@ -74,7 +79,7 @@ def test_download_progress_is_throttled_but_completion_is_logged(monkeypatch):
         reporter(
             {
                 "kind": "download_progress",
-                "label": "Homo_sapiens_reviewed.fasta",
+                "label": "uniprot_human_UP000005640.fasta",
                 "downloaded": 20 * 1024 * 1024,
                 "total": 20 * 1024 * 1024,
                 "speed_bps": 1 * 1024 * 1024,
@@ -130,6 +135,80 @@ def test_build_review_summary_extracts_fixed_sidebar_parameters(tmp_path):
     assert "precursor_tol" in labels
     assert summary["needs_review"] is True
     assert summary["issues"] == ["搜库参数需要人工复核"]
+
+
+def test_build_review_summary_includes_user_choices_for_multi_species_and_instruments(tmp_path):
+    result = SimpleNamespace(
+        attributes=SimpleNamespace(
+            acquisition_mode=_value("DDA"),
+            species=_value("Homo sapiens; Mus musculus", source="pride.organisms", conflict_flag=True),
+            instrument_name=_value("Orbitrap Fusion Lumos; Q Exactive HF", source="pride.instruments", conflict_flag=True),
+            enzyme=_value("Trypsin"),
+            fixed_mods=_value(["Carbamidomethyl C"]),
+            variable_mods=_value(["Oxidation M"]),
+            search_parameter_hints=_value({"recommended_workflow_name": "Default.workflow"}),
+        ),
+        context=SimpleNamespace(
+            metadata={
+                "organisms": SimpleNamespace(value=["Homo sapiens", "Mus musculus"]),
+                "instruments": SimpleNamespace(value=["Orbitrap Fusion Lumos", "Q Exactive HF"]),
+            },
+            project_files=[],
+        ),
+        plan=SimpleNamespace(
+            fragpipe_workflow_path=tmp_path / "Default.workflow",
+            fasta_path=tmp_path / "uniprot_human_UP000005640.fasta",
+            fasta_selection_mode="inferred",
+            fasta_download_url="https://rest.uniprot.org/uniprotkb/stream?compressed=false&format=fasta&query=%28proteome%3AUP000005640%29",
+            raw_data_type="mzml",
+            thread_num=1,
+            needs_review=True,
+            blocking_issues=[
+                "未找到匹配的 SDRF 行，且项目包含多个物种；无法确定文件级物种信息。",
+                "未找到匹配的 SDRF 行，且项目包含多个仪器；无法确定文件级仪器信息。",
+            ],
+        ),
+    )
+
+    summary = _build_review_summary(result)
+
+    assert summary["review_options"] == [
+        {"field": "species", "label": "选择物种", "values": ["Homo sapiens", "Mus musculus"]},
+        {"field": "instrument_name", "label": "选择仪器", "values": ["Orbitrap Fusion Lumos", "Q Exactive HF"]},
+    ]
+
+
+def test_submit_task_review_requeues_blocked_task_with_user_overrides(monkeypatch, tmp_path):
+    task_id = "review-task"
+    monkeypatch.setattr(web_app, "_start_ready_queued_tasks", lambda: [])
+    _tasks[task_id] = {
+        "task_id": task_id,
+        "input_value": "sample.raw",
+        "submitter": "Alice",
+        "output_dir": str(tmp_path / "sample"),
+        "status": "blocked",
+        "created_at": datetime.now(UTC).isoformat(),
+        "finished_at": datetime.now(UTC).isoformat(),
+        "logs": deque(maxlen=20),
+        "step": 4,
+        "total_steps": 5,
+        "blocking_issues": ["未找到匹配的 SDRF 行，且项目包含多个物种；无法确定文件级物种信息。"],
+        "llm_config": {"api_key": "sk-test", "base_url": "https://api.example.test", "model": "model", "timeout": "1"},
+    }
+    try:
+        result = asyncio.run(
+            submit_task_review(
+                task_id,
+                {"overrides": {"species": "Homo sapiens", "instrument_name": "Q Exactive HF"}},
+            )
+        )
+
+        assert result["status"] == "queued"
+        assert _tasks[task_id]["review_overrides"] == {"species": "Homo sapiens", "instrument_name": "Q Exactive HF"}
+        assert _tasks[task_id]["blocking_issues"] == []
+        assert "finished_at" not in _tasks[task_id]
+    finally:
+        _tasks.pop(task_id, None)
 
 
 def test_list_public_results_discovers_existing_run_directories(monkeypatch, tmp_path):
@@ -363,6 +442,139 @@ def test_project_history_keeps_record_after_download_directory_is_removed(monkey
     assert history["results"][0]["task_id"] == "old"
     assert history["results"][0]["status"] == "completed"
     assert history["results"][0]["can_download"] is False
+
+
+def test_task_history_persists_logs_and_review_without_api_key(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    task_id = "history-detail"
+    output_dir = tmp_path / "history-detail"
+    _tasks[task_id] = {
+        "task_id": task_id,
+        "input_value": "sample.raw",
+        "submitter": "Alice",
+        "status": "completed",
+        "created_at": "2026-05-09T00:00:00+00:00",
+        "finished_at": "2026-05-09T00:10:00+00:00",
+        "output_dir": str(output_dir),
+        "logs": deque(
+            [
+                {"type": "log", "ts": "00:00:01", "level": "info", "message": "started"},
+                {"type": "review", "ts": "00:00:02", "summary": {"items": []}},
+            ],
+            maxlen=10,
+        ),
+        "step": 5,
+        "total_steps": 5,
+        "review_summary": {"items": [{"label": "workflow", "value": "LFQ-MBR.workflow"}]},
+        "blocking_issues": ["manual review"],
+        "llm_config": {"api_key": "sk-secret", "model": "m1"},
+    }
+
+    try:
+        web_app._write_task_history(task_id)
+    finally:
+        _tasks.pop(task_id, None)
+
+    history_text = (output_dir / "task_history.json").read_text(encoding="utf-8")
+    history = json.loads(history_text)
+    assert history["logs"][0]["message"] == "started"
+    assert history["review_summary"]["items"][0]["value"] == "LFQ-MBR.workflow"
+    assert history["blocking_issues"] == ["manual review"]
+    assert "sk-secret" not in history_text
+    assert "api_key" not in history_text
+    assert "llm_config" not in history_text
+
+
+def test_get_task_returns_archived_history_logs_after_result_directory_removed(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    (tmp_path / "project_history.json").write_text(
+        json.dumps(
+            [
+                {
+                    "task_id": "archived",
+                    "input_value": "archived.raw",
+                    "submitter": "Bob",
+                    "status": "completed",
+                    "output_dir": "archived",
+                    "finished_at": "2026-05-09T00:10:00+00:00",
+                    "logs": [{"type": "log", "ts": "00:00:01", "level": "info", "message": "done"}],
+                    "review_summary": {"items": [{"label": "workflow", "value": "Default.workflow"}]},
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    detail = asyncio.run(get_task("archived"))
+
+    assert detail["task_id"] == "archived"
+    assert detail["archived"] is True
+    assert detail["logs"][0]["message"] == "done"
+    assert detail["review_summary"]["items"][0]["value"] == "Default.workflow"
+    assert detail["can_download"] is False
+
+
+def test_cleanup_results_uses_finished_at_not_old_file_mtime(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setenv("AGENT_RESULT_RETENTION_SECONDS", "1800")
+    project = tmp_path / "fresh-finished"
+    project.mkdir()
+    result_file = project / "result.txt"
+    result_file.write_text("ok", encoding="utf-8")
+    finished_at = time.time() - 60
+    old_stamp = time.time() - 7200
+    (project / "task_history.json").write_text(
+        json.dumps(
+            {
+                "task_id": "fresh-finished",
+                "status": "completed",
+                "input_value": "fresh.raw",
+                "output_dir": "fresh-finished",
+                "finished_at": datetime_from_timestamp(finished_at),
+            }
+        ),
+        encoding="utf-8",
+    )
+    for path in project.rglob("*"):
+        os.utime(path, (old_stamp, old_stamp))
+    os.utime(project, (old_stamp, old_stamp))
+
+    removed = _cleanup_expired_results()
+
+    assert "fresh-finished" not in removed
+    assert project.exists()
+
+
+def test_cleanup_preserves_history_index_after_result_files_expire(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setenv("AGENT_RESULT_RETENTION_SECONDS", "1800")
+    project = tmp_path / "expired"
+    project.mkdir()
+    (project / "result.txt").write_text("ok", encoding="utf-8")
+    old_stamp = time.time() - 7200
+    (project / "task_history.json").write_text(
+        json.dumps(
+            {
+                "task_id": "expired",
+                "status": "completed",
+                "input_value": "expired.raw",
+                "submitter": "Alice",
+                "output_dir": "expired",
+                "finished_at": datetime_from_timestamp(old_stamp),
+                "logs": [{"type": "log", "ts": "00:00:01", "level": "info", "message": "expired"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    removed = _cleanup_expired_results()
+    detail = asyncio.run(get_task("expired"))
+
+    assert "expired" in removed
+    assert not project.exists()
+    assert detail["archived"] is True
+    assert detail["logs"][0]["message"] == "expired"
+    assert detail["can_download"] is False
 
 
 def test_history_reflects_failed_status_and_disables_download(monkeypatch, tmp_path):
@@ -650,7 +862,7 @@ def test_download_results_uses_cached_zip(tmp_path):
         before_pack = asyncio.run(get_task(task_id))
         not_ready = asyncio.run(download_results(task_id))
         assert before_pack["can_download"] is False
-        assert not_ready == {"error": "ZIP package is not ready. Wait for packaging to finish before downloading."}
+        assert not_ready == {"error": "结果 ZIP 尚未打包完成，请等待任务日志提示后再下载。"}
         zip_path = _zip_output_dir(output_dir)
         assert zip_path.name == "results-compressed.zip"
         response = asyncio.run(download_results(task_id))

@@ -46,6 +46,7 @@ _DOWNLOAD_CACHE_DIR = ".download_cache"
 _DOWNLOAD_ZIP_NAME = "results-compressed.zip"
 _DOWNLOAD_RESULT_DIRS = {"ai_ready", "msdt", "rawspectrum", "logs"}
 _DOWNLOAD_ROOT_SUFFIXES = {".json", ".txt", ".log", ".tsv", ".csv"}
+_MAX_PERSISTED_LOGS = 2000
 
 # 默认配置（不从 .env 加载，由用户在页面填写）
 _DEFAULT_CONFIG = {
@@ -72,6 +73,71 @@ def _clean_submitter(value: Any) -> str:
 
 def _strip_ansi(value: Any) -> str:
     return _ANSI_RE.sub("", str(value)).replace("\r", "")
+
+
+def _redact_secrets(value: Any) -> str:
+    text = _strip_ansi(value)
+    text = re.sub(r"(?i)(api[_ -]?key\s*[:=]\s*)\S+", r"\1[redacted]", text)
+    text = re.sub(r"sk-[A-Za-z0-9_\-]{6,}", "[redacted-api-key]", text)
+    return text
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        json.dumps(value, ensure_ascii=False)
+    except TypeError:
+        return str(value)
+    return value
+
+
+def _sanitize_log_entry(entry: Any) -> dict[str, Any] | None:
+    if not isinstance(entry, dict):
+        return None
+    allowed = ("type", "ts", "level", "message", "key", "replace", "step", "status", "summary")
+    sanitized: dict[str, Any] = {}
+    for key in allowed:
+        if key not in entry:
+            continue
+        value = entry[key]
+        if key == "message":
+            value = _redact_secrets(value).strip()
+        sanitized[key] = _json_safe(value)
+    if not sanitized:
+        return None
+    return sanitized
+
+
+def _public_logs_from_task(task: dict[str, Any]) -> list[dict[str, Any]]:
+    logs = list(task.get("logs") or [])
+    public_logs: list[dict[str, Any]] = []
+    for entry in logs[-_MAX_PERSISTED_LOGS:]:
+        sanitized = _sanitize_log_entry(entry)
+        if sanitized:
+            public_logs.append(sanitized)
+    return public_logs
+
+
+def _parse_history_timestamp(value: Any) -> float | None:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.timestamp()
+
+
+def _history_retention_start(history: dict[str, Any], fallback_mtime: float = 0.0) -> float:
+    for key in ("finished_at", "started_at", "created_at", "updated_at"):
+        parsed = _parse_history_timestamp(history.get(key))
+        if parsed is not None:
+            return parsed
+    return fallback_mtime
 
 
 def _positive_float(value: str, default: float) -> float:
@@ -200,7 +266,7 @@ def _read_public_history(run_dir: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _public_task_record_locked(task_id: str, task: dict[str, Any]) -> dict[str, Any]:
+def _public_task_record_locked(task_id: str, task: dict[str, Any], *, include_logs: bool = False) -> dict[str, Any]:
     output_dir_raw = task.get("output_dir")
     output_dir = Path(output_dir_raw) if output_dir_raw else None
     can_download = bool(
@@ -209,7 +275,9 @@ def _public_task_record_locked(task_id: str, task: dict[str, Any]) -> dict[str, 
         and output_dir.exists()
         and _is_download_zip_ready(output_dir)
     )
-    return {
+    logs = _public_logs_from_task(task)
+    updated_at = task.get("updated_at") or task.get("finished_at") or task.get("started_at") or task.get("created_at")
+    record = {
         "task_id": task_id,
         "input_value": task.get("input_value", ""),
         "submitter": task.get("submitter", "未填写"),
@@ -217,12 +285,20 @@ def _public_task_record_locked(task_id: str, task: dict[str, Any]) -> dict[str, 
         "created_at": task.get("created_at"),
         "started_at": task.get("started_at"),
         "finished_at": task.get("finished_at"),
+        "updated_at": updated_at,
         "step": task.get("step", 0),
         "total_steps": task.get("total_steps", 5),
         "queue_position": _queue_position_locked(task_id),
         "output_dir": Path(output_dir).name if output_dir else "",
+        "log_count": len(logs),
+        "blocking_issues": list(task.get("blocking_issues") or []),
+        "review_summary": task.get("review_summary"),
+        "fasta_preference": "project" if task.get("prefer_project_fasta") else "llm",
         "can_download": can_download,
     }
+    if include_logs:
+        record["logs"] = logs
+    return record
 
 
 def _history_index_path() -> Path:
@@ -271,7 +347,7 @@ def _write_task_history(task_id: str) -> None:
         output_dir_raw = task.get("output_dir")
         if not output_dir_raw:
             return
-        record = _public_task_record_locked(task_id, task)
+        record = _public_task_record_locked(task_id, task, include_logs=True)
     output_dir = Path(output_dir_raw)
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -282,6 +358,83 @@ def _write_task_history(task_id: str) -> None:
         _upsert_history_index(record)
     except OSError:
         return
+
+
+def _archive_run_history(run_dir: Path, history: dict[str, Any] | None = None) -> None:
+    record = dict(history or _read_public_history(run_dir))
+    if not record:
+        record = {
+            "task_id": run_dir.name,
+            "input_value": run_dir.name,
+            "status": "completed",
+            "output_dir": run_dir.name,
+        }
+    record.setdefault("output_dir", run_dir.name)
+    record["can_download"] = False
+    _upsert_history_index(record)
+
+
+def _find_history_record(task_id: str) -> dict[str, Any] | None:
+    for record in reversed(_read_history_index()):
+        if str(record.get("task_id") or "") == task_id or str(record.get("output_dir") or "") == task_id:
+            return dict(record)
+    if not _runs_dir.exists():
+        return None
+    for run_dir in _runs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        record = _read_public_history(run_dir)
+        if not record:
+            continue
+        if str(record.get("task_id") or "") == task_id or str(record.get("output_dir") or run_dir.name) == task_id:
+            return dict(record)
+    return None
+
+
+def _public_logs_from_history(record: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_logs = record.get("logs")
+    if not isinstance(raw_logs, list):
+        return []
+    logs: list[dict[str, Any]] = []
+    for entry in raw_logs[-_MAX_PERSISTED_LOGS:]:
+        sanitized = _sanitize_log_entry(entry)
+        if sanitized:
+            logs.append(sanitized)
+    return logs
+
+
+def _task_detail_from_history(task_id: str, record: dict[str, Any]) -> dict[str, Any]:
+    output_dir_name = str(record.get("output_dir") or "")
+    output_dir = _runs_dir / output_dir_name if output_dir_name else None
+    can_download = bool(
+        record.get("status") == "completed"
+        and output_dir
+        and output_dir.exists()
+        and _is_download_zip_ready(output_dir)
+    )
+    logs = _public_logs_from_history(record)
+    return {
+        "task_id": str(record.get("task_id") or task_id),
+        "input_value": record.get("input_value", ""),
+        "submitter": record.get("submitter", "未填写"),
+        "status": record.get("status", "unknown"),
+        "created_at": record.get("created_at"),
+        "started_at": record.get("started_at"),
+        "finished_at": record.get("finished_at"),
+        "updated_at": record.get("updated_at") or record.get("finished_at") or record.get("started_at") or record.get("created_at"),
+        "step": record.get("step", 5 if record.get("status") == "completed" else 0),
+        "total_steps": record.get("total_steps", 5),
+        "log_count": len(logs),
+        "logs": logs,
+        "blocking_issues": list(record.get("blocking_issues") or []),
+        "review_summary": record.get("review_summary"),
+        "fasta_preference": record.get("fasta_preference", "llm"),
+        "can_download": can_download,
+        "archived": True,
+        "queue_position": 0,
+        "queue_length": 0,
+        "queued_tasks": 0,
+    }
 
 
 def _list_public_results() -> list[dict[str, Any]]:
@@ -306,7 +459,9 @@ def _list_public_results() -> list[dict[str, Any]]:
             continue
         history = _read_public_history(run_dir)
         status = history.get("status", "completed")
-        expires_at_ts = latest_mtime + retention
+        retention_start = _history_retention_start(history, latest_mtime)
+        updated_at_ts = max(latest_mtime, retention_start)
+        expires_at_ts = retention_start + retention
         results.append(
             {
                 "result_id": run_dir.name,
@@ -318,7 +473,7 @@ def _list_public_results() -> list[dict[str, Any]]:
                 "path": str(run_dir),
                 "file_count": file_count,
                 "size_bytes": size_bytes,
-                "updated_at": datetime.fromtimestamp(latest_mtime, UTC).isoformat(),
+                "updated_at": datetime.fromtimestamp(updated_at_ts, UTC).isoformat(),
                 "expires_at": datetime.fromtimestamp(expires_at_ts, UTC).isoformat(),
                 "expires_in_seconds": max(0, int(expires_at_ts - now)),
                 "can_download": status == "completed" and _is_download_zip_ready(run_dir),
@@ -334,6 +489,7 @@ def _list_project_history_records() -> list[dict[str, Any]]:
         key = str(record.get("task_id") or record.get("output_dir") or "")
         if key:
             item = dict(record)
+            item.pop("logs", None)
             output_dir_name = item.get("output_dir")
             output_dir = _runs_dir / str(output_dir_name) if output_dir_name else None
             file_count = 0
@@ -389,19 +545,22 @@ def _cleanup_expired_results() -> list[str]:
             excluded_names={_PUBLIC_HISTORY_FILE, _HISTORY_INDEX_FILE},
             excluded_dir_names={_DOWNLOAD_CACHE_DIR},
         )
-        if latest_mtime <= 0:
+        retention_start = _history_retention_start(history, latest_mtime)
+        if retention_start <= 0:
             continue
-        if now - latest_mtime >= retention:
+        if now - retention_start >= retention:
+            _archive_run_history(run_dir, history)
             shutil.rmtree(run_dir, ignore_errors=True)
             removed.append(run_dir.name)
             continue
         if status != "completed" or file_count == 0 or not _has_downloadable_result_file(run_dir):
             continue
-        candidates.append((latest_mtime, run_dir))
+        candidates.append((retention_start, run_dir))
     max_projects = _max_result_projects()
     candidates.sort(key=lambda item: item[0], reverse=True)
     to_remove = sorted(candidates[max_projects:], key=lambda item: item[0])
     for _mtime, run_dir in to_remove:
+        _archive_run_history(run_dir)
         shutil.rmtree(run_dir, ignore_errors=True)
         removed.append(run_dir.name)
     if not has_active_tasks:
@@ -511,7 +670,7 @@ def _zip_output_dir(output_dir: Path, report: Callable[[str], None] | None = Non
     except OSError:
         pass
     if not files:
-        raise FileNotFoundError("No result files available for ZIP packaging.")
+        raise FileNotFoundError("没有可打包的结果文件。")
 
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = zip_path.parent / f".{uuid.uuid4().hex}.zip.tmp"
@@ -716,6 +875,49 @@ def _append_attribute_item(items: list[dict[str, Any]], label: str, attribute: A
     )
 
 
+def _choice_values_from_metadata(result: Any, key: str) -> list[str]:
+    context = getattr(result, "context", None)
+    metadata = getattr(context, "metadata", {}) or {}
+    raw = getattr(metadata.get(key), "value", None) if hasattr(metadata, "get") else None
+    values = raw if isinstance(raw, list | tuple | set) else [raw] if raw else []
+    unique: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if text and text not in unique:
+            unique.append(text)
+    return unique
+
+
+def _choice_values_from_attribute(attribute: Any) -> list[str]:
+    raw = getattr(attribute, "value", None)
+    if isinstance(raw, list | tuple | set):
+        candidates = [str(item) for item in raw]
+    else:
+        candidates = re.split(r"\s*(?:;|\||,)\s*", str(raw or ""))
+    unique: list[str] = []
+    for value in candidates:
+        text = value.strip()
+        if text and text.lower() != "unknown" and text not in unique:
+            unique.append(text)
+    return unique
+
+
+def _review_options(result: Any, issues: list[str]) -> list[dict[str, Any]]:
+    attributes = result.attributes
+    options: list[dict[str, Any]] = []
+    species_attr = getattr(attributes, "species", None)
+    if bool(getattr(species_attr, "conflict_flag", False)) or any("多个物种" in issue for issue in issues):
+        values = _choice_values_from_metadata(result, "organisms") or _choice_values_from_attribute(species_attr)
+        if len(values) > 1:
+            options.append({"field": "species", "label": "选择物种", "values": values})
+    instrument_attr = getattr(attributes, "instrument_name", None)
+    if bool(getattr(instrument_attr, "conflict_flag", False)) or any("多个仪器" in issue for issue in issues):
+        values = _choice_values_from_metadata(result, "instruments") or _choice_values_from_attribute(instrument_attr)
+        if len(values) > 1:
+            options.append({"field": "instrument_name", "label": "选择仪器", "values": values})
+    return options
+
+
 def _build_review_summary(result: Any) -> dict[str, Any]:
     attributes = result.attributes
     plan = result.plan
@@ -727,6 +929,23 @@ def _build_review_summary(result: Any) -> dict[str, Any]:
     if fasta_mode:
         fasta = f"{fasta} ({fasta_mode})"
     _append_review_item(items, "FASTA", fasta, source="plan")
+    _append_review_item(items, "FASTA URL", getattr(plan, "fasta_download_url", None), source="plan")
+    project_files = getattr(getattr(result, "context", None), "project_files", []) or []
+    project_fastas = [
+        str(file_record.get("fileName", ""))
+        for file_record in project_files
+        if str(file_record.get("fileName", "")).lower().endswith((".fasta", ".fa", ".faa", ".fasta.gz", ".fa.gz", ".faa.gz"))
+    ]
+    if project_fastas and fasta_mode != "reproduced":
+        preview = ", ".join(project_fastas[:3])
+        if len(project_fastas) > 3:
+            preview += f", +{len(project_fastas) - 3}"
+        _append_review_item(
+            items,
+            "项目 FASTA 可选",
+            f"已默认使用大模型/物种推荐的 UniProt FASTA；PRIDE 项目中也检测到 {preview}。如需复现原项目 FASTA，勾选创建区的项目 FASTA 优先后重新提交。",
+            source="pride",
+        )
     _append_review_item(items, "raw_data_type", getattr(plan, "raw_data_type", None), source="plan")
     _append_review_item(items, "thread_num", getattr(plan, "thread_num", None), source="plan")
 
@@ -762,6 +981,7 @@ def _build_review_summary(result: Any) -> dict[str, Any]:
         "updated_at": datetime.now(UTC).strftime("%H:%M:%S"),
         "needs_review": bool(getattr(plan, "needs_review", False)),
         "issues": issues,
+        "review_options": _review_options(result, issues),
         "items": items,
     }
 
@@ -935,7 +1155,7 @@ async def download_public_result(result_id: str):
         return {"error": "结果目录没有可下载文件。"}
 
     if not _is_download_zip_ready(output_dir):
-        return {"error": "ZIP package is not ready. Wait for packaging to finish before downloading."}
+        return {"error": "结果 ZIP 尚未打包完成，请等待任务日志提示后再下载。"}
     zip_path = _download_zip_path(output_dir)
     return FileResponse(
         path=str(zip_path),
@@ -958,6 +1178,8 @@ async def _create_task_inner(body: dict[str, Any]):
     if not input_value:
         return {"error": "请输入 PRIDE 文件名"}
     submitter = _clean_submitter(body.get("submitter"))
+    fasta_preference = _clean_text(body.get("fasta_preference")).lower()
+    prefer_project_fasta = fasta_preference == "project" or body.get("prefer_project_fasta") is True
 
     # 应用用户填写的 LLM 配置
     llm_config = body.get("llm_config", {})
@@ -986,6 +1208,7 @@ async def _create_task_inner(body: dict[str, Any]):
             "step": 0,
             "total_steps": 5,
             "blocking_issues": [],
+            "prefer_project_fasta": prefer_project_fasta,
             "llm_config": dict(config),
         }
         queue_state = _queue_state_locked(task_id)
@@ -1169,6 +1392,8 @@ def _run_pipeline(task_id: str):
     input_value = task["input_value"]
     output_dir = Path(task["output_dir"])
     llm_config = task.get("llm_config")
+    prefer_project_fasta = bool(task.get("prefer_project_fasta"))
+    review_overrides = dict(task.get("review_overrides") or {})
     if not isinstance(llm_config, dict):
         _set_task_terminal_status(task_id, "failed")
         _log(task_id, "error", "缺少本次任务的 API Key 配置。")
@@ -1195,7 +1420,20 @@ def _run_pipeline(task_id: str):
 
         _log(task_id, "info", "正在查询 PRIDE API 并调用大模型推断参数…")
         with StderrCapture(task_id):
-            result = service.plan_dda_run_from_pride(task=task_obj, output_dir=output_dir)
+            result = service.plan_dda_run_from_pride(
+                task=task_obj,
+                output_dir=output_dir,
+                prefer_project_fasta=prefer_project_fasta,
+            )
+        if review_overrides:
+            result = service.apply_review_overrides_to_result(
+                result,
+                review_overrides,
+                task_obj,
+                output_dir,
+                prefer_project_fasta=prefer_project_fasta,
+            )
+            _log(task_id, "info", "已应用人工复核选择，重新生成执行计划。")
         _set_review_summary(task_id, result)
         _log(task_id, "info", "PRIDE 查询和大模型推断完成")
 
@@ -1211,6 +1449,23 @@ def _run_pipeline(task_id: str):
             _log(task_id, "info", f"推荐 workflow：{hints.get('recommended_workflow_name', '无')}")
             _log(task_id, "info", f"推荐 FASTA：{hints.get('recommended_fasta_name', '无')}")
 
+        prepared_path = None
+        if result.plan.needs_review and service._can_retry_with_mzml_instrument(result.plan):
+            _log(task_id, "info", "检测到项目级多个仪器，先下载/转换 mzML，并从 mzML 读取文件级仪器信息。")
+            _step(task_id, 2, "[2/5] 下载 PRIDE 数据文件")
+            with StderrCapture(task_id):
+                prepared_path = service.prepare_asset(result.asset)
+            _log(task_id, "info", f"数据文件已就绪：{prepared_path}")
+            result = service.replan_with_mzml_instrument(
+                result,
+                prepared_path,
+                task_obj,
+                output_dir,
+                prefer_project_fasta=prefer_project_fasta,
+            )
+            _set_review_summary(task_id, result)
+            _log(task_id, "info", f"仪器复核后计划状态：{'需要人工复核' if result.plan.needs_review else '可继续运行'}")
+
         if result.plan.needs_review:
             task["blocking_issues"] = result.plan.blocking_issues
             for issue in result.plan.blocking_issues:
@@ -1222,10 +1477,13 @@ def _run_pipeline(task_id: str):
         _log(task_id, "info", f"workflow：{result.plan.fragpipe_workflow_path.name}  FASTA：{result.plan.fasta_path.name}（{result.plan.fasta_selection_mode}）")
 
         # ── 步骤 2 ──
-        _step(task_id, 2, "[2/5] 下载 PRIDE 数据文件")
-        with StderrCapture(task_id):
-            prepared_path = service.prepare_asset(result.asset)
-        _log(task_id, "info", f"数据文件已就绪：{prepared_path}")
+        if prepared_path is None:
+            _step(task_id, 2, "[2/5] 下载 PRIDE 数据文件")
+            with StderrCapture(task_id):
+                prepared_path = service.prepare_asset(result.asset)
+            _log(task_id, "info", f"数据文件已就绪：{prepared_path}")
+        else:
+            _log(task_id, "info", f"复用已准备的数据文件：{prepared_path}")
 
         # ── 步骤 3 ──
         _step(task_id, 3, "[3/5] 生成 MSDT-Converter 输入包")
@@ -1238,6 +1496,7 @@ def _run_pipeline(task_id: str):
                 attributes=result.attributes,
                 source_data_path=prepared_path,
                 output_dir=output_dir,
+                prefer_project_fasta=prefer_project_fasta,
                 report=reporter,
             )
         service.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, bundle.plan, asset=result.asset)
@@ -1272,9 +1531,9 @@ def _run_pipeline(task_id: str):
             _log(task_id, "info", "=" * 50)
             if not _has_downloadable_result_file(output_dir):
                 raise RuntimeError("No downloadable result files were produced.")
-            _log(task_id, "info", "Start packaging compressed ZIP. The download button appears after packaging finishes.")
+            _log(task_id, "info", "开始压缩打包结果 ZIP，打包完成后才会显示下载按钮。")
             _zip_output_dir(output_dir, report=lambda message: _log(task_id, "info", message))
-            _log(task_id, "info", "ZIP packaging finished. The result ZIP is ready to download.")
+            _log(task_id, "info", "结果 ZIP 已压缩打包完成，可以下载。")
             _set_task_terminal_status(task_id, "completed")
         else:
             _log(task_id, "error", f"Docker 运行失败，返回码：{docker_result.returncode}")
@@ -1297,6 +1556,9 @@ def _run_pipeline(task_id: str):
 @app.get("/api/tasks/{task_id}")
 async def get_task(task_id: str):
     if task_id not in _tasks:
+        history = _find_history_record(task_id)
+        if history is not None:
+            return _task_detail_from_history(task_id, history)
         return {"error": "任务不存在"}
     task = _tasks[task_id]
     with _tasks_lock:
@@ -1317,16 +1579,85 @@ async def get_task(task_id: str):
         "step": task.get("step", 0),
         "total_steps": task.get("total_steps", 5),
         "log_count": len(task["logs"]),
+        "logs": _public_logs_from_task(task),
         "blocking_issues": task.get("blocking_issues", []),
         "review_summary": task.get("review_summary"),
+        "fasta_preference": "project" if task.get("prefer_project_fasta") else "llm",
         "can_download": can_download,
+        "archived": False,
         **queue_state,
     }
+
+
+def _clean_review_overrides(body: dict[str, Any]) -> dict[str, str]:
+    raw = body.get("overrides") if isinstance(body.get("overrides"), dict) else body
+    overrides: dict[str, str] = {}
+    for field in ("species", "instrument_name"):
+        value = _clean_text(raw.get(field)) if isinstance(raw, dict) else ""
+        if value:
+            overrides[field] = value
+    return overrides
+
+
+@app.post("/api/tasks/{task_id}/review")
+async def submit_task_review(task_id: str, body: dict[str, Any]):
+    overrides = _clean_review_overrides(body)
+    if not overrides:
+        return {"error": "请选择至少一个复核参数。"}
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            return {"error": "任务不存在"}
+        if task.get("status") not in {"blocked", "failed"}:
+            return {"error": "当前任务不在可复核状态。"}
+        if not isinstance(task.get("llm_config"), dict):
+            return {"error": "服务器内存中没有本次任务的 API Key，无法继续；请重新提交任务。"}
+        merged = dict(task.get("review_overrides") or {})
+        merged.update(overrides)
+        task["review_overrides"] = merged
+        task["status"] = "queued"
+        task["step"] = 0
+        task["blocking_issues"] = []
+        task.pop("finished_at", None)
+        task["logs"].append(
+            {
+                "type": "log",
+                "ts": datetime.now(UTC).strftime("%H:%M:%S"),
+                "level": "info",
+                "message": "已提交人工复核选择，任务重新进入队列。",
+            }
+        )
+        queue_state = _queue_state_locked(task_id)
+    _write_task_history(task_id)
+    _start_ready_queued_tasks()
+    with _tasks_lock:
+        status = _tasks.get(task_id, {}).get("status", "queued")
+        queue_state = _queue_state_locked(task_id)
+    return {"task_id": task_id, "status": status, "review_overrides": overrides, **queue_state}
 
 
 @app.get("/api/tasks/{task_id}/download")
 async def download_results(task_id: str):
     if task_id not in _tasks:
+        history = _find_history_record(task_id)
+        if history is not None:
+            if history.get("status") != "completed":
+                return {"error": "Task is not completed; results cannot be downloaded."}
+            output_dir_name = str(history.get("output_dir") or "")
+            output_dir = _runs_dir / output_dir_name if output_dir_name else None
+            if output_dir is None or not output_dir.exists():
+                return {"error": "Result directory does not exist."}
+            if not _has_downloadable_result_file(output_dir):
+                return {"error": "Result directory has no downloadable files."}
+            if not _is_download_zip_ready(output_dir):
+                return {"error": "Result ZIP is not ready yet."}
+            zip_path = _download_zip_path(output_dir)
+            stem = safe_output_stem(str(history.get("input_value") or output_dir_name or task_id))
+            return FileResponse(
+                path=str(zip_path),
+                filename=f"{stem}_results.zip",
+                media_type="application/zip",
+            )
         return {"error": "任务不存在"}
     task = _tasks[task_id]
     if task.get("status") != "completed":
@@ -1338,7 +1669,7 @@ async def download_results(task_id: str):
         return {"error": "结果目录没有可下载文件"}
 
     if not _is_download_zip_ready(output_dir):
-        return {"error": "ZIP package is not ready. Wait for packaging to finish before downloading."}
+        return {"error": "结果 ZIP 尚未打包完成，请等待任务日志提示后再下载。"}
     zip_path = _download_zip_path(output_dir)
     stem = safe_output_stem(task["input_value"])
     return FileResponse(
