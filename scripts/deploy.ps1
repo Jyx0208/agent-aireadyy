@@ -61,43 +61,39 @@ if (-not $NoPush) {
     Write-Host "Skipping git push because -NoPush was supplied."
 }
 
-$BuildCommand = if ($NoCache) {
-    '$SUDO docker compose build --no-cache web'
-} else {
-    '$SUDO docker compose build web'
+function ConvertTo-BashSingleQuoted {
+    param([string]$Value)
+    return "'" + $Value.Replace("'", "'\''") + "'"
 }
 
-$RemoteScript = @'
-set -euxo pipefail
-SERVER_PATH='__SERVER_PATH__'
-REMOTE_NAME='__REMOTE__'
-BRANCH_NAME='__BRANCH__'
-cd "$SERVER_PATH"
-git config --global --add safe.directory "$SERVER_PATH" || true
-git fetch "$REMOTE_NAME" "$BRANCH_NAME"
-git checkout "$BRANCH_NAME"
-git pull --ff-only "$REMOTE_NAME" "$BRANCH_NAME"
-if [ "$(id -u)" -eq 0 ]; then
-  SUDO=""
-else
-  SUDO="sudo"
-fi
-__BUILD_COMMAND__
-$SUDO docker compose up -d
-$SUDO docker compose ps
-'@
+$QuotedServerPath = ConvertTo-BashSingleQuoted $ServerPath
+$QuotedRemote = ConvertTo-BashSingleQuoted $Remote
+$QuotedBranch = ConvertTo-BashSingleQuoted $Branch
+$BuildCommand = if ($NoCache) {
+    '${SUDO} docker compose build --no-cache web'
+} else {
+    '${SUDO} docker compose build web'
+}
 
-$RemoteScript = $RemoteScript.Replace("__SERVER_PATH__", $ServerPath.Replace("'", "'\''"))
-$RemoteScript = $RemoteScript.Replace("__REMOTE__", $Remote.Replace("'", "'\''"))
-$RemoteScript = $RemoteScript.Replace("__BRANCH__", $Branch.Replace("'", "'\''"))
-$RemoteScript = $RemoteScript.Replace("__BUILD_COMMAND__", $BuildCommand)
-# Normalize remote script newlines before piping from Windows PowerShell to bash.
-$RemoteScript = $RemoteScript.Replace("`r`n", "`n").Replace("`r", "`n")
+$RemoteCommandLines = @(
+    "set -euxo pipefail",
+    "cd $QuotedServerPath",
+    "git config --global --add safe.directory $QuotedServerPath || true",
+    "git fetch $QuotedRemote $QuotedBranch",
+    "git checkout $QuotedBranch",
+    "git pull --ff-only $QuotedRemote $QuotedBranch",
+    'if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi',
+    $BuildCommand,
+    '${SUDO} docker compose up -d',
+    '${SUDO} docker compose ps'
+)
+$RemoteCommand = $RemoteCommandLines -join "; "
+$QuotedRemoteCommand = ConvertTo-BashSingleQuoted $RemoteCommand
 
 $Target = "$ServerUser@$ServerHost"
 Write-Host ""
 Write-Host "==> Deploying ${Remote}/${Branch} to ${Target}:${ServerPath}"
-$RemoteScript | ssh $Target "bash -s"
+ssh $Target "bash -lc $QuotedRemoteCommand"
 if ($LASTEXITCODE -ne 0) {
     throw "Remote deploy failed."
 }
