@@ -9,10 +9,13 @@ def test_deploy_script_pushes_main_and_rebuilds_remote_service():
     assert "git push" in text
     assert "HEAD:$Branch" in text
     assert "ssh" in text
-    assert "sudo docker compose build" in text
-    assert "sudo docker compose up -d" in text
+    assert "$SUDO docker compose build" in text
+    assert "$SUDO docker compose up -d" in text
+    assert "safe.directory" in text
+    assert 'id -u' in text
     assert "/opt/pride-agent" in text
     assert "47.253.243.164" in text
+    assert '"root"' in text
     assert "sk-" not in text
     assert "api_key" not in text.lower()
 

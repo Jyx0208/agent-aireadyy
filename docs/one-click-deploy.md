@@ -10,7 +10,7 @@ Default target:
 
 - Git remote: `origin`
 - Branch: `main`
-- Server: `admin@47.253.243.164`
+- Server: `root@47.253.243.164`
 - Server path: `/opt/pride-agent`
 
 The script does:
@@ -23,6 +23,12 @@ The script does:
 6. `sudo docker compose build web`
 7. `sudo docker compose up -d`
 
+If the SSH login user is not root:
+
+```powershell
+.\scripts\deploy.ps1 -ServerUser admin -CommitMessage "fix: describe the change"
+```
+
 For a clean rebuild:
 
 ```powershell
@@ -34,7 +40,7 @@ Override the server if needed:
 ```powershell
 .\scripts\deploy.ps1 `
   -ServerHost 47.253.243.164 `
-  -ServerUser admin `
+  -ServerUser root `
   -ServerPath /opt/pride-agent `
   -Branch main `
   -CommitMessage "fix: describe the change"

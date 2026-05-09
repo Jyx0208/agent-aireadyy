@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$ServerHost = $(if ($env:AGENT_DEPLOY_HOST) { $env:AGENT_DEPLOY_HOST } else { "47.253.243.164" }),
-    [string]$ServerUser = $(if ($env:AGENT_DEPLOY_USER) { $env:AGENT_DEPLOY_USER } else { "admin" }),
+    [string]$ServerUser = $(if ($env:AGENT_DEPLOY_USER) { $env:AGENT_DEPLOY_USER } else { "root" }),
     [string]$ServerPath = $(if ($env:AGENT_DEPLOY_PATH) { $env:AGENT_DEPLOY_PATH } else { "/opt/pride-agent" }),
     [string]$Branch = $(if ($env:AGENT_DEPLOY_BRANCH) { $env:AGENT_DEPLOY_BRANCH } else { "main" }),
     [string]$Remote = $(if ($env:AGENT_DEPLOY_REMOTE) { $env:AGENT_DEPLOY_REMOTE } else { "origin" }),
@@ -62,21 +62,35 @@ if (-not $NoPush) {
 }
 
 $BuildCommand = if ($NoCache) {
-    "sudo docker compose build --no-cache web"
+    '$SUDO docker compose build --no-cache web'
 } else {
-    "sudo docker compose build web"
+    '$SUDO docker compose build web'
 }
 
-$RemoteScript = @"
-set -euo pipefail
-cd '$ServerPath'
-git fetch '$Remote' '$Branch'
-git checkout '$Branch'
-git pull --ff-only '$Remote' '$Branch'
-$BuildCommand
-sudo docker compose up -d
-sudo docker compose ps
-"@
+$RemoteScript = @'
+set -euxo pipefail
+SERVER_PATH='__SERVER_PATH__'
+REMOTE_NAME='__REMOTE__'
+BRANCH_NAME='__BRANCH__'
+cd "$SERVER_PATH"
+git config --global --add safe.directory "$SERVER_PATH" || true
+git fetch "$REMOTE_NAME" "$BRANCH_NAME"
+git checkout "$BRANCH_NAME"
+git pull --ff-only "$REMOTE_NAME" "$BRANCH_NAME"
+if [ "$(id -u)" -eq 0 ]; then
+  SUDO=""
+else
+  SUDO="sudo"
+fi
+__BUILD_COMMAND__
+$SUDO docker compose up -d
+$SUDO docker compose ps
+'@
+
+$RemoteScript = $RemoteScript.Replace("__SERVER_PATH__", $ServerPath.Replace("'", "'\''"))
+$RemoteScript = $RemoteScript.Replace("__REMOTE__", $Remote.Replace("'", "'\''"))
+$RemoteScript = $RemoteScript.Replace("__BRANCH__", $Branch.Replace("'", "'\''"))
+$RemoteScript = $RemoteScript.Replace("__BUILD_COMMAND__", $BuildCommand)
 
 $Target = "$ServerUser@$ServerHost"
 Write-Host ""
