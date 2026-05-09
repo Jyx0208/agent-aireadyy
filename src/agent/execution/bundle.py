@@ -54,6 +54,43 @@ def _download_fasta(client: PrideClient, url: str, target_path: Path, report: Ca
     return client.download_to_path(url, target_path, report=report)
 
 
+def _validate_fasta_file(path: Path) -> None:
+    try:
+        sample = path.read_bytes()[:8192]
+    except OSError as exc:
+        raise ValueError(f"无法读取 FASTA 文件：{path}") from exc
+    if not sample:
+        raise ValueError(f"下载的 FASTA 文件为空，不能用于搜库：{path}")
+    if sample.startswith(b"\x1f\x8b"):
+        raise ValueError(f"下载的 FASTA 文件仍是 gzip 压缩内容，未正确解压：{path}")
+
+    try:
+        text = sample.decode("utf-8", errors="replace")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"下载的 FASTA 文件不是有效文本 FASTA：{path}") from exc
+
+    first_line = ""
+    has_sequence = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not first_line:
+            first_line = stripped
+            if not first_line.startswith(">"):
+                preview = first_line[:80]
+                raise ValueError(f"下载的文件不是有效 FASTA：{path}；首行={preview!r}")
+            continue
+        if not stripped.startswith(">"):
+            has_sequence = True
+            break
+
+    if not first_line:
+        raise ValueError(f"下载的 FASTA 文件没有 FASTA header：{path}")
+    if not has_sequence:
+        raise ValueError(f"下载的 FASTA 文件没有可用蛋白序列：{path}")
+
+
 def _write_sage_config(plan: DdaExecutionPlan, attributes: AttributeSet) -> Path:
     sage_config_path = plan.fragpipe_workdir.parent / "sage" / "sage_config.json"
     sage_config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,6 +151,7 @@ def materialize_dda_task_bundle(
             client.close()
     else:
         shutil.copyfile(plan.fasta_path, materialized_fasta_path)
+    _validate_fasta_file(materialized_fasta_path)
     if is_placeholder_fasta(materialized_fasta_path):
         raise ValueError(f"下载/生成的 FASTA 文件是占位文件，不能用于搜库：{materialized_fasta_path}")
 

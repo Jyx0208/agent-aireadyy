@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Callable
@@ -121,16 +122,25 @@ class DockerMSDTConverterRunner:
     def build_command(self, bundle: MaterializedTaskBundle) -> list[str]:
         task_root = docker_host_mount_path(bundle.task_root)
         container_config_path = f"/workspace/{bundle.converter_config_path.name}"
-        return [
+        command = [
             "docker",
             "run",
             "--rm",
             "-v",
             f"{task_root}:/workspace",
-            self.image,
-            "-config",
-            container_config_path,
+            "-e",
+            f"TZ={os.getenv('AGENT_MSDT_DOCKER_TZ') or os.getenv('TZ') or 'Asia/Shanghai'}",
         ]
+        if os.name != "nt" and Path("/etc/localtime").exists():
+            command.extend(["-v", "/etc/localtime:/etc/localtime:ro"])
+        command.extend(
+            [
+                self.image,
+                "-config",
+                container_config_path,
+            ]
+        )
+        return command
 
     def run(self, bundle: MaterializedTaskBundle) -> subprocess.CompletedProcess[str]:
         self.write_container_config(bundle)

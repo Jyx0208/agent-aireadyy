@@ -422,6 +422,49 @@ def test_materialize_dda_task_bundle_decompresses_reproduced_project_fasta_gz(tm
     assert bundle.materialized_fasta_path.read_text(encoding="utf-8") == ">sp|P1|\nPEPTIDE\n"
 
 
+def test_materialize_dda_task_bundle_rejects_downloaded_non_fasta_content(tmp_path: Path, monkeypatch):
+    task = normalize_input("WT_5_Lys-c.raw")
+    context = ProjectContext(project_accession="PXD123456", file_name="WT_5_Lys-c.raw")
+    attributes = _attributes()
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "recommended_workflow_name": "Default.workflow",
+            "recommended_fasta_name": "bad.fasta",
+            "recommended_fasta_url": "https://rest.uniprot.org/uniprotkb/stream?compressed=false&format=fasta&query=%28proteome%3AUP000005640%29",
+            "recommended_fasta_source": "UniProt",
+        },
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="bad download",
+        conflict_flag=False,
+    )
+
+    class FakePrideClient:
+        def download_to_path(self, url, target_path, report=None):
+            Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(target_path).write_text("<html>not a FASTA</html>\n", encoding="utf-8")
+            return Path(target_path)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("agent.execution.bundle.PrideClient", FakePrideClient)
+
+    try:
+        materialize_dda_task_bundle(
+            task=task,
+            project_resolution=ProjectResolution.empty(),
+            project_context=context,
+            attributes=attributes,
+            source_data_path=tmp_path / "WT_5_Lys-c.mzML",
+            output_dir=tmp_path / "task_out",
+        )
+    except ValueError as exc:
+        assert "不是有效 FASTA" in str(exc)
+    else:
+        raise AssertionError("non-FASTA download should be rejected before MSDT Docker runs")
+
+
 def _minimal_plan(tmp_path: Path, workflow_path: Path):
     from agent.models import DdaExecutionPlan
 

@@ -791,7 +791,9 @@ def test_plan_dda_execution_trusts_high_confidence_llm_species_for_multi_species
     assert plan.blocking_issues == []
     assert plan.fasta_path == tmp_path / "fasta" / "uniprot_rat_UP000002494.fasta"
     assert plan.fasta_download_url is not None
+    assert "rest.uniprot.org" in plan.fasta_download_url
     assert "UP000002494" in plan.fasta_download_url
+    assert "ftp.uniprot.org" not in plan.fasta_download_url
 
 
 def test_plan_dda_execution_allows_multi_metadata_when_file_level_values_are_resolved(tmp_path: Path):

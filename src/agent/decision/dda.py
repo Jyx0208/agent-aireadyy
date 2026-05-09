@@ -162,6 +162,7 @@ def _llm_recommended_fasta_choice(attributes: AttributeSet, output_dir: Path) ->
     if fasta_url and _is_uniprot_url(fasta_url):
         if proteome_id:
             fasta_name = _canonical_uniprot_fasta_name(proteome_id, species_file_name)
+            fasta_url = _uniprot_proteome_url(proteome_id)
         else:
             fasta_name = species_file_name
         return _reviewed_fasta_choice(output_dir, reviewed_fasta_url=fasta_url, reviewed_fasta_name=fasta_name)

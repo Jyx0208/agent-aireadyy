@@ -51,6 +51,8 @@ def test_docker_runner_builds_expected_command(tmp_path: Path):
     cmd = runner.build_command(bundle)
 
     assert cmd[:4] == ["docker", "run", "--rm", "-v"]
+    assert "-e" in cmd
+    assert "TZ=Asia/Shanghai" in cmd
     assert "guomics2017/msdt-converter:v1.3" in cmd
     assert "/workspace/converter_config.docker.json" in cmd
 
