@@ -70,6 +70,27 @@ def test_list_project_files_honors_pride_page_cap_of_100():
     ]
 
 
+def test_list_project_files_can_stop_after_max_files():
+    fake_client = _FakeHTTPClient(
+        {
+            0: [{"fileName": f"page0-{index}.raw"} for index in range(100)],
+            1: [{"fileName": f"page1-{index}.raw"} for index in range(100)],
+            2: [{"fileName": "page2-0.raw"}],
+        }
+    )
+    client = PrideClient()
+    client._client = fake_client
+
+    files = client.list_project_files("PXD000003", page_size=100, max_files=120)
+
+    assert len(files) == 120
+    assert files[-1]["fileName"] == "page1-19.raw"
+    assert fake_client.calls == [
+        ("/projects/PXD000003/files", {"pageSize": 100, "page": 0}),
+        ("/projects/PXD000003/files", {"pageSize": 100, "page": 1}),
+    ]
+
+
 def test_first_download_url_prefers_ftp_or_http_over_aspera():
     file_record = {
         "publicFileLocations": [

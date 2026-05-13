@@ -11,6 +11,12 @@ external/
 dist/
 sample_task/
 .agent_cache/
+.codex/
+.codex_ssh/
+.codex_online_ssh/
+.codex_known_hosts
+.check_hela_argc_try/
+.upload_tmp/
 
 # Local tool archives and unpacked vendor bundles
 FragPipe-*.zip
@@ -20,9 +26,18 @@ FragPipe-*/
 runs/
 task_out/
 task_run_real/
+benchmark_runs/
+pride_planning_smoke_runs/
+pride_planning_smoke_verify/
+pride_resolution_smoke_verify/
+pride_resolution_smoke_verify_40/
+pride_smoke_runs/
+test_aspn_f4_r1_llm_fasta_*/
 
 # Runtime logs and scratch data
 *.log
+*.xlsx
+~$*
 
 # Mass spectrometry raw data and derived artifacts
 *.raw

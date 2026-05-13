@@ -144,6 +144,21 @@ def test_plan_dda_execution_generates_converter_compatible_paths(tmp_path: Path)
     assert plan.output_paths["fp_msdt"].suffix == ".parquet"
 
 
+def test_plan_dda_execution_uses_search_threads_from_environment(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("AGENT_SEARCH_THREADS", "2")
+
+    plan = plan_dda_execution(
+        task_id="task-threads",
+        source_file_name="sample.raw",
+        source_data_path="/data/sample.mzML",
+        project_resolution=ProjectResolution.empty(),
+        attributes=_dda_attributes(),
+        output_dir=tmp_path,
+    )
+
+    assert plan.thread_num == 2
+
+
 def test_plan_dda_execution_maps_mouse_species_alias_to_mouse_fasta(tmp_path: Path):
     attributes = _dda_attributes()
     attributes.species = AttributeValue(
@@ -195,7 +210,7 @@ def test_plan_dda_execution_maps_rat_species_to_uniprot_download_target(tmp_path
     assert "UP000002494" in plan.fasta_download_url
 
 
-def test_plan_dda_execution_uses_generic_fasta_for_multi_species_mixture(tmp_path: Path):
+def test_plan_dda_execution_uses_combined_fasta_for_known_multi_species_mixture(tmp_path: Path):
     attributes = _dda_attributes()
     attributes.species = AttributeValue(
         value="Homo sapiens; Saccharomyces cerevisiae; Escherichia coli",
@@ -214,9 +229,13 @@ def test_plan_dda_execution_uses_generic_fasta_for_multi_species_mixture(tmp_pat
         output_dir=tmp_path,
     )
 
-    assert plan.fasta_path.name == "reference_requires_review.fasta"
-    assert plan.fasta_selection_mode == "defaulted"
-    assert plan.needs_review is True
+    assert plan.fasta_path.name == "uniprot_human_UP000005640_yeast_UP000002311_ecoli_k12_UP000000625.fasta"
+    assert plan.fasta_selection_mode == "inferred"
+    assert plan.fasta_download_url is not None
+    assert "UP000005640" in plan.fasta_download_url
+    assert "UP000002311" in plan.fasta_download_url
+    assert "UP000000625" in plan.fasta_download_url
+    assert plan.needs_review is False
 
 
 def test_plan_dda_execution_uses_wiff2mzml_mode_for_converted_sciex_input(tmp_path: Path):
@@ -728,6 +747,7 @@ def test_plan_dda_execution_requires_review_for_multi_metadata_without_sdrf(tmp_
 def test_plan_dda_execution_trusts_high_confidence_llm_species_for_multi_species_project_without_sdrf(
     tmp_path: Path,
 ):
+    source_name = "20191002_EXP1_Evo1_AMV_TMT11prot_Rat_SetC_21min_46fracs_36.raw"
     attributes = _dda_attributes()
     attributes.species = AttributeValue(
         value="Rattus norvegicus",
@@ -764,7 +784,7 @@ def test_plan_dda_execution_trusts_high_confidence_llm_species_for_multi_species
     )
     context = ProjectContext(
         project_accession="PXD016662",
-        file_name="20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.raw",
+        file_name=source_name,
         metadata={
             "organisms": MetadataValue(
                 value=["Rattus norvegicus", "Homo sapiens"],
@@ -779,8 +799,8 @@ def test_plan_dda_execution_trusts_high_confidence_llm_species_for_multi_species
 
     plan = plan_dda_execution(
         task_id="task-rat-multi-species",
-        source_file_name="20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.raw",
-        source_data_path=tmp_path / "20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.mzML",
+        source_file_name=source_name,
+        source_data_path=tmp_path / "20191002_EXP1_Evo1_AMV_TMT11prot_Rat_SetC_21min_46fracs_36.mzML",
         project_resolution=ProjectResolution.empty(),
         project_context=context,
         attributes=attributes,
@@ -793,12 +813,14 @@ def test_plan_dda_execution_trusts_high_confidence_llm_species_for_multi_species
     assert plan.fasta_download_url is not None
     assert "rest.uniprot.org" in plan.fasta_download_url
     assert "UP000002494" in plan.fasta_download_url
+    assert "reviewed%3Atrue" in plan.fasta_download_url
     assert "ftp.uniprot.org" not in plan.fasta_download_url
 
 
 def test_plan_dda_execution_uses_species_uniprot_url_for_rat_taxonomy_hint_without_sdrf(
     tmp_path: Path,
 ):
+    source_name = "20191002_EXP1_Evo1_AMV_TMT11prot_Rat_SetC_21min_46fracs_36.raw"
     attributes = _dda_attributes()
     attributes.species = AttributeValue(
         value="Rattus norvegicus",
@@ -835,7 +857,7 @@ def test_plan_dda_execution_uses_species_uniprot_url_for_rat_taxonomy_hint_witho
     )
     context = ProjectContext(
         project_accession="PXD016662",
-        file_name="20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.raw",
+        file_name=source_name,
         metadata={
             "organisms": MetadataValue(
                 value=["Rattus norvegicus", "Homo sapiens"],
@@ -850,8 +872,8 @@ def test_plan_dda_execution_uses_species_uniprot_url_for_rat_taxonomy_hint_witho
 
     plan = plan_dda_execution(
         task_id="task-rat-taxonomy-url",
-        source_file_name="20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.raw",
-        source_data_path=tmp_path / "20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.mzML",
+        source_file_name=source_name,
+        source_data_path=tmp_path / "20191002_EXP1_Evo1_AMV_TMT11prot_Rat_SetC_21min_46fracs_36.mzML",
         project_resolution=ProjectResolution.empty(),
         project_context=context,
         attributes=attributes,
@@ -862,7 +884,259 @@ def test_plan_dda_execution_uses_species_uniprot_url_for_rat_taxonomy_hint_witho
     assert plan.blocking_issues == []
     assert plan.fasta_path == tmp_path / "fasta" / "uniprot_rat_UP000002494.fasta"
     assert plan.fasta_download_url is not None
-    assert plan.fasta_download_url == "https://rest.uniprot.org/uniprotkb/stream?compressed=false&format=fasta&query=%28proteome%3AUP000002494%29"
+    assert plan.fasta_download_url == "https://rest.uniprot.org/uniprotkb/stream?compressed=false&format=fasta&query=%28proteome%3AUP000002494%29%20AND%20%28reviewed%3Atrue%29"
+
+
+def test_plan_dda_execution_resolves_pxd016662_rat_file_species_conflict_from_file_name(tmp_path: Path):
+    source_name = "20191002_EXP1_Evo1_AMV_TMT11prot_Rat_SetC_21min_46fracs_36.raw"
+    attributes = _dda_attributes()
+    attributes.species = AttributeValue(
+        value="Rattus norvegicus (rat); Homo sapiens (human)",
+        confidence=0.5,
+        source="pride.organisms",
+        evidence_excerpt="Project-level organisms list rat and human.",
+        conflict_flag=True,
+    )
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "recommended_workflow_name": "TMT10.workflow",
+            "recommended_fasta_name": "Rattus_norvegicus_uniprot_2024.fasta",
+            "recommended_fasta_url": "https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/reference_proteomes/Eukaryota/UP000002494/UP000002494_10116.fasta.gz",
+            "recommended_fasta_source": "UniProt",
+        },
+        confidence=0.8,
+        source="llm_confirmed",
+        evidence_excerpt="Rat TMT file.",
+        conflict_flag=False,
+    )
+    context = ProjectContext(
+        project_accession="PXD016662",
+        file_name=source_name,
+        metadata={
+            "organisms": MetadataValue(
+                value=["Rattus norvegicus (rat)", "Homo sapiens (human)"],
+                source="pride.organisms",
+                source_level="project",
+                completeness=1.0,
+            )
+        },
+        sdrf_rows=[],
+        project_files=[],
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-pxd016662-rat-tmt",
+        source_file_name=source_name,
+        source_data_path=tmp_path / "20191002_EXP1_Evo1_AMV_TMT11prot_Rat_SetC_21min_46fracs_36.mzML",
+        project_resolution=ProjectResolution.empty(),
+        project_context=context,
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is False
+    assert plan.blocking_issues == []
+    assert plan.fasta_path == tmp_path / "fasta" / "uniprot_rat_UP000002494.fasta"
+
+
+def test_plan_dda_execution_corrects_pxd016662_non_rat_file_to_human_fasta(tmp_path: Path):
+    attributes = _dda_attributes()
+    attributes.species = AttributeValue(
+        value="Rattus norvegicus",
+        confidence=0.8,
+        source="llm_confirmed",
+        evidence_excerpt="LLM incorrectly inferred rat for a non-rat PXD016662 file.",
+        conflict_flag=False,
+    )
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "recommended_workflow_name": "LFQ-phospho.workflow",
+            "recommended_fasta_name": "UP000002494_10116.fasta",
+            "recommended_fasta_url": "https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/reference_proteomes/Eukaryota/UP000002494/UP000002494_10116.fasta.gz",
+            "recommended_fasta_source": "UniProt",
+        },
+        confidence=0.8,
+        source="llm_confirmed",
+        evidence_excerpt="LLM returned a rat FASTA hint.",
+        conflict_flag=False,
+    )
+    context = ProjectContext(
+        project_accession="PXD016662",
+        file_name="20190914_EXP1_Evo1_AMV_LFQPhos_200ug_30ul-TiIMACHP_200ul_RT_01.raw",
+        metadata={
+            "organisms": MetadataValue(
+                value=["Rattus norvegicus (rat)", "Homo sapiens (human)"],
+                source="pride.organisms",
+                source_level="project",
+                completeness=1.0,
+            )
+        },
+        sdrf_rows=[],
+        project_files=[],
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-pxd016662-human-phospho",
+        source_file_name="20190914_EXP1_Evo1_AMV_LFQPhos_200ug_30ul-TiIMACHP_200ul_RT_01.raw",
+        source_data_path=tmp_path / "20190914_EXP1_Evo1_AMV_LFQPhos_200ug_30ul-TiIMACHP_200ul_RT_01.mzML",
+        project_resolution=ProjectResolution.empty(),
+        project_context=context,
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.fasta_path == tmp_path / "fasta" / "uniprot_human_UP000005640.fasta"
+    assert plan.fasta_download_url is not None
+    assert "UP000005640" in plan.fasta_download_url
+    assert "UP000002494" not in plan.fasta_download_url
+
+
+def test_plan_dda_execution_uses_combined_reviewed_uniprot_for_resolved_multi_species_without_sdrf(
+    tmp_path: Path,
+):
+    attributes = _dda_attributes()
+    attributes.species = AttributeValue(
+        value="Rattus norvegicus (rat); Homo sapiens (human)",
+        confidence=0.8,
+        source="llm_confirmed",
+        evidence_excerpt="PRIDE organisms field lists both rat and human.",
+        conflict_flag=False,
+    )
+    attributes.instrument_name = AttributeValue(
+        value="Orbitrap Exploris 480",
+        confidence=0.95,
+        source="llm_confirmed",
+        evidence_excerpt="PRIDE instrument field: Orbitrap Exploris 480",
+        conflict_flag=False,
+    )
+    attributes.instrument_family = AttributeValue(
+        value="orbitrap",
+        confidence=0.95,
+        source="llm_confirmed",
+        evidence_excerpt="Orbitrap Exploris 480",
+        conflict_flag=False,
+    )
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "recommended_workflow_name": "Default.workflow",
+            "recommended_fasta_name": "uniprot-human+rat-2019-01",
+            "recommended_fasta_url": "https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/reference_proteomes/Homo_sapiens+Rattus_norvegicus.fasta",
+            "recommended_fasta_source": "UniProt",
+        },
+        confidence=0.8,
+        source="llm_confirmed",
+        evidence_excerpt="Use both species listed in PRIDE.",
+        conflict_flag=False,
+    )
+    context = ProjectContext(
+        project_accession="PXD_MULTI",
+        file_name="20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.raw",
+        metadata={
+            "organisms": MetadataValue(
+                value=["Rattus norvegicus (rat)", "Homo sapiens (human)"],
+                source="pride.organisms",
+                source_level="project",
+                completeness=1.0,
+            )
+        },
+        sdrf_rows=[],
+        project_files=[],
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-human-rat-combined",
+        source_file_name="20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.raw",
+        source_data_path=tmp_path / "20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.mzML",
+        project_resolution=ProjectResolution.empty(),
+        project_context=context,
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is False
+    assert plan.blocking_issues == []
+    assert plan.fasta_path == tmp_path / "fasta" / "uniprot_human_UP000005640_rat_UP000002494.fasta"
+    assert plan.fasta_download_url is not None
+    assert "rest.uniprot.org" in plan.fasta_download_url
+    assert "UP000005640" in plan.fasta_download_url
+    assert "UP000002494" in plan.fasta_download_url
+    assert "reviewed%3Atrue" in plan.fasta_download_url
+    assert "ftp.uniprot.org" not in plan.fasta_download_url
+
+
+def test_plan_dda_execution_uses_all_llm_uniprot_proteome_ids_for_hye_mixture(tmp_path: Path):
+    attributes = _dda_attributes()
+    attributes.species = AttributeValue(
+        value="Escherichia coli; Homo sapiens; Saccharomyces cerevisiae",
+        confidence=0.95,
+        source="llm_confirmed",
+        evidence_excerpt="SDRF rows describe the HYE benchmark mixture.",
+        conflict_flag=False,
+    )
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "recommended_workflow_name": "Default.workflow",
+            "recommended_fasta_name": "H_sapiens_Yeast_Ecoli_2024.fasta",
+            "recommended_fasta_url": "https://uniprot.org/proteomes/UP000005640+UP000002311+UP000000625.fasta",
+            "recommended_fasta_source": "UniProt",
+        },
+        confidence=0.95,
+        source="llm_confirmed",
+        evidence_excerpt="Use reviewed Human/Yeast/E. coli UniProt proteomes.",
+        conflict_flag=False,
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-hye-fasta",
+        source_file_name="LFQ_Orbitrap_GP_QC_400_500.raw",
+        source_data_path=tmp_path / "LFQ_Orbitrap_GP_QC_400_500.mzML",
+        project_resolution=ProjectResolution.empty(),
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.fasta_path == tmp_path / "fasta" / "uniprot_human_UP000005640_yeast_UP000002311_ecoli_k12_UP000000625.fasta"
+    assert plan.fasta_download_url is not None
+    assert "UP000005640" in plan.fasta_download_url
+    assert "UP000002311" in plan.fasta_download_url
+    assert "UP000000625" in plan.fasta_download_url
+
+
+def test_plan_dda_execution_prefers_species_fasta_over_conflicting_llm_uniprot_id(tmp_path: Path):
+    attributes = _dda_attributes()
+    attributes.species = AttributeValue(
+        value="Oryza sativa (rice)",
+        confidence=0.95,
+        source="llm_confirmed",
+        evidence_excerpt="PRIDE organisms field: Oryza sativa (rice).",
+        conflict_flag=False,
+    )
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "recommended_workflow_name": "LFQ-ubiquitin.workflow",
+            "recommended_fasta_name": "Oryza_sativa_uniprot_2024.fasta",
+            "recommended_fasta_url": "https://www.uniprot.org/proteomes/UP000000763",
+            "recommended_fasta_source": "UniProt",
+        },
+        confidence=0.8,
+        source="llm_confirmed",
+        evidence_excerpt="LLM returned a UniProt URL but the proteome ID conflicts with rice.",
+        conflict_flag=False,
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-rice-conflicting-fasta",
+        source_file_name="Ubi-MSP1ox-F1-R1.raw",
+        source_data_path=tmp_path / "Ubi-MSP1ox-F1-R1.mzML",
+        project_resolution=ProjectResolution.empty(),
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.fasta_path == tmp_path / "fasta" / "uniprot_oryza_sativa_UP000059680.fasta"
+    assert plan.fasta_download_url is not None
+    assert "UP000059680" in plan.fasta_download_url
+    assert "UP000000763" not in plan.fasta_download_url
 
 
 def test_plan_dda_execution_allows_multi_metadata_when_file_level_values_are_resolved(tmp_path: Path):
@@ -919,6 +1193,69 @@ def test_plan_dda_execution_allows_multi_metadata_when_file_level_values_are_res
 
     assert plan.needs_review is False
     assert not any("多个物种" in issue or "多个仪器" in issue for issue in plan.blocking_issues)
+
+
+def test_plan_dda_execution_allows_multi_instrument_same_family_when_search_tolerances_are_resolved(
+    tmp_path: Path,
+):
+    attributes = _dda_attributes()
+    attributes.instrument_name = AttributeValue(
+        value="LTQ Orbitrap Elite; Q Exactive",
+        confidence=0.8,
+        source="pride.instruments",
+        evidence_excerpt="Project instruments are both Orbitrap-family instruments",
+        conflict_flag=False,
+    )
+    attributes.instrument_family = AttributeValue(
+        value="orbitrap",
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="Both listed instruments are Orbitrap-family instruments",
+        conflict_flag=False,
+    )
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "recommended_workflow_name": "Default.workflow",
+            "precursor_tol": "20 ppm",
+            "fragment_tol": "0.5 Da",
+        },
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="LLM resolved Orbitrap search tolerances",
+        conflict_flag=False,
+    )
+    context = ProjectContext(
+        project_accession="PXD000900",
+        file_name="HeLa_ArgC-Try_CID_1.raw",
+        metadata={
+            "organisms": MetadataValue(
+                value=["Homo sapiens"],
+                source="pride.organisms",
+                source_level="project",
+                completeness=1.0,
+            ),
+            "instruments": MetadataValue(
+                value=["LTQ Orbitrap Elite", "Q Exactive"],
+                source="pride.instruments",
+                source_level="project",
+                completeness=1.0,
+            ),
+        },
+        sdrf_rows=[],
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-hela-arg-c-try",
+        source_file_name="HeLa_ArgC-Try_CID_1.raw",
+        source_data_path=tmp_path / "HeLa_ArgC-Try_CID_1.mzML",
+        project_resolution=ProjectResolution.empty(),
+        project_context=context,
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is False
+    assert not any("多个仪器" in issue for issue in plan.blocking_issues)
 
 
 def test_plan_dda_execution_names_query_url_reviewed_fasta_with_fasta_suffix(tmp_path: Path):

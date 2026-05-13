@@ -1,64 +1,121 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PRIDE AI-ready Agent</title>
 <style>
-:root{--bg:#101114;--surface:#191b20;--panel:#111318;--line:#2a2e36;--text:#e8e8ea;--muted:#8b909a;--soft:#5f6673;--accent:#2dd4bf;--accent2:#60a5fa;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--radius:8px}
+:root{--bg:#f6f8fb;--surface:#ffffff;--panel:#f8fafc;--panel2:#eef2f7;--line:#d8dee9;--line-strong:#b7c1d2;--text:#172033;--muted:#5f6b7a;--soft:#8a94a6;--primary:#4f46e5;--primary-soft:#eef2ff;--accent:#4f46e5;--accent2:#0284c7;--success:#059669;--green:#059669;--red:#dc2626;--amber:#d97706;--danger-soft:#fef2f2;--warning-soft:#fff7ed;--shadow:0 14px 34px rgba(15,23,42,.08);--radius:8px}
 *{box-sizing:border-box;margin:0;padding:0}
-body{min-height:100vh;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;line-height:1.55}
-button,input{font:inherit}
-.container{max-width:1280px;margin:0 auto;padding:22px}
-header{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;padding:8px 0 18px;border-bottom:1px solid var(--line);margin-bottom:18px}
-h1{font-size:1.35rem;letter-spacing:0}
-.subtitle{font-size:.82rem;color:var(--muted);margin-top:3px}
-.server-status{font-size:.8rem;color:var(--muted);white-space:nowrap}
-.grid{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:14px;align-items:start}
-.surface{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:18px}
-.surface h2{font-size:.92rem;margin-bottom:12px}
+body{min-height:100vh;background:var(--bg);color:var(--text);font-family:"Plus Jakarta Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;line-height:1.55}
+button,input,select{font:inherit}
+button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.skip-link{position:absolute;left:12px;top:8px;z-index:20;transform:translateY(-140%);background:var(--primary);color:#fff;border-radius:6px;padding:8px 12px;font-weight:700;text-decoration:none}
+.skip-link:focus{transform:translateY(0)}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.container{max-width:1440px;margin:0 auto;padding:22px}
+.app-shell{display:grid;gap:16px}
+header{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;padding:16px 18px;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);box-shadow:var(--shadow)}
+.brand-stack{display:grid;gap:3px}
+.product-kicker{font-size:.72rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--primary)}
+h1{font-size:1.38rem;letter-spacing:0}
+.subtitle{font-size:.84rem;color:var(--muted);margin-top:1px;max-width:760px}
+.header-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:flex-end}
+.server-status{font-size:.8rem;color:var(--muted);white-space:nowrap;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:7px 10px}
+.segmented,.language-switch{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);overflow:hidden}
+.segmented button,.language-switch button{border:0;border-right:1px solid var(--line);background:transparent;color:var(--muted);padding:8px 12px;font-size:.8rem;cursor:pointer;min-height:36px}
+.segmented button:last-child,.language-switch button:last-child{border-right:0}
+.segmented button.active,.language-switch button.active{background:var(--primary-soft);color:var(--primary);font-weight:750}
+.grid{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:14px;align-items:start}
+.surface{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow)}
+.workbench-card{display:grid;gap:14px}
+.section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:0}
+.surface h2{font-size:.96rem;margin-bottom:12px}
+.section-heading h2{margin-bottom:0}
+.section-eyebrow{font-size:.72rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
 .main-input{display:flex;gap:10px;margin-bottom:10px}
-.main-input input{flex:1;min-width:0;padding:12px 14px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);color:var(--text)}
-.main-input input:focus,.form-row input:focus{outline:none;border-color:var(--accent)}
-.examples{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:.78rem;color:var(--muted);margin-bottom:14px}
-.examples button{padding:3px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--accent);cursor:pointer}
+.main-input input{flex:1;min-width:0;padding:12px 14px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);color:var(--text)}
+.main-input input:focus,.form-row input:focus,.review-actions select:focus{border-color:var(--accent)}
 .btn{border:0;border-radius:var(--radius);padding:11px 16px;font-size:.86rem;font-weight:650;cursor:pointer;transition:.15s background,.15s border-color,.15s color}
 .btn:disabled{opacity:.55;cursor:not-allowed}
-.btn-primary{background:var(--accent);color:#06201d}
-.btn-primary:hover{background:#5eead4}
+.btn-primary{background:var(--primary);color:#fff}
+.btn-primary:hover{background:#4338ca}
 .btn-secondary{background:transparent;color:var(--text);border:1px solid var(--line)}
 .btn-secondary:hover{border-color:var(--accent);color:var(--accent)}
-.btn-green{background:var(--green);color:#06140a}
+.btn-green{background:var(--success);color:#fff}
 .btn-small{padding:7px 10px;font-size:.78rem}
+.form-row{display:grid;grid-template-columns:104px minmax(0,1fr);gap:10px;align-items:center;margin-bottom:9px}
+.form-row label{text-align:right;color:var(--muted);font-size:.8rem}
+.form-row input{width:100%;padding:9px 11px;background:var(--surface);border:1px solid var(--line);border-radius:6px;color:var(--text)}
+.form-row input.error,.main-input input[aria-invalid="true"]{border-color:var(--red);background:var(--danger-soft)}
+.mode-row{display:grid;grid-template-columns:104px minmax(0,1fr);gap:10px;align-items:start;margin:11px 0 9px}
+.mode-label{text-align:right;color:var(--muted);font-size:.8rem;padding-top:8px}
+.mode-control{display:grid;gap:7px}
+.mode-control .segmented{justify-self:start}
+.mode-help{font-size:.76rem;color:var(--muted);max-width:680px}
+.option-row{display:flex;align-items:flex-start;gap:8px;margin:8px 0 12px 114px;color:var(--muted);font-size:.78rem}
+.option-row input{margin-top:3px;accent-color:var(--accent)}
+.examples{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:.78rem;color:var(--muted);margin:4px 0 14px 114px}
+.examples button{padding:3px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--primary);cursor:pointer}
+.form-alert{padding:10px 12px;border:1px solid #fecaca;background:var(--danger-soft);color:#991b1b;border-radius:var(--radius);font-size:.82rem}
+.form-alert[hidden]{display:none}
+.batch-panel{margin:0;padding:0;border:0;background:transparent}
+.batch-panel h3{font-size:.86rem;margin-bottom:4px}
+.batch-help{font-size:.76rem;color:var(--muted);margin-bottom:8px}
+.batch-input{width:100%;min-height:154px;resize:vertical;padding:10px 12px;background:var(--surface);border:1px solid var(--line);border-radius:6px;color:var(--text);font-family:"Cascadia Code","JetBrains Mono",Consolas,monospace;font-size:.8rem}
+.batch-input:focus{border-color:var(--accent)}
+.batch-input.error{border-color:var(--red);background:var(--danger-soft)}
+.batch-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:9px}
+.batch-toolbar label{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:.78rem}
+.batch-toolbar input{width:68px;padding:7px 8px;background:var(--surface);border:1px solid var(--line);border-radius:6px;color:var(--text)}
+.batch-status{margin-top:8px;font-size:.78rem;color:var(--muted)}
+.batch-status.ok{color:var(--green)}
+.batch-status.error{color:var(--red)}
+.batch-items{display:grid;gap:5px;margin-top:8px;max-height:130px;overflow:auto}
+.batch-item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 8px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel);font-size:.74rem}
+.batch-item-name{overflow-wrap:anywhere}
+.batch-item-status{color:var(--muted);white-space:nowrap}
+.batch-item-error{grid-column:1/-1;color:var(--red);font-size:.72rem;overflow-wrap:anywhere}
+.batch-log-panel{margin-top:10px;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);padding:10px}
+.batch-log-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
+.batch-log-title{font-size:.78rem;font-weight:750}
+.batch-log-meta{font-size:.72rem;color:var(--muted)}
+.batch-log-box{max-height:190px;overflow:auto;background:#111827;color:#d1d5db;border-radius:6px;padding:8px;font-family:"Cascadia Code","JetBrains Mono",Consolas,monospace;font-size:.72rem}
+.batch-event{display:grid;grid-template-columns:132px 54px minmax(0,1fr);gap:6px;padding:2px 0}
+.batch-event-time{color:#9ca3af}
+.batch-event-level{color:#bfdbfe;text-transform:uppercase;font-weight:750}
+.batch-event.error .batch-event-level,.batch-event.error .batch-event-message{color:#fecaca}
+.batch-event-message{overflow-wrap:anywhere}
 .config-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:8px;padding-top:12px;border-top:1px solid var(--line)}
-.config-toggle{background:transparent;border:0;color:var(--muted);cursor:pointer;font-size:.82rem}
+.config-toggle{background:transparent;border:0;color:var(--primary);cursor:pointer;font-size:.82rem;font-weight:700}
 .config-body{display:none;margin-top:12px}
 .config-body.open{display:block}
-.form-row{display:grid;grid-template-columns:86px minmax(0,1fr);gap:10px;align-items:center;margin-bottom:9px}
-.form-row label{text-align:right;color:var(--muted);font-size:.8rem}
-.form-row input{width:100%;padding:9px 11px;background:var(--panel);border:1px solid var(--line);border-radius:6px;color:var(--text)}
-.form-row input.error{border-color:var(--red);background:#231215}
-.option-row{display:flex;align-items:flex-start;gap:8px;margin:8px 0 12px 96px;color:var(--muted);font-size:.78rem}
-.option-row input{margin-top:3px;accent-color:var(--accent)}
-.config-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-left:96px}
+.config-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-left:114px}
 .inline-status{font-size:.78rem;color:var(--muted)}
 .inline-status.ok{color:var(--green)}
 .inline-status.error{color:var(--red)}
-.warn{display:none;margin-top:10px;padding:10px 12px;border:1px solid #5d430f;background:#191407;color:#fbbf24;border-radius:var(--radius);font-size:.8rem}
+.warn{display:none;margin-top:10px;padding:10px 12px;border:1px solid #fed7aa;background:var(--warning-soft);color:#9a3412;border-radius:var(--radius);font-size:.8rem}
 .warn.show{display:block}
 .public-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}
 .public-meta{font-size:.76rem;color:var(--muted)}
 .history-card{max-height:560px;display:flex;flex-direction:column;min-height:0}
+.operations-rail{position:sticky;top:16px}
 .history-card .result-list{max-height:430px;overflow-y:auto;padding-right:4px}
 .result-list{display:flex;flex-direction:column;gap:8px}
 .empty{font-size:.8rem;color:var(--muted)}
+.empty-history{display:grid;gap:10px;padding:16px;border:1px dashed var(--line-strong);border-radius:var(--radius);background:var(--panel)}
+.empty-history-title{font-size:.9rem;font-weight:760;color:var(--text)}
+.empty-history-body{font-size:.78rem;color:var(--muted)}
+.empty-history-actions{display:flex;gap:8px;flex-wrap:wrap}
 .result-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel)}
+.result-row[aria-busy="true"]{opacity:.72}
 .result-title{font-size:.84rem;font-weight:650;overflow-wrap:anywhere}
 .result-sub{font-size:.74rem;color:var(--muted);margin-top:2px}
 .result-actions{display:flex;gap:6px;align-items:center}
 .run-card{display:none;margin-top:14px}
+.monitor-card{box-shadow:var(--shadow)}
 .steps{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:5px;margin-bottom:14px}
-.step-item{padding:8px 5px;text-align:center;font-size:.74rem;color:var(--muted);background:var(--panel);border:1px solid var(--line);border-radius:6px}
+.step-item{padding:8px 5px;text-align:center;font-size:.74rem;color:var(--muted);background:var(--panel);border:1px solid var(--line);border-radius:6px;min-height:38px}
 .step-item.active{color:var(--accent);border-color:var(--accent)}
 .step-item.done{color:var(--green);border-color:var(--green)}
 .step-item.error{color:var(--red);border-color:var(--red)}
@@ -72,7 +129,7 @@ h1{font-size:1.35rem;letter-spacing:0}
 @keyframes pulse{50%{opacity:.3}}
 .status-text{font-size:.86rem;font-weight:650}
 .status-time{margin-left:auto;color:var(--muted);font-size:.78rem}
-.queue-panel{display:none;margin-bottom:12px;padding:10px 12px;background:#191407;border:1px solid #5d430f;color:#fbbf24;border-radius:var(--radius);font-size:.8rem}
+.queue-panel{display:none;margin-bottom:12px;padding:10px 12px;background:var(--warning-soft);border:1px solid #fed7aa;color:#9a3412;border-radius:var(--radius);font-size:.8rem}
 .queue-panel.show{display:block}
 .run-grid{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:14px;align-items:start}
 .log-header{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:9px}
@@ -80,19 +137,19 @@ h1{font-size:1.35rem;letter-spacing:0}
 .log-filters{display:flex;gap:4px;flex-wrap:wrap}
 .log-filters button{padding:3px 8px;border:1px solid var(--line);border-radius:5px;background:transparent;color:var(--muted);font-size:.72rem;cursor:pointer}
 .log-filters button.active{border-color:var(--accent);color:var(--accent)}
-.log-box{height:500px;overflow-y:auto;background:#0b0d10;border:1px solid var(--line);border-radius:var(--radius);padding:12px;font-family:"Cascadia Code","JetBrains Mono",Consolas,monospace;font-size:.76rem}
+.log-box{height:500px;overflow-y:auto;background:#0f172a;border:1px solid #1e293b;border-radius:var(--radius);padding:12px;font-family:"Cascadia Code","JetBrains Mono",Consolas,monospace;font-size:.76rem}
 .log-line{display:flex;gap:8px;padding:1px 0}
-.log-line .ts{color:#59606b;min-width:64px;flex-shrink:0}
+.log-line .ts{color:#94a3b8;min-width:64px;flex-shrink:0}
 .log-line .badge{min-width:42px;text-align:center;border-radius:4px;font-size:.66rem;font-weight:700;flex-shrink:0}
-.badge.info{color:var(--accent2);background:#101a27}
-.badge.llm{color:var(--accent);background:#0c1e1b}
-.badge.debug{color:#c084fc;background:#1b1026}
-.badge.error{color:#fca5a5;background:#2a1114}
-.badge.step{color:#fbbf24;background:#261b07}
-.msg{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text)}
-.msg.llm{color:#99f6e4}
-.msg.error{color:#fca5a5}
-.msg.step{color:#fbbf24;font-weight:650}
+.badge.info{color:#bae6fd;background:#0c4a6e}
+.badge.llm{color:#c7d2fe;background:#312e81}
+.badge.debug{color:#e9d5ff;background:#581c87}
+.badge.error{color:#fecaca;background:#7f1d1d}
+.badge.step{color:#fed7aa;background:#7c2d12}
+.msg{white-space:pre-wrap;overflow-wrap:anywhere;color:#e2e8f0}
+.msg.llm{color:#c7d2fe}
+.msg.error{color:#fecaca}
+.msg.step{color:#fed7aa;font-weight:650}
 .review-panel{position:sticky;top:16px;max-height:720px;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px}
 .review-panel h3{font-size:.88rem;margin-bottom:8px}
 .review-empty,.review-updated{font-size:.76rem;color:var(--muted)}
@@ -100,133 +157,599 @@ h1{font-size:1.35rem;letter-spacing:0}
 .review-label{font-size:.72rem;color:var(--muted)}
 .review-value{font-size:.8rem;overflow-wrap:anywhere}
 .review-meta{font-size:.68rem;color:var(--soft)}
-.review-item.conflict .review-value{color:#fca5a5}
-.review-issues{margin-top:10px;padding-top:10px;border-top:1px solid #5d430f;color:#fbbf24;font-size:.78rem}
+.review-item.conflict .review-value{color:var(--red)}
+.review-issues{margin-top:10px;padding-top:10px;border-top:1px solid #fed7aa;color:#9a3412;font-size:.78rem}
 .review-actions{margin-top:10px;padding-top:10px;border-top:1px solid var(--line);display:grid;gap:8px}
 .review-actions label{display:grid;gap:4px;color:var(--muted);font-size:.74rem}
-.review-actions select{width:100%;padding:8px;background:var(--panel-2);border:1px solid var(--line);border-radius:6px;color:var(--text)}
+.review-actions select{width:100%;padding:8px;background:var(--surface);border:1px solid var(--line);border-radius:6px;color:var(--text)}
 .review-issues li,.blocked-panel li{margin-left:16px}
 .result-panel,.blocked-panel{display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
 .result-panel h3,.blocked-panel h3{font-size:.88rem;margin-bottom:8px}
 .file-list{max-height:180px;overflow:auto;font-family:"Cascadia Code",Consolas,monospace;font-size:.76rem;color:var(--muted);line-height:1.7}
 .download-status{display:block;margin-top:8px;font-size:.78rem;color:var(--muted)}
 .download-status.error{color:var(--red)}
-footer{padding:20px 0 4px;color:#575d68;font-size:.74rem;text-align:center}
-@media(max-width:980px){.grid,.run-grid{grid-template-columns:1fr}.history-card{max-height:60vh}.history-card .result-list{max-height:calc(60vh - 90px)}.review-panel{position:static;max-height:none}header{align-items:flex-start;flex-direction:column}.main-input{flex-direction:column}.steps{grid-template-columns:1fr 1fr}.config-actions,.option-row{margin-left:0}.form-row{grid-template-columns:1fr}.form-row label{text-align:left}}
+.status-cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.system-summary{margin:0}
+.metric-card{min-height:78px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:12px;box-shadow:0 8px 24px rgba(15,23,42,.05)}
+.metric-label{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.metric-value{font-size:1.25rem;font-weight:750;margin-top:3px}
+.metric-meta{font-size:.72rem;color:var(--soft);margin-top:2px;overflow-wrap:anywhere}
+.workflow-tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}
+.workflow-tab{display:grid;gap:3px;text-align:left;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);color:var(--text);padding:11px 12px;cursor:pointer;min-height:72px}
+.workflow-tab strong{font-size:.86rem}
+.workflow-tab span{font-size:.72rem;color:var(--muted)}
+.workflow-tab[aria-selected="true"]{border-color:var(--primary);background:var(--primary-soft)}
+.task-pane[hidden]{display:none}
+.pane-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}
+.pane-title h3{font-size:.88rem}
+.pane-title p,.helper-text{font-size:.76rem;color:var(--muted)}
+.status-pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:4px 8px;font-size:.72rem;color:var(--muted);white-space:nowrap}
+.status-pill::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--soft)}
+.status-pill.running::before{background:var(--accent)}
+.status-pill.completed::before{background:var(--green)}
+.status-pill.failed::before{background:var(--red)}
+.status-pill.queued::before,.status-pill.needs_review::before,.status-pill.blocked::before{background:var(--amber)}
+footer{padding:4px 0 4px;color:var(--soft);font-size:.74rem;text-align:center}
+@media(max-width:1100px){.grid,.run-grid{grid-template-columns:1fr}.operations-rail,.review-panel{position:static}.status-cards{grid-template-columns:1fr 1fr}.workflow-tabs{grid-template-columns:1fr}.history-card{max-height:60vh}.history-card .result-list{max-height:calc(60vh - 90px)}header{align-items:flex-start;flex-direction:column}.header-actions{justify-content:flex-start}.main-input{flex-direction:column}.steps{grid-template-columns:1fr 1fr}.form-row,.mode-row{grid-template-columns:1fr}.form-row label,.mode-label{text-align:left}.config-actions,.option-row,.examples{margin-left:0}.batch-toolbar{align-items:stretch}.batch-toolbar label,.batch-toolbar .btn{width:100%;justify-content:center}.batch-toolbar input{flex:1}}
+@media(max-width:720px){.container{padding:14px}.surface{padding:14px}.status-cards{grid-template-columns:1fr}.pane-title{display:grid}.workflow-tab{min-height:58px}.server-status{white-space:normal}.log-box{height:380px}}
 </style>
 </head>
 <body>
-<div class="container">
+<a class="skip-link" href="#mainContent">Skip to main content</a>
+<main class="container app-shell" id="mainContent" tabindex="-1">
   <header>
-    <div>
+    <div class="brand-stack">
+      <div class="product-kicker" data-i18n="productKicker">Proteomics workflow workbench</div>
       <h1>PRIDE AI-ready Agent</h1>
-      <div class="subtitle">PRIDE 文件解析、RAW 转换、搜库参数推断与 MSDT-Converter 结果生成</div>
+      <div class="subtitle" data-i18n="subtitle">Resolve PRIDE files, infer search parameters, and run or preview the MSDT-Converter workflow.</div>
     </div>
-    <div class="server-status" id="serverStatus">服务器状态读取中...</div>
+    <div class="header-actions">
+      <div class="language-switch" role="group" aria-label="Language">
+        <button type="button" data-lang-btn="en" aria-pressed="true" onclick="setLanguage('en')">EN</button>
+        <button type="button" data-lang-btn="zh" aria-pressed="false" onclick="setLanguage('zh')">中文</button>
+      </div>
+      <div class="server-status" id="serverStatus" role="status" aria-live="polite" data-i18n="serverReading">Reading server status...</div>
+    </div>
   </header>
 
+  <section class="status-cards system-summary" aria-label="System summary">
+    <div class="metric-card" id="metricRunning"></div>
+    <div class="metric-card" id="metricQueued"></div>
+    <div class="metric-card" id="metricHistory"></div>
+    <div class="metric-card" id="metricStorage"></div>
+  </section>
+
   <div class="grid">
-    <section class="surface">
-      <h2>创建任务</h2>
-      <div class="main-input">
-        <input type="text" id="inputValue" placeholder="例如 P17_severe_NoPOTS.raw">
-        <button class="btn btn-primary" id="startBtn" onclick="startTask()">启动</button>
+    <section class="surface workbench-card">
+      <div class="section-heading">
+        <div>
+          <div class="section-eyebrow" data-i18n="taskEyebrow">Workflow control</div>
+          <h2 data-i18n="createTask">Create Task</h2>
+        </div>
       </div>
-      <div class="form-row"><label>提交人 *</label><input type="text" id="submitter" placeholder="例如 张三 / Alice / 课题组成员名"></div>
-      <label class="option-row"><input type="checkbox" id="preferProjectFasta"><span>默认使用大模型/物种推荐的 UniProt FASTA；如 PRIDE 原项目有 FASTA，可勾选改用项目 FASTA。</span></label>
+      <div class="form-alert" id="formAlert" role="alert" aria-live="assertive" aria-atomic="true" hidden></div>
+      <div class="workflow-tabs" role="tablist" aria-label="Workflow type">
+        <button class="workflow-tab" id="singleTaskTab" type="button" role="tab" aria-selected="true" aria-controls="singleTaskPanel" data-workflow-tab="single" onclick="setWorkflowTab('single')">
+          <strong data-i18n="singleTabTitle">Single file</strong>
+          <span data-i18n="singleTabDesc">Run one PRIDE file through planning or the full workflow.</span>
+        </button>
+        <button class="workflow-tab" id="batchTaskTab" type="button" role="tab" aria-selected="false" aria-controls="batchTaskPanel" data-workflow-tab="batch" onclick="setWorkflowTab('batch')">
+          <strong data-i18n="batchTabTitle">Batch Excel</strong>
+          <span data-i18n="batchTabDesc">Plan many files and export a benchmark spreadsheet.</span>
+        </button>
+      </div>
+      <div class="task-pane" id="singleTaskPanel" role="tabpanel" aria-labelledby="singleTaskTab">
+        <div class="pane-title">
+          <div>
+            <h3 data-i18n="singleSetupTitle">Single task setup</h3>
+            <p data-i18n="singleSetupHelp">Use Parameters only for quick metadata validation; use Full workflow when Docker and storage are ready.</p>
+          </div>
+          <span class="status-pill queued" data-i18n="workflowReady">Ready</span>
+        </div>
+      <div class="main-input">
+        <label class="sr-only" for="inputValue" data-i18n="createTask">Create Task</label>
+        <input type="text" id="inputValue" aria-required="true" aria-invalid="false" autocomplete="off" data-i18n-placeholder="inputPlaceholder" placeholder="Example: P17_severe_NoPOTS.raw">
+        <button class="btn btn-primary" id="startBtn" onclick="startTask()" data-i18n="start">Start</button>
+      </div>
+      <div class="form-row">
+        <label for="submitter" data-i18n="submitter">Submitter *</label>
+        <input type="text" id="submitter" aria-required="true" aria-invalid="false" autocomplete="name" data-i18n-placeholder="submitterPlaceholder" placeholder="Name or lab member">
+      </div>
+      <div class="mode-row">
+        <div class="mode-label" data-i18n="runMode">Run mode</div>
+        <div class="mode-control">
+          <div class="segmented" role="radiogroup" aria-label="Run mode" aria-describedby="runModeHelp">
+            <button type="button" role="radio" aria-checked="true" data-run-mode="full" onclick="setRunMode('full')" data-i18n="modeFull">Full workflow</button>
+            <button type="button" role="radio" aria-checked="false" data-run-mode="parameters" onclick="setRunMode('parameters')" data-i18n="modeParameters">Parameters only</button>
+          </div>
+          <div class="mode-help" id="runModeHelp"></div>
+        </div>
+      </div>
+      <label class="option-row">
+        <input type="checkbox" id="preferProjectFasta">
+        <span data-i18n="preferFasta">Use the project FASTA when PRIDE provides one; otherwise use the inferred UniProt FASTA.</span>
+      </label>
       <div class="examples">
-        示例
+        <span data-i18n="examples">Examples</span>
         <button onclick="fill('P17_severe_NoPOTS.raw')">P17_severe_NoPOTS.raw</button>
         <button onclick="fill('junge_jo000024_20210119_17951_BioID_FZD4_2.raw')">BioID_FZD4_2.raw</button>
         <button onclick="fill('TOTALRAW_AF_CTRLs.raw')">TOTALRAW_AF_CTRLs.raw</button>
       </div>
+      </div>
+      <div class="batch-panel task-pane" id="batchTaskPanel" role="tabpanel" aria-labelledby="batchTaskTab" hidden>
+        <div class="pane-title">
+          <div>
+            <h3 id="batchTitle" data-i18n="batchTitle">Batch Excel Report</h3>
+            <p class="batch-help" id="batchHelp" data-i18n="batchHelp">Paste one PRIDE file name per line. This runs parameter planning only and generates a benchmark Excel report.</p>
+          </div>
+          <span class="status-pill queued" data-i18n="modeParameters">Parameters only</span>
+        </div>
+        <div class="form-row">
+          <label for="batchSubmitter" data-i18n="batchSubmitter">Batch submitter *</label>
+          <input type="text" id="batchSubmitter" aria-required="true" aria-invalid="false" autocomplete="name" data-i18n-placeholder="submitterPlaceholder" placeholder="Name or lab member">
+        </div>
+        <label class="sr-only" for="batchInput" data-i18n="batchTitle">Batch Excel Report</label>
+        <textarea class="batch-input" id="batchInput" aria-describedby="batchHelp" aria-invalid="false" spellcheck="false" data-i18n-placeholder="batchPlaceholder" placeholder="sample_a.raw&#10;sample_b.raw"></textarea>
+        <div class="batch-toolbar">
+          <label for="batchJobs"><span data-i18n="batchJobs">Parallel jobs</span><input type="number" id="batchJobs" min="1" max="8" value="4"></label>
+          <button class="btn btn-primary btn-small" id="batchStartBtn" type="button" onclick="startBatch()" data-i18n="startBatch">Run batch Excel</button>
+          <button class="btn btn-secondary btn-small" id="batchDownloadBtn" type="button" onclick="downloadBatchExcel()" disabled data-i18n="downloadExcel">Download Excel</button>
+          <button class="btn btn-secondary btn-small" id="batchAuditBtn" type="button" onclick="downloadBatchAudit()" disabled data-i18n="downloadAudit">Download audit ZIP</button>
+        </div>
+        <div class="batch-status" id="batchStatus" role="status" aria-live="polite"></div>
+        <div class="batch-items" id="batchItems" aria-live="polite"></div>
+        <div class="batch-log-panel">
+          <div class="batch-log-head">
+            <span class="batch-log-title" data-i18n="batchLogTitle">Batch log</span>
+            <span class="batch-log-meta" id="batchLogMeta" data-i18n="batchLogEmpty">No batch events yet.</span>
+          </div>
+          <div class="batch-log-box" id="batchLogBox" role="log" aria-live="polite"></div>
+        </div>
+      </div>
       <div class="config-head">
-        <button class="config-toggle" onclick="toggleConfig()">API 配置 <span id="configStatus"></span></button>
-        <span class="inline-status" id="apiCheckStatus"></span>
+        <button class="config-toggle" id="configToggle" aria-controls="configBody" aria-expanded="false" onclick="toggleConfig()"><span data-i18n="apiConfig">API Configuration</span> <span id="configStatus"></span></button>
+        <span class="inline-status" id="apiCheckStatus" role="status" aria-live="polite"></span>
       </div>
       <div class="config-body" id="configBody">
-        <div class="form-row"><label>API Key *</label><input type="password" id="cfgApiKey" placeholder="每个用户填写自己的 API Key"></div>
-        <div class="form-row"><label>Base URL</label><input type="text" id="cfgBaseUrl" placeholder="https://api.deepseek.com"></div>
-        <div class="form-row"><label>模型</label><input type="text" id="cfgModel" placeholder="deepseek-v4-flash"></div>
-        <div class="form-row"><label>超时秒数</label><input type="number" id="cfgTimeout" placeholder="1200"></div>
+        <div class="form-row"><label for="cfgApiKey">API Key *</label><input type="password" id="cfgApiKey" aria-required="true" aria-invalid="false" autocomplete="off" data-i18n-placeholder="apiKeyPlaceholder" placeholder="Your API key for this task"></div>
+        <div class="form-row"><label for="cfgBaseUrl">Base URL</label><input type="text" id="cfgBaseUrl" inputmode="url" placeholder="https://api.deepseek.com"></div>
+        <div class="form-row"><label for="cfgModel" data-i18n="model">Model</label><input type="text" id="cfgModel" placeholder="deepseek-v4-flash"></div>
+        <div class="form-row"><label for="cfgTimeout" data-i18n="timeout">Timeout</label><input type="number" id="cfgTimeout" min="1" placeholder="1200"></div>
         <div class="config-actions">
-          <button class="btn btn-secondary btn-small" id="checkApiBtn" onclick="checkLLMConfig()">检查 API Key</button>
+          <button class="btn btn-secondary btn-small" id="checkApiBtn" onclick="checkLLMConfig()" data-i18n="checkApi">Check API Key</button>
           <span class="inline-status" id="resultRetention"></span>
         </div>
       </div>
-      <div class="warn show" id="warnBanner">任务启动前会先检查本次填写的 API Key；服务器不会使用固定公共 Key。</div>
+      <div class="warn show" id="warnBanner" data-i18n="apiWarning">The API key is checked when a task starts and is not written to public history.</div>
     </section>
 
-    <section class="surface history-card">
+    <section class="surface history-card operations-rail">
       <div class="public-head">
-        <h2>项目历史</h2>
-        <button class="btn btn-secondary btn-small" onclick="loadResults()">刷新</button>
+        <h2 data-i18n="projectHistory">Project History</h2>
+        <button class="btn btn-secondary btn-small" onclick="loadResults()" data-i18n="refresh">Refresh</button>
       </div>
-      <div class="public-meta" id="publicResultsMeta">处理队列和可下载结果所有人可见；API Key 不共享。</div>
-      <div class="result-list" id="publicResults"><div class="empty">正在读取结果...</div></div>
+      <div class="public-meta" id="publicResultsMeta" role="status" aria-live="polite" data-i18n="historyReading">Reading queue and result history...</div>
+      <div class="result-list" id="publicResults"><div class="empty" data-i18n="historyReading">Reading queue and result history...</div></div>
     </section>
   </div>
 
-  <section class="surface run-card" id="runCard">
-    <div class="steps" id="steps">
-      <div class="step-item" data-step="1">1 解析项目</div>
-      <div class="step-item" data-step="2">2 下载/转换</div>
-      <div class="step-item" data-step="3">3 生成配置</div>
-      <div class="step-item" data-step="4">4 Docker 执行</div>
-      <div class="step-item" data-step="5">5 完成</div>
+  <section class="surface run-card monitor-card" id="runCard" aria-label="Task monitor">
+    <div class="steps" id="steps" aria-label="Pipeline progress" role="list">
+      <div class="step-item" data-step="1" role="listitem"></div>
+      <div class="step-item" data-step="2" role="listitem"></div>
+      <div class="step-item" data-step="3" role="listitem"></div>
+      <div class="step-item" data-step="4" role="listitem"></div>
+      <div class="step-item" data-step="5" role="listitem"></div>
     </div>
-    <div class="status-bar">
+    <div class="status-bar" role="status" aria-live="polite">
       <span class="status-dot" id="statusDot"></span>
-      <span class="status-text" id="statusText">等待中</span>
+      <span class="status-text" id="statusText" data-i18n="waiting">Waiting</span>
       <span class="status-time" id="statusTime"></span>
     </div>
     <div class="queue-panel" id="queuePanel"></div>
     <div class="run-grid">
       <div>
         <div class="log-header">
-          <span class="log-count" id="logCount">0 条日志</span>
+          <span class="log-count" id="logCount">0 logs</span>
           <div class="log-filters">
-            <button class="active" data-filter="all" onclick="setFilter('all',this)">全部</button>
-            <button data-filter="info" onclick="setFilter('info',this)">INFO</button>
-            <button data-filter="llm" onclick="setFilter('llm',this)">LLM</button>
-            <button data-filter="debug" onclick="setFilter('debug',this)">DEBUG</button>
-            <button data-filter="error" onclick="setFilter('error',this)">ERROR</button>
-            <button data-filter="step" onclick="setFilter('step',this)">STEP</button>
+            <button class="active" data-filter="all" aria-pressed="true" onclick="setFilter('all',this)" data-i18n="all">All</button>
+            <button data-filter="info" aria-pressed="false" onclick="setFilter('info',this)">INFO</button>
+            <button data-filter="llm" aria-pressed="false" onclick="setFilter('llm',this)">LLM</button>
+            <button data-filter="debug" aria-pressed="false" onclick="setFilter('debug',this)">DEBUG</button>
+            <button data-filter="error" aria-pressed="false" onclick="setFilter('error',this)">ERROR</button>
+            <button data-filter="step" aria-pressed="false" onclick="setFilter('step',this)">STEP</button>
           </div>
         </div>
         <div class="log-box" id="logBox"></div>
         <div class="result-panel" id="resultPanel">
-          <h3>结果文件</h3>
-          <div class="file-list" id="fileList"></div>
-          <button class="btn btn-green" id="downloadBtn" style="margin-top:12px" onclick="downloadResults()">下载 ZIP</button>
-          <span class="download-status" id="downloadStatus"></span>
+          <h3 data-i18n="resultFiles">Result Files</h3>
+          <div class="file-list" id="fileList" aria-live="polite"></div>
+          <button class="btn btn-green" id="downloadBtn" style="margin-top:12px" onclick="downloadResults()" data-i18n="downloadZip">Download ZIP</button>
+          <span class="download-status" id="downloadStatus" role="status" aria-live="polite"></span>
         </div>
         <div class="blocked-panel" id="blockedPanel">
-          <h3>需要人工处理</h3>
+          <h3 data-i18n="needsReview">Needs Review</h3>
           <ul id="issuesList"></ul>
         </div>
       </div>
-      <aside class="review-panel" id="reviewPanel">
-        <h3>人工复核参数</h3>
-        <div class="review-empty">任务运行后会固定显示 workflow、FASTA、搜库参数、修饰和需要复核的问题。</div>
-      </aside>
+      <aside class="review-panel" id="reviewPanel"></aside>
     </div>
   </section>
 
   <footer>PRIDE AI-ready Agent v0.3.1</footer>
-</div>
+</main>
 
 <script>
 let taskId=null,ws=null,currentFilter='all',allLogs=[],startTime=null,timerInterval=null,renderScheduled=false;
+let currentLanguage='en';
+let currentRunMode='full';
+let lastReviewSummary=null;
+let currentBatchId=null,batchPollTimer=null;
+let currentWorkflowTab='single';
 
+const I18N={
+  en:{
+    productKicker:'Proteomics workflow workbench',
+    subtitle:'Resolve PRIDE files, infer search parameters, and run or preview the MSDT-Converter workflow.',
+    serverReading:'Reading server status...',
+    taskEyebrow:'Workflow control',
+    createTask:'Create Task',
+    singleTabTitle:'Single file',
+    singleTabDesc:'Plan one PRIDE file or run it end to end.',
+    batchTabTitle:'Batch Excel',
+    batchTabDesc:'Parameter planning for many files with a complete spreadsheet report.',
+    singleSetupTitle:'Single task setup',
+    singleSetupHelp:'Use Parameter planning for quick metadata checks; use Full workflow when Docker and storage are ready.',
+    workflowReady:'Ready',
+    inputPlaceholder:'Example: P17_severe_NoPOTS.raw',
+    start:'Start',
+    creating:'Creating...',
+    queuedBtn:'Queued...',
+    runningBtn:'Running...',
+    submitter:'Submitter *',
+    submitterPlaceholder:'Name or lab member',
+    runMode:'Run mode',
+    modeFull:'Full workflow',
+    modeParameters:'Parameters only',
+    modeFullHelp:'Download or convert the data file, generate inputs, run Docker, and package downloadable results.',
+    modeParametersHelp:'Resolve the PRIDE project and infer workflow, FASTA, digestion, modifications, species, and instrument. No raw download or Docker run.',
+    preferFasta:'Use the project FASTA when PRIDE provides one; otherwise use the inferred UniProt FASTA.',
+    examples:'Examples',
+    batchTitle:'Batch Excel Report',
+    batchHelp:'Paste one PRIDE file name per line. This runs parameter planning only and generates a benchmark Excel report.',
+    batchPlaceholder:'20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.raw\nHeLa_ArgC-Try_CID_1.raw',
+    batchSubmitter:'Batch submitter *',
+    batchJobs:'Parallel jobs',
+    startBatch:'Run batch Excel',
+    downloadExcel:'Download Excel',
+    downloadAudit:'Download audit ZIP',
+    batchLogTitle:'Batch log',
+    batchLogEmpty:'No batch events yet.',
+    batchAuditReady:'Audit package is ready.',
+    auditReady:'audit saved',
+    batchRequired:'Please paste at least one PRIDE file name.',
+    batchCreating:'Creating batch and checking API key...',
+    batchStatus:(status,done,total,failed,review)=>`Batch ${status}: ${done}/${total} planned, ${failed} failed, ${review} need review.`,
+    batchDownloadReady:'Excel report is ready.',
+    batchCreateFailed:e=>`Batch request failed: ${e}`,
+    batchReadFailed:e=>`Failed to read batch: ${e}`,
+    apiConfig:'API Configuration',
+    apiKeyPlaceholder:'Your API key for this task',
+    model:'Model',
+    timeout:'Timeout',
+    checkApi:'Check API Key',
+    apiWarning:'The API key is checked when a task starts and is not written to public history.',
+    projectHistory:'Project History',
+    refresh:'Refresh',
+    historyReading:'Reading queue and result history...',
+    historyEmpty:'No active tasks or retained results.',
+    historyEmptyTitle:'No project history yet',
+    historyEmptyBody:'Start a single file run or launch a batch Excel plan. Runs appear here with status, submitter, timing, downloads, and failure review links.',
+    historyEmptySingleAction:'Single file',
+    historyEmptyBatchAction:'Batch Excel',
+    waiting:'Waiting',
+    all:'All',
+    resultFiles:'Result Files',
+    downloadZip:'Download ZIP',
+    needsReview:'Needs Review',
+    reviewTitle:'Search Parameters',
+    reviewEmpty:'Run a task to pin workflow, FASTA, search parameters, modifications, and review issues.',
+    updated:'Updated',
+    automatic:'automatic inference',
+    manualReview:'needs manual review',
+    issues:'Issues',
+    chooseContinue:'Choose values and continue',
+    continueWithChoices:'Continue with choices',
+    chooseReview:'Choose review parameters.',
+    apiRequired:'Please enter an API key first.',
+    submitterRequired:'Please enter a submitter.',
+    inputRequired:'Please enter a PRIDE file name.',
+    checking:'Checking...',
+    apiOk:'API key is available.',
+    apiFailed:'API key check failed.',
+    checkRequestFailed:'API check request failed.',
+    logCount:n=>`${n} logs`,
+    serverStatus:(running,queued,max)=>`Running ${running}/${max}, queued ${queued}`,
+    retention:(retention,maxProjects)=>`Results are retained for about ${retention} minutes; latest ${maxProjects} downloadable projects are kept.`,
+    historyMeta:(total,active,failed,downloadable,size,minutes)=>`History ${total} · active ${active} · failed ${failed} · downloadable ${downloadable} · storage ${size} · files expire after about ${minutes} minutes; API keys are never shared.`,
+    unknown:'Unknown',
+    notProvided:'Not provided',
+    active:'active',
+    status:{queued:'Queued',running:'Running',completed:'Completed',failed:'Failed',blocked:'Needs review',pending:'Waiting'},
+    statusBar:{pending:'Waiting',queued:'Queued',running:'Running',completed:'Completed',failed:'Failed',blocked:'Needs review'},
+    action:{watch:'Watch',inspect:'Inspect',download:'Download',view:'View'},
+    batchAction:{watch:'Track batch',download:'Download Excel',view:'Open batch'},
+    mode:{full:'Full workflow',parameters:'Parameters only'},
+    timeSource:{started_at:'Started',created_at:'Created',finished_at:'Finished',updated_at:'Updated',history_time:'Recorded'},
+    duration:'duration',
+    queue:(pos,len,running,max)=>`Task queued at position ${pos}/${len}. Server is running ${running}/${max} tasks and will start this one automatically.`,
+    createdTask:id=>`Task created: ${id}`,
+    creatingTask:'Checking API key and creating task...',
+    createFailed:e=>`Create task request failed: ${e}`,
+    readFailed:e=>`Failed to read task: ${e}`,
+    websocketError:'WebSocket connection error.',
+    reviewSubmitted:'Review choices submitted; task returned to the queue.',
+    reviewSubmitFailed:e=>`Failed to submit review: ${e}`,
+    noIssues:'No blocking issues were saved.',
+    generatedNoZip:'The parameter package was generated. It contains converter_config, workflow, audit JSON, decision trace, and logs; RAW/mzML/FASTA payload files are excluded.',
+    generatedWaitingZip:'Result directory generated; ZIP is being prepared or no downloadable file is available.',
+    zipReady:'ZIP package is ready to download.',
+    noDownload:'No downloadable file is available.',
+    preparingDownload:'Preparing download...',
+    downloadStarted:'Download started.',
+    downloadFailed:e=>`Download failed: ${e}`,
+    filesCleaned:'download files cleaned',
+    fileCount:n=>`${n} files`,
+    stepFull:['1 Resolve','2 Download','3 Bundle','4 Docker','5 Results'],
+    stepParams:['1 Resolve','2 Infer','3 Plan','4 Review','5 Complete']
+  },
+  zh:{
+    productKicker:'蛋白质组学流程工作台',
+    subtitle:'解析 PRIDE 文件，推断搜库参数，并选择完整运行或仅预览参数。',
+    serverReading:'正在读取服务器状态...',
+    taskEyebrow:'流程控制',
+    createTask:'创建任务',
+    singleTabTitle:'单文件',
+    singleTabDesc:'规划一个 PRIDE 文件，或直接执行完整流程。',
+    batchTabTitle:'批量 Excel 报表',
+    batchTabDesc:'并行规划多个文件，并生成完整基准 Excel 表。',
+    singleSetupTitle:'单文件任务设置',
+    singleSetupHelp:'仅搜参数适合快速核对元数据；Docker 和磁盘准备好后再使用完整流程。',
+    workflowReady:'就绪',
+    inputPlaceholder:'例如：P17_severe_NoPOTS.raw',
+    start:'启动',
+    creating:'创建中...',
+    queuedBtn:'排队中...',
+    runningBtn:'运行中...',
+    submitter:'提交人 *',
+    submitterPlaceholder:'姓名或课题组成员',
+    runMode:'运行模式',
+    modeFull:'完整流程',
+    modeParameters:'仅搜参数',
+    modeFullHelp:'下载或转换数据文件，生成输入包，运行 Docker，并打包可下载结果。',
+    modeParametersHelp:'只解析 PRIDE 项目并推断 workflow、FASTA、酶切、修饰、物种和仪器；不下载 RAW，不运行 Docker。',
+    preferFasta:'PRIDE 原项目提供 FASTA 时优先使用；否则使用按物种推断的 UniProt FASTA。',
+    examples:'示例',
+    apiConfig:'API 配置',
+    apiKeyPlaceholder:'本次任务使用的 API Key',
+    model:'模型',
+    timeout:'超时',
+    checkApi:'检查 API Key',
+    apiWarning:'任务启动前会检查本次填写的 API Key，且不会写入公开历史。',
+    projectHistory:'项目历史',
+    refresh:'刷新',
+    historyReading:'正在读取队列和结果历史...',
+    historyEmpty:'暂无运行中任务或保留结果。',
+    historyEmptyTitle:'还没有项目历史',
+    historyEmptyBody:'可以先启动单文件任务，或运行批量 Excel 参数规划。状态、提交人、时间、下载和失败复核入口都会显示在这里。',
+    historyEmptySingleAction:'单文件',
+    historyEmptyBatchAction:'批量 Excel',
+    waiting:'等待中',
+    all:'全部',
+    resultFiles:'结果文件',
+    downloadZip:'下载 ZIP',
+    needsReview:'需要复核',
+    reviewTitle:'搜库参数',
+    reviewEmpty:'任务运行后会固定显示 workflow、FASTA、搜库参数、修饰和需要复核的问题。',
+    updated:'更新时间',
+    automatic:'自动推断',
+    manualReview:'需要人工复核',
+    issues:'问题',
+    chooseContinue:'选择后继续',
+    continueWithChoices:'使用选择继续',
+    chooseReview:'请选择复核参数。',
+    apiRequired:'请先填写 API Key。',
+    submitterRequired:'请填写提交人。',
+    inputRequired:'请输入 PRIDE 文件名。',
+    checking:'检查中...',
+    apiOk:'API Key 可用。',
+    apiFailed:'API Key 检查失败。',
+    checkRequestFailed:'API 检查请求失败。',
+    logCount:n=>`${n} 条日志`,
+    serverStatus:(running,queued,max)=>`运行 ${running}/${max}，排队 ${queued}`,
+    retention:(retention,maxProjects)=>`结果约 ${retention} 分钟后清理；最多保留 ${maxProjects} 个可下载项目。`,
+    historyMeta:(total,active,failed,downloadable,size,minutes)=>`历史 ${total} 条 · 运行中 ${active} · 失败 ${failed} · 可下载 ${downloadable} · 占用 ${size} · 文件约 ${minutes} 分钟后清理；API Key 不共享。`,
+    unknown:'未知',
+    notProvided:'未填写',
+    active:'运行中',
+    status:{queued:'排队中',running:'运行中',completed:'已完成',failed:'失败',blocked:'需要复核',pending:'等待中'},
+    statusBar:{pending:'等待中',queued:'排队中',running:'运行中',completed:'运行完成',failed:'运行失败',blocked:'需要复核'},
+    action:{watch:'查看',inspect:'检查',download:'下载',view:'查看'},
+    batchAction:{watch:'跟踪批量',download:'下载 Excel',view:'打开批量'},
+    mode:{full:'完整流程',parameters:'仅搜参数'},
+    timeSource:{started_at:'开始',created_at:'创建',finished_at:'完成',updated_at:'更新',history_time:'记录'},
+    duration:'耗时',
+    queue:(pos,len,running,max)=>`任务已进入队列，当前位置 ${pos}/${len}。服务器正在运行 ${running}/${max} 个任务，空位释放后会自动启动。`,
+    createdTask:id=>`任务已创建：${id}`,
+    creatingTask:'正在检查 API Key 并创建任务...',
+    createFailed:e=>`创建任务请求失败：${e}`,
+    readFailed:e=>`读取任务失败：${e}`,
+    websocketError:'WebSocket 连接错误。',
+    reviewSubmitted:'已提交复核选择，任务重新进入队列。',
+    reviewSubmitFailed:e=>`提交复核失败：${e}`,
+    noIssues:'没有保存阻断原因。',
+    generatedNoZip:'参数包已生成，包含 converter_config、workflow、审计 JSON、decision_trace 和日志；不包含 RAW/mzML/FASTA 大文件。',
+    generatedWaitingZip:'结果目录已生成；ZIP 正在打包或当前没有可下载文件。',
+    zipReady:'ZIP 已打包完成，可以下载。',
+    noDownload:'没有可下载文件。',
+    preparingDownload:'正在准备下载...',
+    downloadStarted:'下载已开始。',
+    downloadFailed:e=>`下载失败：${e}`,
+    filesCleaned:'下载文件已清理',
+    fileCount:n=>`${n} 个文件`,
+    stepFull:['1 解析','2 下载','3 输入包','4 Docker','5 结果'],
+    stepParams:['1 解析','2 推断','3 计划','4 复核','5 完成']
+  }
+};
+
+function t(key){return I18N[currentLanguage][key]??I18N.en[key]??key}
+function tf(key,...args){const v=t(key);return typeof v==='function'?v(...args):v}
 function fill(v){document.getElementById('inputValue').value=v}
 function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+function jsArg(value){return JSON.stringify(String(value??'')).replace(/'/g,'&#39;')}
 function now(){const d=new Date();return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0')}
 function formatSize(n){if(n>1024*1024*1024)return(n/1024/1024/1024).toFixed(1)+' GB';if(n>1024*1024)return(n/1024/1024).toFixed(1)+' MB';if(n>1024)return(n/1024).toFixed(1)+' KB';return(n||0)+' B'}
 function retentionMinutes(d){return Math.max(1,Math.round((d.retention_seconds||1800)/60))}
-function formatRetention(sec){const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60);return h>0?h+' 小时 '+m+' 分钟':m+' 分钟'}
-function statusText(s){return {queued:'排队中',running:'运行中',completed:'已完成',failed:'失败',blocked:'需要复核'}[s]||s||'未知'}
-function toggleConfig(){document.getElementById('configBody').classList.toggle('open')}
+function formatHistoryTime(item){const v=item.history_time||item.updated_at||item.finished_at||item.started_at||item.created_at||'';if(!v)return'';const d=new Date(v);return isNaN(d.getTime())?String(v):d.toLocaleString(currentLanguage==='zh'?'zh-CN':'en-US',{hour12:false})}
+function formatDuration(sec){if(sec===null||sec===undefined)return'';const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=Math.floor(sec%60);if(currentLanguage==='zh'){if(h>0)return h+'小时'+String(m).padStart(2,'0')+'分';if(m>0)return m+'分'+String(s).padStart(2,'0')+'秒';return s+'秒'}if(h>0)return h+'h '+String(m).padStart(2,'0')+'m';if(m>0)return m+'m '+String(s).padStart(2,'0')+'s';return s+'s'}
+function timeSourceText(k){return t('timeSource')[k]||t('timeSource').history_time}
+function historyStatusText(s){return t('status')[s]||s||t('unknown')}
+function actionText(a){return t('action')[a]||t('action').view}
+function batchActionText(a){return t('batchAction')[a]||t('batchAction').view}
+function modeText(m){return t('mode')[m]||t('mode').full}
+function statusText(s){return t('statusBar')[s]||s||t('unknown')}
+
+const UI={
+  emptyState(message){return '<div class="empty" role="status">'+esc(message)+'</div>'},
+  emptyHistory(message,primaryAction,secondaryAction){
+    const actions=[primaryAction,secondaryAction].filter(Boolean).map(action=>{
+      return '<button class="btn '+esc(action.className||'btn-secondary')+' btn-small" type="button" onclick="'+esc(action.handler||'')+'">'+esc(action.label||'')+'</button>';
+    }).join('');
+    return '<div class="empty-history" role="status"><div class="empty-history-title">'+esc(t('historyEmptyTitle'))+'</div><div class="empty-history-body">'+esc(message)+'</div><div class="empty-history-actions">'+actions+'</div></div>';
+  },
+  statusPill(status,label){
+    return '<span class="status-pill '+esc(status||'')+'">'+esc(label||status||t('unknown'))+'</span>';
+  },
+  metricCard(label,value,meta){
+    return '<div class="metric-label">'+esc(label)+'</div><div class="metric-value">'+esc(value)+'</div><div class="metric-meta">'+esc(meta||'')+'</div>';
+  },
+  helperText(title,body){
+    return '<div class="helper-text"><strong>'+esc(title)+'</strong> '+esc(body||'')+'</div>';
+  },
+  actionButton(label,handler,ariaLabel){
+    const safeLabel=esc(label);
+    const safeAria=ariaLabel?(' aria-label="'+esc(ariaLabel)+'"'):'';
+    return '<button class="btn btn-secondary btn-small" type="button"'+safeAria+" onclick='"+handler+"'>"+safeLabel+'</button>';
+  },
+  batchItem(item){
+    const error=item.error?'<div class="batch-item-error">'+esc(item.error)+'</div>':'';
+    const audit=item.audit_path?'<span class="review-meta">'+esc(t('auditReady'))+'</span>':'';
+    return '<div class="batch-item"><span class="batch-item-name">'+esc(item.input||'')+audit+'</span><span class="batch-item-status">'+this.statusPill(item.status||'queued',item.status||'queued')+'</span>'+error+'</div>';
+  },
+  batchEvent(event){
+    const level=String(event.level||'info').toLowerCase();
+    return '<div class="batch-event '+esc(level)+'"><span class="batch-event-time">'+esc(event.ts||'')+'</span><span class="batch-event-level">'+esc(level)+'</span><span class="batch-event-message">'+esc(event.message||'')+'</span></div>';
+  },
+  taskRow(item,options={}){
+    const title=item.display_name||item.input_value||item.output_dir||item.task_id||item.name||t('unknown');
+    const meta=options.meta||'';
+    const actions=options.actions||'';
+    const busy=item.status==='queued'||item.status==='running';
+    return '<article class="result-row" aria-label="'+esc(title)+'" aria-busy="'+(busy?'true':'false')+'"><div><div class="result-title">'+esc(title)+'</div><div class="result-sub">'+meta+'</div></div><div class="result-actions">'+actions+'</div></article>';
+  },
+  reviewItem(item){
+    const meta=[];
+    if(item.source)meta.push(item.source);
+    if(typeof item.confidence==='number')meta.push('confidence '+item.confidence.toFixed(2));
+    let html='<div class="review-item '+(item.conflict?'conflict':'')+'"><div class="review-label">'+esc(item.label)+'</div><div class="review-value">'+esc(item.value)+'</div>';
+    if(meta.length)html+='<div class="review-meta">'+esc(meta.join(' · '))+'</div>';
+    return html+'</div>';
+  }
+};
+
+function setButtonBusy(button,busy,label){
+  if(!button)return;
+  if(!button.dataset.defaultLabel)button.dataset.defaultLabel=button.textContent;
+  button.disabled=!!busy;
+  button.setAttribute('aria-busy',busy?'true':'false');
+  if(label!==undefined)button.textContent=label;
+  else if(!busy)button.textContent=button.dataset.defaultLabel;
+}
+
+function showFormAlert(message){
+  const alertBox=document.getElementById('formAlert');
+  if(!alertBox)return;
+  alertBox.textContent=message||'';
+  alertBox.hidden=!message;
+}
+
+function clearFormAlert(){
+  showFormAlert('');
+}
+
+function toggleConfig(){
+  const body=document.getElementById('configBody');
+  const toggle=document.getElementById('configToggle');
+  const open=body.classList.toggle('open');
+  toggle.setAttribute('aria-expanded',open?'true':'false');
+}
+
+function applyStepLabels(){
+  const labels=currentRunMode==='parameters'?t('stepParams'):t('stepFull');
+  document.querySelectorAll('.step-item').forEach((el,idx)=>{el.textContent=labels[idx]||''});
+}
+
+function setLanguage(lang){
+  currentLanguage=(lang==='zh')?'zh':'en';
+  document.documentElement.lang=currentLanguage==='zh'?'zh-CN':'en';
+  localStorage.setItem('uiLanguage',currentLanguage);
+  document.querySelectorAll('[data-lang-btn]').forEach(btn=>{
+    const active=btn.dataset.langBtn===currentLanguage;
+    btn.classList.toggle('active',active);
+    btn.setAttribute('aria-pressed',active?'true':'false');
+  });
+  document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.dataset.i18n)});
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el=>{el.placeholder=t(el.dataset.i18nPlaceholder)});
+  document.getElementById('runModeHelp').textContent=currentRunMode==='parameters'?t('modeParametersHelp'):t('modeFullHelp');
+  const startBtn=document.getElementById('startBtn');
+  if(startBtn.disabled){
+    const status=document.getElementById('statusDot').className.replace('status-dot','').trim();
+    startBtn.textContent=status==='queued'?t('queuedBtn'):t('runningBtn');
+  }else{
+    startBtn.textContent=t('start');
+  }
+  applyStepLabels();
+  setStatus(document.getElementById('statusDot').className.replace('status-dot','').trim()||'pending');
+  renderLogs();
+  renderReview(lastReviewSummary);
+  loadHealth();
+  loadResults();
+}
+
+function setRunMode(mode,persist=true){
+  currentRunMode=(mode==='parameters')?'parameters':'full';
+  if(persist)localStorage.setItem('runMode',currentRunMode);
+  document.querySelectorAll('[data-run-mode]').forEach(btn=>{
+    const active=btn.dataset.runMode===currentRunMode;
+    btn.classList.toggle('active',active);
+    btn.setAttribute('aria-checked',active?'true':'false');
+    btn.tabIndex=active?0:-1;
+  });
+  document.getElementById('runModeHelp').textContent=currentRunMode==='parameters'?t('modeParametersHelp'):t('modeFullHelp');
+  applyStepLabels();
+}
+
+function setWorkflowTab(tab,persist=true){
+  currentWorkflowTab=(tab==='batch')?'batch':'single';
+  if(persist)localStorage.setItem('workflowTab',currentWorkflowTab);
+  document.querySelectorAll('[data-workflow-tab]').forEach(btn=>{
+    const active=btn.dataset.workflowTab===currentWorkflowTab;
+    btn.setAttribute('aria-selected',active?'true':'false');
+    btn.tabIndex=active?0:-1;
+  });
+  document.getElementById('singleTaskPanel').hidden=currentWorkflowTab!=='single';
+  document.getElementById('batchTaskPanel').hidden=currentWorkflowTab!=='batch';
+}
 
 async function loadConfig(){
   try{
@@ -236,10 +759,10 @@ async function loadConfig(){
     document.getElementById('cfgModel').value=d.model||'';
     document.getElementById('cfgTimeout').value=d.timeout||'';
     document.getElementById('configBody').classList.add('open');
-    document.getElementById('configStatus').textContent='每次任务单独填写';
-    document.getElementById('resultRetention').textContent='最多保存 '+(d.max_result_projects||4)+' 个项目下载文件';
+    document.getElementById('configToggle').setAttribute('aria-expanded','true');
+    document.getElementById('configStatus').textContent='';
+    document.getElementById('resultRetention').textContent=tf('retention',retentionMinutes(d),d.max_result_projects||4);
     updateServerStatus(d);
-    document.getElementById('resultRetention').textContent='结果和过程文件约 '+retentionMinutes(d)+' 分钟后清理；最多保留 '+(d.max_result_projects||4)+' 个可下载项目';
   }catch(e){}
 }
 
@@ -252,7 +775,9 @@ async function loadHealth(){
 
 function updateServerStatus(d){
   const running=d.running_tasks||0,queued=d.queued_tasks||0,max=d.max_concurrent_tasks||1;
-  document.getElementById('serverStatus').textContent='运行 '+running+'/'+max+'，排队 '+queued;
+  document.getElementById('serverStatus').textContent=tf('serverStatus',running,queued,max);
+  document.getElementById('metricRunning').innerHTML=UI.metricCard('Running',running+'/'+max,'Active workflow slots');
+  document.getElementById('metricQueued').innerHTML=UI.metricCard('Queued',queued,'Waiting to start');
 }
 
 async function loadResults(){
@@ -260,63 +785,225 @@ async function loadResults(){
   try{
     const r=await fetch('/api/history');
     const d=await r.json();
-    document.getElementById('publicResultsMeta').textContent='处理队列和历史状态所有人可见；结果和过程文件约 '+retentionMinutes(d)+' 分钟后清理；最多保留 '+(d.max_result_projects||4)+' 个可下载项目；API Key 不共享。';
-    document.getElementById('publicResultsMeta').textContent='处理队列和历史状态所有人可见；最多保存 '+(d.max_result_projects||4)+' 个项目下载文件；API Key 不共享。';
-    document.getElementById('publicResultsMeta').textContent='处理队列和历史状态所有人可见；结果和过程文件约 '+retentionMinutes(d)+' 分钟后清理；最多保留 '+(d.max_result_projects||4)+' 个可下载项目；API Key 不共享。';
+    const summary=d.summary||{};
+    document.getElementById('publicResultsMeta').textContent=tf('historyMeta',summary.total||0,summary.active||0,summary.failed||0,summary.downloadable||0,formatSize(summary.storage_bytes||0),retentionMinutes(d));
+    document.getElementById('metricHistory').innerHTML=UI.metricCard('History',summary.total||0,(summary.failed||0)+' failed · '+(summary.downloadable||0)+' downloadable');
+    document.getElementById('metricStorage').innerHTML=UI.metricCard('Storage',formatSize(summary.storage_bytes||0),'Auto-cleaned result files');
     const active=d.active_tasks||[];
     const results=d.results||[];
     if(active.length===0&&results.length===0){
-      box.innerHTML='<div class="empty">暂无处理中的任务或可下载结果。</div>';
+      box.innerHTML=UI.emptyHistory(t('historyEmptyBody'),{label:t('historyEmptySingleAction'),handler:"setWorkflowTab('single')",className:'btn-primary'},{label:t('historyEmptyBatchAction'),handler:"setWorkflowTab('batch')",className:'btn-secondary'});
       return;
     }
+    const metaLine=item=>{
+      const parts=[item.submitter||t('notProvided'),historyStatusText(item.status),modeText(item.run_mode||'full')];
+      if(item.kind==='batch'&&item.item_count!==undefined)parts.push((item.item_count||0)+' files');
+      const tValue=formatHistoryTime(item);
+      if(tValue)parts.push(timeSourceText(item.time_label)+' '+tValue);
+      const duration=formatDuration(item.duration_seconds);
+      if(duration)parts.push(t('duration')+' '+duration);
+      if(item.run_label&&item.run_label!==item.display_name)parts.push(item.run_label);
+      return parts.map(esc).join(' · ');
+    };
     const activeHtml=active.map(item=>{
-      const pos=item.queue_position?(' · 队列 '+item.queue_position):'';
-      return '<div class="result-row"><div><div class="result-title">'+esc(item.input_value||item.output_dir||item.task_id)+'</div><div class="result-sub">'+
-        esc(item.submitter||'未填写')+' · '+esc(statusText(item.status))+pos+
-        '</div></div><div class="result-actions"><button class="btn btn-secondary btn-small" onclick="attachTask(\''+esc(item.task_id).replace(/'/g,'&#39;')+'\')">查看</button></div></div>';
+      const pos=item.queue_position?(' · '+tf('queue',item.queue_position,item.queue_length||item.queued_tasks||0,item.running_tasks||0,item.max_concurrent_tasks||1)):'';
+      const viewId=item.kind==='batch'?(item.batch_id||item.result_id||''):(item.task_id||item.history_id||'');
+      const label=item.kind==='batch'?batchActionText(item.primary_action):actionText(item.primary_action);
+      const handler=item.kind==='batch'?'attachBatch('+jsArg(viewId)+')':'attachTask('+jsArg(viewId)+')';
+      const actions=UI.actionButton(label,handler,label+' '+(item.display_name||item.input_value||item.task_id||item.batch_id||''));
+      return UI.taskRow(item,{meta:metaLine(item)+esc(pos),actions});
     }).join('');
     const resultHtml=results.map(item=>{
-      const fileInfo=(item.file_count||0)>0?(esc(item.file_count)+' 个文件 · '+formatSize(item.size_bytes)):'下载文件已清理';
-      const viewId=item.task_id||item.result_id||item.name;
-      const viewBtn=viewId?'<button class="btn btn-secondary btn-small" onclick="attachTask(\''+esc(viewId).replace(/'/g,'&#39;')+'\')">查看</button>':'';
-      const downloadBtn=item.can_download?'<button class="btn btn-secondary btn-small" onclick="downloadPublicResult(\''+esc(item.result_id).replace(/'/g,'&#39;')+'\')">下载</button>':'<span class="public-meta">不可下载</span>';
-      const actionHtml=viewBtn+downloadBtn;
-      return '<div class="result-row"><div><div class="result-title">'+esc(item.input_value||item.name)+'</div><div class="result-sub">'+
-        esc(item.submitter||'未填写')+' · '+esc(statusText(item.status))+' · '+fileInfo+
-        '</div></div><div class="result-actions">'+actionHtml+'</div></div>';
+      const fileInfo=(item.file_count||0)>0?(tf('fileCount',item.file_count)+' · '+formatSize(item.size_bytes)):t('filesCleaned');
+      const viewId=item.kind==='batch'?(item.batch_id||item.result_id||''):(item.task_id||item.result_id||item.name);
+      const viewLabel=item.kind==='batch'?batchActionText(item.primary_action):actionText(item.primary_action);
+      const viewHandler=item.kind==='batch'?'attachBatch('+jsArg(viewId)+')':'attachTask('+jsArg(viewId)+')';
+      const viewBtn=viewId?UI.actionButton(viewLabel,viewHandler,viewLabel+' '+(item.display_name||item.input_value||item.name||'')):'';
+      const downloadBtn=item.can_download?(item.kind==='batch'?UI.actionButton(batchActionText('download'),'downloadBatchExcelById('+jsArg(item.batch_id||item.result_id)+')',batchActionText('download')+' '+(item.display_name||item.name||'')):UI.actionButton(t('downloadZip'),'downloadPublicResult('+jsArg(item.result_id)+')',t('downloadZip')+' '+(item.display_name||item.name||''))):'';
+      const actionHtml=(viewBtn+downloadBtn)||'<span class="public-meta">'+esc(t('noDownload'))+'</span>';
+      return UI.taskRow(item,{meta:metaLine(item)+' · '+esc(fileInfo),actions:actionHtml});
     }).join('');
     box.innerHTML=activeHtml+resultHtml;
   }catch(e){
-    box.innerHTML='<div class="empty">项目历史读取失败。</div>';
+    box.innerHTML=UI.emptyState(t('historyReading'));
   }
 }
 
 function downloadPublicResult(id){window.location.href='/api/results/'+encodeURIComponent(id)+'/download'}
 
+function collectBatchInputs(){
+  return document.getElementById('batchInput').value.split(/\r?\n/).map(v=>v.trim()).filter(v=>v&&!v.startsWith('#'));
+}
+
+function renderBatchItems(items){
+  const box=document.getElementById('batchItems');
+  if(!items||!items.length){box.innerHTML='';return}
+  box.innerHTML=items.map(item=>UI.batchItem(item)).join('');
+}
+
+function renderBatchEvents(batch){
+  const box=document.getElementById('batchLogBox');
+  const meta=document.getElementById('batchLogMeta');
+  if(!box||!meta)return;
+  const events=(batch&&Array.isArray(batch.events))?batch.events.slice(-120):[];
+  const itemLogs=[];
+  (batch&&Array.isArray(batch.items)?batch.items:[]).forEach(item=>{
+    (Array.isArray(item.log_tail)?item.log_tail.slice(-8):[]).forEach(line=>{
+      itemLogs.push({ts:'',level:item.status==='failed'?'error':'debug',message:(item.input||'item')+': '+line});
+    });
+  });
+  const rows=[...events,...itemLogs.slice(-80)];
+  meta.textContent=rows.length?rows.length+' events/log lines':t('batchLogEmpty');
+  box.innerHTML=rows.length?rows.map(event=>UI.batchEvent(event)).join(''):UI.emptyState(t('batchLogEmpty'));
+  box.scrollTop=box.scrollHeight;
+}
+
+function updateBatchView(batch){
+  if(!batch||batch.error){
+    const status=document.getElementById('batchStatus');
+    status.textContent=batch&&batch.error?batch.error:'';
+    status.className='batch-status error';
+    renderBatchEvents(batch||{});
+    return;
+  }
+  currentBatchId=batch.batch_id||currentBatchId;
+  const done=(batch.completed_items||0)+(batch.failed_items||0)+(batch.needs_review_items||0);
+  const total=batch.item_count||0;
+  const failed=batch.failed_items||0;
+  const review=batch.needs_review_items||0;
+  const status=document.getElementById('batchStatus');
+  status.textContent=tf('batchStatus',batch.status||'unknown',done,total,failed,review);
+  status.className=batch.status==='failed'?'batch-status error':(batch.can_download?'batch-status ok':'batch-status');
+  renderBatchItems(batch.items||[]);
+  renderBatchEvents(batch);
+  const downloadBtn=document.getElementById('batchDownloadBtn');
+  downloadBtn.disabled=!batch.can_download;
+  const auditBtn=document.getElementById('batchAuditBtn');
+  auditBtn.disabled=!batch.can_download_audit;
+  if(batch.can_download)status.textContent+=' '+t('batchDownloadReady');
+  if(batch.can_download_audit)status.textContent+=' '+t('batchAuditReady');
+  if(batch.status==='completed'||batch.status==='failed'){
+    clearInterval(batchPollTimer);
+    setButtonBusy(document.getElementById('batchStartBtn'),false,t('startBatch'));
+  }
+}
+
+async function pollBatch(id){
+  try{
+    const r=await fetch('/api/batches/'+encodeURIComponent(id));
+    const d=await r.json();
+    updateBatchView(d);
+  }catch(e){
+    const status=document.getElementById('batchStatus');
+    status.textContent=tf('batchReadFailed',e);
+    status.className='batch-status error';
+  }
+}
+
+async function startBatch(){
+  const input=document.getElementById('batchInput');
+  const inputs=collectBatchInputs();
+  if(inputs.length===0){input.classList.add('error');input.setAttribute('aria-invalid','true');input.focus();showFormAlert(t('batchRequired'));return}
+  if(!validateBatchSubmitter()){showFormAlert(t('submitterRequired'));return}
+  if(!validateConfig()){showFormAlert(t('apiRequired'));return}
+  clearFormAlert();
+  const btn=document.getElementById('batchStartBtn'),status=document.getElementById('batchStatus');
+  setButtonBusy(btn,true,t('creating'));
+  document.getElementById('batchDownloadBtn').disabled=true;
+  document.getElementById('batchAuditBtn').disabled=true;
+  status.textContent=t('batchCreating');
+  status.className='batch-status';
+  renderBatchItems(inputs.map((value,index)=>({input:value,status:index===0?'queued':'queued'})));
+  renderBatchEvents({events:[{ts:now(),level:'info',message:t('batchCreating')}],items:[]});
+  try{
+    const payload={
+      inputs,
+      submitter:document.getElementById('batchSubmitter').value.trim(),
+      jobs:parseInt(document.getElementById('batchJobs').value||'3',10),
+      fasta_preference:document.getElementById('preferProjectFasta').checked?'project':'llm',
+      ui_language:currentLanguage,
+      llm_config:collectConfig()
+    };
+    const resp=await fetch('/api/batches/parameters',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){status.textContent=data.error;status.className='batch-status error';setButtonBusy(btn,false,t('startBatch'));return}
+    updateBatchView(data);
+    clearInterval(batchPollTimer);
+    batchPollTimer=setInterval(()=>pollBatch(data.batch_id),1500);
+  }catch(e){
+    status.textContent=tf('batchCreateFailed',e);
+    status.className='batch-status error';
+    setButtonBusy(btn,false,t('startBatch'));
+  }
+}
+
+function downloadBatchExcel(){
+  downloadBatchExcelById(currentBatchId);
+}
+
+function downloadBatchExcelById(id){
+  if(!id)return;
+  window.location.href='/api/batches/'+encodeURIComponent(id)+'/download';
+}
+
+function downloadBatchAudit(){
+  downloadBatchAuditById(currentBatchId);
+}
+
+function downloadBatchAuditById(id){
+  if(!id)return;
+  window.location.href='/api/batches/'+encodeURIComponent(id)+'/audit.zip';
+}
+
+async function attachBatch(id){
+  if(!id)return;
+  setWorkflowTab('batch');
+  currentBatchId=id;
+  clearInterval(batchPollTimer);
+  await pollBatch(id);
+  batchPollTimer=setInterval(()=>pollBatch(id),1500);
+}
+
 function validateConfig(){
   const key=document.getElementById('cfgApiKey').value.trim();
   const input=document.getElementById('cfgApiKey');
-  if(!key){input.classList.add('error');input.focus();document.getElementById('configBody').classList.add('open');return false}
+  if(!key){input.classList.add('error');input.setAttribute('aria-invalid','true');input.focus();document.getElementById('configBody').classList.add('open');document.getElementById('configToggle').setAttribute('aria-expanded','true');return false}
   input.classList.remove('error');
+  input.setAttribute('aria-invalid','false');
   return true;
 }
 
 function validateSubmitter(){
   const input=document.getElementById('submitter');
   const value=input.value.trim();
-  if(!value){input.classList.add('error');input.focus();return false}
+  if(!value){input.classList.add('error');input.setAttribute('aria-invalid','true');input.focus();return false}
   input.classList.remove('error');
+  input.setAttribute('aria-invalid','false');
+  return true;
+}
+
+function validateBatchSubmitter(){
+  const input=document.getElementById('batchSubmitter');
+  const value=input.value.trim();
+  if(!value){input.classList.add('error');input.setAttribute('aria-invalid','true');input.focus();return false}
+  input.classList.remove('error');
+  input.setAttribute('aria-invalid','false');
   return true;
 }
 
 document.addEventListener('input',e=>{
+  if(e.target&&['cfgApiKey','submitter','batchSubmitter','inputValue','batchInput'].includes(e.target.id))clearFormAlert();
   if(e.target&&e.target.id==='cfgApiKey'){
     e.target.classList.remove('error');
+    e.target.setAttribute('aria-invalid','false');
     const status=document.getElementById('apiCheckStatus');
     status.textContent='';
     status.className='inline-status';
   }
-  if(e.target&&e.target.id==='submitter')e.target.classList.remove('error');
+  if(e.target&&e.target.id==='submitter'){e.target.classList.remove('error');e.target.setAttribute('aria-invalid','false')}
+  if(e.target&&e.target.id==='batchSubmitter'){e.target.classList.remove('error');e.target.setAttribute('aria-invalid','false')}
+  if(e.target&&e.target.id==='inputValue')e.target.setAttribute('aria-invalid','false');
+  if(e.target&&e.target.id==='batchInput'){e.target.classList.remove('error');e.target.setAttribute('aria-invalid','false')}
 });
 
 function collectConfig(){
@@ -333,23 +1020,25 @@ function collectConfig(){
 }
 
 async function checkLLMConfig(){
-  if(!validateConfig()){alert('请先填写 API Key');return false}
+  if(!validateConfig()){showFormAlert(t('apiRequired'));return false}
+  clearFormAlert();
   const btn=document.getElementById('checkApiBtn'),status=document.getElementById('apiCheckStatus');
-  btn.disabled=true;status.textContent='检查中...';status.className='inline-status';
+  setButtonBusy(btn,true,t('checking'));status.textContent=t('checking');status.className='inline-status';
   try{
     const resp=await fetch('/api/llm/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({llm_config:collectConfig()})});
     const data=await resp.json();
-    if(data.ok){status.textContent='API Key 可用';status.className='inline-status ok';return true}
-    status.textContent=data.error||'API Key 检查失败';status.className='inline-status error';document.getElementById('cfgApiKey').classList.add('error');return false;
+    if(data.ok){status.textContent=t('apiOk');status.className='inline-status ok';return true}
+    status.textContent=data.error||t('apiFailed');status.className='inline-status error';document.getElementById('cfgApiKey').classList.add('error');return false;
   }catch(e){
-    status.textContent='检查请求失败';status.className='inline-status error';return false;
-  }finally{btn.disabled=false;loadHealth()}
+    status.textContent=t('checkRequestFailed');status.className='inline-status error';return false;
+  }finally{setButtonBusy(btn,false,t('checkApi'));loadHealth()}
 }
 
 function setFilter(f,btn){
   currentFilter=f;
-  document.querySelectorAll('.log-filters button').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('.log-filters button').forEach(b=>{b.classList.remove('active');b.setAttribute('aria-pressed','false')});
   btn.classList.add('active');
+  btn.setAttribute('aria-pressed','true');
   renderLogs();
 }
 
@@ -365,7 +1054,7 @@ function renderLogs(){
     box.appendChild(div);
   });
   box.scrollTop=box.scrollHeight;
-  document.getElementById('logCount').textContent=allLogs.length+' 条日志';
+  document.getElementById('logCount').textContent=tf('logCount',allLogs.length);
 }
 
 function scheduleRenderLogs(){
@@ -396,16 +1085,16 @@ function setStep(n,status){
 
 function setStatus(s){
   const dot=document.getElementById('statusDot'),txt=document.getElementById('statusText');
-  dot.className='status-dot '+s;
-  const m={pending:'等待中',queued:'排队中',running:'运行中',completed:'运行完成',failed:'运行失败',blocked:'需要复核'};
-  txt.textContent=m[s]||s;
+  const status=s||'pending';
+  dot.className='status-dot '+status;
+  txt.textContent=statusText(status);
 }
 
 function updateQueuePanel(data){
   const panel=document.getElementById('queuePanel');
   if(!data||data.status!=='queued'){panel.classList.remove('show');panel.textContent='';return}
   const pos=data.queue_position||0,len=data.queue_length||data.queued_tasks||0,running=data.running_tasks||0,max=data.max_concurrent_tasks||1;
-  panel.textContent='任务已进入队列，当前位置 '+pos+'/'+len+'。服务器正在运行 '+running+'/'+max+' 个任务，空位释放后会自动启动。';
+  panel.textContent=tf('queue',pos,len,running,max);
   panel.classList.add('show');
 }
 
@@ -420,32 +1109,28 @@ function startTimer(){
 function stopTimer(){clearInterval(timerInterval)}
 
 function renderReview(summary){
+  lastReviewSummary=summary||null;
   const panel=document.getElementById('reviewPanel');
   if(!summary||!summary.items){
-    panel.innerHTML='<h3>人工复核参数</h3><div class="review-empty">任务运行后会固定显示 workflow、FASTA、搜库参数、修饰和需要复核的问题。</div>';
+    panel.innerHTML='<h3>'+esc(t('reviewTitle'))+'</h3>'+UI.emptyState(t('reviewEmpty'));
     return;
   }
-  let html='<h3>人工复核参数</h3><div class="review-updated">更新时间 '+esc(summary.updated_at||'')+(summary.needs_review?' · 需要人工复核':' · 自动推断')+'</div>';
-  if(summary.items.length===0){html+='<div class="review-empty">暂无参数。</div>'}
+  let html='<h3>'+esc(t('reviewTitle'))+'</h3><div class="review-updated">'+esc(t('updated'))+' '+esc(summary.updated_at||'')+' · '+esc(summary.needs_review?t('manualReview'):t('automatic'))+'</div>';
+  if(summary.items.length===0){html+=UI.emptyState(t('reviewEmpty'))}
   summary.items.forEach(item=>{
-    const meta=[];
-    if(item.source)meta.push(item.source);
-    if(typeof item.confidence==='number')meta.push('confidence '+item.confidence.toFixed(2));
-    html+='<div class="review-item '+(item.conflict?'conflict':'')+'"><div class="review-label">'+esc(item.label)+'</div><div class="review-value">'+esc(item.value)+'</div>';
-    if(meta.length)html+='<div class="review-meta">'+esc(meta.join(' · '))+'</div>';
-    html+='</div>';
+    html+=UI.reviewItem(item);
   });
   if(summary.issues&&summary.issues.length){
-    html+='<div class="review-issues"><strong>问题</strong><ul>'+summary.issues.map(i=>'<li>'+esc(i)+'</li>').join('')+'</ul></div>';
+    html+='<div class="review-issues"><strong>'+esc(t('issues'))+'</strong><ul>'+summary.issues.map(i=>'<li>'+esc(i)+'</li>').join('')+'</ul></div>';
   }
   if(summary.review_options&&summary.review_options.length){
-    html+='<div class="review-actions"><strong>选择后继续</strong>';
+    html+='<div class="review-actions"><strong>'+esc(t('chooseContinue'))+'</strong>';
     summary.review_options.forEach(opt=>{
       html+='<label>'+esc(opt.label||opt.field)+'<select data-review-field="'+esc(opt.field)+'">';
       (opt.values||[]).forEach(v=>{html+='<option value="'+esc(v)+'">'+esc(v)+'</option>'});
       html+='</select></label>';
     });
-    html+='<button class="btn btn-primary btn-small" onclick="submitReviewSelections()">使用选择继续运行</button></div>';
+    html+='<button class="btn btn-primary btn-small" onclick="submitReviewSelections()">'+esc(t('continueWithChoices'))+'</button></div>';
   }
   panel.innerHTML=html;
 }
@@ -456,21 +1141,20 @@ async function submitReviewSelections(){
   document.querySelectorAll('[data-review-field]').forEach(sel=>{
     if(sel.value)overrides[sel.dataset.reviewField]=sel.value;
   });
-  if(Object.keys(overrides).length===0){alert('请选择复核参数');return}
+  if(Object.keys(overrides).length===0){receiveLog({type:'log',level:'error',message:t('chooseReview'),ts:now()});return}
   try{
     const r=await fetch('/api/tasks/'+taskId+'/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({overrides})});
     const d=await r.json();
     if(d.error){receiveLog({type:'log',level:'error',message:d.error,ts:now()});return}
-    receiveLog({type:'log',level:'info',message:'已提交复核选择，任务继续排队/运行。',ts:now()});
+    receiveLog({type:'log',level:'info',message:t('reviewSubmitted'),ts:now()});
     document.getElementById('blockedPanel').style.display='none';
     setStatus(d.status);
-    if(d.status==='queued'){updateQueuePanel(d);document.getElementById('startBtn').textContent='排队中...'}
-    else{updateQueuePanel(null);document.getElementById('startBtn').textContent='运行中...'}
-    document.getElementById('startBtn').disabled=true;
+    if(d.status==='queued'){updateQueuePanel(d);setButtonBusy(document.getElementById('startBtn'),true,t('queuedBtn'))}
+    else{updateQueuePanel(null);setButtonBusy(document.getElementById('startBtn'),true,t('runningBtn'))}
     connectTaskSocket(taskId);
     loadHealth();loadResults();
   }catch(e){
-    receiveLog({type:'log',level:'error',message:'提交复核失败：'+e,ts:now()});
+    receiveLog({type:'log',level:'error',message:tf('reviewSubmitFailed',e),ts:now()});
   }
 }
 
@@ -484,6 +1168,7 @@ function resetRunView(){
   allLogs=[];
   renderLogs();
   renderReview(null);
+  applyStepLabels();
   setStep(0);
   updateQueuePanel(null);
   stopTimer();
@@ -496,17 +1181,17 @@ function connectTaskSocket(id){
   ws.onmessage=e=>{
     const msg=JSON.parse(e.data);
     if(msg.type==='log')receiveLog(msg);
-    else if(msg.type==='step'){setStatus('running');updateQueuePanel(null);document.getElementById('startBtn').textContent='运行中...';setStep(msg.step,'active');receiveLog({type:'log',level:'step',message:msg.message,ts:msg.ts})}
+    else if(msg.type==='step'){setStatus('running');updateQueuePanel(null);document.getElementById('startBtn').textContent=t('runningBtn');setStep(msg.step,'active');receiveLog({type:'log',level:'step',message:msg.message,ts:msg.ts})}
     else if(msg.type==='queue'){setStatus('queued');updateQueuePanel(msg);loadHealth()}
     else if(msg.type==='review')renderReview(msg.summary);
     else if(msg.type==='done'){
-      updateQueuePanel(null);setStatus(msg.status);stopTimer();document.getElementById('startBtn').disabled=false;document.getElementById('startBtn').textContent='启动';
+      updateQueuePanel(null);setStatus(msg.status);stopTimer();setButtonBusy(document.getElementById('startBtn'),false,t('start'));
       if(msg.status==='completed')showResults();
       if(msg.status==='blocked'||msg.status==='failed')loadIssues();
       loadHealth();loadResults();
     }
   };
-  ws.onerror=()=>{receiveLog({type:'log',level:'error',message:'WebSocket 连接错误',ts:now()});loadHealth()};
+  ws.onerror=()=>{receiveLog({type:'log',level:'error',message:t('websocketError'),ts:now()});loadHealth()};
 }
 
 async function attachTask(id){
@@ -517,6 +1202,7 @@ async function attachTask(id){
     const r=await fetch('/api/tasks/'+id);
     const d=await r.json();
     if(d.error){receiveLog({type:'log',level:'error',message:d.error,ts:now()});setStatus('failed');stopTimer();return}
+    if(d.run_mode)setRunMode(d.run_mode,false);
     allLogs=Array.isArray(d.logs)?d.logs:[];
     renderLogs();
     setStatus(d.status);
@@ -526,46 +1212,56 @@ async function attachTask(id){
     if(d.archived||d.status==='completed'||d.status==='failed'||d.status==='blocked'){
       updateQueuePanel(null);
       stopTimer();
-      document.getElementById('startBtn').disabled=false;
-      document.getElementById('startBtn').textContent='启动';
+      setButtonBusy(document.getElementById('startBtn'),false,t('start'));
       if(d.status==='completed')showResults();
       if(d.status==='blocked'||d.status==='failed')loadIssues();
       return;
     }
     connectTaskSocket(id);
   }catch(e){
-    receiveLog({type:'log',level:'error',message:'读取任务失败：'+e,ts:now()});
+    receiveLog({type:'log',level:'error',message:tf('readFailed',e),ts:now()});
     setStatus('failed');stopTimer();
   }
 }
 
 async function startTask(){
-  const input=document.getElementById('inputValue').value.trim();
-  if(!input){alert('请输入 PRIDE 文件名');return}
-  if(!validateSubmitter()){alert('请填写提交人');return}
-  if(!validateConfig()){alert('请先填写 API Key');return}
+  const inputEl=document.getElementById('inputValue');
+  const input=inputEl.value.trim();
+  if(!input){inputEl.setAttribute('aria-invalid','true');inputEl.focus();showFormAlert(t('inputRequired'));return}
+  if(!validateSubmitter()){showFormAlert(t('submitterRequired'));return}
+  if(!validateConfig()){showFormAlert(t('apiRequired'));return}
+  clearFormAlert();
   const btn=document.getElementById('startBtn');
-  btn.disabled=true;btn.textContent='创建中...';
+  setButtonBusy(btn,true,t('creating'));
   resetRunView();setStatus('running');startTimer();
-  receiveLog({type:'log',level:'info',message:'正在检查 API Key 并创建任务...',ts:now()});
+  receiveLog({type:'log',level:'info',message:t('creatingTask'),ts:now()});
 
   let data;
   try{
     const fastaPreference=document.getElementById('preferProjectFasta').checked?'project':'llm';
-    const resp=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({input_value:input,submitter:document.getElementById('submitter').value.trim(),fasta_preference:fastaPreference,llm_config:collectConfig()})});
+    const payload={
+      input_value:input,
+      submitter:document.getElementById('submitter').value.trim(),
+      fasta_preference:fastaPreference,
+      run_mode:currentRunMode,
+      ui_language:currentLanguage,
+      llm_config:collectConfig()
+    };
+    const resp=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     data=await resp.json();
   }catch(e){
-    receiveLog({type:'log',level:'error',message:'创建任务请求失败：'+e,ts:now()});
-    setStatus('failed');stopTimer();btn.disabled=false;btn.textContent='启动';return;
+    receiveLog({type:'log',level:'error',message:tf('createFailed',e),ts:now()});
+    setStatus('failed');stopTimer();setButtonBusy(btn,false,t('start'));return;
   }
   if(data.error){
     receiveLog({type:'log',level:'error',message:data.error,ts:now()});
-    setStatus('failed');stopTimer();btn.disabled=false;btn.textContent='启动';loadHealth();return;
+    setStatus('failed');stopTimer();setButtonBusy(btn,false,t('start'));loadHealth();return;
   }
   taskId=data.task_id;
-  receiveLog({type:'log',level:'info',message:'任务已创建：'+taskId,ts:now()});
-  if(data.status==='queued'){setStatus('queued');updateQueuePanel(data);btn.textContent='排队中...'}else{btn.textContent='运行中...'}
+  receiveLog({type:'log',level:'info',message:tf('createdTask',taskId),ts:now()});
+  if(data.status==='queued'){setStatus('queued');updateQueuePanel(data);btn.textContent=t('queuedBtn')}else{btn.textContent=t('runningBtn')}
   loadHealth();
+  loadResults();
   connectTaskSocket(taskId);
 }
 
@@ -574,14 +1270,14 @@ async function showResults(){
   const d=await r.json();
   renderReview(d.review_summary);
   const fileLines=allLogs.filter(l=>l.message&&l.message.includes('  (')&&l.message.includes(')')).map(l=>l.message);
-  document.getElementById('fileList').innerHTML=fileLines.length?fileLines.map(f=>'<div>'+esc(f)+'</div>').join(''):'<div>结果目录已生成，可下载 ZIP。</div>';
+  const isParameterOnly=d.run_mode==='parameters';
+  document.getElementById('fileList').innerHTML=fileLines.length?fileLines.map(f=>'<div>'+esc(f)+'</div>').join(''):'<div>'+esc(isParameterOnly?t('generatedNoZip'):t('generatedWaitingZip'))+'</div>';
   const status=document.getElementById('downloadStatus');
   const btn=document.getElementById('downloadBtn');
   btn.style.display=d.can_download?'inline-block':'none';
   btn.disabled=!d.can_download;
-  status.textContent=d.can_download?'可下载 ZIP 结果文件。':'当前没有可下载文件。';
+  status.textContent=d.can_download?t('zipReady'):(isParameterOnly?t('generatedNoZip'):t('generatedWaitingZip'));
   status.className=d.can_download?'download-status':'download-status error';
-  status.textContent=d.can_download?'ZIP 已压缩打包完成，可下载。':'结果 ZIP 正在打包或没有可下载文件。';
   document.getElementById('resultPanel').style.display='block';
   setStep(5,'done');
 }
@@ -591,7 +1287,8 @@ async function loadIssues(){
   const d=await r.json();
   renderReview(d.review_summary);
   const list=document.getElementById('issuesList');
-  list.innerHTML=(d.blocking_issues||[]).map(i=>'<li>'+esc(i)+'</li>').join('');
+  const issues=d.blocking_issues||[];
+  list.innerHTML=issues.length?issues.map(i=>'<li>'+esc(i)+'</li>').join(''):'<li>'+esc(t('noIssues'))+'</li>';
   document.getElementById('blockedPanel').style.display='block';
   setStep(4,'error');
 }
@@ -599,21 +1296,22 @@ async function loadIssues(){
 async function downloadResults(){
   if(!taskId)return;
   const status=document.getElementById('downloadStatus');
-  status.textContent='正在准备下载...';status.className='download-status';
+  status.textContent=t('preparingDownload');status.className='download-status';
   try{
     const r=await fetch('/api/tasks/'+taskId);
     const d=await r.json();
-    if(!d.can_download){status.textContent='没有可下载文件。';status.className='download-status error';return}
+    if(!d.can_download){status.textContent=t('noDownload');status.className='download-status error';return}
     window.location.href='/api/tasks/'+taskId+'/download';
-    status.textContent='下载已开始。';
+    status.textContent=t('downloadStarted');
   }catch(e){
-    status.textContent='下载失败：'+e;status.className='download-status error';
+    status.textContent=tf('downloadFailed',e);status.className='download-status error';
   }
 }
 
+setRunMode(localStorage.getItem('runMode')||'full');
+setWorkflowTab(localStorage.getItem('workflowTab')||'single',false);
+setLanguage(localStorage.getItem('uiLanguage')||'en');
 loadConfig();
-loadHealth();
-loadResults();
 setInterval(loadHealth,5000);
 setInterval(loadResults,30000);
 </script>

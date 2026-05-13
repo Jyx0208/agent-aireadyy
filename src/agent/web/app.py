@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
+import concurrent.futures
 import json
 import os
 import re
@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 import zipfile
-from collections import deque
+from collections import Counter, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,10 +23,14 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
 from agent.input.normalizer import safe_output_stem
 from agent.progress import render_download_progress
+from agent.web.history import history_timestamp, merge_project_history_records, with_history_identity
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    _runs_dir.mkdir(exist_ok=True)
+    _sync_history_index_from_disk()
+    _repair_interrupted_history_index()
     _start_result_cleanup_worker()
     yield
 
@@ -35,8 +39,9 @@ app = FastAPI(title="PRIDE AI-ready Agent", version="0.3.1", lifespan=lifespan)
 
 _tasks: dict[str, dict[str, Any]] = {}
 _tasks_lock = threading.Lock()
+_batches: dict[str, dict[str, Any]] = {}
+_batches_lock = threading.Lock()
 _runs_dir = Path("runs")
-_runs_dir.mkdir(exist_ok=True)
 _templates_dir = Path(__file__).parent / "templates"
 _ACTIVE_STATUSES = {"queued", "running"}
 _TERMINAL_STATUSES = {"completed", "failed", "blocked"}
@@ -45,9 +50,19 @@ _PUBLIC_HISTORY_FILE = "task_history.json"
 _HISTORY_INDEX_FILE = "project_history.json"
 _DOWNLOAD_CACHE_DIR = ".download_cache"
 _DOWNLOAD_ZIP_NAME = "results-compressed.zip"
+_BATCHES_DIR_NAME = "_batches"
+_BATCH_MANIFEST_FILE = "batch_manifest.json"
+_BATCH_EXCEL_FILE = "benchmark_results.xlsx"
+_BATCH_AUDIT_ZIP_NAME = "batch_parameter_audit.zip"
 _DOWNLOAD_RESULT_DIRS = {"ai_ready", "msdt", "rawspectrum", "logs"}
 _DOWNLOAD_ROOT_SUFFIXES = {".json", ".txt", ".log", ".tsv", ".csv"}
+_DOWNLOAD_FRAGPIPE_PARAMETER_FILES = {"fragger.params", "msbooster_params.txt"}
 _MAX_PERSISTED_LOGS = 2000
+_INTERRUPTED_HISTORY_MESSAGE = "服务重启或任务被手动停止，任务已中断。"
+_RUN_MODE_FULL = "full"
+_RUN_MODE_PARAMETERS = "parameters"
+_RUN_MODES = {_RUN_MODE_FULL, _RUN_MODE_PARAMETERS}
+_UI_LANGUAGES = {"en", "zh"}
 
 # 默认配置（不从 .env 加载，由用户在页面填写）
 _DEFAULT_CONFIG = {
@@ -56,6 +71,7 @@ _DEFAULT_CONFIG = {
     "timeout": "1200",
 }
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\[(?:\d{1,3};?)*m")
+_CJK_RE = re.compile(r"[\u3400-\u9fff\u3000-\u303f\uff00-\uffef]")
 def _app_timezone():
     timezone_name = os.getenv("TZ", "Asia/Shanghai")
     try:
@@ -93,6 +109,24 @@ def _clean_submitter(value: Any) -> str:
     return submitter[:80]
 
 
+def _clean_run_mode(value: Any) -> str:
+    mode = _clean_text(value).lower().replace("-", "_")
+    if mode in {"parameters", "parameter", "parameter_only", "params", "plan", "planning"}:
+        return _RUN_MODE_PARAMETERS
+    if mode in {"full", "workflow", "full_workflow", "run", "run_full"}:
+        return _RUN_MODE_FULL
+    return _RUN_MODE_FULL
+
+
+def _clean_ui_language(value: Any) -> str:
+    language = _clean_text(value).lower()
+    if language in {"zh", "zh_cn", "zh-cn", "cn", "chinese"}:
+        return "zh"
+    if language in {"en", "en_us", "en-us", "english"}:
+        return "en"
+    return "en"
+
+
 def _strip_ansi(value: Any) -> str:
     return _ANSI_RE.sub("", str(value)).replace("\r", "")
 
@@ -101,6 +135,200 @@ def _redact_secrets(value: Any) -> str:
     text = _strip_ansi(value)
     text = re.sub(r"(?i)(api[_ -]?key\s*[:=]\s*)\S+", r"\1[redacted]", text)
     text = re.sub(r"sk-[A-Za-z0-9_\-]{6,}", "[redacted-api-key]", text)
+    return text
+
+
+def _contains_cjk(value: Any) -> bool:
+    return bool(_CJK_RE.search(str(value)))
+
+
+def _task_ui_language(task_id: str) -> str:
+    task = _tasks.get(task_id)
+    if not task:
+        return "en"
+    return _clean_ui_language(task.get("ui_language"))
+
+
+def _english_punctuation(text: str) -> str:
+    replacements = {
+        "：": ": ",
+        "；": "; ",
+        "，": ", ",
+        "。": ".",
+        "（": " (",
+        "）": ") ",
+        "、": ", ",
+        "…": "...",
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+        "！": "!",
+        "？": "?",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    return text.strip()
+
+
+_EN_LOG_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^\[(\d)/5\] 正在根据文件名解析 PRIDE 项目：(.+)$"), r"[\1/5] Resolving PRIDE project from file name: \2"),
+    (re.compile(r"^\[(\d)/5\] 项目上下文已准备完成。SDRF 行数：(\d+)$"), r"[\1/5] Project context prepared. SDRF rows: \2"),
+    (re.compile(r"^\[(\d)/5\] 已解析数据文件：(.+) （类型=(.+)，是否需要转换=(.+)）$"), r"[\1/5] Data file resolved: \2 (type=\3, requires_conversion=\4)"),
+    (re.compile(r"^\[(\d)/5\] 文件属性推断完成。采集模式=(.+)$"), r"[\1/5] File attribute inference completed. Acquisition mode=\2"),
+    (re.compile(r"^\[(\d)/5\] DDA 执行计划已生成。workflow=(.+)$"), r"[\1/5] DDA execution plan generated. workflow=\2"),
+    (re.compile(r"^任务开始：(.+)$"), r"Task started: \1"),
+    (re.compile(r"^输出目录：(.+)$"), r"Output directory: \1"),
+    (re.compile(r"^运行模式：仅搜参数$"), "Run mode: parameter planning only"),
+    (re.compile(r"^运行模式：完整流程$"), "Run mode: full workflow"),
+    (re.compile(r"^任务已进入队列，当前位置 (\d+)/(\d+)。$"), r"Task queued. Position \1/\2."),
+    (re.compile(r"^任务已从队列启动。$"), "Task started from queue."),
+    (re.compile(r"^输入规范化：(.+)$"), r"Input normalized: \1"),
+    (re.compile(r"^已选择主项目：(.+)$"), r"Selected primary project: \1"),
+    (re.compile(r"^解析原因：(.+)$"), r"Resolution reason: \1"),
+    (re.compile(r"^FASTA 下载源：(.+)$"), r"FASTA download source: \1"),
+    (re.compile(r"^推荐 workflow：(.+)$"), r"Recommended workflow: \1"),
+    (re.compile(r"^推荐 FASTA：(.+)$"), r"Recommended FASTA: \1"),
+    (re.compile(r"^数据文件已就绪：(.+)$"), r"Data file ready: \1"),
+    (re.compile(r"^输入包已生成：(.+)$"), r"Input bundle generated: \1"),
+    (re.compile(r"^转换完成：(.+)$"), r"Conversion completed: \1"),
+    (re.compile(r"^下载完成：(.+)$"), r"Download completed: \1"),
+    (re.compile(r"^正在下载：(.+)$"), r"Downloading: \1"),
+    (re.compile(r"^正在运行命令：(.+)$"), r"Running command: \1"),
+    (re.compile(r"^\[阻断\]\s*(.+)$"), r"[blocked] \1"),
+)
+
+_EN_LOG_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    ("解析 PRIDE 项目", "Resolve PRIDE project"),
+    ("下载 PRIDE 数据文件", "Download PRIDE data file"),
+    ("生成 MSDT-Converter 输入包", "Generate MSDT-Converter input bundle"),
+    ("运行 MSDT-Converter Docker", "Run MSDT-Converter Docker"),
+    ("处理结果", "Process results"),
+    ("正在初始化 AgentService…", "Initializing AgentService..."),
+    ("AgentService 初始化完成", "AgentService initialized"),
+    ("正在查询 PRIDE API 并调用大模型推断参数…", "Querying PRIDE API and inferring parameters with the LLM..."),
+    ("正在查询 PRIDE Archive API 并匹配项目/文件…", "Querying PRIDE Archive API and matching project/file..."),
+    ("PRIDE 查询完成。", "PRIDE query completed."),
+    ("项目解析摘要：", "Project resolution summary: "),
+    ("项目元数据摘要：", "Project metadata summary: "),
+    ("文件资产判断：", "File asset decision: "),
+    ("未找到 SDRF 行；将结合 PRIDE 项目描述、协议、文件名和参数/FASTA 文件线索推断搜库参数。", "No matching SDRF row was found; PRIDE metadata, protocols, file name, parameter files, and FASTA clues will be used to infer search parameters."),
+    ("正在调用大模型确认文件属性和搜库参数。", "Calling the LLM to confirm file attributes and search parameters."),
+    ("大模型正在阅读 PRIDE 元数据并生成搜库参数…", "The LLM is reading PRIDE metadata and generating search parameters..."),
+    ("大模型确认结果已合并到属性推断中。", "LLM confirmation was merged into attribute inference."),
+    ("PRIDE 查询和大模型推断完成", "PRIDE query and LLM inference completed"),
+    ("属性判断：", "Attribute decision: "),
+    ("搜库参数判断：", "Search parameter decision: "),
+    ("数据适配提示：", "Data compatibility hint: "),
+    ("执行计划：", "Execution plan: "),
+    ("预期输出：", "Expected outputs: "),
+    ("采集模式", "acquisition mode"),
+    ("物种", "species"),
+    ("仪器", "instrument"),
+    ("酶", "enzyme"),
+    ("项目", "project"),
+    ("匹配文件", "matched file"),
+    ("匹配类型", "match type"),
+    ("匹配分数", "match score"),
+    ("解析置信度", "resolution confidence"),
+    ("置信度", "confidence"),
+    ("实验类型", "experiment type"),
+    ("解析类型", "resolved type"),
+    ("是否需要转换", "requires conversion"),
+    ("资产置信度", "asset confidence"),
+    ("参数", "parameters"),
+    ("固定修饰", "fixed modifications"),
+    ("可变修饰", "variable modifications"),
+    ("数据类型", "data type"),
+    ("无", "none"),
+    ("线程数", "threads"),
+    ("原始数据类型", "raw data type"),
+    ("正在下载数据文件", "Downloading data file"),
+    ("下载完成", "Download complete"),
+    ("已硬链接缓存的 PRIDE 文件", "Hard-linked cached PRIDE file"),
+    ("已复制缓存的 PRIDE 文件", "Copied cached PRIDE file"),
+    ("复用已下载的数据文件", "Reusing downloaded data file"),
+    ("复用项目缓存中的 PRIDE 文件", "Reusing PRIDE project cache file"),
+    ("数据文件需要格式转换", "Data file requires format conversion"),
+    ("正在使用本地 msconvert 转换质谱文件", "Converting mass spectrometry file with local msconvert"),
+    ("正在使用 Docker ProteoWizard 转换质谱文件", "Converting mass spectrometry file with Docker ProteoWizard"),
+    ("主转换器失败", "Primary converter failed"),
+    ("正在切换到备用转换器", "Switching to fallback converter"),
+    ("数据文件已可直接用于执行", "Data file can be used directly"),
+    ("正在解压", "Extracting"),
+    ("解压完成", "Extraction completed"),
+    ("已写入 Docker MSDT-Converter 配置", "Docker MSDT-Converter config written"),
+    ("正在启动 MSDT-Converter Docker 镜像", "Starting MSDT-Converter Docker image"),
+    ("MSDT-Converter 内部步骤失败，任务已标记为失败，不打包下载 ZIP。", "An MSDT-Converter internal step failed; the task was marked as failed and no ZIP will be packaged."),
+    ("全部运行完成！", "Full workflow completed."),
+    ("开始压缩打包结果 ZIP，打包完成后才会显示下载按钮。", "Compressing result ZIP; the download button will appear after packaging finishes."),
+    ("结果 ZIP 已压缩打包完成，可以下载。", "Result ZIP is ready to download."),
+    ("结果 ZIP 已存在，复用缓存", "Result ZIP already exists; reusing cache"),
+    ("开始打包下载 ZIP", "Packaging download ZIP"),
+    ("ZIP 打包进度", "ZIP packaging progress"),
+    ("结果 ZIP 打包完成", "Result ZIP packaging completed"),
+    ("仅搜参数模式", "Parameter-only mode"),
+    ("已完成 PRIDE 项目解析、文件属性推断、workflow/FASTA/搜库参数计划生成。", "PRIDE project resolution, file attribute inference, and workflow/FASTA/search-parameter planning are complete."),
+    ("参数推断完成", "Parameter inference completed"),
+    ("人工已确认搜库参数；继续处理剩余步骤。", "Manual search-parameter review confirmed; continuing."),
+    ("检测到项目级多个仪器；先准备/转换 mzML，并尝试从 mzML 解析文件级仪器。", "Multiple project-level instruments detected; preparing/converting mzML and reading file-level instrument metadata."),
+    ("已从 mzML 解析文件级仪器", "File-level instrument parsed from mzML"),
+    ("当前计划需要人工复核，暂不下载或准备数据文件。原因", "The current plan needs manual review; data download/preparation is paused. Reason"),
+    ("未找到匹配的 SDRF 行，且项目包含多个物种；无法确定文件级物种信息。", "No matching SDRF row was found, and the project contains multiple species; file-level species cannot be determined."),
+    ("未找到匹配的 SDRF 行，且项目包含多个仪器；无法确定文件级仪器信息。", "No matching SDRF row was found, and the project contains multiple instruments; file-level instrument cannot be determined."),
+    ("当前 bottom-up MSDT 搜库流程不支持 Top-down 蛋白质组学项目。", "The current bottom-up MSDT search workflow does not support top-down proteomics projects."),
+    ("大模型推荐的 workflow", "The LLM-recommended workflow"),
+    ("不存在于 profiles/fragpipe/ 目录中。请检查 workflow 名称是否正确。", "does not exist in profiles/fragpipe/. Check the workflow name."),
+    ("大模型未推荐 workflow。必须配置 LLM API 并确保大模型能正确推荐 workflow。请检查 AGENT_LLM_API_KEY 配置。", "The LLM did not recommend a workflow. Configure the LLM API and ensure it can recommend a workflow."),
+    ("任务运行失败。", "Task execution failed."),
+    ("网络连接失败。", "Network connection failed."),
+    ("Docker 服务不可用。", "Docker service is unavailable."),
+    ("内存不足导致任务失败。", "The task failed because memory was insufficient."),
+    ("外部命令执行失败。", "An external command failed."),
+    ("任务需要人工复核。", "The task needs manual review."),
+    ("运行出错", "Run failed"),
+    ("错误", "error"),
+    ("失败", "failed"),
+    ("成功", "succeeded"),
+    ("完成", "completed"),
+    ("正在", "in progress"),
+    ("已", ""),
+)
+
+
+def _ascii_fallback(text: str, level: str = "") -> str:
+    ascii_text = _CJK_RE.sub(" ", _english_punctuation(text))
+    ascii_text = re.sub(r"[^A-Za-z0-9_./:;=+\-()[\]{}|,@#%&?\\\s]", " ", ascii_text)
+    ascii_text = re.sub(r"\s{2,}", " ", ascii_text).strip(" ;,")
+    if ascii_text and re.search(r"[A-Za-z0-9]", ascii_text):
+        return f"Backend message: {ascii_text}"
+    if str(level).lower() == "llm":
+        return "LLM reasoning output was not shown in English logs; structured parameters were saved in the audit files."
+    return "Backend message omitted in English mode because it was not localized."
+
+
+def _to_english_log_message(message: Any, level: str = "") -> str:
+    text = _redact_secrets(message).strip()
+    if not text:
+        return ""
+    for pattern, replacement in _EN_LOG_PATTERNS:
+        text = pattern.sub(replacement, text)
+    for old, new in sorted(_EN_LOG_REPLACEMENTS, key=lambda item: len(item[0]), reverse=True):
+        text = text.replace(old, new)
+    text = _english_punctuation(text)
+    if not _contains_cjk(text):
+        return text
+    if str(level).lower() == "llm":
+        return "LLM reasoning output was not shown in English logs; structured parameters were saved in the audit files."
+    return _ascii_fallback(text, level=level)
+
+
+def _localize_public_message(message: Any, language: str, level: str = "") -> str:
+    text = _redact_secrets(message).strip()
+    if _clean_ui_language(language) == "en":
+        return _to_english_log_message(text, level=level)
     return text
 
 
@@ -131,10 +359,17 @@ def _sanitize_log_entry(entry: Any) -> dict[str, Any] | None:
 
 def _public_logs_from_task(task: dict[str, Any]) -> list[dict[str, Any]]:
     logs = list(task.get("logs") or [])
+    ui_language = _clean_ui_language(task.get("ui_language"))
     public_logs: list[dict[str, Any]] = []
     for entry in logs[-_MAX_PERSISTED_LOGS:]:
         sanitized = _sanitize_log_entry(entry)
         if sanitized:
+            if "message" in sanitized:
+                sanitized["message"] = _localize_public_message(
+                    sanitized["message"],
+                    ui_language,
+                    level=str(sanitized.get("level") or sanitized.get("type") or "info"),
+                )
             public_logs.append(sanitized)
     return public_logs
 
@@ -160,6 +395,113 @@ def _history_retention_start(history: dict[str, Any], fallback_mtime: float = 0.
         if parsed is not None:
             return parsed
     return fallback_mtime
+
+
+_HISTORY_DISPLAY_TIME_FIELDS = ("started_at", "created_at", "finished_at", "updated_at")
+
+
+def _history_basename(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return Path(text).name
+
+
+def _history_display_name(item: dict[str, Any]) -> str:
+    input_name = _history_basename(item.get("input_value"))
+    if input_name:
+        return input_name
+    for field in ("output_dir", "run_id", "result_id", "name", "history_id", "task_id"):
+        value = _history_basename(item.get(field))
+        if value:
+            return value
+    return ""
+
+
+def _history_run_label(item: dict[str, Any]) -> str:
+    for field in ("output_dir", "run_id", "result_id", "name", "history_id", "project_key"):
+        value = _history_basename(item.get(field))
+        if value:
+            return value
+    return _history_display_name(item)
+
+
+def _history_time_label(item: dict[str, Any]) -> str:
+    for field in _HISTORY_DISPLAY_TIME_FIELDS:
+        if item.get(field):
+            return field
+    return "history_time" if item.get("history_time") else ""
+
+
+def _history_duration_seconds(item: dict[str, Any]) -> int | None:
+    started = _parse_history_timestamp(item.get("started_at") or item.get("created_at"))
+    finished = _parse_history_timestamp(item.get("finished_at") or item.get("updated_at"))
+    if started is None or finished is None or finished < started:
+        return None
+    return int(finished - started)
+
+
+def _history_status_group(status: Any) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized in _ACTIVE_STATUSES:
+        return "active"
+    if normalized == "completed":
+        return "success"
+    if normalized == "blocked":
+        return "blocked"
+    if normalized == "failed":
+        return "failed"
+    return "unknown"
+
+
+def _history_primary_action(item: dict[str, Any]) -> str:
+    status = str(item.get("status") or "").strip().lower()
+    if status in _ACTIVE_STATUSES:
+        return "watch"
+    if item.get("can_download"):
+        return "download"
+    if status in {"failed", "blocked"} or item.get("blocking_issues"):
+        return "inspect"
+    return "view"
+
+
+def _decorate_history_item(record: dict[str, Any]) -> dict[str, Any]:
+    item = with_history_identity(record)
+    run_label = _history_run_label(item)
+    if run_label:
+        item.setdefault("run_id", run_label)
+        item.setdefault("result_id", run_label)
+    item["display_name"] = _history_display_name(item) or run_label
+    item["run_label"] = run_label or item["display_name"]
+    item["time_label"] = _history_time_label(item)
+    item["duration_seconds"] = _history_duration_seconds(item)
+    item["status_group"] = _history_status_group(item.get("status"))
+    item["primary_action"] = _history_primary_action(item)
+    return item
+
+
+def _history_summary(active_tasks: list[dict[str, Any]], results: list[dict[str, Any]]) -> dict[str, Any]:
+    items = [*active_tasks, *results]
+    status_counts = Counter(str(item.get("status") or "unknown") for item in items)
+    status_group_counts = Counter(str(item.get("status_group") or _history_status_group(item.get("status"))) for item in items)
+    storage_bytes = 0
+    for item in items:
+        try:
+            storage_bytes += int(item.get("size_bytes") or 0)
+        except (TypeError, ValueError):
+            continue
+    return {
+        "total": len(items),
+        "active": len(active_tasks),
+        "results": len(results),
+        "downloadable": sum(1 for item in items if item.get("can_download")),
+        "storage_bytes": storage_bytes,
+        "failed": status_counts.get("failed", 0),
+        "blocked": status_counts.get("blocked", 0),
+        "interrupted": sum(1 for item in items if item.get("interrupted")),
+        "status_counts": dict(status_counts),
+        "status_group_counts": dict(status_group_counts),
+    }
 
 
 def _positive_float(value: str, default: float) -> float:
@@ -203,6 +545,527 @@ def _zip_compress_level() -> int:
     except (TypeError, ValueError):
         return 6
     return min(9, max(1, parsed))
+
+
+def _max_batch_items() -> int:
+    raw = os.getenv("AGENT_MAX_BATCH_ITEMS", "100")
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return 100
+    return max(1, parsed)
+
+
+def _max_batch_jobs() -> int:
+    raw = os.getenv("AGENT_MAX_BATCH_JOBS", "4")
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return 4
+    return max(1, parsed)
+
+
+def _batch_root_dir() -> Path:
+    return _runs_dir / _BATCHES_DIR_NAME
+
+
+def _batch_dir(batch_id: str) -> Path:
+    return _batch_root_dir() / safe_output_stem(batch_id)
+
+
+def _batch_manifest_path(batch_id: str) -> Path:
+    return _batch_dir(batch_id) / _BATCH_MANIFEST_FILE
+
+
+def _clean_batch_inputs(body: dict[str, Any]) -> list[str]:
+    raw_inputs = body.get("inputs")
+    inputs: list[str] = []
+    if isinstance(raw_inputs, list):
+        inputs.extend(_clean_text(item) for item in raw_inputs)
+    else:
+        text = _clean_text(body.get("input_text") or body.get("batch_input") or body.get("input_value"))
+        inputs.extend(line.strip() for line in text.splitlines())
+    return [item for item in inputs if item and not item.startswith("#")]
+
+
+def _batch_jobs(value: Any, item_count: int) -> int:
+    try:
+        requested = int(value)
+    except (TypeError, ValueError):
+        requested = 3
+    return max(1, min(requested, item_count, _max_batch_jobs()))
+
+
+def _batch_item_dir(batch_dir: Path, index: int, input_value: str) -> Path:
+    stem = safe_output_stem(input_value) or f"item_{index:03d}"
+    return batch_dir / "items" / f"{index:03d}_{stem}"
+
+
+def _json_write(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+
+
+def _tail_text_file(path: Path, max_lines: int = 80, max_chars: int = 20000) -> list[str]:
+    if not path.exists() or not path.is_file():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+    return [_redact_secrets(line) for line in text.splitlines()[-max_lines:]]
+
+
+def _append_batch_event_unlocked(
+    batch: dict[str, Any],
+    level: str,
+    message: Any,
+    item_index: int | None = None,
+) -> None:
+    event = {
+        "ts": _now_iso(),
+        "level": str(level or "info").lower(),
+        "message": _redact_secrets(message).strip(),
+    }
+    if item_index is not None:
+        event["item_index"] = item_index
+    events = list(batch.get("events") or [])
+    events.append(event)
+    batch["events"] = events[-500:]
+    batch["updated_at"] = event["ts"]
+
+
+def _append_batch_event(batch_id: str, level: str, message: Any, item_index: int | None = None) -> None:
+    with _batches_lock:
+        batch = _batches.get(batch_id)
+        if batch is None:
+            return
+        _append_batch_event_unlocked(batch, level, message, item_index=item_index)
+        _write_batch_manifest(batch)
+
+
+def _plain(value: Any) -> Any:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [_plain(item) for item in value]
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return _plain(model_dump(mode="json"))
+        except TypeError:
+            return _plain(model_dump())
+    if hasattr(value, "__dict__"):
+        return {key: _plain(item) for key, item in vars(value).items() if not key.startswith("_")}
+    return str(value)
+
+
+def _attribute_value(attributes: Any, name: str) -> Any:
+    attr = getattr(attributes, name, None)
+    if attr is None:
+        return None
+    return getattr(attr, "value", attr)
+
+
+def _search_parameter_hints(attributes: Any) -> dict[str, Any]:
+    hints = _attribute_value(attributes, "search_parameter_hints")
+    return dict(hints) if isinstance(hints, dict) else {}
+
+
+def _plan_output_path(plan: Any, key: str) -> str:
+    outputs = getattr(plan, "output_paths", {}) or {}
+    if isinstance(outputs, dict) and outputs.get(key) is not None:
+        return str(outputs[key])
+    return ""
+
+
+def _materialize_parameter_workflow(output_dir: Path, attributes: Any, plan: Any) -> Path | None:
+    workflow = getattr(plan, "fragpipe_workflow_path", None)
+    if workflow is None:
+        return None
+    source = Path(workflow)
+    if not source.exists() or not source.is_file():
+        return None
+    destination = output_dir / "workflows" / source.name
+    try:
+        from agent.execution.workflow import materialize_workflow_with_attributes
+
+        materialize_workflow_with_attributes(source, destination, attributes)
+    except Exception:
+        return None
+    return destination
+
+
+def _rewrite_converter_config_workflow(config_path: Path, workflow_path: Path | None) -> None:
+    if workflow_path is None or not config_path.exists():
+        return
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(config, dict):
+        return
+    fragpipe = config.get("generate_fragpipe_search_result")
+    if isinstance(fragpipe, dict):
+        fragpipe["workflow_path"] = _workspace_container_path(config_path.parent, workflow_path)
+    _rewrite_config_paths_for_workspace(config, config_path.parent)
+    _json_write(config_path, config)
+
+
+def _workspace_container_path(root: Path, path: Any) -> str:
+    if path in (None, ""):
+        return ""
+    text = str(path)
+    try:
+        resolved = Path(text).resolve()
+        relative = resolved.relative_to(root.resolve())
+    except (OSError, ValueError):
+        return text
+    return f"/workspace/{relative.as_posix()}"
+
+
+def _rewrite_config_paths_for_workspace(value: Any, root: Path, key: str = "") -> None:
+    if isinstance(value, dict):
+        for child_key, child in value.items():
+            if isinstance(child, str) and child and _looks_like_converter_path_key(str(child_key)):
+                value[child_key] = _workspace_container_path(root, child)
+            else:
+                _rewrite_config_paths_for_workspace(child, root, str(child_key))
+    elif isinstance(value, list):
+        for item in value:
+            _rewrite_config_paths_for_workspace(item, root, key)
+
+
+def _looks_like_converter_path_key(key: str) -> bool:
+    return key in {"data_path", "fasta_path", "workflow_path", "manifest_path", "workdir", "output"} or key.endswith("_path")
+
+
+def _write_task_runtime_log(task_id: str, output_dir: Path) -> Path:
+    log_path = output_dir / "logs" / "runtime.log"
+    with _tasks_lock:
+        task = dict(_tasks.get(task_id) or {})
+    lines: list[str] = []
+    for entry in _public_logs_from_task(task):
+        level = str(entry.get("level") or "info").upper()
+        ts = str(entry.get("ts") or "")
+        message = _redact_secrets(entry.get("message") or "")
+        lines.append(f"{ts}\t{level}\t{message}".strip())
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return log_path
+
+
+def _write_parameter_audit_files(output_dir: Path, batch_id: str, index: int, input_value: str, result: Any) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resolution = getattr(result, "resolution", None)
+    primary = getattr(resolution, "primary_project", None)
+    attributes = getattr(result, "attributes", None)
+    plan = getattr(result, "plan", None)
+    asset = getattr(result, "asset", None)
+    hints = _search_parameter_hints(attributes)
+    asset_payload: dict[str, Any] = {}
+    try:
+        loaded_asset = json.loads((output_dir / "asset_resolution.json").read_text(encoding="utf-8"))
+        if isinstance(loaded_asset, dict):
+            asset_payload = loaded_asset
+    except (OSError, json.JSONDecodeError):
+        asset_payload = {}
+
+    def asset_field(name: str) -> Any:
+        value = getattr(asset, name, None)
+        return value if value not in (None, "") else asset_payload.get(name)
+
+    materialized_workflow = _materialize_parameter_workflow(output_dir, attributes, plan) if attributes is not None and plan is not None else None
+    converter_config = output_dir / "converter_config.json"
+    _rewrite_converter_config_workflow(converter_config, materialized_workflow)
+
+    workflow_template = getattr(plan, "fragpipe_workflow_path", None) if plan is not None else None
+    fasta_path = getattr(plan, "fasta_path", None) if plan is not None else None
+    fasta_url = getattr(plan, "fasta_download_url", None) if plan is not None else None
+    audit = {
+        "batch_id": batch_id,
+        "index": index,
+        "input_value": input_value,
+        "generated_at": _now_iso(),
+        "project": {
+            "accession": getattr(primary, "project_accession", None),
+            "matched_file": getattr(primary, "matched_file", None),
+            "match_type": getattr(primary, "match_type", None),
+            "match_score": getattr(primary, "match_score", None),
+            "needs_review": bool(getattr(resolution, "needs_review", False)) if resolution is not None else False,
+        },
+        "input": {
+            "original_file_name": asset_field("original_file_name") or getattr(plan, "source_file_name", None),
+            "matched_project_file": asset_field("matched_project_file") or getattr(primary, "matched_file", None),
+            "asset_type": asset_field("resolved_asset_type"),
+            "download_url": asset_field("download_url"),
+            "expected_size_bytes": asset_field("expected_size_bytes"),
+            "requires_conversion": asset_field("requires_conversion"),
+        },
+        "plan": {
+            "source_file_name": getattr(plan, "source_file_name", None),
+            "source_data_path": str(getattr(plan, "source_data_path", "")) if plan is not None else "",
+            "raw_data_type": getattr(plan, "raw_data_type", None),
+            "thread_num": getattr(plan, "thread_num", None),
+            "needs_review": bool(getattr(plan, "needs_review", False)) if plan is not None else False,
+        },
+        "workflow": {
+            "name": Path(str(workflow_template)).name if workflow_template else "",
+            "template_path": str(workflow_template) if workflow_template else "",
+            "materialized_path": str(materialized_workflow) if materialized_workflow else "",
+            "parameter_overrides": hints.get("workflow_parameter_overrides")
+            or hints.get("fragpipe_workflow_overrides")
+            or hints.get("msfragger_parameter_overrides")
+            or {},
+        },
+        "fasta": {
+            "name": Path(str(fasta_path)).name if fasta_path else "",
+            "path": str(fasta_path) if fasta_path else "",
+            "selection_mode": getattr(plan, "fasta_selection_mode", None) if plan is not None else None,
+            "download_url": fasta_url or hints.get("recommended_fasta_url") or hints.get("fasta_url"),
+        },
+        "search_parameters": {
+            "acquisition_mode": _attribute_value(attributes, "acquisition_mode"),
+            "species": _attribute_value(attributes, "species"),
+            "instrument_name": _attribute_value(attributes, "instrument_name"),
+            "enzyme": _attribute_value(attributes, "enzyme"),
+            "labeling_strategy": _attribute_value(attributes, "labeling_strategy"),
+            "fixed_mods": _attribute_value(attributes, "fixed_mods"),
+            "variable_mods": _attribute_value(attributes, "variable_mods"),
+            "hints": hints,
+        },
+        "files": {
+            "converter_config": str(converter_config),
+            "fragpipe_manifest": str(getattr(plan, "manifest_path", "")) if plan is not None else "",
+            "decision_trace": str(output_dir / "decision_trace.json"),
+            "attributes": str(output_dir / "attributes.json"),
+            "asset_resolution": str(output_dir / "asset_resolution.json"),
+        },
+        "expected_outputs": {
+            "rawspectrum": str(getattr(plan, "rawspectrum_output_path", "")) if plan is not None else "",
+            "fp_pin": str(getattr(plan, "expected_pin_path", "")) if plan is not None else "",
+            "fp_msdt": _plan_output_path(plan, "fp_msdt") if plan is not None else "",
+        },
+        "blocking_issues": list(getattr(plan, "blocking_issues", []) or []) if plan is not None else [],
+    }
+    audit = _plain(audit)
+    _json_write(output_dir / "parameter_audit.json", audit)
+    manifest = {
+        "package_type": "parameter_only_msdt_input_preview",
+        "generated_at": _now_iso(),
+        "input_file": audit.get("input", {}).get("original_file_name"),
+        "project_accession": audit.get("project", {}).get("accession"),
+        "run_without_full_execution": True,
+        "note": (
+            "This package contains the planned MSDT-Converter configuration and audit files. "
+            "RAW/mzML data and FASTA sequences are not downloaded in parameter-only mode."
+        ),
+        "msdt_converter_inputs": {
+            "converter_config": "converter_config.json",
+            "workflow": _relative_package_path(output_dir, materialized_workflow) if materialized_workflow else "",
+            "source_data_path_expected": audit.get("plan", {}).get("source_data_path", ""),
+            "fasta_path_expected": audit.get("fasta", {}).get("path", ""),
+            "fasta_download_url": audit.get("fasta", {}).get("download_url", ""),
+            "fragpipe_manifest_expected": audit.get("files", {}).get("fragpipe_manifest", ""),
+        },
+        "audit_files": [
+            "project_resolution.json",
+            "metadata.json",
+            "asset_resolution.json",
+            "attributes.json",
+            "decision_trace.json",
+            "parameter_audit.json",
+            "task_state.json",
+            "logs/runtime.log",
+        ],
+    }
+    _json_write(output_dir / "msdt_input_manifest.json", _plain(manifest))
+    return audit
+
+
+def _relative_package_path(root: Path, path: Path | None) -> str:
+    if path is None:
+        return ""
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _batch_audit_zip_path(batch: dict[str, Any]) -> Path:
+    return Path(batch.get("output_dir", "")) / _BATCH_AUDIT_ZIP_NAME
+
+
+def _include_batch_audit_file(root: Path, file: Path) -> bool:
+    try:
+        rel = file.relative_to(root)
+    except ValueError:
+        return False
+    parts = {part.lower() for part in rel.parts}
+    if file.name == _BATCH_AUDIT_ZIP_NAME:
+        return False
+    if {"downloads", "prepared", "input", "fasta"} & parts:
+        return False
+    if file.suffix.lower() in {".raw", ".mzml", ".mzxml", ".wiff", ".scan", ".d", ".fasta", ".fa", ".fas", ".gz", ".zip"}:
+        return False
+    return True
+
+
+def _ensure_batch_audit_zip(batch: dict[str, Any]) -> Path | None:
+    root = Path(batch.get("output_dir", ""))
+    if not root.exists() or not root.is_dir():
+        return None
+    zip_path = root / _BATCH_AUDIT_ZIP_NAME
+    files = [file for file in root.rglob("*") if file.is_file() and _include_batch_audit_file(root, file)]
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for file in sorted(files):
+            archive.write(file, file.relative_to(root).as_posix())
+    return zip_path
+
+
+def _write_batch_manifest(batch: dict[str, Any]) -> None:
+    manifest = {key: value for key, value in batch.items() if key not in {"llm_config"}}
+    _json_write(Path(batch["output_dir"]) / _BATCH_MANIFEST_FILE, manifest)
+
+
+def _public_batch_record(batch: dict[str, Any]) -> dict[str, Any]:
+    output_dir = Path(batch.get("output_dir", ""))
+    excel_path = output_dir / _BATCH_EXCEL_FILE
+    ui_language = _clean_ui_language(batch.get("ui_language"))
+    items = [dict(item) for item in batch.get("items") or []]
+    for item in items:
+        item_dir = Path(item.get("output_dir", ""))
+        item["error"] = _localize_public_message(item.get("error", ""), ui_language, level="error")
+        item["log_tail"] = [
+            _localize_public_message(line, ui_language, level="info")
+            for line in _tail_text_file(item_dir / "logs" / "runtime.log", max_lines=40, max_chars=12000)
+        ]
+        audit_path = item_dir / "parameter_audit.json"
+        item["audit_path"] = str(audit_path) if audit_path.exists() else ""
+    events = []
+    for event in list(batch.get("events") or [])[-500:]:
+        public_event = dict(event)
+        public_event["message"] = _localize_public_message(
+            public_event.get("message", ""),
+            ui_language,
+            level=str(public_event.get("level") or "info"),
+        )
+        events.append(public_event)
+    return {
+        "batch_id": batch.get("batch_id", ""),
+        "status": batch.get("status", "unknown"),
+        "submitter": batch.get("submitter", ""),
+        "created_at": batch.get("created_at"),
+        "started_at": batch.get("started_at"),
+        "finished_at": batch.get("finished_at"),
+        "updated_at": batch.get("updated_at") or batch.get("finished_at") or batch.get("started_at") or batch.get("created_at"),
+        "item_count": len(items),
+        "completed_items": sum(1 for item in items if item.get("status") == "completed"),
+        "failed_items": sum(1 for item in items if item.get("status") == "failed"),
+        "needs_review_items": sum(1 for item in items if item.get("status") in {"needs_review", "blocked"}),
+        "jobs": batch.get("jobs", 1),
+        "ui_language": ui_language,
+        "fasta_preference": "project" if batch.get("prefer_project_fasta") else "llm",
+        "output_dir": str(output_dir),
+        "excel_path": str(excel_path),
+        "can_download": batch.get("status") == "completed" and excel_path.exists(),
+        "audit_zip_path": str(output_dir / _BATCH_AUDIT_ZIP_NAME),
+        "can_download_audit": batch.get("status") in _TERMINAL_STATUSES and output_dir.exists(),
+        "items": items,
+        "events": events,
+        "errors": [_localize_public_message(error, ui_language, level="error") for error in list(batch.get("errors") or [])],
+        "interrupted": bool(batch.get("interrupted")),
+    }
+
+
+def _mark_interrupted_batch(batch: dict[str, Any]) -> dict[str, Any]:
+    if batch.get("status") not in _ACTIVE_STATUSES:
+        return batch
+    repaired = dict(batch)
+    repaired["status"] = "failed"
+    repaired["interrupted"] = True
+    repaired["finished_at"] = repaired.get("finished_at") or repaired.get("updated_at") or repaired.get("started_at") or repaired.get("created_at")
+    repaired["updated_at"] = repaired.get("updated_at") or repaired.get("finished_at")
+    errors = [str(value) for value in repaired.get("errors") or [] if str(value)]
+    if _INTERRUPTED_HISTORY_MESSAGE not in errors:
+        errors.append(_INTERRUPTED_HISTORY_MESSAGE)
+    repaired["errors"] = errors
+    return repaired
+
+
+def _batch_history_record(batch: dict[str, Any]) -> dict[str, Any]:
+    public = _public_batch_record(batch)
+    batch_id = str(public.get("batch_id") or "").strip()
+    output_dir = Path(public.get("output_dir") or "")
+    file_count = 0
+    size_bytes = 0
+    if output_dir.exists():
+        file_count, size_bytes, _latest_mtime = _path_file_stats(output_dir)
+    public.update(
+        {
+            "kind": "batch",
+            "task_id": f"batch-{batch_id}" if batch_id else "",
+            "project_key": f"batch-{batch_id}" if batch_id else "batch",
+            "history_id": f"batch-{batch_id}" if batch_id else "",
+            "run_id": output_dir.name if output_dir.name else batch_id,
+            "result_id": batch_id,
+            "name": "Batch Excel report",
+            "input_value": "Batch Excel report",
+            "run_mode": _RUN_MODE_PARAMETERS,
+            "file_count": file_count,
+            "size_bytes": size_bytes,
+        }
+    )
+    return _decorate_history_item(public)
+
+
+def _load_batch_from_disk(batch_id: str) -> dict[str, Any] | None:
+    manifest_path = _batch_manifest_path(batch_id)
+    if not manifest_path.exists():
+        return None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _list_parameter_batch_history_records() -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    with _batches_lock:
+        memory_batches = [dict(batch) for batch in _batches.values()]
+    for batch in memory_batches:
+        batch_id = str(batch.get("batch_id") or "").strip()
+        if not batch_id:
+            continue
+        seen.add(batch_id)
+        records.append(_batch_history_record(batch))
+
+    batch_root = _batch_root_dir()
+    if not batch_root.exists() or not batch_root.is_dir():
+        return records
+    for batch_dir in batch_root.iterdir():
+        if not batch_dir.is_dir():
+            continue
+        batch_id = batch_dir.name
+        if batch_id in seen:
+            continue
+        batch = _load_batch_from_disk(batch_id)
+        if batch is None:
+            continue
+        if batch.get("status") in _ACTIVE_STATUSES:
+            batch = _mark_interrupted_batch(batch)
+            _write_batch_manifest(batch)
+        seen.add(batch_id)
+        records.append(_batch_history_record(batch))
+    return records
 
 
 def _format_bytes(size: int | float) -> str:
@@ -288,6 +1151,45 @@ def _read_public_history(run_dir: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _project_key_for_input(input_value: str) -> str:
+    return safe_output_stem(input_value)
+
+
+def _history_output_names_for_project(project_key: str) -> set[str]:
+    names: set[str] = set()
+    if not project_key:
+        return names
+    for record in _read_history_index():
+        item = with_history_identity(record)
+        if str(item.get("project_key") or "") != project_key:
+            continue
+        for field in ("output_dir", "result_id", "history_id", "run_id", "name"):
+            value = str(item.get(field) or "").strip()
+            if value:
+                names.add(Path(value).name)
+    return names
+
+
+def _next_output_dir_locked(project_key: str, task_id: str) -> Path:
+    base = safe_output_stem(project_key) or safe_output_stem(task_id)
+    used = _history_output_names_for_project(base)
+    used.update(path.name for path in _active_output_dirs_locked())
+    if (_runs_dir / base).exists():
+        used.add(base)
+    if base not in used:
+        return _runs_dir / base
+
+    timestamp = datetime.now(_APP_TZ).strftime("%Y%m%d-%H%M%S")
+    task_suffix = safe_output_stem(task_id)[:8] or uuid.uuid4().hex[:8]
+    stem = f"{base}__{timestamp}__{task_suffix}"
+    candidate = stem
+    counter = 2
+    while candidate in used or (_runs_dir / candidate).exists():
+        candidate = f"{stem}-{counter}"
+        counter += 1
+    return _runs_dir / candidate
+
+
 def _public_task_record_locked(task_id: str, task: dict[str, Any], *, include_logs: bool = False) -> dict[str, Any]:
     output_dir_raw = task.get("output_dir")
     output_dir = Path(output_dir_raw) if output_dir_raw else None
@@ -302,6 +1204,7 @@ def _public_task_record_locked(task_id: str, task: dict[str, Any], *, include_lo
     record = {
         "task_id": task_id,
         "input_value": task.get("input_value", ""),
+        "project_key": task.get("project_key") or _project_key_for_input(str(task.get("input_value", ""))),
         "submitter": task.get("submitter", "未填写"),
         "status": task.get("status", "unknown"),
         "created_at": task.get("created_at"),
@@ -312,23 +1215,45 @@ def _public_task_record_locked(task_id: str, task: dict[str, Any], *, include_lo
         "total_steps": task.get("total_steps", 5),
         "queue_position": _queue_position_locked(task_id),
         "output_dir": Path(output_dir).name if output_dir else "",
+        "run_id": Path(output_dir).name if output_dir else "",
         "log_count": len(logs),
         "blocking_issues": list(task.get("blocking_issues") or []),
+        "error_summary": task.get("error_summary"),
         "review_summary": task.get("review_summary"),
         "fasta_preference": "project" if task.get("prefer_project_fasta") else "llm",
+        "run_mode": _clean_run_mode(task.get("run_mode")),
+        "ui_language": _clean_ui_language(task.get("ui_language")),
         "can_download": can_download,
     }
     if include_logs:
         record["logs"] = logs
-    return record
+    return _decorate_history_item(record)
 
 
 def _history_index_path() -> Path:
     return _runs_dir / _HISTORY_INDEX_FILE
 
 
-def _read_history_index() -> list[dict[str, Any]]:
-    path = _history_index_path()
+def _history_index_backup_path() -> Path:
+    return _runs_dir / f"{_HISTORY_INDEX_FILE}.bak"
+
+
+def _is_legacy_batches_history_record(record: dict[str, Any]) -> bool:
+    names = {
+        str(record.get("task_id") or ""),
+        str(record.get("input_value") or ""),
+        _identity_name(record.get("output_dir")),
+        _identity_name(record.get("history_id")),
+        _identity_name(record.get("run_id")),
+        _identity_name(record.get("result_id")),
+        _identity_name(record.get("name")),
+        str(record.get("project_key") or ""),
+    }
+    names.discard("")
+    return _BATCHES_DIR_NAME in names or names == {"batches"}
+
+
+def _read_history_index_file(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     try:
@@ -337,26 +1262,34 @@ def _read_history_index() -> list[dict[str, Any]]:
         return []
     if not isinstance(data, list):
         return []
-    return [item for item in data if isinstance(item, dict)]
+    return [item for item in data if isinstance(item, dict) and not _is_legacy_batches_history_record(item)]
+
+
+def _read_history_index() -> list[dict[str, Any]]:
+    records = _read_history_index_file(_history_index_path())
+    if records:
+        return records
+    return _read_history_index_file(_history_index_backup_path())
 
 
 def _upsert_history_index(record: dict[str, Any]) -> None:
-    key = record.get("task_id") or record.get("output_dir")
-    if not key:
+    indexed_record = with_history_identity(record)
+    if not indexed_record.get("project_key"):
         return
-    records = _read_history_index()
-    replaced = False
-    for index, existing in enumerate(records):
-        existing_key = existing.get("task_id") or existing.get("output_dir")
-        if existing_key == key:
-            records[index] = record
-            replaced = True
-            break
-    if not replaced:
-        records.append(record)
+    records = merge_project_history_records([*_read_history_index(), indexed_record], limit=200)
+    _write_history_index(records)
+
+
+def _write_history_index(records: list[dict[str, Any]]) -> None:
     try:
         _runs_dir.mkdir(parents=True, exist_ok=True)
-        _history_index_path().write_text(json.dumps(records[-200:], indent=2, ensure_ascii=False), encoding="utf-8")
+        cleaned = [with_history_identity(record) for record in records if not _is_legacy_batches_history_record(record)]
+        payload = json.dumps(cleaned, indent=2, ensure_ascii=False)
+        path = _history_index_path()
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(payload, encoding="utf-8")
+        os.replace(tmp_path, path)
+        _history_index_backup_path().write_text(payload, encoding="utf-8")
     except OSError:
         return
 
@@ -396,10 +1329,109 @@ def _archive_run_history(run_dir: Path, history: dict[str, Any] | None = None) -
     _upsert_history_index(record)
 
 
+def _identity_name(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return Path(text).name
+
+
+def _active_history_identity_sets_locked() -> tuple[set[str], set[str]]:
+    task_ids: set[str] = set()
+    history_ids: set[str] = set()
+    for task_id, task in _tasks.items():
+        if task.get("status") not in _ACTIVE_STATUSES:
+            continue
+        task_ids.add(str(task_id))
+        task_ids.add(str(task.get("task_id") or ""))
+        for field in ("history_id", "run_id", "result_id", "name", "output_dir"):
+            name = _identity_name(task.get(field))
+            if name:
+                history_ids.add(name)
+    task_ids.discard("")
+    history_ids.discard("")
+    return task_ids, history_ids
+
+
+def _history_item_is_active(item: dict[str, Any], active_task_ids: set[str], active_history_ids: set[str]) -> bool:
+    task_ids = {str(item.get("task_id") or ""), *(str(value or "") for value in item.get("task_ids") or [])}
+    history_ids = {_identity_name(item.get(field)) for field in ("history_id", "output_dir", "run_id", "result_id", "name")}
+    task_ids.discard("")
+    history_ids.discard("")
+    return bool(task_ids & active_task_ids or history_ids & active_history_ids)
+
+
+def _mark_interrupted_history_item(item: dict[str, Any]) -> dict[str, Any]:
+    if item.get("status") not in _ACTIVE_STATUSES:
+        return item
+    repaired = dict(item)
+    repaired["status"] = "failed"
+    repaired["interrupted"] = True
+    repaired["finished_at"] = repaired.get("finished_at") or repaired.get("updated_at") or repaired.get("started_at") or repaired.get("created_at")
+    repaired["updated_at"] = repaired.get("updated_at") or repaired.get("finished_at")
+    issues = [str(value) for value in repaired.get("blocking_issues") or [] if str(value)]
+    if _INTERRUPTED_HISTORY_MESSAGE not in issues:
+        issues.append(_INTERRUPTED_HISTORY_MESSAGE)
+    repaired["blocking_issues"] = issues
+    return with_history_identity(repaired)
+
+
+def _repair_interrupted_history_index() -> None:
+    with _tasks_lock:
+        active_task_ids, active_history_ids = _active_history_identity_sets_locked()
+    repaired: list[dict[str, Any]] = []
+    changed = False
+    for record in _read_history_index():
+        item = with_history_identity(record)
+        if item.get("status") in _ACTIVE_STATUSES and not _history_item_is_active(item, active_task_ids, active_history_ids):
+            item = _mark_interrupted_history_item(item)
+            changed = True
+        repaired.append(item)
+    if changed:
+        _write_history_index(merge_project_history_records(repaired, limit=200))
+
+
+def _disk_task_history_records() -> list[dict[str, Any]]:
+    if not _runs_dir.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    for run_dir in _runs_dir.iterdir():
+        if not run_dir.is_dir() or run_dir.name == _BATCHES_DIR_NAME:
+            continue
+        history = _read_public_history(run_dir)
+        if not history:
+            continue
+        history.setdefault("output_dir", run_dir.name)
+        records.append(_decorate_history_item(history))
+    return records
+
+
+def _sync_history_index_from_disk() -> None:
+    records = [*_read_history_index(), *_disk_task_history_records()]
+    for batch in _list_parameter_batch_history_records():
+        if batch.get("status") in _ACTIVE_STATUSES:
+            continue
+        records.append(batch)
+    if not records:
+        return
+    _write_history_index(merge_project_history_records(records, limit=200))
+
+
 def _find_history_record(task_id: str) -> dict[str, Any] | None:
+    needle = str(task_id or "")
     for record in reversed(_read_history_index()):
-        if str(record.get("task_id") or "") == task_id or str(record.get("output_dir") or "") == task_id:
-            return dict(record)
+        item = with_history_identity(record)
+        aliases = {
+            str(item.get("task_id") or ""),
+            str(item.get("output_dir") or ""),
+            str(item.get("history_id") or ""),
+            str(item.get("run_id") or ""),
+            str(item.get("result_id") or ""),
+            str(item.get("name") or ""),
+        }
+        aliases.update(str(value or "") for value in item.get("task_ids") or [])
+        if needle in aliases:
+            return item
     if not _runs_dir.exists():
         return None
     for run_dir in _runs_dir.iterdir():
@@ -408,8 +1440,18 @@ def _find_history_record(task_id: str) -> dict[str, Any] | None:
         record = _read_public_history(run_dir)
         if not record:
             continue
-        if str(record.get("task_id") or "") == task_id or str(record.get("output_dir") or run_dir.name) == task_id:
-            return dict(record)
+        item = with_history_identity({**record, "output_dir": record.get("output_dir") or run_dir.name})
+        aliases = {
+            str(item.get("task_id") or ""),
+            str(item.get("output_dir") or run_dir.name),
+            str(item.get("history_id") or ""),
+            str(item.get("run_id") or ""),
+            str(item.get("result_id") or ""),
+            str(item.get("name") or ""),
+        }
+        aliases.update(str(value or "") for value in item.get("task_ids") or [])
+        if needle in aliases:
+            return item
     return None
 
 
@@ -426,6 +1468,7 @@ def _public_logs_from_history(record: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _task_detail_from_history(task_id: str, record: dict[str, Any]) -> dict[str, Any]:
+    record = with_history_identity(record)
     output_dir_name = str(record.get("output_dir") or "")
     output_dir = _runs_dir / output_dir_name if output_dir_name else None
     can_download = bool(
@@ -435,7 +1478,7 @@ def _task_detail_from_history(task_id: str, record: dict[str, Any]) -> dict[str,
         and _is_download_zip_ready(output_dir)
     )
     logs = _public_logs_from_history(record)
-    return {
+    detail = {
         "task_id": str(record.get("task_id") or task_id),
         "input_value": record.get("input_value", ""),
         "submitter": record.get("submitter", "未填写"),
@@ -444,19 +1487,26 @@ def _task_detail_from_history(task_id: str, record: dict[str, Any]) -> dict[str,
         "started_at": record.get("started_at"),
         "finished_at": record.get("finished_at"),
         "updated_at": record.get("updated_at") or record.get("finished_at") or record.get("started_at") or record.get("created_at"),
+        "history_time": record.get("history_time"),
+        "project_key": record.get("project_key"),
+        "task_ids": record.get("task_ids") or [],
         "step": record.get("step", 5 if record.get("status") == "completed" else 0),
         "total_steps": record.get("total_steps", 5),
         "log_count": len(logs),
         "logs": logs,
         "blocking_issues": list(record.get("blocking_issues") or []),
+        "error_summary": record.get("error_summary"),
         "review_summary": record.get("review_summary"),
         "fasta_preference": record.get("fasta_preference", "llm"),
+        "run_mode": _clean_run_mode(record.get("run_mode")),
+        "ui_language": _clean_ui_language(record.get("ui_language")),
         "can_download": can_download,
         "archived": True,
         "queue_position": 0,
         "queue_length": 0,
         "queued_tasks": 0,
     }
+    return _decorate_history_item(detail)
 
 
 def _list_public_results() -> list[dict[str, Any]]:
@@ -469,6 +1519,8 @@ def _list_public_results() -> list[dict[str, Any]]:
         active_dirs = _active_output_dirs_locked()
     for run_dir in _runs_dir.iterdir():
         if not run_dir.is_dir():
+            continue
+        if run_dir.name == _BATCHES_DIR_NAME:
             continue
         if run_dir.resolve() in active_dirs:
             continue
@@ -483,6 +1535,8 @@ def _list_public_results() -> list[dict[str, Any]]:
         status = history.get("status", "completed")
         retention_start = _history_retention_start(history, latest_mtime)
         updated_at_ts = max(latest_mtime, retention_start)
+        file_updated_at = datetime.fromtimestamp(latest_mtime, _APP_TZ).isoformat()
+        result_updated_at = datetime.fromtimestamp(updated_at_ts, _APP_TZ).isoformat()
         expires_at_ts = retention_start + retention
         results.append(
             {
@@ -490,57 +1544,88 @@ def _list_public_results() -> list[dict[str, Any]]:
                 "task_id": history.get("task_id", ""),
                 "name": run_dir.name,
                 "input_value": history.get("input_value", run_dir.name),
+                "project_key": history.get("project_key") or _project_key_for_input(str(history.get("input_value", run_dir.name))),
+                "run_id": history.get("run_id") or run_dir.name,
+                "history_id": history.get("history_id") or run_dir.name,
                 "submitter": history.get("submitter", "未填写"),
                 "status": status,
                 "path": str(run_dir),
                 "file_count": file_count,
                 "size_bytes": size_bytes,
-                "updated_at": datetime.fromtimestamp(updated_at_ts, _APP_TZ).isoformat(),
+                "created_at": history.get("created_at"),
+                "started_at": history.get("started_at"),
+                "finished_at": history.get("finished_at"),
+                "task_updated_at": history.get("updated_at"),
+                "run_mode": _clean_run_mode(history.get("run_mode")),
+                "ui_language": _clean_ui_language(history.get("ui_language")),
+                "file_updated_at": file_updated_at,
+                "result_updated_at": result_updated_at,
+                "updated_at": result_updated_at,
                 "expires_at": datetime.fromtimestamp(expires_at_ts, _APP_TZ).isoformat(),
                 "expires_in_seconds": max(0, int(expires_at_ts - now)),
                 "can_download": status == "completed" and _is_download_zip_ready(run_dir),
             }
         )
+    results = [_decorate_history_item(item) for item in results]
     results.sort(key=lambda item: item["updated_at"], reverse=True)
     return results
 
 
 def _list_project_history_records() -> list[dict[str, Any]]:
-    records: dict[str, dict[str, Any]] = {}
+    records: list[dict[str, Any]] = []
+    _repair_interrupted_history_index()
+    with _tasks_lock:
+        active_task_ids, active_history_ids = _active_history_identity_sets_locked()
     for record in _read_history_index():
-        key = str(record.get("task_id") or record.get("output_dir") or "")
-        if key:
-            item = dict(record)
-            item.pop("logs", None)
-            output_dir_name = item.get("output_dir")
-            output_dir = _runs_dir / str(output_dir_name) if output_dir_name else None
-            file_count = 0
-            size_bytes = 0
-            if output_dir and output_dir.exists():
-                file_count, size_bytes, latest_mtime = _path_file_stats(
-                    output_dir,
-                    excluded_names={_PUBLIC_HISTORY_FILE, _HISTORY_INDEX_FILE},
-                    excluded_dir_names={_DOWNLOAD_CACHE_DIR},
-                )
-                item["updated_at"] = datetime.fromtimestamp(latest_mtime, _APP_TZ).isoformat() if latest_mtime else item.get("updated_at")
-            item["file_count"] = file_count
-            item["size_bytes"] = size_bytes
-            item["can_download"] = bool(item.get("status") == "completed" and output_dir and output_dir.exists() and _is_download_zip_ready(output_dir))
-            records[key] = item
+        item = with_history_identity(record)
+        if not item.get("project_key"):
+            continue
+        if item.get("status") in _ACTIVE_STATUSES and not _history_item_is_active(item, active_task_ids, active_history_ids):
+            item = _mark_interrupted_history_item(item)
+        output_dir_name = item.get("output_dir")
+        output_dir = _runs_dir / str(output_dir_name) if output_dir_name else None
+        if output_dir_name and not item.get("result_id"):
+            item["result_id"] = str(output_dir_name)
+        if output_dir_name and not item.get("run_id"):
+            item["run_id"] = str(output_dir_name)
+        file_count = 0
+        size_bytes = 0
+        if output_dir and output_dir.exists():
+            file_count, size_bytes, latest_mtime = _path_file_stats(
+                output_dir,
+                excluded_names={_PUBLIC_HISTORY_FILE, _HISTORY_INDEX_FILE},
+                excluded_dir_names={_DOWNLOAD_CACHE_DIR},
+            )
+            if latest_mtime:
+                item["file_updated_at"] = datetime.fromtimestamp(latest_mtime, _APP_TZ).isoformat()
+        item["file_count"] = file_count
+        item["size_bytes"] = size_bytes
+        item["can_download"] = bool(item.get("status") == "completed" and output_dir and output_dir.exists() and _is_download_zip_ready(output_dir))
+        records.append(_decorate_history_item(item))
 
     for result in _list_public_results():
-        key = str(result.get("task_id") or result.get("result_id") or "")
-        if key:
-            records[key] = result
+        task_updated_at = result.get("task_updated_at") or result.get("finished_at") or result.get("started_at") or result.get("created_at")
+        if task_updated_at:
+            result["updated_at"] = task_updated_at
+        if result.get("status") in _ACTIVE_STATUSES and not _history_item_is_active(result, active_task_ids, active_history_ids):
+            result = _mark_interrupted_history_item(result)
+        records.append(_decorate_history_item(result))
+
+    for batch in _list_parameter_batch_history_records():
+        if batch.get("status") in _ACTIVE_STATUSES:
+            continue
+        records.append(_decorate_history_item(batch))
 
     with _tasks_lock:
         for task_id, task in _tasks.items():
             if task.get("status") in _ACTIVE_STATUSES:
                 continue
-            records[task_id] = _public_task_record_locked(task_id, task)
+            records.append(_public_task_record_locked(task_id, task))
 
-    items = list(records.values())
-    items.sort(key=lambda item: str(item.get("updated_at") or item.get("finished_at") or item.get("created_at") or ""), reverse=True)
+    items = [_decorate_history_item(item) for item in merge_project_history_records(records)]
+    for item in items:
+        item.pop("logs", None)
+    items.sort(key=lambda item: (history_timestamp(item), str(item.get("history_time") or "")), reverse=True)
     return items
 
 
@@ -550,12 +1635,16 @@ def _cleanup_expired_results() -> list[str]:
     with _tasks_lock:
         active_dirs = _active_output_dirs_locked()
         has_active_tasks = any(task.get("status") in _ACTIVE_STATUSES for task in _tasks.values())
+    with _batches_lock:
+        has_active_batches = any(batch.get("status") in _ACTIVE_STATUSES for batch in _batches.values())
     now = time.time()
     retention = _result_retention_seconds()
     candidates: list[tuple[float, Path]] = []
     removed: list[str] = []
     for run_dir in _runs_dir.iterdir():
         if not run_dir.is_dir():
+            continue
+        if run_dir.name == _BATCHES_DIR_NAME:
             continue
         resolved = run_dir.resolve()
         if resolved in active_dirs:
@@ -585,7 +1674,7 @@ def _cleanup_expired_results() -> list[str]:
         _archive_run_history(run_dir)
         shutil.rmtree(run_dir, ignore_errors=True)
         removed.append(run_dir.name)
-    if not has_active_tasks:
+    if not has_active_tasks and not has_active_batches:
         removed.extend(_cleanup_pride_cache(now, retention))
     return removed
 
@@ -644,6 +1733,11 @@ def _is_download_result_file(output_dir: Path, file: Path) -> bool:
         return False
     if first in _DOWNLOAD_RESULT_DIRS:
         return True
+    if first == "fragpipe" and len(relative.parts) == 2:
+        if file.name in _DOWNLOAD_FRAGPIPE_PARAMETER_FILES or file.suffix.lower() == ".workflow":
+            return True
+    if first == "workflows" and len(relative.parts) == 2 and file.suffix.lower() == ".workflow":
+        return True
     if len(relative.parts) == 1 and file.suffix.lower() in _DOWNLOAD_ROOT_SUFFIXES:
         return True
     return False
@@ -671,13 +1765,43 @@ def _download_source_mtime(output_dir: Path, files: list[Path] | None = None) ->
     return latest_mtime
 
 
+def _zip_contains_download_files(zip_path: Path, output_dir: Path, files: list[Path]) -> bool:
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            names = set(archive.namelist())
+    except (OSError, zipfile.BadZipFile):
+        return False
+    return all(file.relative_to(output_dir).as_posix() in names for file in files)
+
+
 def _is_download_zip_ready(output_dir: Path) -> bool:
     zip_path = _download_zip_path(output_dir)
     try:
-        source_mtime = _download_source_mtime(output_dir)
-        return source_mtime > 0 and zip_path.exists() and zip_path.is_file() and zip_path.stat().st_size > 0 and zip_path.stat().st_mtime >= source_mtime
+        files = _download_result_files(output_dir)
+        source_mtime = _download_source_mtime(output_dir, files)
+        return (
+            source_mtime > 0
+            and zip_path.exists()
+            and zip_path.is_file()
+            and zip_path.stat().st_size > 0
+            and zip_path.stat().st_mtime >= source_mtime
+            and _zip_contains_download_files(zip_path, output_dir, files)
+        )
     except OSError:
         return False
+
+
+def _ensure_existing_download_zip_ready(output_dir: Path) -> bool:
+    if _is_download_zip_ready(output_dir):
+        return True
+    zip_path = _download_zip_path(output_dir)
+    if not zip_path.exists():
+        return False
+    try:
+        _zip_output_dir(output_dir)
+    except OSError:
+        return False
+    return _is_download_zip_ready(output_dir)
 
 
 def _zip_output_dir(output_dir: Path, report: Callable[[str], None] | None = None) -> Path:
@@ -685,7 +1809,7 @@ def _zip_output_dir(output_dir: Path, report: Callable[[str], None] | None = Non
     source_mtime = _download_source_mtime(output_dir, files)
     zip_path = _download_zip_path(output_dir)
     try:
-        if files and zip_path.exists() and zip_path.stat().st_mtime >= source_mtime:
+        if files and zip_path.exists() and zip_path.stat().st_mtime >= source_mtime and _zip_contains_download_files(zip_path, output_dir, files):
             if report:
                 report(f"结果 ZIP 已存在，复用缓存：{zip_path.name} ({_format_bytes(zip_path.stat().st_size)})")
             return zip_path
@@ -1005,6 +2129,7 @@ def _build_review_summary(result: Any) -> dict[str, Any]:
             "max_variable_mods",
             "data_family",
             "recommended_workflow_name",
+            "workflow_parameter_overrides",
             "recommended_fasta_name",
             "recommended_fasta_url",
             "recommended_fasta_source",
@@ -1087,10 +2212,7 @@ async def _check_llm_api(config: dict[str, str]) -> tuple[bool, str]:
 
 
 async def _run_llm_check(config: dict[str, str]) -> tuple[bool, str]:
-    result = _check_llm_api(config)
-    if inspect.isawaitable(result):
-        return await result
-    return result
+    return await _check_llm_api(config)
 
 
 # ── 页面 ──────────────────────────────────────────────────────────
@@ -1167,20 +2289,47 @@ async def list_public_results():
 
 @app.get("/api/history")
 async def list_project_history():
+    _sync_history_index_from_disk()
     removed = _cleanup_expired_results()
+    if removed:
+        _sync_history_index_from_disk()
     with _tasks_lock:
         active_tasks = [
             _public_task_record_locked(task_id, task)
             for task_id, task in _tasks.items()
             if task.get("status") in _ACTIVE_STATUSES
         ]
+    active_tasks.extend(batch for batch in _list_parameter_batch_history_records() if batch.get("status") in _ACTIVE_STATUSES)
     active_tasks.sort(key=lambda item: str(item.get("created_at") or ""))
+    active_task_ids = {str(item.get("task_id") or "") for item in active_tasks}
+    active_history_ids = {str(item.get("history_id") or "") for item in active_tasks}
+    active_history_ids.update(str(item.get("output_dir") or "") for item in active_tasks)
+    active_history_ids.update(str(item.get("run_id") or "") for item in active_tasks)
+    active_task_ids.discard("")
+    active_history_ids.discard("")
+    results = []
+    for item in _list_project_history_records():
+        task_ids = {str(item.get("task_id") or ""), *(str(value or "") for value in item.get("task_ids") or [])}
+        history_ids = {
+            str(item.get("history_id") or ""),
+            str(item.get("output_dir") or ""),
+            str(item.get("run_id") or ""),
+            str(item.get("result_id") or ""),
+            str(item.get("name") or ""),
+        }
+        task_ids.discard("")
+        history_ids.discard("")
+        if task_ids & active_task_ids or history_ids & active_history_ids:
+            continue
+        results.append(item)
+    summary = _history_summary(active_tasks, results)
     return {
         "retention_seconds": _result_retention_seconds(),
         "max_result_projects": _max_result_projects(),
         "removed": removed,
+        "summary": summary,
         "active_tasks": active_tasks,
-        "results": _list_project_history_records(),
+        "results": results,
     }
 
 
@@ -1195,7 +2344,7 @@ async def download_public_result(result_id: str):
     if not _has_downloadable_result_file(output_dir):
         return {"error": "结果目录没有可下载文件。"}
 
-    if not _is_download_zip_ready(output_dir):
+    if not _ensure_existing_download_zip_ready(output_dir):
         return {"error": "结果 ZIP 尚未打包完成，请等待任务日志提示后再下载。"}
     zip_path = _download_zip_path(output_dir)
     return FileResponse(
@@ -1206,6 +2355,400 @@ async def download_public_result(result_id: str):
 
 
 # ── 创建任务 ──────────────────────────────────────────────────────
+class BatchFileReporter:
+    def __init__(self, output_dir: Path, ui_language: str = "en") -> None:
+        self.path = output_dir / "logs" / "runtime.log"
+        self.ui_language = _clean_ui_language(ui_language)
+        self._lock = threading.Lock()
+
+    def __call__(self, message: Any) -> None:
+        if isinstance(message, dict):
+            text = json.dumps(message, ensure_ascii=False, default=str)
+        else:
+            text = _redact_secrets(message)
+        text = _localize_public_message(text, self.ui_language, level="info")
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(text + "\n")
+
+
+def _update_batch_item(batch_id: str, index: int, **fields: Any) -> None:
+    with _batches_lock:
+        batch = _batches.get(batch_id)
+        if batch is None:
+            return
+        items = batch.get("items") or []
+        if index < 0 or index >= len(items):
+            return
+        items[index].update(fields)
+        batch["updated_at"] = _now_iso()
+        _write_batch_manifest(batch)
+
+
+def _write_batch_item_error(output_dir: Path, input_value: str, exc: BaseException) -> str:
+    from agent.audit.review import build_task_state_snapshot, write_task_state
+    from agent.errors import build_error_record, write_error_record
+    from agent.input.normalizer import normalize_input
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    task_id = ""
+    source_file = Path(input_value).name
+    try:
+        task = normalize_input(input_value)
+        task_id = task.task_id
+        source_file = task.file_name
+    except Exception:
+        task_id = f"batch-{safe_output_stem(input_value)}"
+    error = build_error_record(exc, stage="planning", input_file=input_value)
+    write_error_record(output_dir / "error.json", error)
+    public_message = str(error.get("public_message") or error.get("message") or exc)
+    write_task_state(
+        output_dir / "task_state.json",
+        build_task_state_snapshot(
+            task_id=task_id,
+            status="failed",
+            stage="planning",
+            source_file=source_file,
+            project_accession=None,
+            notes=[public_message],
+        ),
+    )
+    return public_message
+
+
+def _primary_project_error(result: Any) -> str:
+    resolution = getattr(result, "resolution", None)
+    primary = getattr(resolution, "primary_project", None)
+    if primary is None:
+        return "No exact PRIDE project match found."
+    match_type = str(getattr(primary, "match_type", "") or "")
+    try:
+        match_score = int(getattr(primary, "match_score", 0) or 0)
+    except (TypeError, ValueError):
+        match_score = 0
+    if match_type not in {"exact", "stem"} or match_score < 90:
+        return (
+            f"Non-exact PRIDE project match: {getattr(primary, 'project_accession', 'unknown')}, "
+            f"match_type={match_type}, score={match_score}, matched_file={getattr(primary, 'matched_file', '')}"
+        )
+    if bool(getattr(resolution, "needs_review", False)):
+        return f"Ambiguous PRIDE project match: {getattr(resolution, 'resolution_reason', 'manual review required')}"
+    return ""
+
+
+def _path_within(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve(strict=False).relative_to(parent.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def _cleanup_batch_instrument_probe_files(output_dir: Path, result: Any, prepared_path: Path | None = None) -> None:
+    if str(os.getenv("AGENT_BATCH_KEEP_INSTRUMENT_PROBE_FILES", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        return
+    assets_dir = output_dir / "assets"
+    allowed_roots = [assets_dir / "downloads", assets_dir / "prepared"]
+    asset = getattr(result, "asset", None)
+    candidates: list[Path] = []
+    for raw_path in (
+        prepared_path,
+        getattr(asset, "prepared_path", None),
+        getattr(asset, "local_path", None),
+    ):
+        if raw_path:
+            candidates.append(Path(raw_path))
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate.resolve(strict=False))
+        if key in seen:
+            continue
+        seen.add(key)
+        if not any(_path_within(candidate, root) for root in allowed_roots):
+            continue
+        try:
+            if candidate.is_file():
+                candidate.unlink()
+            elif candidate.is_dir():
+                shutil.rmtree(candidate)
+        except OSError:
+            pass
+
+
+def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
+    with _batches_lock:
+        batch = _batches[batch_id]
+        item = dict(batch["items"][index])
+        llm_config = dict(batch["llm_config"])
+        prefer_project_fasta = bool(batch.get("prefer_project_fasta"))
+        ui_language = _clean_ui_language(batch.get("ui_language"))
+
+    input_value = str(item["input"])
+    output_dir = Path(item["output_dir"])
+    _update_batch_item(batch_id, index, status="running", started_at=_now_iso(), error="")
+    _append_batch_event(batch_id, "info", f"Started {input_value}", item_index=index)
+    service = None
+    try:
+        from agent.input.normalizer import normalize_input
+        from agent.orchestrator.pipeline import AgentService
+
+        reporter = BatchFileReporter(output_dir, ui_language=ui_language)
+        service = AgentService(reporter=reporter, llm_reasoner=_task_llm_reasoner(llm_config))
+        task = normalize_input(input_value)
+        result = service.plan_dda_run_from_pride(
+            task=task,
+            output_dir=output_dir,
+            prefer_project_fasta=prefer_project_fasta,
+        )
+        if (
+            bool(getattr(result.plan, "needs_review", False))
+            and callable(getattr(service, "_can_retry_with_mzml_instrument", None))
+            and service._can_retry_with_mzml_instrument(result.plan)
+        ):
+            prepared_path: Path | None = None
+            _append_batch_event(
+                batch_id,
+                "warning",
+                f"{input_value} needs file-level instrument; downloading/converting mzML probe.",
+                item_index=index,
+            )
+            try:
+                prepared_path = service.prepare_asset(result.asset)
+                result = service.replan_with_mzml_instrument(
+                    result,
+                    prepared_path,
+                    task,
+                    output_dir,
+                    prefer_project_fasta=prefer_project_fasta,
+                )
+                _append_batch_event(
+                    batch_id,
+                    "info",
+                    f"{input_value} mzML instrument probe completed.",
+                    item_index=index,
+                )
+            except Exception as probe_exc:
+                reporter(f"mzML instrument probe failed; keeping needs_review. Reason: {probe_exc}")
+                _append_batch_event(
+                    batch_id,
+                    "warning",
+                    f"{input_value} mzML instrument probe failed: {probe_exc}",
+                    item_index=index,
+                )
+            finally:
+                _cleanup_batch_instrument_probe_files(output_dir, result, prepared_path)
+        service.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
+        _write_parameter_audit_files(output_dir, batch_id, index, input_value, result)
+        project_error = _primary_project_error(result)
+        if project_error:
+            raise RuntimeError(project_error)
+        status = "needs_review" if bool(getattr(result.plan, "needs_review", False)) else "completed"
+        error = "; ".join(str(issue) for issue in getattr(result.plan, "blocking_issues", []) or [])
+        _update_batch_item(batch_id, index, status=status, finished_at=_now_iso(), error=error)
+        level = "warning" if status == "needs_review" else "info"
+        _append_batch_event(batch_id, level, f"{input_value} {status}", item_index=index)
+        return {"status": status, "error": error}
+    except Exception as exc:
+        message = _write_batch_item_error(output_dir, input_value, exc)
+        _update_batch_item(batch_id, index, status="failed", finished_at=_now_iso(), error=message)
+        _append_batch_event(batch_id, "error", f"{input_value} failed: {message}", item_index=index)
+        return {"status": "failed", "error": message}
+    finally:
+        if service is not None:
+            pride_client = getattr(service, "pride_client", None)
+            close = getattr(pride_client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+
+def _run_parameter_batch(batch_id: str) -> None:
+    with _batches_lock:
+        batch = _batches.get(batch_id)
+        if batch is None:
+            return
+        batch["status"] = "running"
+        batch["started_at"] = _now_iso()
+        batch["updated_at"] = batch["started_at"]
+        jobs = int(batch.get("jobs") or 1)
+        item_count = len(batch.get("items") or [])
+        _append_batch_event_unlocked(batch, "info", f"Batch started; {item_count} files; jobs={jobs}")
+        _write_batch_manifest(batch)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+            futures = {pool.submit(_run_parameter_batch_item, batch_id, index): index for index in range(item_count)}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    index = futures[future]
+                    with _batches_lock:
+                        item = dict(_batches.get(batch_id, {}).get("items", [{}])[index])
+                    message = _write_batch_item_error(Path(item.get("output_dir", "")), str(item.get("input", "")), exc)
+                    _update_batch_item(batch_id, index, status="failed", finished_at=_now_iso(), error=message)
+
+        from scripts.export_benchmark_excel import ResultSource, summarize_source, write_xlsx
+
+        with _batches_lock:
+            batch = _batches[batch_id]
+            sources = [ResultSource(label=str(item["input"]), path=Path(item["output_dir"])) for item in batch["items"]]
+            output_dir = Path(batch["output_dir"])
+        rows = [summarize_source(source) for source in sources]
+        write_xlsx(rows, output_dir / _BATCH_EXCEL_FILE)
+        _append_batch_event(batch_id, "info", f"Excel report written: {_BATCH_EXCEL_FILE}")
+
+        with _batches_lock:
+            batch = _batches[batch_id]
+            batch["status"] = "completed"
+            batch["finished_at"] = _now_iso()
+            batch["updated_at"] = batch["finished_at"]
+            batch["excel_path"] = str(Path(batch["output_dir"]) / _BATCH_EXCEL_FILE)
+            _append_batch_event_unlocked(batch, "info", "Batch completed")
+            _write_batch_manifest(batch)
+    except Exception as exc:
+        with _batches_lock:
+            batch = _batches.get(batch_id)
+            if batch is None:
+                return
+            batch["status"] = "failed"
+            batch["finished_at"] = _now_iso()
+            batch["updated_at"] = batch["finished_at"]
+            batch.setdefault("errors", []).append(_redact_secrets(str(exc)))
+            _append_batch_event_unlocked(batch, "error", f"Batch failed: {exc}")
+            _write_batch_manifest(batch)
+
+
+def _start_parameter_batch_thread(batch_id: str) -> None:
+    thread = threading.Thread(target=_run_parameter_batch, args=(batch_id,), daemon=True)
+    thread.start()
+
+
+@app.post("/api/batches/parameters")
+async def create_parameter_batch(body: dict[str, Any]):
+    inputs = _clean_batch_inputs(body)
+    if not inputs:
+        return {"error": "Please enter at least one PRIDE file name."}
+    max_items = _max_batch_items()
+    if len(inputs) > max_items:
+        return {"error": f"Too many batch inputs: {len(inputs)}; maximum is {max_items}."}
+    submitter = _clean_submitter(body.get("submitter"))
+    ui_language = _clean_ui_language(body.get("ui_language"))
+    fasta_preference = _clean_text(body.get("fasta_preference")).lower()
+    prefer_project_fasta = fasta_preference == "project" or body.get("prefer_project_fasta") is True
+    llm_config = body.get("llm_config", {})
+    if not isinstance(llm_config, dict):
+        llm_config = {}
+    config, config_error = _build_llm_config(llm_config)
+    if config_error or config is None:
+        return {"error": config_error}
+    ok, message = await _run_llm_check(config)
+    if not ok:
+        return {"error": message}
+
+    batch_id = uuid.uuid4().hex[:12]
+    batch_dir = _batch_dir(batch_id)
+    jobs = _batch_jobs(body.get("jobs"), len(inputs))
+    items = [
+        {
+            "index": index,
+            "input": input_value,
+            "status": "queued",
+            "output_dir": str(_batch_item_dir(batch_dir, index, input_value)),
+            "error": "",
+        }
+        for index, input_value in enumerate(inputs, start=1)
+    ]
+    batch = {
+        "batch_id": batch_id,
+        "status": "queued",
+        "submitter": submitter,
+        "created_at": _now_iso(),
+        "updated_at": _now_iso(),
+        "jobs": jobs,
+        "ui_language": ui_language,
+        "prefer_project_fasta": prefer_project_fasta,
+        "output_dir": str(batch_dir),
+        "excel_path": str(batch_dir / _BATCH_EXCEL_FILE),
+        "items": items,
+        "errors": [],
+        "events": [
+            {
+                "ts": _now_iso(),
+                "level": "info",
+                "message": f"Batch created with {len(items)} files; jobs={jobs}; submitter={submitter}",
+            }
+        ],
+        "llm_config": dict(config),
+    }
+    with _batches_lock:
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        _batches[batch_id] = batch
+        _write_batch_manifest(batch)
+    _start_parameter_batch_thread(batch_id)
+    return _public_batch_record(batch)
+
+
+@app.get("/api/batches/{batch_id}")
+async def get_parameter_batch(batch_id: str):
+    safe_id = safe_output_stem(batch_id)
+    if safe_id != batch_id:
+        return {"error": "Batch not found."}
+    with _batches_lock:
+        batch = _batches.get(batch_id)
+        if batch is not None:
+            return _public_batch_record(batch)
+    batch = _load_batch_from_disk(batch_id)
+    if batch is None:
+        return {"error": "Batch not found."}
+    return _public_batch_record(batch)
+
+
+@app.get("/api/batches/{batch_id}/download")
+async def download_parameter_batch(batch_id: str):
+    safe_id = safe_output_stem(batch_id)
+    if safe_id != batch_id:
+        return {"error": "Batch not found."}
+    batch = _load_batch_from_disk(batch_id)
+    if batch is None:
+        with _batches_lock:
+            batch = _batches.get(batch_id)
+    if batch is None:
+        return {"error": "Batch not found."}
+    excel_path = Path(batch.get("excel_path") or Path(batch.get("output_dir", "")) / _BATCH_EXCEL_FILE)
+    if not excel_path.exists():
+        return {"error": "Excel report is not ready."}
+    return FileResponse(
+        path=str(excel_path),
+        filename=f"{batch_id}_benchmark_results.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.get("/api/batches/{batch_id}/audit.zip")
+async def download_parameter_batch_audit(batch_id: str):
+    safe_id = safe_output_stem(batch_id)
+    if safe_id != batch_id:
+        return {"error": "Batch not found."}
+    batch = _load_batch_from_disk(batch_id)
+    if batch is None:
+        with _batches_lock:
+            batch = _batches.get(batch_id)
+    if batch is None:
+        return {"error": "Batch not found."}
+    zip_path = _ensure_batch_audit_zip(batch)
+    if zip_path is None or not zip_path.exists():
+        return {"error": "Audit package is not ready."}
+    return FileResponse(
+        path=str(zip_path),
+        filename=f"{batch_id}_audit.zip",
+        media_type="application/zip",
+    )
+
+
 @app.post("/api/tasks")
 async def create_task(body: dict[str, Any]):
     try:
@@ -1221,6 +2764,8 @@ async def _create_task_inner(body: dict[str, Any]):
     submitter = _clean_submitter(body.get("submitter"))
     fasta_preference = _clean_text(body.get("fasta_preference")).lower()
     prefer_project_fasta = fasta_preference == "project" or body.get("prefer_project_fasta") is True
+    run_mode = _clean_run_mode(body.get("run_mode"))
+    ui_language = _clean_ui_language(body.get("ui_language"))
 
     # 应用用户填写的 LLM 配置
     llm_config = body.get("llm_config", {})
@@ -1235,12 +2780,14 @@ async def _create_task_inner(body: dict[str, Any]):
         return {"error": message}
 
     task_id = uuid.uuid4().hex[:12]
-    output_dir = _runs_dir / safe_output_stem(input_value)
+    project_key = _project_key_for_input(input_value)
 
     with _tasks_lock:
+        output_dir = _next_output_dir_locked(project_key, task_id)
         _tasks[task_id] = {
             "task_id": task_id,
             "input_value": input_value,
+            "project_key": project_key,
             "submitter": submitter,
             "output_dir": str(output_dir),
             "status": "queued",
@@ -1250,6 +2797,8 @@ async def _create_task_inner(body: dict[str, Any]):
             "total_steps": 5,
             "blocking_issues": [],
             "prefer_project_fasta": prefer_project_fasta,
+            "run_mode": run_mode,
+            "ui_language": ui_language,
             "llm_config": dict(config),
         }
         queue_state = _queue_state_locked(task_id)
@@ -1258,7 +2807,11 @@ async def _create_task_inner(body: dict[str, Any]):
                 "type": "log",
                 "ts": _now_time(),
                 "level": "info",
-                "message": f"任务已进入队列，当前位置 {queue_state['queue_position']}/{queue_state['queue_length']}。",
+                "message": _localize_public_message(
+                    f"任务已进入队列，当前位置 {queue_state['queue_position']}/{queue_state['queue_length']}。",
+                    ui_language,
+                    level="info",
+                ),
             }
         )
     _write_task_history(task_id)
@@ -1266,7 +2819,15 @@ async def _create_task_inner(body: dict[str, Any]):
     with _tasks_lock:
         status = _tasks[task_id]["status"]
         queue_state = _queue_state_locked(task_id)
-    return {"task_id": task_id, "submitter": submitter, "output_dir": str(output_dir), "status": status, **queue_state}
+    return {
+        "task_id": task_id,
+        "submitter": submitter,
+        "output_dir": str(output_dir),
+        "status": status,
+        "run_mode": run_mode,
+        "ui_language": ui_language,
+        **queue_state,
+    }
 
 
 # ── WebSocket 实时日志 ────────────────────────────────────────────
@@ -1274,12 +2835,12 @@ async def _create_task_inner(body: dict[str, Any]):
 async def task_ws(websocket: WebSocket, task_id: str):
     await websocket.accept()
 
-    if task_id not in _tasks:
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+    if task is None:
         await websocket.send_json({"type": "error", "message": f"任务 {task_id} 不存在"})
         await websocket.close()
         return
-
-    task = _tasks[task_id]
 
     for log in task["logs"]:
         await websocket.send_json(log)
@@ -1294,20 +2855,25 @@ async def task_ws(websocket: WebSocket, task_id: str):
         while task["status"] == "queued":
             with _tasks_lock:
                 queue_message = {"type": "queue", "status": "queued", **_queue_state_locked(task_id)}
+                new_logs = list(task["logs"])[sent:]
             await websocket.send_json(queue_message)
-            while sent < len(task["logs"]):
-                await websocket.send_json(task["logs"][sent])
-                sent += 1
+            for log in new_logs:
+                await websocket.send_json(log)
+            sent += len(new_logs)
             await asyncio.sleep(1.0)
         while task["status"] == "running":
             await asyncio.sleep(0.3)
-            while sent < len(task["logs"]):
-                await websocket.send_json(task["logs"][sent])
-                sent += 1
-        while sent < len(task["logs"]):
-            await websocket.send_json(task["logs"][sent])
-            sent += 1
-        await websocket.send_json({"type": "done", "status": task["status"]})
+            with _tasks_lock:
+                new_logs = list(task["logs"])[sent:]
+            for log in new_logs:
+                await websocket.send_json(log)
+            sent += len(new_logs)
+        with _tasks_lock:
+            new_logs = list(task["logs"])[sent:]
+            final_status = task["status"]
+        for log in new_logs:
+            await websocket.send_json(log)
+        await websocket.send_json({"type": "done", "status": final_status})
     except WebSocketDisconnect:
         pass
 
@@ -1318,7 +2884,11 @@ def _emit(task_id: str, msg_type: str, data: Any = None, **kwargs):
     if task is None:
         return
     if "message" in kwargs:
-        kwargs["message"] = _strip_ansi(kwargs["message"]).strip()
+        kwargs["message"] = _localize_public_message(
+            _strip_ansi(kwargs["message"]).strip(),
+            _clean_ui_language(task.get("ui_language")),
+            level=str(kwargs.get("level") or msg_type),
+        )
     entry = {"type": msg_type, "ts": _now_time(), **kwargs}
     if data is not None:
         entry["data"] = data
@@ -1434,6 +3004,8 @@ def _run_pipeline(task_id: str):
     output_dir = Path(task["output_dir"])
     llm_config = task.get("llm_config")
     prefer_project_fasta = bool(task.get("prefer_project_fasta"))
+    run_mode = _clean_run_mode(task.get("run_mode"))
+    parameter_only = run_mode == _RUN_MODE_PARAMETERS
     review_overrides = dict(task.get("review_overrides") or {})
     if not isinstance(llm_config, dict):
         _set_task_terminal_status(task_id, "failed")
@@ -1450,6 +3022,7 @@ def _run_pipeline(task_id: str):
         _log(task_id, "info", f"任务开始：{input_value}")
         _log(task_id, "info", f"输出目录：{output_dir}")
         _log(task_id, "info", f"LLM 模型：{llm_config['model']}  Base URL：{llm_config['base_url']}")
+        _log(task_id, "info", f"运行模式：{'仅搜参数' if parameter_only else '完整流程'}")
 
         # ── 步骤 1 ──
         _step(task_id, 1, "[1/5] 解析 PRIDE 项目")
@@ -1493,7 +3066,7 @@ def _run_pipeline(task_id: str):
                 _log(task_id, "info", f"FASTA 下载源：{result.plan.fasta_download_url}")
 
         prepared_path = None
-        if result.plan.needs_review and service._can_retry_with_mzml_instrument(result.plan):
+        if not parameter_only and result.plan.needs_review and service._can_retry_with_mzml_instrument(result.plan):
             _log(task_id, "info", "检测到项目级多个仪器，先下载/转换 mzML，并从 mzML 读取文件级仪器信息。")
             _step(task_id, 2, "[2/5] 下载 PRIDE 数据文件")
             with StderrCapture(task_id):
@@ -1518,6 +3091,36 @@ def _run_pipeline(task_id: str):
             return
 
         _log(task_id, "info", f"workflow：{result.plan.fragpipe_workflow_path.name}  FASTA：{result.plan.fasta_path.name}（{result.plan.fasta_selection_mode}）")
+
+        if parameter_only:
+            _step(task_id, 5, "[5/5] 参数推断完成")
+            _log(task_id, "info", "仅搜参数模式：已完成 PRIDE 项目解析、文件属性推断、workflow/FASTA/搜库参数计划生成。")
+            service.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
+            try:
+                from agent.audit.review import build_task_state_snapshot, write_task_state
+
+                project_accession = result.resolution.primary_project.project_accession if result.resolution.primary_project else None
+                write_task_state(
+                    output_dir / "task_state.json",
+                    build_task_state_snapshot(
+                        task_id=task_obj.task_id,
+                        status="completed",
+                        stage="planning",
+                        source_file=task_obj.file_name,
+                        project_accession=project_accession,
+                        notes=["Parameter-only mode completed; full execution was not run."],
+                    ),
+                )
+                _write_parameter_audit_files(output_dir, task_id, 1, input_value, result)
+                _write_task_runtime_log(task_id, output_dir)
+                _log(task_id, "info", "Parameter package generated: converter_config, workflow, decision_trace, attributes, parameter_audit and runtime.log.")
+                _log(task_id, "info", "Compressing parameter ZIP; parameter-only mode excludes RAW/mzML/FASTA payload files.")
+                _zip_output_dir(output_dir, report=lambda message: _log(task_id, "info", message))
+                _log(task_id, "info", "Parameter ZIP is ready to download.")
+            except Exception as audit_exc:
+                _log(task_id, "debug", f"Failed to write parameter-only audit files: {audit_exc}")
+            _set_task_terminal_status(task_id, "completed")
+            return
 
         # ── 步骤 2 ──
         if prepared_path is None:
@@ -1557,7 +3160,14 @@ def _run_pipeline(task_id: str):
 
         # ── 步骤 5 ──
         _step(task_id, 5, "[5/5] 处理结果")
-        if docker_result.returncode == 0:
+        from agent.execution.outputs import execution_failure_reasons
+        failure_reasons = execution_failure_reasons(
+            bundle.plan,
+            docker_result.returncode,
+            docker_result.stdout,
+            docker_result.stderr,
+        )
+        if not failure_reasons:
             _log(task_id, "info", "=" * 50)
             _log(task_id, "info", "全部运行完成！")
             if output_dir.exists():
@@ -1577,19 +3187,72 @@ def _run_pipeline(task_id: str):
             _log(task_id, "info", "开始压缩打包结果 ZIP，打包完成后才会显示下载按钮。")
             _zip_output_dir(output_dir, report=lambda message: _log(task_id, "info", message))
             _log(task_id, "info", "结果 ZIP 已压缩打包完成，可以下载。")
+            try:
+                from agent.audit.review import build_task_state_snapshot, write_task_state
+
+                project_accession = result.resolution.primary_project.project_accession if result.resolution.primary_project else None
+                write_task_state(
+                    output_dir / "task_state.json",
+                    build_task_state_snapshot(
+                        task_id=task_obj.task_id,
+                        status="completed",
+                        stage="execution",
+                        source_file=task_obj.file_name,
+                        project_accession=project_accession,
+                        notes=[],
+                    ),
+                )
+            except Exception as audit_exc:
+                _log(task_id, "debug", f"Failed to write execution success audit files: {audit_exc}")
             _set_task_terminal_status(task_id, "completed")
         else:
-            _log(task_id, "error", f"Docker 运行失败，返回码：{docker_result.returncode}")
+            _log(task_id, "error", "MSDT-Converter 内部步骤失败，任务已标记为失败，不打包下载 ZIP。")
+            for reason in failure_reasons:
+                _log(task_id, "error", f"[failure] {reason}")
             if docker_result.stdout:
                 _log(task_id, "error", f"[stdout]\n{docker_result.stdout[-2000:]}")
             if docker_result.stderr:
                 _log(task_id, "error", f"[stderr]\n{docker_result.stderr[-2000:]}")
+            try:
+                from agent.audit.review import append_review_item, build_review_item, build_task_state_snapshot, write_task_state
+
+                project_accession = result.resolution.primary_project.project_accession if result.resolution.primary_project else None
+                write_task_state(
+                    output_dir / "task_state.json",
+                    build_task_state_snapshot(
+                        task_id=task_obj.task_id,
+                        status="failed",
+                        stage="execution",
+                        source_file=task_obj.file_name,
+                        project_accession=project_accession,
+                        notes=failure_reasons,
+                    ),
+                )
+                append_review_item(
+                    output_dir / "review_queue.json",
+                    build_review_item(
+                        task_id=task_obj.task_id,
+                        source_file=task_obj.file_name,
+                        project_accession=project_accession,
+                        stage="execution",
+                        reasons=failure_reasons,
+                    ),
+                )
+            except Exception as audit_exc:
+                _log(task_id, "debug", f"Failed to write execution failure audit files: {audit_exc}")
             _set_task_terminal_status(task_id, "failed")
 
     except Exception as exc:
-        import traceback
-        _log(task_id, "error", f"运行出错：{exc}")
-        _log(task_id, "debug", traceback.format_exc())
+        from agent.errors import build_error_record, public_error_summary, write_error_record
+
+        error_record = build_error_record(exc, stage="pipeline", input_file=input_value)
+        write_error_record(output_dir / "error.json", error_record)
+        summary = public_error_summary(error_record)
+        task["error_summary"] = summary
+        task["blocking_issues"] = [summary.get("public_message") or "任务运行失败。"]
+        _log(task_id, "error", f"运行出错：{summary.get('public_message')}（{summary.get('category')}）")
+        if "traceback" in error_record:
+            _log(task_id, "debug", error_record["traceback"])
         _set_task_terminal_status(task_id, "failed")
     finally:
         _start_ready_queued_tasks()
@@ -1624,8 +3287,11 @@ async def get_task(task_id: str):
         "log_count": len(task["logs"]),
         "logs": _public_logs_from_task(task),
         "blocking_issues": task.get("blocking_issues", []),
+        "error_summary": task.get("error_summary"),
         "review_summary": task.get("review_summary"),
         "fasta_preference": "project" if task.get("prefer_project_fasta") else "llm",
+        "run_mode": _clean_run_mode(task.get("run_mode")),
+        "ui_language": _clean_ui_language(task.get("ui_language")),
         "can_download": can_download,
         "archived": False,
         **queue_state,
@@ -1667,7 +3333,11 @@ async def submit_task_review(task_id: str, body: dict[str, Any]):
                 "type": "log",
                 "ts": _now_time(),
                 "level": "info",
-                "message": "已提交人工复核选择，任务重新进入队列。",
+                "message": _localize_public_message(
+                    "已提交人工复核选择，任务重新进入队列。",
+                    _clean_ui_language(task.get("ui_language")),
+                    level="info",
+                ),
             }
         )
         queue_state = _queue_state_locked(task_id)
@@ -1692,13 +3362,14 @@ async def download_results(task_id: str):
                 return {"error": "Result directory does not exist."}
             if not _has_downloadable_result_file(output_dir):
                 return {"error": "Result directory has no downloadable files."}
-            if not _is_download_zip_ready(output_dir):
+            if not _ensure_existing_download_zip_ready(output_dir):
                 return {"error": "Result ZIP is not ready yet."}
             zip_path = _download_zip_path(output_dir)
             stem = safe_output_stem(str(history.get("input_value") or output_dir_name or task_id))
+            suffix = "parameters" if _clean_run_mode(history.get("run_mode")) == _RUN_MODE_PARAMETERS else "results"
             return FileResponse(
                 path=str(zip_path),
-                filename=f"{stem}_results.zip",
+                filename=f"{stem}_{suffix}.zip",
                 media_type="application/zip",
             )
         return {"error": "任务不存在"}
@@ -1711,13 +3382,14 @@ async def download_results(task_id: str):
     if not _has_downloadable_result_file(output_dir):
         return {"error": "结果目录没有可下载文件"}
 
-    if not _is_download_zip_ready(output_dir):
+    if not _ensure_existing_download_zip_ready(output_dir):
         return {"error": "结果 ZIP 尚未打包完成，请等待任务日志提示后再下载。"}
     zip_path = _download_zip_path(output_dir)
     stem = safe_output_stem(task["input_value"])
+    suffix = "parameters" if _clean_run_mode(task.get("run_mode")) == _RUN_MODE_PARAMETERS else "results"
     return FileResponse(
         path=str(zip_path),
-        filename=f"{stem}_results.zip",
+        filename=f"{stem}_{suffix}.zip",
         media_type="application/zip",
     )
 

@@ -277,6 +277,54 @@ def test_llm_confirmation_keeps_fasta_and_workflow_recommendations_in_hints():
     assert hints["recommended_workflow_name"] == "LFQ-MBR.workflow"
 
 
+def test_llm_confirmation_keeps_workflow_parameter_overrides_in_hints():
+    context = ProjectContext(
+        project_accession="PXD000011",
+        file_name="HeLa_ArgC-Try_CID_1.raw",
+        metadata={
+            "projectDescription": MetadataValue(
+                value="DDA raw file generated from a Trypsin and Arg-C multi-enzyme digest.",
+                source="pride.projectDescription",
+                source_level="project",
+                completeness=0.8,
+            )
+        },
+        sdrf_rows=[],
+    )
+    base = infer_attributes(context)
+
+    class WorkflowOverrideReasoner:
+        def confirm_search_parameters(self, context, attributes):
+            return {
+                "recommended_workflow_name": {
+                    "value": "Default.workflow",
+                    "confidence": 0.92,
+                    "source": "llm_confirmed",
+                    "evidence_excerpt": "Standard DDA search; only enzyme parameters need adjustment.",
+                    "conflict_flag": False,
+                },
+                "workflow_parameter_overrides": {
+                    "value": {
+                        "msfragger.search_enzyme_name_1": "stricttrypsin",
+                        "msfragger.search_enzyme_cut_1": "KR",
+                        "msfragger.search_enzyme_name_2": "Arg-C",
+                        "msfragger.search_enzyme_cut_2": "R",
+                    },
+                    "confidence": 0.9,
+                    "source": "llm_confirmed",
+                    "evidence_excerpt": "File name contains ArgC-Try.",
+                    "conflict_flag": False,
+                },
+            }
+
+    confirmed = confirm_no_sdrf_parameters(context, base, llm_reasoner=WorkflowOverrideReasoner())
+
+    hints = confirmed.search_parameter_hints.value
+    assert hints["recommended_workflow_name"] == "Default.workflow"
+    assert hints["workflow_parameter_overrides"]["msfragger.search_enzyme_name_2"] == "Arg-C"
+    assert hints["workflow_parameter_overrides"]["msfragger.search_enzyme_cut_2"] == "R"
+
+
 def test_no_sdrf_llm_context_includes_parameter_and_fasta_files():
     context = ProjectContext(
         project_accession="PXD000020",
@@ -395,6 +443,61 @@ def test_openai_compatible_reasoner_falls_back_when_json_mode_returns_5xx(monkey
     assert updates["enzyme"].value == "Asp-N"
     assert any("response_format" in payload for payload in calls)
     assert any("response_format" not in payload for payload in calls)
+
+
+def test_openai_compatible_reasoner_suppresses_debug_output_by_default(monkeypatch, capsys):
+    class FakeStreamResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self):
+            payload = json.dumps(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "content": json.dumps(
+                                    {
+                                        "enzyme": {
+                                            "value": "Trypsin",
+                                            "confidence": 0.9,
+                                            "source": "llm_confirmed",
+                                            "evidence_excerpt": "standard digest",
+                                            "conflict_flag": False,
+                                        }
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+            )
+            return iter([f"data: {payload}", "data: [DONE]"])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    def fake_stream(method, url, headers, json, timeout):
+        return FakeStreamResponse()
+
+    monkeypatch.delenv("AGENT_LLM_DEBUG", raising=False)
+    monkeypatch.setattr("agent.llm.reasoner.httpx.stream", fake_stream)
+
+    context = ProjectContext(project_accession="PXD000001", file_name="sample.raw", metadata={}, sdrf_rows=[])
+    attributes = infer_attributes(context)
+    reasoner = OpenAICompatibleReasoner(api_key="test-key", base_url="http://example.test/v1")
+
+    updates = reasoner.confirm_search_parameters(context, attributes)
+
+    captured = capsys.readouterr()
+    assert updates["enzyme"].value == "Trypsin"
+    assert captured.err == ""
+    assert captured.out == ""
 
 
 def test_llm_confirmation_is_skipped_when_sdrf_exists():

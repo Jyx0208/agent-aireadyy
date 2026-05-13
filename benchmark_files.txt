@@ -1,0 +1,11 @@
+20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.raw
+20190914_EXP1_Evo1_AMV_LFQPhos_200ug_30ul-TiIMACHP_200ul_RT_01.raw
+20191002_EXP1_Evo1_AMV_TMT11prot_Rat_SetC_21min_46fracs_36.raw
+Control_5.raw
+HeLa_ArgC-Try_CID_1.raw
+LFQ_TTOF6600_DDA_QC_09.wiff
+LFQ_Orbitrap_GP_QC_400_500.raw
+LFQ_timsTOFPro_PASEF_Ecoli_01.d
+Phospho-MSP1ox-F2-R1.raw
+ACT-MSP1ox-F2-R3.raw
+Ubi-MSP1ox-F1-R1.raw

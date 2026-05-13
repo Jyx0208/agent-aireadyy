@@ -1,11 +1,12 @@
 ﻿from __future__ import annotations
 
 import re
+import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.parse import urlparse
 
-from agent.models import AttributeSet, DdaExecutionPlan, ProjectContext, ProjectResolution
+from agent.models import AttributeSet, AttributeValue, DdaExecutionPlan, ProjectContext, ProjectResolution
 from agent.pride.client import PrideClient
 
 
@@ -35,11 +36,29 @@ def _detect_raw_type(source_data_path: Path, source_file_name: str = "") -> str:
         return "mzml"
     if suffix == ".d":
         return "tims"
-    raise ValueError(f"MSDT-Converter 不支持的数据格式：{source_data_path}")
+    raise ValueError(f"Unsupported data format for MSDT-Converter: {source_data_path}")
+
+
+def _search_thread_num() -> int:
+    raw = os.getenv("AGENT_SEARCH_THREADS", "").strip()
+    if not raw:
+        return 10
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 10
 
 
 def _uniprot_proteome_url(proteome_id: str) -> str:
-    return f"https://rest.uniprot.org/uniprotkb/stream?compressed=false&format=fasta&query=%28proteome%3A{proteome_id}%29"
+    query = f"%28proteome%3A{proteome_id}%29%20AND%20%28reviewed%3Atrue%29"
+    return f"https://rest.uniprot.org/uniprotkb/stream?compressed=false&format=fasta&query={query}"
+
+
+def _uniprot_multi_proteome_url(proteome_ids: list[str]) -> str:
+    if len(proteome_ids) == 1:
+        return _uniprot_proteome_url(proteome_ids[0])
+    query = "%20OR%20".join(f"%28proteome%3A{proteome_id}%29" for proteome_id in proteome_ids)
+    return f"https://rest.uniprot.org/uniprotkb/stream?compressed=false&format=fasta&query=%28{query}%29%20AND%20%28reviewed%3Atrue%29"
 
 
 _KNOWN_UNIPROT_FASTAS = {
@@ -48,26 +67,53 @@ _KNOWN_UNIPROT_FASTAS = {
     "UP000002494": (("rattus norvegicus", "rat"), "uniprot_rat_UP000002494.fasta"),
     "UP000002311": (("saccharomyces cerevisiae", "yeast"), "uniprot_yeast_UP000002311.fasta"),
     "UP000000625": (("escherichia coli", "e. coli"), "uniprot_ecoli_k12_UP000000625.fasta"),
+    "UP000059680": (("oryza sativa", "rice"), "uniprot_oryza_sativa_UP000059680.fasta"),
 }
 
 
-def _species_fasta_choice(species: str) -> tuple[str, str, str | None]:
+def _known_uniprot_matches(species: str) -> list[tuple[str, str]]:
     normalized = species.lower()
-    multi_species_groups = [
-        aliases for aliases, _file_name in _KNOWN_UNIPROT_FASTAS.values()
-    ]
-    if sum(1 for aliases in multi_species_groups if any(alias in normalized for alias in aliases)) > 1:
-        return "reference_requires_review.fasta", "defaulted", None
+    matches: list[tuple[str, str]] = []
     for proteome_id, (aliases, file_name) in _KNOWN_UNIPROT_FASTAS.items():
         if any(alias in normalized for alias in aliases):
-            return file_name, "inferred", _uniprot_proteome_url(proteome_id)
+            matches.append((proteome_id, file_name))
+    return matches
+
+
+def _combined_uniprot_fasta_name(matches: list[tuple[str, str]]) -> str:
+    parts = []
+    for _proteome_id, file_name in matches:
+        stem = Path(file_name).stem
+        parts.append(stem.removeprefix("uniprot_"))
+    return f"uniprot_{'_'.join(parts)}.fasta"
+
+
+def _species_fasta_choice(species: str) -> tuple[str, str, str | None]:
+    matches = _known_uniprot_matches(species)
+    if len(matches) >= 2:
+        proteome_ids = [proteome_id for proteome_id, _file_name in matches]
+        return _combined_uniprot_fasta_name(matches), "inferred", _uniprot_multi_proteome_url(proteome_ids)
+    if len(matches) == 1:
+        proteome_id, file_name = matches[0]
+        return file_name, "inferred", _uniprot_proteome_url(proteome_id)
     return "reference_requires_review.fasta", "defaulted", None
 
 
 def _uniprot_proteome_id_from_text(*values: Any) -> str | None:
+    ids = _uniprot_proteome_ids_from_text(*values)
+    return ids[0] if ids else None
+
+
+def _uniprot_proteome_ids_from_text(*values: Any) -> list[str]:
     text = " ".join(str(value) for value in values if value)
-    match = re.search(r"\bUP\d{9}\b", text, re.IGNORECASE)
-    return match.group(0).upper() if match else None
+    ids: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"\bUP\d{9}\b", text, re.IGNORECASE):
+        proteome_id = match.group(0).upper()
+        if proteome_id not in seen:
+            seen.add(proteome_id)
+            ids.append(proteome_id)
+    return ids
 
 
 def _canonical_uniprot_fasta_name(proteome_id: str, fallback_name: str) -> str:
@@ -75,6 +121,66 @@ def _canonical_uniprot_fasta_name(proteome_id: str, fallback_name: str) -> str:
     if known is not None:
         return known[1]
     return fallback_name if proteome_id in fallback_name else f"uniprot_{proteome_id}.fasta"
+
+
+def _canonical_uniprot_fasta_name_for_ids(proteome_ids: list[str], fallback_name: str) -> str:
+    if len(proteome_ids) == 1:
+        return _canonical_uniprot_fasta_name(proteome_ids[0], fallback_name)
+    matches: list[tuple[str, str]] = []
+    for proteome_id in proteome_ids:
+        known = _KNOWN_UNIPROT_FASTAS.get(proteome_id)
+        if known is None:
+            return fallback_name
+        matches.append((proteome_id, known[1]))
+    return _combined_uniprot_fasta_name(matches)
+
+
+def _metadata_text_values(project_context: ProjectContext | None, key: str) -> list[str]:
+    if project_context is None:
+        return []
+    metadata_value = project_context.metadata.get(key)
+    value = metadata_value.value if metadata_value is not None else []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return [str(value)] if value else []
+
+
+def _project_file_species_override(project_context: ProjectContext | None, source_file_name: str) -> str | None:
+    if project_context is None or project_context.project_accession != "PXD016662":
+        return None
+    organisms = " ".join(_metadata_text_values(project_context, "organisms")).lower()
+    if not ("rattus" in organisms and "homo sapiens" in organisms):
+        return None
+    name = source_file_name.lower()
+    if re.search(r"(^|[_-])rat([_-]|\d|$)", name):
+        return "Rattus norvegicus (rat)"
+    if any(token in name for token in ("lfqprot", "lfqphos", "diaprot", "diafaims", "hela")):
+        return "Homo sapiens (human)"
+    return None
+
+
+def _attributes_with_fasta_species_override(
+    attributes: AttributeSet,
+    project_context: ProjectContext | None,
+    source_file_name: str,
+) -> AttributeSet:
+    source = str(attributes.species.source or "").strip().lower()
+    if source.startswith("user_review"):
+        return attributes
+    species = _project_file_species_override(project_context, source_file_name)
+    if species is None:
+        return attributes
+    return attributes.model_copy(
+        update={
+            "species": AttributeValue(
+                value=species,
+                confidence=1.0,
+                source="file_name_rule",
+                evidence_excerpt=f"PXD016662 file-level species inferred from file name: {source_file_name}",
+                conflict_flag=False,
+            )
+        }
+    )
 
 
 def is_placeholder_fasta(path: Path) -> bool:
@@ -150,9 +256,11 @@ def _is_uniprot_url(url: str) -> bool:
 
 def _llm_recommended_fasta_choice(attributes: AttributeSet, output_dir: Path) -> tuple[Path | None, str | None]:
     hints = _hint_mapping(attributes)
+    species_matches = _known_uniprot_matches(str(attributes.species.value))
+    species_proteome_ids = {proteome_id for proteome_id, _file_name in species_matches}
     species_file_name, _species_mode, species_url = _species_fasta_choice(str(attributes.species.value))
     fasta_url = PrideClient._normalize_download_url(str(hints.get("recommended_fasta_url") or "").strip()) or ""
-    proteome_id = _uniprot_proteome_id_from_text(
+    proteome_ids = _uniprot_proteome_ids_from_text(
         fasta_url,
         hints.get("recommended_fasta_name"),
         hints.get("recommended_fasta_source"),
@@ -160,9 +268,13 @@ def _llm_recommended_fasta_choice(attributes: AttributeSet, output_dir: Path) ->
         attributes.species.value,
     )
     if fasta_url and _is_uniprot_url(fasta_url):
-        if proteome_id:
-            fasta_name = _canonical_uniprot_fasta_name(proteome_id, species_file_name)
-            fasta_url = _uniprot_proteome_url(proteome_id)
+        if proteome_ids:
+            if species_url and species_proteome_ids and not set(proteome_ids).issubset(species_proteome_ids):
+                fasta_name = species_file_name
+                fasta_url = species_url
+            else:
+                fasta_name = _canonical_uniprot_fasta_name_for_ids(proteome_ids, species_file_name)
+                fasta_url = _uniprot_multi_proteome_url(proteome_ids)
         elif species_url:
             fasta_name = species_file_name
             fasta_url = species_url
@@ -180,12 +292,14 @@ def _llm_recommended_fasta_choice(attributes: AttributeSet, output_dir: Path) ->
         )
         if value
     )
-    proteome_id = _uniprot_proteome_id_from_text(hint_text)
-    if proteome_id:
-        fasta_name = _canonical_uniprot_fasta_name(proteome_id, species_file_name)
+    proteome_ids = _uniprot_proteome_ids_from_text(hint_text)
+    if proteome_ids:
+        if species_url and species_proteome_ids and not set(proteome_ids).issubset(species_proteome_ids):
+            return _reviewed_fasta_choice(output_dir, reviewed_fasta_url=species_url, reviewed_fasta_name=species_file_name)
+        fasta_name = _canonical_uniprot_fasta_name_for_ids(proteome_ids, species_file_name)
         return _reviewed_fasta_choice(
             output_dir,
-            reviewed_fasta_url=_uniprot_proteome_url(proteome_id),
+            reviewed_fasta_url=_uniprot_multi_proteome_url(proteome_ids),
             reviewed_fasta_name=fasta_name,
         )
 
@@ -296,18 +410,59 @@ def _is_resolved_attribute(value: AttributeValue) -> bool:
     raw_value = value.value
     if raw_value in (None, "", "unknown"):
         return False
+    source = str(value.source or "").strip().lower()
+    trusted_sources = ("llm_confirmed", "sdrf", "mzml", "user_review")
+    is_trusted_source = any(source.startswith(trusted) for trusted in trusted_sources)
     if isinstance(raw_value, str):
         normalized = raw_value.strip().lower()
         if not normalized or normalized == "unknown":
             return False
         if re.search(r"\s*(;|\|)\s*", raw_value):
-            return False
+            return value.confidence >= 0.8 and is_trusted_source and len(_known_uniprot_matches(raw_value)) == 2
     if not value.conflict_flag:
         return True
 
-    source = str(value.source or "").strip().lower()
-    trusted_sources = ("llm_confirmed", "sdrf", "mzml", "user_review")
-    return value.confidence >= 0.8 and any(source.startswith(trusted) for trusted in trusted_sources)
+    return value.confidence >= 0.8 and is_trusted_source
+
+
+def _instrument_family_from_name(name: str) -> str:
+    lowered = name.lower()
+    if "orbitrap" in lowered or "exploris" in lowered or "q exactive" in lowered or "ltq" in lowered:
+        return "orbitrap"
+    if "tims" in lowered or "pasef" in lowered:
+        return "tims"
+    if "tof" in lowered:
+        return "tof"
+    return "unknown"
+
+
+def _project_instrument_families(project_context: ProjectContext | None) -> set[str]:
+    families = {
+        _instrument_family_from_name(instrument)
+        for instrument in _metadata_values(project_context, "instruments")
+        if str(instrument).strip()
+    }
+    families.discard("unknown")
+    return families
+
+
+def _has_search_tolerances(attributes: AttributeSet) -> bool:
+    hints = attributes.search_parameter_hints.value
+    if not isinstance(hints, dict):
+        return False
+    return bool(hints.get("precursor_tol") and hints.get("fragment_tol"))
+
+
+def _is_resolved_instrument_context(project_context: ProjectContext | None, attributes: AttributeSet) -> bool:
+    if _is_resolved_attribute(attributes.instrument_name) and _is_resolved_attribute(attributes.instrument_family):
+        return True
+    if not _is_resolved_attribute(attributes.instrument_family):
+        return False
+    family = str(attributes.instrument_family.value or "").strip().lower()
+    if family in {"", "unknown", "ambiguous"}:
+        return False
+    project_families = _project_instrument_families(project_context)
+    return len(project_families) == 1 and family in project_families and _has_search_tolerances(attributes)
 
 
 def _context_blocking_issues(project_context: ProjectContext | None, attributes: AttributeSet) -> list[str]:
@@ -320,9 +475,7 @@ def _context_blocking_issues(project_context: ProjectContext | None, attributes:
         instruments = set(_metadata_values(project_context, "instruments"))
         if len(organisms) > 1 and not _is_resolved_attribute(attributes.species):
             issues.append("未找到匹配的 SDRF 行，且项目包含多个物种；无法确定文件级物种信息。")
-        if len(instruments) > 1 and not (
-            _is_resolved_attribute(attributes.instrument_name) and _is_resolved_attribute(attributes.instrument_family)
-        ):
+        if len(instruments) > 1 and not _is_resolved_instrument_context(project_context, attributes):
             issues.append("未找到匹配的 SDRF 行，且项目包含多个仪器；无法确定文件级仪器信息。")
     return issues
 
@@ -393,13 +546,14 @@ def plan_dda_execution(
     output_dir = Path(output_dir)
     raw_data_type = _detect_raw_type(source_data_path, source_file_name)
     workspace_root = _workspace_root()
+    decision_attributes = _attributes_with_fasta_species_override(attributes, project_context, source_file_name)
     reviewed_path, reviewed_url = _reviewed_fasta_choice(
         output_dir,
         reviewed_fasta_path=reviewed_fasta_path,
         reviewed_fasta_url=reviewed_fasta_url,
         reviewed_fasta_name=reviewed_fasta_name,
     )
-    llm_fasta_path, llm_fasta_url = _llm_recommended_fasta_choice(attributes, output_dir)
+    llm_fasta_path, llm_fasta_url = _llm_recommended_fasta_choice(decision_attributes, output_dir)
     if reviewed_path is not None:
         fasta_path = reviewed_path
         fasta_mode = "reviewed"
@@ -415,7 +569,7 @@ def plan_dda_execution(
             fasta_mode = "inferred"
             project_fasta_url = llm_fasta_url
         else:
-            fasta_file_name, fasta_mode, inferred_fasta_url = _species_fasta_choice(str(attributes.species.value))
+            fasta_file_name, fasta_mode, inferred_fasta_url = _species_fasta_choice(str(decision_attributes.species.value))
             fasta_path = output_dir / "fasta" / fasta_file_name
             project_fasta_url = inferred_fasta_url
     elif llm_fasta_path is not None:
@@ -429,7 +583,7 @@ def plan_dda_execution(
             fasta_path = project_fasta_path
             fasta_mode = "reproduced"
         else:
-            fasta_file_name, fasta_mode, inferred_fasta_url = _species_fasta_choice(str(attributes.species.value))
+            fasta_file_name, fasta_mode, inferred_fasta_url = _species_fasta_choice(str(decision_attributes.species.value))
             fasta_path = output_dir / "fasta" / fasta_file_name
             project_fasta_url = inferred_fasta_url
     # 必须由大模型推荐 workflow，不使用规则推断
@@ -442,13 +596,13 @@ def plan_dda_execution(
             blocking_issues = ["大模型未推荐 workflow。必须配置 LLM API 并确保大模型能正确推荐 workflow。请检查 AGENT_LLM_API_KEY 配置。"]
         workflow_name = ""  # 设置为空，后续会因为 blocking_issues 而被阻止
     else:
-        blocking_issues = _blocking_issues(attributes, workflow_name, raw_data_type)
+        blocking_issues = _blocking_issues(decision_attributes, workflow_name, raw_data_type)
     blocking_issues.extend(fasta_issues)
-    blocking_issues.extend(_context_blocking_issues(project_context, attributes))
+    blocking_issues.extend(_context_blocking_issues(project_context, decision_attributes))
     blocking_issues.extend(
         _fasta_blocking_issues(
             project_context,
-            attributes,
+            decision_attributes,
             fasta_path,
             fasta_mode,
             raw_data_type,
@@ -493,6 +647,7 @@ def plan_dda_execution(
         expected_pin_path=expected_pin_path,
         expected_pin_glob=str(expected_pin_path),
         output_paths=output_paths,
+        thread_num=_search_thread_num(),
         needs_review=bool(blocking_issues),
         blocking_issues=blocking_issues,
     )

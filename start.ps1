@@ -85,7 +85,28 @@ function Test-ApiKeyConfigured {
     }
 
     $Value = ($ApiKeyLine -split "=", 2)[1].Trim().Trim('"').Trim("'")
-    return ($Value -and $Value -ne "your_siliconflow_api_key")
+    if (-not $Value) {
+        return $false
+    }
+
+    # Reject obvious placeholders so users who forgot to fill the key fail fast.
+    $Placeholders = @(
+        "your_siliconflow_api_key",
+        "your_deepseek_api_key",
+        "your_api_key",
+        "sk-your-key-here",
+        "changeme"
+    )
+    foreach ($Placeholder in $Placeholders) {
+        if ($Value -ieq $Placeholder) {
+            return $false
+        }
+    }
+    if ($Value -match "^your[_-].*api[_-]?key$") {
+        return $false
+    }
+
+    return $true
 }
 
 function Ensure-Setup {
@@ -161,11 +182,12 @@ Show-DockerHint
 
 if (-not (Test-ApiKeyConfigured $EnvPath)) {
     Write-Host ""
-    Write-Host "Warning: AGENT_LLM_API_KEY is not configured in .env."
-    Write-Host "The agent can still run with rule-based inference, but LLM FASTA/search-parameter recommendation will be weaker."
-    Write-Host "Run this to configure it:"
+    Write-Host "Error: AGENT_LLM_API_KEY is not configured in .env."
+    Write-Host "The CLI pipeline requires a working LLM API key; it will not fall back to rule-only inference."
+    Write-Host "Configure it first:"
     Write-Host "  .\start.ps1 -Configure"
     Write-Host ""
+    exit 1
 }
 
 if ($BatchFile) {

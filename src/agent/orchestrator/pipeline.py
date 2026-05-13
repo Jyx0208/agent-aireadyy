@@ -12,6 +12,7 @@ from agent.assets.preparer import AssetPreparationError, DockerPwizConverter, Ra
 from agent.assets.resolver import resolve_file_asset
 from agent.decision.dda import plan_dda_execution
 from agent.execution.bundle import materialize_dda_task_bundle
+from agent.execution.outputs import execution_failure_reasons
 from agent.inference.rules import infer_attributes
 from agent.inference.mzml_metadata import infer_instrument_family_from_name, parse_mzml_instrument
 from agent.llm.reasoner import LLMReasoner, confirm_no_sdrf_parameters, confirm_sdrf_parameters
@@ -49,8 +50,8 @@ class AgentService:
             raise ValueError(
                 "必须配置大模型 API 才能运行。请设置环境变量 AGENT_LLM_API_KEY。\n"
                 "示例配置：\n"
-                "  AGENT_LLM_API_KEY=your_api_key\n"
-                "  AGENT_LLM_BASE_URL=https://api.siliconflow.cn/v1\n"
+                "  AGENT_LLM_API_KEY=your_deepseek_api_key\n"
+                "  AGENT_LLM_BASE_URL=https://api.deepseek.com\n"
                 "  AGENT_LLM_MODEL=deepseek-v4-flash"
             )
 
@@ -390,6 +391,7 @@ class AgentService:
             project_context=context,
         )
         self._report_plan_summary(plan)
+        self._last_attributes = attributes
         return resolution, context, plan
 
     def plan_dda_run_from_pride(
@@ -491,7 +493,7 @@ class AgentService:
         converter_root: str | Path,
     ) -> RunManifest:
         resolution, context, plan = self.plan_dda_run(task, source_data_path, output_dir)
-        attributes = self.infer_attributes(context)
+        attributes = self._last_attributes
         if plan.needs_review:
             self.write_task_bundle(output_dir, resolution, context, attributes, plan)
             manifest = RunManifest(
@@ -580,8 +582,14 @@ class AgentService:
         if runtime_log_path.exists():
             outputs["runtime_log"] = str(runtime_log_path)
         msdt_output = bundle.plan.output_paths.get("fp_msdt")
-        if msdt_output is None or not msdt_output.exists():
-            notes = [docker_result.stdout, f"MSDT output missing: {msdt_output}"]
+        failure_reasons = execution_failure_reasons(
+            bundle.plan,
+            docker_result.returncode,
+            docker_result.stdout,
+            docker_result.stderr,
+        )
+        if failure_reasons:
+            notes = [docker_result.stdout, *failure_reasons]
             manifest = RunManifest(
                 task_id=task.task_id,
                 created_at=datetime.now(UTC),
@@ -609,7 +617,7 @@ class AgentService:
                 source_file=task.file_name,
                 project_accession=result.resolution.primary_project.project_accession if result.resolution.primary_project else None,
                 stage="execution",
-                reasons=[f"MSDT output missing: {msdt_output}"],
+                reasons=failure_reasons,
             )
             append_review_item(Path(output_dir) / "review_queue.json", review_item)
             return manifest

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from agent.decision.dda import plan_dda_execution
 from agent.execution.bundle import materialize_dda_task_bundle
+from agent.execution.workflow import materialize_workflow_with_attributes
 from agent.input.normalizer import normalize_input
 from agent.models import (
     AttributeSet,
@@ -253,6 +254,302 @@ def test_materialize_dda_task_bundle_applies_fragpipe_workflow_attributes(tmp_pa
     assert "msfragger.search_enzyme_name_1=lysc" in workflow_text
     assert "msfragger.precursor_mass_lower=-10" in workflow_text
     assert "msfragger.fragment_mass_units=0" in workflow_text
+
+
+def test_materialize_dda_task_bundle_applies_llm_workflow_parameter_overrides_for_multi_enzyme(tmp_path: Path):
+    task = normalize_input("HeLa_ArgC-Try_CID_1.raw")
+    resolution = ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession="PXD123456",
+            matched_file=task.file_name,
+            match_type="exact",
+            match_score=100,
+            evidence=["exact"],
+            metadata_consistency=1.0,
+        ),
+        alternative_projects=[],
+        resolution_reason="exact match",
+        resolution_confidence=1.0,
+        needs_review=False,
+    )
+    context = ProjectContext(project_accession="PXD123456", file_name=task.file_name)
+    attributes = _attributes()
+    attributes.enzyme = AttributeValue(
+        value="Trypsin and Arg-C",
+        confidence=0.95,
+        source="llm_confirmed",
+        evidence_excerpt="ArgC-Try file name",
+        conflict_flag=False,
+    )
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "recommended_workflow_name": "Default.workflow",
+            "workflow_parameter_overrides": {
+                "msfragger.misc.fragger.enzyme-dropdown-1": "stricttrypsin",
+                "msfragger.search_enzyme_name_1": "stricttrypsin",
+                "msfragger.search_enzyme_cut_1": "KR",
+                "msfragger.search_enzyme_sense_1": "C",
+                "msfragger.misc.fragger.enzyme-dropdown-2": "Arg-C",
+                "msfragger.search_enzyme_name_2": "Arg-C",
+                "msfragger.search_enzyme_cut_2": "R",
+                "msfragger.search_enzyme_sense_2": "C",
+                "msfragger.num_enzyme_termini": 2,
+                "msfragger.allowed_missed_cleavage_1": 3,
+                "msfragger.misc.fragger.digest-mass-lo": 600,
+                "msfragger.misc.fragger.digest-mass-hi": 4000,
+            },
+        },
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="LLM adjusted Default.workflow for Trypsin + Arg-C digest.",
+        conflict_flag=False,
+    )
+
+    bundle = materialize_dda_task_bundle(
+        task=task,
+        project_resolution=resolution,
+        project_context=context,
+        attributes=attributes,
+        source_data_path=tmp_path / "HeLa_ArgC-Try_CID_1.mzML",
+        output_dir=tmp_path / "task_out",
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
+    )
+
+    workflow_text = bundle.materialized_workflow_path.read_text(encoding="utf-8")
+    assert "msfragger.search_enzyme_name_1=stricttrypsin" in workflow_text
+    assert "msfragger.search_enzyme_cut_1=KR" in workflow_text
+    assert "msfragger.search_enzyme_name_2=Arg-C" in workflow_text
+    assert "msfragger.search_enzyme_cut_2=R" in workflow_text
+    assert "msfragger.num_enzyme_termini=2" in workflow_text
+    assert "msfragger.allowed_missed_cleavage_1=3" in workflow_text
+    assert "msfragger.misc.fragger.digest-mass-lo=600" in workflow_text
+    assert "msfragger.misc.fragger.digest-mass-hi=4000" in workflow_text
+
+
+def test_materialize_dda_task_bundle_keeps_multi_enzyme_dropdowns_consistent(tmp_path: Path):
+    task = normalize_input("HeLa_ArgC-Try_CID_1.raw")
+    resolution = ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession="PXD123456",
+            matched_file=task.file_name,
+            match_type="exact",
+            match_score=100,
+            evidence=["exact"],
+            metadata_consistency=1.0,
+        ),
+        alternative_projects=[],
+        resolution_reason="exact match",
+        resolution_confidence=1.0,
+        needs_review=False,
+    )
+    context = ProjectContext(project_accession="PXD123456", file_name=task.file_name)
+    attributes = _attributes()
+    attributes.enzyme = AttributeValue(
+        value="Arg-C; Trypsin",
+        confidence=0.95,
+        source="file_name",
+        evidence_excerpt="HeLa_ArgC-Try_CID_1.raw",
+        conflict_flag=False,
+    )
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "recommended_workflow_name": "Default.workflow",
+            "workflow_parameter_overrides": {
+                "msfragger.search_enzyme_name_1": "stricttrypsin",
+                "msfragger.search_enzyme_cut_1": "KR",
+                "msfragger.search_enzyme_sense_1": "C",
+                "msfragger.search_enzyme_name_2": "Arg-C",
+                "msfragger.search_enzyme_cut_2": "R",
+                "msfragger.search_enzyme_sense_2": "C",
+                "msfragger.num_enzyme_termini": 2,
+            },
+        },
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="LLM adjusted Default.workflow for Trypsin + Arg-C digest.",
+        conflict_flag=False,
+    )
+
+    bundle = materialize_dda_task_bundle(
+        task=task,
+        project_resolution=resolution,
+        project_context=context,
+        attributes=attributes,
+        source_data_path=tmp_path / "HeLa_ArgC-Try_CID_1.mzML",
+        output_dir=tmp_path / "task_out",
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
+    )
+
+    workflow_text = bundle.materialized_workflow_path.read_text(encoding="utf-8")
+    assert "msfragger.misc.fragger.enzyme-dropdown-1=stricttrypsin" in workflow_text
+    assert "msfragger.search_enzyme_name_1=stricttrypsin" in workflow_text
+    assert "msfragger.search_enzyme_cut_1=KR" in workflow_text
+    assert "msfragger.misc.fragger.enzyme-dropdown-2=argc" in workflow_text
+    assert "msfragger.search_enzyme_name_2=Arg-C" in workflow_text
+    assert "msfragger.search_enzyme_cut_2=R" in workflow_text
+
+
+def test_workflow_parameter_overrides_ignore_unknown_msfragger_keys(tmp_path: Path):
+    source = tmp_path / "Default.workflow"
+    source.write_text(
+        "\n".join(
+            [
+                "msfragger.allowed_missed_cleavage_1=2",
+                "msfragger.search_enzyme_cut_2=",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "out.workflow"
+    attributes = _attributes()
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "workflow_parameter_overrides": {
+                "msfragger.allowed_missed_cleavage": 4,
+                "msfragger.precursor_mass_tolerance": "10ppm",
+                "msfragger.allowed_missed_cleavage_1": 3,
+                "msfragger.search_enzyme_cut_2": "R",
+            }
+        },
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="LLM proposed exact and inexact FragPipe keys.",
+        conflict_flag=False,
+    )
+
+    materialize_workflow_with_attributes(source, destination, attributes)
+
+    workflow_text = destination.read_text(encoding="utf-8")
+    assert "msfragger.allowed_missed_cleavage=4" not in workflow_text
+    assert "msfragger.precursor_mass_tolerance=10ppm" not in workflow_text
+    assert "msfragger.allowed_missed_cleavage_1=3" in workflow_text
+    assert "msfragger.search_enzyme_cut_2=R" in workflow_text
+
+
+def test_search_hint_missed_cleavages_accepts_common_range_text(tmp_path: Path):
+    source = tmp_path / "Default.workflow"
+    source.write_text("msfragger.allowed_missed_cleavage_1=2\n", encoding="utf-8")
+    destination = tmp_path / "out.workflow"
+    attributes = _attributes()
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "missed_cleavages": "3-4",
+            "recommended_workflow_name": "Default.workflow",
+        },
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="Multi-enzyme digest recommendation.",
+        conflict_flag=False,
+    )
+
+    materialize_workflow_with_attributes(source, destination, attributes)
+
+    workflow_text = destination.read_text(encoding="utf-8")
+    assert "msfragger.allowed_missed_cleavage_1=4" in workflow_text
+
+
+def test_search_hint_missed_cleavages_ignores_unparseable_text(tmp_path: Path):
+    source = tmp_path / "Default.workflow"
+    source.write_text("msfragger.allowed_missed_cleavage_1=2\n", encoding="utf-8")
+    destination = tmp_path / "out.workflow"
+    attributes = _attributes()
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "missed_cleavages": "not specified",
+            "recommended_workflow_name": "Default.workflow",
+        },
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="Ambiguous project metadata.",
+        conflict_flag=False,
+    )
+
+    materialize_workflow_with_attributes(source, destination, attributes)
+
+    workflow_text = destination.read_text(encoding="utf-8")
+    assert "msfragger.allowed_missed_cleavage_1=2" in workflow_text
+    assert "not specified" not in workflow_text
+
+
+def test_materialize_dda_task_bundle_applies_configured_fragpipe_ram(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("AGENT_FRAGPIPE_RAM_GB", "6")
+
+    task = normalize_input("WT_5_Lys-c.raw")
+    resolution = ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession="PXD123456",
+            matched_file="WT_5_Lys-c.raw",
+            match_type="exact",
+            match_score=100,
+            evidence=["exact"],
+            metadata_consistency=1.0,
+        ),
+        alternative_projects=[],
+        resolution_reason="exact match",
+        resolution_confidence=1.0,
+        needs_review=False,
+    )
+    context = ProjectContext(project_accession="PXD123456", file_name="WT_5_Lys-c.raw")
+
+    bundle = materialize_dda_task_bundle(
+        task=task,
+        project_resolution=resolution,
+        project_context=context,
+        attributes=_attributes(),
+        source_data_path=tmp_path / "WT_5_Lys-c.mzML",
+        output_dir=tmp_path / "task_out",
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
+    )
+
+    workflow_text = bundle.materialized_workflow_path.read_text(encoding="utf-8")
+    assert "workflow.ram=6" in workflow_text
+
+
+def test_materialize_dda_task_bundle_preserves_tmt_search_mods_and_disables_integrator_without_annotation(tmp_path: Path):
+    task = normalize_input("20191002_EXP1_Evo1_AMV_TMT11prot_Rat_SetC_21min_46fracs_36.raw")
+    resolution = ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession="PXD016662",
+            matched_file=task.file_name,
+            match_type="exact",
+            match_score=100,
+            evidence=["exact"],
+            metadata_consistency=1.0,
+        ),
+        alternative_projects=[],
+        resolution_reason="exact match",
+        resolution_confidence=1.0,
+        needs_review=False,
+    )
+    context = ProjectContext(project_accession="PXD016662", file_name=task.file_name)
+    attributes = _attributes()
+    attributes.species = AttributeValue(value="Rattus norvegicus", confidence=0.9, source="llm_confirmed", evidence_excerpt="Rat")
+    attributes.labeling_strategy = AttributeValue(value="TMT", confidence=0.95, source="llm_confirmed", evidence_excerpt="TMT11prot")
+    attributes.fixed_mods = AttributeValue(value=["C[57.02]"], confidence=0.8, source="llm_confirmed", evidence_excerpt="generic fixed mods")
+    attributes.variable_mods = AttributeValue(value=["M[15.99]"], confidence=0.8, source="llm_confirmed", evidence_excerpt="generic variable mods")
+    attributes.search_parameter_hints = AttributeValue(
+        value={"recommended_workflow_name": "TMT10-bridge.workflow", "precursor_tol": "20ppm", "fragment_tol": "20ppm"},
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="TMT bridge",
+        conflict_flag=False,
+    )
+
+    bundle = materialize_dda_task_bundle(
+        task=task,
+        project_resolution=resolution,
+        project_context=context,
+        attributes=attributes,
+        source_data_path=tmp_path / f"{Path(task.file_name).stem}.mzML",
+        output_dir=tmp_path / "task_out",
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
+    )
+
+    workflow_text = bundle.materialized_workflow_path.read_text(encoding="utf-8")
+    assert "tmtintegrator.run-tmtintegrator=false" in workflow_text
+    assert "229.16293,K (lysine),true,-1" in workflow_text
+    assert "229.16293,n^,true,1" in workflow_text
 
 
 def test_materialize_dda_task_bundle_applies_aspn_to_fragpipe_workflow(tmp_path: Path):

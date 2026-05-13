@@ -40,12 +40,15 @@ foreach ($Item in $Items) {
     Write-Host "Output: $OutputDir"
     Write-Host "============================================================"
 
-    $Arguments = @($Item, $OutputDir)
+    $Arguments = @{
+        RawFileName = $Item
+        OutputDir = $OutputDir
+    }
     if ($NoAutoConfirm) {
-        $Arguments += "-NoAutoConfirm"
+        $Arguments.NoAutoConfirm = $true
     }
     if ($RunFull) {
-        $Arguments += "-RunFull"
+        $Arguments.RunFull = $true
     }
 
     & (Join-Path $PSScriptRoot "run_one.ps1") @Arguments

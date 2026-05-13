@@ -119,6 +119,9 @@ def _infer_instrument_name(context: ProjectContext) -> AttributeValue:
         if isinstance(instruments.value, list) and instruments.value:
             unique_values = [str(value) for value in dict.fromkeys(instruments.value) if str(value).strip()]
             if len(unique_values) > 1:
+                file_level = _file_name_instrument_hint(context.file_name, unique_values)
+                if file_level is not None:
+                    return file_level
                 return _attribute(
                     "; ".join(unique_values),
                     0.5,
@@ -129,6 +132,38 @@ def _infer_instrument_name(context: ProjectContext) -> AttributeValue:
             return _attribute(instruments.value[0], 0.9, "pride.instruments", str(instruments.value[0]))
         return _attribute(instruments.value, 0.9, "pride.instruments", _flatten(instruments.value))
     return _attribute("unknown", 0.0, "none", "")
+
+
+def _file_name_instrument_hint(file_name: str, instruments: list[str]) -> AttributeValue | None:
+    normalized_file = file_name.lower()
+    candidates = [(instrument, instrument.lower()) for instrument in instruments]
+
+    def choose(*patterns: str) -> str | None:
+        for instrument, lowered in candidates:
+            if any(pattern in lowered for pattern in patterns):
+                return instrument
+        return None
+
+    selected: str | None = None
+    if re.search(r"(?:^|[_\-.])cid(?:$|[_\-.])", normalized_file):
+        selected = choose("ltq orbitrap", "orbitrap elite", "orbitrap velos", "linear ion trap", "ion trap")
+    elif re.search(r"(?:^|[_\-.])hcd(?:$|[_\-.])", normalized_file):
+        selected = choose("q exactive", "exploris", "orbitrap fusion", "orbitrap eclipse")
+    elif "pasef" in normalized_file or "timstof" in normalized_file or "tims" in normalized_file:
+        selected = choose("timstof", "tims")
+    elif "tripletof" in normalized_file or "ttof" in normalized_file or "6600" in normalized_file:
+        selected = choose("tripletof", "ttof", "6600")
+    elif "qexactive" in normalized_file or "q-exactive" in normalized_file:
+        selected = choose("q exactive")
+
+    if selected is None:
+        return None
+    return _attribute(
+        selected,
+        0.9,
+        "file_name_instrument_rule",
+        f"File name '{file_name}' disambiguates project instruments: {', '.join(instruments)}",
+    )
 
 
 def _infer_instrument_family(name: str) -> AttributeValue:

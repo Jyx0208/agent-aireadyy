@@ -92,7 +92,40 @@ def test_download_progress_is_throttled_but_completion_is_logged(monkeypatch):
         assert first["replace"] is True
         assert second["replace"] is True
         assert len(_tasks[task_id]["logs"]) == 2
-        assert "下载完成" in second["message"]
+        assert "Download complete" in second["message"]
+        assert not web_app._contains_cjk(second["message"])
+    finally:
+        _tasks.pop(task_id, None)
+
+
+def test_english_task_logs_are_localized_before_storage():
+    task_id = "english-log-localization"
+    _tasks[task_id] = {"logs": deque(maxlen=20), "ui_language": "en"}
+    try:
+        reporter = WebReporter(task_id)
+
+        web_app._log(task_id, "info", "任务开始：sample.raw")
+        web_app._step(task_id, 1, "[1/5] 解析 PRIDE 项目")
+        reporter({"kind": "activity_start", "label": "正在查询 PRIDE Archive API 并匹配项目/文件…"})
+        reporter("未找到匹配的 SDRF 行，且项目包含多个仪器；无法确定文件级仪器信息。")
+        reporter("我们根据提供的元数据判断采集模式。项目标题和描述提到。")
+
+        messages = [entry["message"] for entry in _tasks[task_id]["logs"]]
+        assert any("Task started: sample.raw" in message for message in messages)
+        assert any("Resolve PRIDE project" in message for message in messages)
+        assert any("Querying PRIDE Archive API" in message for message in messages)
+        assert any("file-level instrument cannot be determined" in message for message in messages)
+        assert all(not web_app._contains_cjk(message) for message in messages)
+    finally:
+        _tasks.pop(task_id, None)
+
+
+def test_chinese_task_logs_remain_chinese():
+    task_id = "chinese-log-localization"
+    _tasks[task_id] = {"logs": deque(maxlen=20), "ui_language": "zh"}
+    try:
+        web_app._log(task_id, "info", "任务开始：sample.raw")
+        assert "任务开始" in _tasks[task_id]["logs"][0]["message"]
     finally:
         _tasks.pop(task_id, None)
 
@@ -427,6 +460,980 @@ def test_create_task_persists_submitter_history_without_api_key(monkeypatch, tmp
             _tasks.pop(task_id, None)
 
 
+def test_create_task_persists_run_mode_and_language(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr("agent.web.app._check_llm_api", _llm_ok, raising=False)
+    monkeypatch.setattr("agent.web.app._start_pipeline_thread", lambda _task_id: None)
+
+    result = asyncio.run(
+        _create_task_inner(
+            {
+                "input_value": "sample.raw",
+                "submitter": "Alice",
+                "run_mode": "parameters",
+                "ui_language": "zh",
+                "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
+            }
+        )
+    )
+
+    task_id = result.get("task_id")
+    try:
+        assert result["run_mode"] == "parameters"
+        assert result["ui_language"] == "zh"
+        assert _tasks[task_id]["run_mode"] == "parameters"
+        assert _tasks[task_id]["ui_language"] == "zh"
+        detail = asyncio.run(get_task(task_id))
+        assert detail["run_mode"] == "parameters"
+        assert detail["ui_language"] == "zh"
+        history = json.loads((tmp_path / "sample" / "task_history.json").read_text(encoding="utf-8"))
+        assert history["run_mode"] == "parameters"
+        assert history["ui_language"] == "zh"
+        assert "sk-secret" not in json.dumps(history)
+    finally:
+        if task_id:
+            _tasks.pop(task_id, None)
+
+
+def test_create_task_defaults_to_full_workflow_and_english(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr("agent.web.app._check_llm_api", _llm_ok, raising=False)
+    monkeypatch.setattr("agent.web.app._start_pipeline_thread", lambda _task_id: None)
+
+    result = asyncio.run(
+        _create_task_inner(
+            {
+                "input_value": "sample.raw",
+                "submitter": "Alice",
+                "run_mode": "unexpected",
+                "ui_language": "fr",
+                "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
+            }
+        )
+    )
+
+    task_id = result.get("task_id")
+    try:
+        assert result["run_mode"] == "full"
+        assert result["ui_language"] == "en"
+        assert _tasks[task_id]["run_mode"] == "full"
+        assert _tasks[task_id]["ui_language"] == "en"
+    finally:
+        if task_id:
+            _tasks.pop(task_id, None)
+
+
+def test_create_parameter_batch_persists_manifest_without_api_key(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr("agent.web.app._run_llm_check", _llm_ok, raising=False)
+    started: list[str] = []
+    monkeypatch.setattr("agent.web.app._start_parameter_batch_thread", lambda batch_id: started.append(batch_id), raising=False)
+
+    result = asyncio.run(
+        web_app.create_parameter_batch(
+            {
+                "input_text": "sample_a.raw\n\nsample_b.raw\n",
+                "submitter": "Alice",
+                "jobs": 8,
+                "ui_language": "zh",
+                "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
+            }
+        )
+    )
+
+    batch_id = result.get("batch_id")
+    try:
+        assert result["status"] == "queued"
+        assert result["item_count"] == 2
+        assert result["jobs"] == 2
+        assert started == [batch_id]
+        manifest_path = tmp_path / "_batches" / batch_id / "batch_manifest.json"
+        manifest_text = manifest_path.read_text(encoding="utf-8")
+        manifest = json.loads(manifest_text)
+        assert manifest["submitter"] == "Alice"
+        assert manifest["ui_language"] == "zh"
+        assert manifest["items"][0]["input"] == "sample_a.raw"
+        assert "sk-secret" not in manifest_text
+        assert "api_key" not in manifest_text
+
+        detail = asyncio.run(web_app.get_parameter_batch(batch_id))
+        assert detail["batch_id"] == batch_id
+        assert detail["status"] == "queued"
+        assert detail["can_download"] is False
+    finally:
+        if batch_id:
+            web_app._batches.pop(batch_id, None)
+
+
+def test_run_parameter_batch_writes_excel_and_manifest(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr("agent.web.app._run_llm_check", _llm_ok, raising=False)
+    monkeypatch.setattr("agent.web.app._start_parameter_batch_thread", lambda _batch_id: None, raising=False)
+
+    def attr(value):
+        return {"value": value, "confidence": 1.0, "source": "test", "evidence_excerpt": "", "conflict_flag": False}
+
+    class FakeService:
+        def __init__(self, **_kwargs):
+            self.reporter = _kwargs.get("reporter")
+
+        def plan_dda_run_from_pride(self, task, output_dir, **_kwargs):
+            output_dir = Path(output_dir)
+            if callable(self.reporter):
+                self.reporter(f"planned {task.file_name}")
+            return SimpleNamespace(
+                resolution=SimpleNamespace(
+                    primary_project=SimpleNamespace(
+                        project_accession="PXDTEST",
+                        matched_file=task.file_name,
+                        match_type="exact",
+                        match_score=100,
+                    ),
+                    needs_review=False,
+                    resolution_confidence=1.0,
+                ),
+                context=SimpleNamespace(metadata={"organisms": {"value": ["Homo sapiens"]}}, project_files=[]),
+                attributes=SimpleNamespace(
+                    acquisition_mode=SimpleNamespace(**attr("DDA")),
+                    species=SimpleNamespace(**attr("Homo sapiens")),
+                    instrument_name=SimpleNamespace(**attr("Orbitrap Fusion")),
+                    enzyme=SimpleNamespace(**attr("Trypsin")),
+                    labeling_strategy=SimpleNamespace(**attr("label-free")),
+                    fixed_mods=SimpleNamespace(**attr(["C[57.02]"])),
+                    variable_mods=SimpleNamespace(**attr(["M[15.99]"])),
+                    search_parameter_hints=SimpleNamespace(
+                        **attr(
+                            {
+                                "recommended_workflow_name": "Default.workflow",
+                                "recommended_fasta_name": "human.fasta",
+                            }
+                        )
+                    ),
+                ),
+                plan=SimpleNamespace(
+                    task_id=task.task_id,
+                    source_file_name=task.file_name,
+                    fragpipe_workflow_path=output_dir / "workflows" / "Default.workflow",
+                    fasta_path=output_dir / "fasta" / "human.fasta",
+                    fasta_selection_mode="inferred",
+                    fasta_download_url="https://example.test/human.fasta",
+                    raw_data_type="mzml",
+                    thread_num=2,
+                    needs_review=False,
+                    blocking_issues=[],
+                ),
+                asset=SimpleNamespace(),
+            )
+
+        def write_task_bundle(self, output_dir, resolution, context, attributes, plan, **_kwargs):
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            project = {
+                "primary_project": {
+                    "project_accession": resolution.primary_project.project_accession,
+                    "matched_file": resolution.primary_project.matched_file,
+                    "match_type": resolution.primary_project.match_type,
+                    "match_score": resolution.primary_project.match_score,
+                },
+                "needs_review": False,
+            }
+            attributes_json = {
+                key: value.__dict__
+                for key, value in attributes.__dict__.items()
+                if not key.startswith("_")
+            }
+            (output_dir / "project_resolution.json").write_text(json.dumps(project), encoding="utf-8")
+            (output_dir / "metadata.json").write_text(
+                json.dumps({"project_accession": "PXDTEST", "metadata": context.metadata}),
+                encoding="utf-8",
+            )
+            (output_dir / "attributes.json").write_text(json.dumps(attributes_json), encoding="utf-8")
+            (output_dir / "decision_trace.json").write_text(
+                json.dumps(
+                    {
+                        "source_file_name": plan.source_file_name,
+                        "source_data_path": str(output_dir / "assets" / "prepared" / f"{Path(plan.source_file_name).stem}.mzML"),
+                        "raw_data_type": plan.raw_data_type,
+                        "fragpipe_workflow_path": str(plan.fragpipe_workflow_path),
+                        "fasta_path": str(plan.fasta_path),
+                        "fasta_download_url": plan.fasta_download_url,
+                        "fasta_selection_mode": plan.fasta_selection_mode,
+                        "converter_config_path": str(output_dir / "converter_config.json"),
+                        "manifest_path": str(output_dir / "fragpipe" / "fragpipe-files.fp-manifest"),
+                        "expected_pin_path": str(output_dir / "fragpipe" / "exp" / f"{Path(plan.source_file_name).stem}_edited.pin"),
+                        "output_paths": {"fp_msdt": str(output_dir / "msdt" / f"{Path(plan.source_file_name).stem}_fp_msdt.parquet")},
+                        "thread_num": plan.thread_num,
+                        "needs_review": plan.needs_review,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (output_dir / "asset_resolution.json").write_text(
+                json.dumps(
+                    {
+                        "original_file_name": plan.source_file_name,
+                        "matched_project_file": plan.source_file_name,
+                        "download_url": f"https://example.test/{plan.source_file_name}",
+                        "resolved_asset_type": "raw",
+                        "requires_conversion": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (output_dir / "converter_config.json").write_text(
+                json.dumps({"generate_fragpipe_search_result": {"workflow_path": str(plan.fragpipe_workflow_path)}}),
+                encoding="utf-8",
+            )
+            plan.fragpipe_workflow_path.parent.mkdir(parents=True, exist_ok=True)
+            plan.fragpipe_workflow_path.write_text(
+                "msfragger.search_enzyme_name_1=stricttrypsin\nmsfragger.search_enzyme_cut_1=KR\n",
+                encoding="utf-8",
+            )
+            (output_dir / "task_state.json").write_text(
+                json.dumps({"status": "completed", "stage": "planning", "source_file": plan.source_file_name}),
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr("agent.orchestrator.pipeline.AgentService", FakeService)
+
+    created = asyncio.run(
+        web_app.create_parameter_batch(
+            {
+                "input_text": "sample_a.raw\nsample_b.raw",
+                "submitter": "Alice",
+                "jobs": 2,
+                "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
+            }
+        )
+    )
+    batch_id = created["batch_id"]
+    try:
+        web_app._run_parameter_batch(batch_id)
+
+        detail = asyncio.run(web_app.get_parameter_batch(batch_id))
+        assert detail["status"] == "completed"
+        assert detail["completed_items"] == 2
+        assert detail["failed_items"] == 0
+        assert detail["can_download"] is True
+        assert detail["submitter"] == "Alice"
+        assert any("Batch started" in event["message"] for event in detail["events"])
+        assert any("Excel report written" in event["message"] for event in detail["events"])
+        assert any("planned sample_a.raw" in line for line in detail["items"][0]["log_tail"])
+        excel_path = tmp_path / "_batches" / batch_id / "benchmark_results.xlsx"
+        assert excel_path.exists()
+        audit_path = tmp_path / "_batches" / batch_id / "items" / "001_sample_a" / "parameter_audit.json"
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        assert audit["workflow"]["name"] == "Default.workflow"
+        assert audit["input"]["download_url"] == "https://example.test/sample_a.raw"
+        audit_response = asyncio.run(web_app.download_parameter_batch_audit(batch_id))
+        assert audit_response.path.endswith("_audit.zip")
+        with zipfile.ZipFile(audit_response.path) as archive:
+            names = set(archive.namelist())
+        assert "items/001_sample_a/parameter_audit.json" in names
+        assert "items/001_sample_a/logs/runtime.log" in names
+        with zipfile.ZipFile(excel_path) as archive:
+            sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        assert "sample_a.raw" in sheet
+        assert "PXDTEST" in sheet
+        assert "Actual input file" in sheet
+        assert "Workflow path" in sheet
+    finally:
+        web_app._batches.pop(batch_id, None)
+
+
+def test_public_batch_record_localizes_english_log_tail_and_events(tmp_path):
+    batch_dir = tmp_path / "batch"
+    item_dir = batch_dir / "items" / "001_sample"
+    (item_dir / "logs").mkdir(parents=True)
+    (item_dir / "logs" / "runtime.log").write_text(
+        "任务开始：sample.raw\n未找到匹配的 SDRF 行，且项目包含多个仪器；无法确定文件级仪器信息。\n",
+        encoding="utf-8",
+    )
+    batch = {
+        "batch_id": "batch_en",
+        "status": "failed",
+        "submitter": "Alice",
+        "ui_language": "en",
+        "output_dir": str(batch_dir),
+        "items": [
+            {
+                "index": 1,
+                "input": "sample.raw",
+                "status": "failed",
+                "output_dir": str(item_dir),
+                "error": "任务运行失败。",
+            }
+        ],
+        "events": [{"ts": "2026-05-13T00:00:00+08:00", "level": "error", "message": "任务运行失败。"}],
+        "errors": ["任务运行失败。"],
+    }
+
+    public = web_app._public_batch_record(batch)
+    visible_text = json.dumps(
+        {
+            "log_tail": public["items"][0]["log_tail"],
+            "item_error": public["items"][0]["error"],
+            "events": [event["message"] for event in public["events"]],
+            "errors": public["errors"],
+        },
+        ensure_ascii=False,
+    )
+
+    assert "Task started" in visible_text
+    assert "file-level instrument cannot be determined" in visible_text
+    assert "Task execution failed." in visible_text
+    assert not web_app._contains_cjk(visible_text)
+
+
+def test_parameter_batch_uses_mzml_probe_for_unresolved_instrument_and_cleans_large_files(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+
+    def attr(value, source="test", confidence=1.0, conflict_flag=False):
+        return {"value": value, "confidence": confidence, "source": source, "evidence_excerpt": "", "conflict_flag": conflict_flag}
+
+    class FakeService:
+        def __init__(self, **_kwargs):
+            self.reporter = _kwargs.get("reporter")
+
+        def plan_dda_run_from_pride(self, task, output_dir, **_kwargs):
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            workflow = output_dir / "template.workflow"
+            workflow.write_text(
+                "msfragger.search_enzyme_name_1=stricttrypsin\nmsfragger.search_enzyme_cut_1=KR\n",
+                encoding="utf-8",
+            )
+            asset = SimpleNamespace(
+                original_file_name=task.file_name,
+                matched_project_file=task.file_name,
+                resolved_asset_type="raw",
+                download_url="https://example.test/raw",
+                expected_size_bytes=123,
+                requires_conversion=True,
+                local_path=output_dir / "assets" / "downloads" / task.file_name,
+                prepared_path=output_dir / "assets" / "prepared" / f"{Path(task.file_name).stem}.mzML",
+            )
+            return SimpleNamespace(
+                resolution=SimpleNamespace(
+                    primary_project=SimpleNamespace(
+                        project_accession="PXDTEST",
+                        matched_file=task.file_name,
+                        match_type="exact",
+                        match_score=100,
+                    ),
+                    needs_review=False,
+                    resolution_confidence=1.0,
+                ),
+                context=SimpleNamespace(metadata={"instruments": {"value": ["Q Exactive", "Orbitrap Fusion"]}}, project_files=[]),
+                attributes=SimpleNamespace(
+                    acquisition_mode=SimpleNamespace(**attr("DDA")),
+                    species=SimpleNamespace(**attr("Homo sapiens")),
+                    instrument_name=SimpleNamespace(**attr("Q Exactive; Orbitrap Fusion", "pride.instruments", 0.5, True)),
+                    instrument_family=SimpleNamespace(**attr("unknown", "pride.instruments", 0.4, True)),
+                    enzyme=SimpleNamespace(**attr("Trypsin")),
+                    labeling_strategy=SimpleNamespace(**attr("label-free")),
+                    fixed_mods=SimpleNamespace(**attr(["C[57.02]"])),
+                    variable_mods=SimpleNamespace(**attr(["M[15.99]"])),
+                    search_parameter_hints=SimpleNamespace(
+                        **attr({"recommended_workflow_name": "Default.workflow", "precursor_tol": "20ppm", "fragment_tol": "20ppm"})
+                    ),
+                ),
+                plan=SimpleNamespace(
+                    task_id=task.task_id,
+                    source_file_name=task.file_name,
+                    source_data_path=asset.prepared_path,
+                    fragpipe_workflow_path=workflow,
+                    fasta_path=output_dir / "fasta" / "human.fasta",
+                    fasta_selection_mode="inferred",
+                    fasta_download_url="https://example.test/human.fasta",
+                    raw_data_type="mzml",
+                    thread_num=2,
+                    manifest_path=output_dir / "fragpipe" / "fragpipe-files.fp-manifest",
+                    expected_pin_path=output_dir / "fragpipe" / "exp" / f"{Path(task.file_name).stem}_edited.pin",
+                    output_paths={"fp_msdt": output_dir / "msdt" / f"{Path(task.file_name).stem}_fp_msdt.parquet"},
+                    rawspectrum_output_path=output_dir / "rawspectrum" / f"{Path(task.file_name).stem}_rawspectrum.parquet",
+                    needs_review=True,
+                    blocking_issues=["未找到匹配的 SDRF 行，且项目包含多个仪器；无法确定文件级仪器信息。"],
+                ),
+                asset=asset,
+            )
+
+        def _can_retry_with_mzml_instrument(self, plan):
+            return bool(plan.needs_review)
+
+        def prepare_asset(self, asset):
+            asset.local_path.parent.mkdir(parents=True, exist_ok=True)
+            asset.prepared_path.parent.mkdir(parents=True, exist_ok=True)
+            asset.local_path.write_bytes(b"raw")
+            asset.prepared_path.write_text("<mzML />", encoding="utf-8")
+            return asset.prepared_path
+
+        def replan_with_mzml_instrument(self, result, prepared_path, task, output_dir, **_kwargs):
+            attrs = result.attributes
+            attrs.instrument_name = SimpleNamespace(**attr("Q Exactive", "mzml"))
+            attrs.instrument_family = SimpleNamespace(**attr("orbitrap", "mzml"))
+            result.plan.needs_review = False
+            result.plan.blocking_issues = []
+            result.plan.source_data_path = Path(prepared_path)
+            return result
+
+        def write_task_bundle(self, output_dir, resolution, context, attributes, plan, **_kwargs):
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "project_resolution.json").write_text(
+                json.dumps({"primary_project": {"project_accession": "PXDTEST", "matched_file": plan.source_file_name}, "needs_review": False}),
+                encoding="utf-8",
+            )
+            (output_dir / "metadata.json").write_text(json.dumps({"metadata": context.metadata}), encoding="utf-8")
+            (output_dir / "attributes.json").write_text(json.dumps({"instrument_name": attributes.instrument_name.__dict__}), encoding="utf-8")
+            (output_dir / "decision_trace.json").write_text(json.dumps({"needs_review": plan.needs_review}), encoding="utf-8")
+            (output_dir / "asset_resolution.json").write_text(json.dumps({"original_file_name": plan.source_file_name}), encoding="utf-8")
+            (output_dir / "converter_config.json").write_text(
+                json.dumps({"generate_fragpipe_search_result": {"workflow_path": str(plan.fragpipe_workflow_path)}}),
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr("agent.orchestrator.pipeline.AgentService", FakeService)
+    batch_id = "probe_batch"
+    output_dir = tmp_path / "_batches" / batch_id / "items" / "001_probe"
+    batch = {
+        "batch_id": batch_id,
+        "status": "running",
+        "created_at": web_app._now_iso(),
+        "updated_at": web_app._now_iso(),
+        "output_dir": str(tmp_path / "_batches" / batch_id),
+        "excel_path": str(tmp_path / "_batches" / batch_id / "benchmark_results.xlsx"),
+        "items": [{"index": 1, "input": "probe.raw", "status": "queued", "output_dir": str(output_dir)}],
+        "llm_config": {"api_key": "sk-test", "base_url": "https://api.example.com", "model": "m1", "timeout": "120"},
+    }
+    with web_app._batches_lock:
+        web_app._batches[batch_id] = batch
+    try:
+        result = web_app._run_parameter_batch_item(batch_id, 0)
+        detail = asyncio.run(web_app.get_parameter_batch(batch_id))
+        assert result["status"] == "completed"
+        assert detail["items"][0]["status"] == "completed"
+        assert (output_dir / "parameter_audit.json").exists()
+        assert not (output_dir / "assets" / "downloads" / "probe.raw").exists()
+        assert not (output_dir / "assets" / "prepared" / "probe.mzML").exists()
+    finally:
+        with web_app._batches_lock:
+            web_app._batches.pop(batch_id, None)
+
+
+def test_project_history_lists_parameter_batches_from_memory_and_disk(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    with web_app._batches_lock:
+        previous_batches = dict(web_app._batches)
+        web_app._batches.clear()
+    try:
+        active_batch = {
+            "batch_id": "activebatch",
+            "status": "running",
+            "submitter": "Alice",
+            "created_at": "2026-05-09T12:00:00+08:00",
+            "started_at": "2026-05-09T12:01:00+08:00",
+            "updated_at": "2026-05-09T12:02:00+08:00",
+            "jobs": 2,
+            "ui_language": "en",
+            "output_dir": str(tmp_path / "_batches" / "activebatch"),
+            "excel_path": str(tmp_path / "_batches" / "activebatch" / "benchmark_results.xlsx"),
+            "items": [
+                {"index": 1, "input": "a.raw", "status": "running", "output_dir": str(tmp_path / "_batches" / "activebatch" / "items" / "001_a")},
+                {"index": 2, "input": "b.raw", "status": "queued", "output_dir": str(tmp_path / "_batches" / "activebatch" / "items" / "002_b")},
+            ],
+            "errors": [],
+        }
+        completed_batch = {
+            "batch_id": "donebatch",
+            "status": "completed",
+            "submitter": "Bob",
+            "created_at": "2026-05-09T11:00:00+08:00",
+            "started_at": "2026-05-09T11:01:00+08:00",
+            "finished_at": "2026-05-09T11:10:00+08:00",
+            "updated_at": "2026-05-09T11:10:00+08:00",
+            "jobs": 1,
+            "ui_language": "en",
+            "output_dir": str(tmp_path / "_batches" / "donebatch"),
+            "excel_path": str(tmp_path / "_batches" / "donebatch" / "benchmark_results.xlsx"),
+            "items": [{"index": 1, "input": "done.raw", "status": "completed", "output_dir": str(tmp_path / "_batches" / "donebatch" / "items" / "001_done")}],
+            "errors": [],
+        }
+        with web_app._batches_lock:
+            web_app._batches["activebatch"] = active_batch
+            web_app._write_batch_manifest(active_batch)
+        done_dir = tmp_path / "_batches" / "donebatch"
+        done_dir.mkdir(parents=True)
+        (done_dir / "benchmark_results.xlsx").write_bytes(b"xlsx")
+        web_app._write_batch_manifest(completed_batch)
+
+        history = asyncio.run(list_project_history())
+    finally:
+        with web_app._batches_lock:
+            web_app._batches.clear()
+            web_app._batches.update(previous_batches)
+
+    active = {item["batch_id"]: item for item in history["active_tasks"] if item.get("kind") == "batch"}
+    results = {item["batch_id"]: item for item in history["results"] if item.get("kind") == "batch"}
+
+    assert active["activebatch"]["display_name"] == "Batch Excel report"
+    assert active["activebatch"]["task_id"] == "batch-activebatch"
+    assert active["activebatch"]["primary_action"] == "watch"
+    assert active["activebatch"]["item_count"] == 2
+    assert active["activebatch"]["run_mode"] == "parameters"
+    assert results["donebatch"]["display_name"] == "Batch Excel report"
+    assert results["donebatch"]["primary_action"] == "download"
+    assert results["donebatch"]["can_download"] is True
+    assert results["donebatch"]["file_count"] >= 1
+    assert history["summary"]["total"] == 2
+    assert history["summary"]["downloadable"] == 1
+
+
+def test_cleanup_results_does_not_remove_batch_history_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setenv("AGENT_RESULT_RETENTION_SECONDS", "1800")
+    batch_root = tmp_path / "_batches"
+    batch_dir = batch_root / "oldbatch"
+    batch_dir.mkdir(parents=True)
+    (batch_dir / "benchmark_results.xlsx").write_bytes(b"xlsx")
+    (batch_dir / "batch_manifest.json").write_text(
+        json.dumps(
+            {
+                "batch_id": "oldbatch",
+                "status": "completed",
+                "submitter": "Alice",
+                "created_at": "2026-05-09T11:00:00+08:00",
+                "finished_at": "2026-05-09T11:10:00+08:00",
+                "output_dir": str(batch_dir),
+                "excel_path": str(batch_dir / "benchmark_results.xlsx"),
+                "items": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    old_stamp = time.time() - 7200
+    for path in batch_root.rglob("*"):
+        os.utime(path, (old_stamp, old_stamp))
+    os.utime(batch_root, (old_stamp, old_stamp))
+
+    removed = _cleanup_expired_results()
+
+    assert "_batches" not in removed
+    assert batch_root.exists()
+    assert batch_dir.exists()
+
+
+def test_project_history_recovers_from_corrupt_index_by_scanning_run_directories(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    (tmp_path / "project_history.json").write_text("{not valid json", encoding="utf-8")
+    run_dir = tmp_path / "recoverable"
+    run_dir.mkdir()
+    (run_dir / "result.txt").write_text("ok", encoding="utf-8")
+    (run_dir / "task_history.json").write_text(
+        json.dumps(
+            {
+                "task_id": "recoverable-task",
+                "input_value": "recoverable.raw",
+                "submitter": "Alice",
+                "status": "completed",
+                "output_dir": "recoverable",
+                "started_at": "2026-05-09T12:00:00+08:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    history = asyncio.run(list_project_history())
+
+    assert history["results"][0]["task_id"] == "recoverable-task"
+    repaired_index = json.loads((tmp_path / "project_history.json").read_text(encoding="utf-8"))
+    assert repaired_index[0]["task_id"] == "recoverable-task"
+
+
+def test_project_history_ignores_legacy_batches_pseudo_record(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    (tmp_path / "project_history.json").write_text(
+        json.dumps(
+            [
+                {
+                    "task_id": "_batches",
+                    "input_value": "_batches",
+                    "status": "completed",
+                    "output_dir": "_batches",
+                    "project_key": "batches",
+                    "history_id": "batches",
+                },
+                {
+                    "task_id": "real",
+                    "input_value": "real.raw",
+                    "status": "completed",
+                    "output_dir": "real",
+                    "started_at": "2026-05-09T12:00:00+08:00",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    history = asyncio.run(list_project_history())
+
+    assert [item["task_id"] for item in history["results"]] == ["real"]
+
+
+def test_project_history_marks_disk_only_running_batch_as_interrupted(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    with web_app._batches_lock:
+        previous_batches = dict(web_app._batches)
+        web_app._batches.clear()
+    batch_dir = tmp_path / "_batches" / "orphanbatch"
+    batch_dir.mkdir(parents=True)
+    (batch_dir / "batch_manifest.json").write_text(
+        json.dumps(
+            {
+                "batch_id": "orphanbatch",
+                "status": "running",
+                "submitter": "Alice",
+                "created_at": "2026-05-09T12:00:00+08:00",
+                "started_at": "2026-05-09T12:01:00+08:00",
+                "updated_at": "2026-05-09T12:02:00+08:00",
+                "output_dir": str(batch_dir),
+                "excel_path": str(batch_dir / "benchmark_results.xlsx"),
+                "items": [{"index": 1, "input": "a.raw", "status": "running", "output_dir": str(batch_dir / "items" / "001_a")}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        history = asyncio.run(list_project_history())
+    finally:
+        with web_app._batches_lock:
+            web_app._batches.clear()
+            web_app._batches.update(previous_batches)
+
+    assert history["active_tasks"] == []
+    assert history["results"][0]["batch_id"] == "orphanbatch"
+    assert history["results"][0]["status"] == "failed"
+    assert history["results"][0]["interrupted"] is True
+
+
+def test_parameter_only_mode_stops_after_planning_without_full_execution(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr(web_app, "_start_ready_queued_tasks", lambda: [])
+
+    calls = []
+    output_dir = tmp_path / "sample"
+    workflow_path = tmp_path / "Default.workflow"
+    workflow_path.write_text(
+        "msfragger.search_enzyme_name_1=stricttrypsin\n"
+        "msfragger.search_enzyme_cut_1=KR\n"
+        "msfragger.allowed_missed_cleavage_1=2\n",
+        encoding="utf-8",
+    )
+    result = SimpleNamespace(
+        resolution=SimpleNamespace(
+            primary_project=SimpleNamespace(project_accession="PXDTEST", matched_file="sample.raw"),
+            resolution_confidence=1.0,
+        ),
+        context=SimpleNamespace(metadata={}, project_files=[]),
+        attributes=SimpleNamespace(
+            acquisition_mode=_value("DDA"),
+            species=_value("Homo sapiens"),
+            instrument_name=_value("Orbitrap Fusion"),
+            enzyme=_value("Trypsin"),
+            fixed_mods=_value(["C[57.02]"]),
+            variable_mods=_value(["M[15.99]"]),
+            search_parameter_hints=_value(
+                {
+                    "recommended_workflow_name": "Default.workflow",
+                    "recommended_fasta_name": "uniprot_human_UP000005640.fasta",
+                    "precursor_tol": "20ppm",
+                    "fragment_tol": "0.02Da",
+                }
+            ),
+        ),
+        plan=SimpleNamespace(
+            task_id="sample",
+            source_file_name="sample.raw",
+            source_data_path=output_dir / "assets" / "prepared" / "sample.mzML",
+            fragpipe_workflow_path=workflow_path,
+            manifest_path=output_dir / "fragpipe" / "fragpipe-files.fp-manifest",
+            fasta_path=tmp_path / "uniprot_human_UP000005640.fasta",
+            fasta_selection_mode="inferred",
+            fasta_download_url="https://example.test/human.fasta",
+            raw_data_type="mzml",
+            converter_config_path=output_dir / "converter_config.json",
+            rawspectrum_output_path=output_dir / "rawspectrum" / "sample_rawspectrum.parquet",
+            expected_pin_path=output_dir / "fragpipe" / "exp" / "sample_edited.pin",
+            output_paths={"fp_msdt": output_dir / "msdt" / "sample_fp_msdt.parquet"},
+            thread_num=2,
+            needs_review=False,
+            blocking_issues=[],
+        ),
+        asset=SimpleNamespace(
+            original_file_name="sample.raw",
+            matched_project_file="sample.raw",
+            download_url="https://example.test/sample.raw",
+            resolved_asset_type="raw",
+            requires_conversion=True,
+            expected_size_bytes=123456,
+        ),
+    )
+
+    class FakeService:
+        def __init__(self, **_kwargs):
+            pass
+
+        def plan_dda_run_from_pride(self, **_kwargs):
+            calls.append("plan")
+            return result
+
+        def _can_retry_with_mzml_instrument(self, _plan):
+            return False
+
+        def prepare_asset(self, _asset):
+            raise AssertionError("parameter-only mode must not prepare raw data")
+
+        def write_task_bundle(self, output_dir_arg, *_args, **_kwargs):
+            calls.append("write_task_bundle")
+            output = Path(output_dir_arg)
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "metadata.json").write_text("{}", encoding="utf-8")
+            (output / "project_resolution.json").write_text(
+                json.dumps(
+                    {
+                        "primary_project": {
+                            "project_accession": "PXDTEST",
+                            "matched_file": "sample.raw",
+                            "match_type": "exact",
+                            "match_score": 100,
+                        },
+                        "needs_review": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (output / "attributes.json").write_text(
+                json.dumps(
+                    {
+                        "acquisition_mode": _value("DDA").__dict__,
+                        "species": _value("Homo sapiens").__dict__,
+                        "instrument_name": _value("Orbitrap Fusion").__dict__,
+                        "enzyme": _value("Trypsin").__dict__,
+                        "fixed_mods": _value(["C[57.02]"]).__dict__,
+                        "variable_mods": _value(["M[15.99]"]).__dict__,
+                        "search_parameter_hints": _value(
+                            {
+                                "recommended_workflow_name": "Default.workflow",
+                                "recommended_fasta_name": "uniprot_human_UP000005640.fasta",
+                                "precursor_tol": "20ppm",
+                                "fragment_tol": "0.02Da",
+                            }
+                        ).__dict__,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (output / "asset_resolution.json").write_text(
+                json.dumps(
+                    {
+                        "original_file_name": "sample.raw",
+                        "matched_project_file": "sample.raw",
+                        "download_url": "https://example.test/sample.raw",
+                        "resolved_asset_type": "raw",
+                        "requires_conversion": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (output / "decision_trace.json").write_text(
+                json.dumps(
+                    {
+                        "source_file_name": "sample.raw",
+                        "source_data_path": str(output / "assets" / "prepared" / "sample.mzML"),
+                        "raw_data_type": "mzml",
+                        "fasta_path": str(tmp_path / "uniprot_human_UP000005640.fasta"),
+                        "fasta_download_url": "https://example.test/human.fasta",
+                        "fasta_selection_mode": "inferred",
+                        "fragpipe_workflow_path": str(workflow_path),
+                        "converter_config_path": str(output / "converter_config.json"),
+                        "manifest_path": str(output / "fragpipe" / "fragpipe-files.fp-manifest"),
+                        "expected_pin_path": str(output / "fragpipe" / "exp" / "sample_edited.pin"),
+                        "output_paths": {"fp_msdt": str(output / "msdt" / "sample_fp_msdt.parquet")},
+                        "thread_num": 2,
+                        "needs_review": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (output / "converter_config.json").write_text(
+                json.dumps(
+                    {
+                        "generate_fragpipe_search_result": {
+                            "workflow_path": str(workflow_path),
+                            "data_path": str(output / "assets" / "prepared" / "sample.mzML"),
+                            "fasta_path": str(tmp_path / "uniprot_human_UP000005640.fasta"),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr("agent.orchestrator.pipeline.AgentService", FakeService)
+
+    task_id = "parameter-only"
+    _tasks[task_id] = {
+        "task_id": task_id,
+        "input_value": "sample.raw",
+        "project_key": "sample",
+        "submitter": "Alice",
+        "output_dir": str(output_dir),
+        "status": "running",
+        "created_at": "2026-05-09T00:00:00+00:00",
+        "started_at": "2026-05-09T00:00:00+00:00",
+        "logs": deque(maxlen=100),
+        "step": 0,
+        "total_steps": 5,
+        "blocking_issues": [],
+        "prefer_project_fasta": False,
+        "run_mode": "parameters",
+        "ui_language": "en",
+        "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1", "timeout": "1200"},
+    }
+
+    try:
+        web_app._run_pipeline(task_id)
+
+        assert calls == ["plan", "write_task_bundle"]
+        assert _tasks[task_id]["status"] == "completed"
+        assert _tasks[task_id]["step"] == 5
+        detail = asyncio.run(get_task(task_id))
+        assert detail["can_download"] is True
+        state = json.loads((output_dir / "task_state.json").read_text(encoding="utf-8"))
+        assert state["status"] == "completed"
+        assert state["stage"] == "planning"
+        zip_path = output_dir / ".download_cache" / "results-compressed.zip"
+        assert zip_path.exists()
+        assert (output_dir / "parameter_audit.json").exists()
+        assert (output_dir / "msdt_input_manifest.json").exists()
+        with zipfile.ZipFile(zip_path) as archive:
+            names = set(archive.namelist())
+            converter_config = json.loads(archive.read("converter_config.json").decode("utf-8"))
+        assert "converter_config.json" in names
+        assert "decision_trace.json" in names
+        assert "parameter_audit.json" in names
+        assert "msdt_input_manifest.json" in names
+        assert "workflows/Default.workflow" in names
+        assert "assets/prepared/sample.mzML" not in names
+        assert "assets/downloads/sample.raw" not in names
+        assert converter_config["generate_fragpipe_search_result"]["workflow_path"].endswith("workflows/Default.workflow")
+        response = asyncio.run(download_results(task_id))
+        assert "sample_parameters.zip" in response.headers["content-disposition"]
+    finally:
+        _tasks.pop(task_id, None)
+
+
+def test_pipeline_failure_persists_structured_error_without_traceback(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr(web_app, "_start_ready_queued_tasks", lambda: [])
+    monkeypatch.delenv("AGENT_DEBUG_TRACEBACK", raising=False)
+
+    output_dir = tmp_path / "failed-sample"
+
+    class FakeService:
+        def __init__(self, **_kwargs):
+            pass
+
+        def plan_dda_run_from_pride(self, **_kwargs):
+            raise RuntimeError("permission denied while trying to connect to the docker API")
+
+    monkeypatch.setattr("agent.orchestrator.pipeline.AgentService", FakeService)
+
+    task_id = "structured-error"
+    _tasks[task_id] = {
+        "task_id": task_id,
+        "input_value": "sample.raw",
+        "project_key": "sample",
+        "submitter": "Alice",
+        "output_dir": str(output_dir),
+        "status": "running",
+        "created_at": "2026-05-09T00:00:00+00:00",
+        "started_at": "2026-05-09T00:00:00+00:00",
+        "logs": deque(maxlen=100),
+        "step": 0,
+        "total_steps": 5,
+        "blocking_issues": [],
+        "prefer_project_fasta": False,
+        "run_mode": "parameters",
+        "ui_language": "en",
+        "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1", "timeout": "1200"},
+    }
+
+    try:
+        web_app._run_pipeline(task_id)
+
+        assert _tasks[task_id]["status"] == "failed"
+        assert _tasks[task_id]["error_summary"]["category"] == "docker_permission"
+        assert _tasks[task_id]["blocking_issues"] == [_tasks[task_id]["error_summary"]["public_message"]]
+        error = json.loads((output_dir / "error.json").read_text(encoding="utf-8"))
+        assert error["category"] == "docker_permission"
+        assert "traceback" not in error
+        history_text = (output_dir / "task_history.json").read_text(encoding="utf-8")
+        assert "Traceback" not in history_text
+        detail = asyncio.run(get_task(task_id))
+        assert detail["error_summary"]["category"] == "docker_permission"
+    finally:
+        _tasks.pop(task_id, None)
+
+
+def test_create_task_uses_unique_output_directory_for_repeated_input(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr("agent.web.app._check_llm_api", _llm_ok, raising=False)
+    monkeypatch.setattr("agent.web.app._start_pipeline_thread", lambda _task_id: None)
+    monkeypatch.setenv("AGENT_MAX_CONCURRENT_TASKS", "1")
+
+    first = asyncio.run(
+        _create_task_inner(
+            {
+                "input_value": "sample.raw",
+                "submitter": "Alice",
+                "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
+            }
+        )
+    )
+    second = asyncio.run(
+        _create_task_inner(
+            {
+                "input_value": "sample.raw",
+                "submitter": "Bob",
+                "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
+            }
+        )
+    )
+
+    task_ids = [first.get("task_id"), second.get("task_id")]
+    try:
+        first_dir = Path(first["output_dir"])
+        second_dir = Path(second["output_dir"])
+        assert first_dir.name == "sample"
+        assert second_dir.name.startswith("sample__")
+        assert second_dir != first_dir
+        assert (first_dir / "task_history.json").exists()
+        assert (second_dir / "task_history.json").exists()
+
+        history = asyncio.run(list_project_history())
+        active_ids = {item["task_id"] for item in history["active_tasks"]}
+        result_ids = {item["task_id"] for item in history["results"]}
+        assert first["task_id"] in active_ids
+        assert second["task_id"] in active_ids
+        assert first["task_id"] not in result_ids
+        assert second["task_id"] not in result_ids
+    finally:
+        for task_id in task_ids:
+            if task_id:
+                _tasks.pop(task_id, None)
+
+
 def test_project_history_lists_active_submitters_and_results_without_secrets(monkeypatch, tmp_path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     active_dir = tmp_path / "active-project"
@@ -454,12 +1461,66 @@ def test_project_history_lists_active_submitters_and_results_without_secrets(mon
     finally:
         _tasks.pop("active", None)
 
+    summary = history["summary"]
     serialized = str(history)
     assert history["active_tasks"][0]["submitter"] == "Alice"
+    assert history["active_tasks"][0]["display_name"] == "active.raw"
+    assert history["active_tasks"][0]["run_label"] == "active-project"
+    assert history["active_tasks"][0]["status_group"] == "active"
+    assert history["active_tasks"][0]["primary_action"] == "watch"
     assert history["results"][0]["submitter"] == "Bob"
+    assert history["results"][0]["display_name"] == "done.raw"
+    assert history["results"][0]["run_label"] == "finished-project"
+    assert history["results"][0]["status_group"] == "success"
+    assert history["results"][0]["primary_action"] == "view"
+    assert summary["total"] == 2
+    assert summary["active"] == 1
+    assert summary["results"] == 1
+    assert summary["status_counts"]["queued"] == 1
+    assert summary["status_counts"]["completed"] == 1
+    assert summary["downloadable"] == 0
+    assert summary["storage_bytes"] >= len("ok")
     assert "sk-active-secret" not in serialized
     assert "api_key" not in serialized
     assert "llm_config" not in serialized
+
+
+def test_project_history_adds_human_timing_and_actions(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    output_dir = tmp_path / "timed-project"
+    output_dir.mkdir()
+    (output_dir / "result.txt").write_text("ok", encoding="utf-8")
+    (output_dir / "task_history.json").write_text(
+        json.dumps(
+            {
+                "task_id": "timed",
+                "input_value": "timed.raw",
+                "submitter": "Alice",
+                "status": "failed",
+                "output_dir": "timed-project",
+                "created_at": "2026-05-09T11:59:00+08:00",
+                "started_at": "2026-05-09T12:00:00+08:00",
+                "finished_at": "2026-05-09T12:05:30+08:00",
+                "updated_at": "2026-05-09T12:10:00+08:00",
+                "blocking_issues": ["boom"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    history = asyncio.run(list_project_history())
+    result = history["results"][0]
+
+    assert result["display_name"] == "timed.raw"
+    assert result["run_label"] == "timed-project"
+    assert result["result_id"] == "timed-project"
+    assert result["history_time"] == "2026-05-09T12:00:00+08:00"
+    assert result["time_label"] == "started_at"
+    assert result["duration_seconds"] == 330
+    assert result["status_group"] == "failed"
+    assert result["primary_action"] == "inspect"
+    assert history["summary"]["status_counts"]["failed"] == 1
+    assert history["summary"]["failed"] == 1
 
 
 def test_project_history_keeps_record_after_download_directory_is_removed(monkeypatch, tmp_path):
@@ -638,6 +1699,106 @@ def test_history_reflects_failed_status_and_disables_download(monkeypatch, tmp_p
     assert result["can_download"] is False
 
 
+def test_project_history_uses_task_start_time_not_result_file_mtime(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setenv("AGENT_RESULT_RETENTION_SECONDS", "8640000")
+    first_dir = tmp_path / "sample"
+    second_dir = tmp_path / "sample__20260509-121000__bbbbbbbb"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first_file = first_dir / "result.txt"
+    second_file = second_dir / "result.txt"
+    first_file.write_text("first", encoding="utf-8")
+    second_file.write_text("second", encoding="utf-8")
+    (first_dir / "task_history.json").write_text(
+        json.dumps(
+            {
+                "task_id": "aaaa",
+                "input_value": "sample.raw",
+                "submitter": "Alice",
+                "status": "completed",
+                "output_dir": first_dir.name,
+                "created_at": "2026-05-09T11:59:00+08:00",
+                "started_at": "2026-05-09T12:00:00+08:00",
+                "finished_at": "2026-05-09T12:20:00+08:00",
+                "updated_at": "2026-05-09T12:30:00+08:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (second_dir / "task_history.json").write_text(
+        json.dumps(
+            {
+                "task_id": "bbbb",
+                "input_value": "sample.raw",
+                "submitter": "Bob",
+                "status": "completed",
+                "output_dir": second_dir.name,
+                "created_at": "2026-05-09T12:09:00+08:00",
+                "started_at": "2026-05-09T12:10:00+08:00",
+                "finished_at": "2026-05-09T12:25:00+08:00",
+                "updated_at": "2026-05-09T12:25:00+08:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_stamp = datetime.fromisoformat("2026-05-09T13:30:00+08:00").timestamp()
+    earlier_stamp = datetime.fromisoformat("2026-05-09T12:40:00+08:00").timestamp()
+    os.utime(first_file, (later_stamp, later_stamp))
+    os.utime(first_dir, (later_stamp, later_stamp))
+    os.utime(second_file, (earlier_stamp, earlier_stamp))
+    os.utime(second_dir, (earlier_stamp, earlier_stamp))
+
+    history = asyncio.run(list_project_history())
+
+    assert [item["task_id"] for item in history["results"]] == ["bbbb", "aaaa"]
+    assert [item["history_time"] for item in history["results"]] == [
+        "2026-05-09T12:10:00+08:00",
+        "2026-05-09T12:00:00+08:00",
+    ]
+    assert history["results"][1]["updated_at"] == "2026-05-09T12:30:00+08:00"
+    assert history["results"][1]["file_updated_at"].startswith("2026-05-09T13:30:00")
+
+
+def test_project_history_marks_orphan_running_record_as_interrupted(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setenv("AGENT_RESULT_RETENTION_SECONDS", "8640000")
+    with web_app._tasks_lock:
+        previous_tasks = dict(_tasks)
+        _tasks.clear()
+    (tmp_path / "project_history.json").write_text(
+        json.dumps(
+            [
+                {
+                    "task_id": "orphan",
+                    "input_value": "orphan.raw",
+                    "submitter": "Alice",
+                    "status": "running",
+                    "output_dir": "orphan",
+                    "created_at": "2026-05-09T12:00:00+08:00",
+                    "started_at": "2026-05-09T12:01:00+08:00",
+                    "updated_at": "2026-05-09T12:02:00+08:00",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        history = asyncio.run(list_project_history())
+    finally:
+        with web_app._tasks_lock:
+            _tasks.clear()
+            _tasks.update(previous_tasks)
+
+    assert history["active_tasks"] == []
+    assert history["results"][0]["task_id"] == "orphan"
+    assert history["results"][0]["status"] == "failed"
+    assert history["results"][0]["interrupted"] is True
+    assert any("服务重启或任务被手动停止" in issue for issue in history["results"][0]["blocking_issues"])
+    assert history["results"][0]["history_time"] == "2026-05-09T12:01:00+08:00"
+
+
 def test_running_and_failed_tasks_are_not_downloadable(monkeypatch, tmp_path):
     running_dir = tmp_path / "running"
     failed_dir = tmp_path / "failed"
@@ -700,7 +1861,9 @@ def test_create_task_keeps_output_dir_inside_runs_for_pathlike_input(monkeypatch
     try:
         assert "error" not in result
         output_dir = Path(result["output_dir"])
-        assert output_dir.parts == ("runs", "outside")
+        assert output_dir.parts[0] == "runs"
+        assert output_dir.name == "outside" or output_dir.name.startswith("outside__")
+        assert ".." not in output_dir.parts
     finally:
         if task_id:
             _tasks.pop(task_id, None)
@@ -930,9 +2093,13 @@ def test_download_results_excludes_large_intermediate_assets(tmp_path):
     (output_dir / "msdt").mkdir()
     (output_dir / "assets" / "downloads").mkdir(parents=True)
     (output_dir / "fragpipe" / "exp").mkdir(parents=True)
+    (output_dir / "workflows").mkdir()
     (output_dir / "ai_ready" / "sample_ai_ready.parquet").write_text("ai", encoding="utf-8")
     (output_dir / "msdt" / "sample_fp_msdt.parquet").write_text("msdt", encoding="utf-8")
     (output_dir / "assets" / "downloads" / "sample.raw").write_text("raw", encoding="utf-8")
+    (output_dir / "fragpipe" / "fragger.params").write_text("search_enzyme_name_1 = stricttrypsin", encoding="utf-8")
+    (output_dir / "fragpipe" / "Default.workflow").write_text("msfragger.search_enzyme_name_1=stricttrypsin", encoding="utf-8")
+    (output_dir / "workflows" / "Default.workflow").write_text("msfragger.search_enzyme_name_1=stricttrypsin", encoding="utf-8")
     (output_dir / "fragpipe" / "exp" / "sample.pin").write_text("pin", encoding="utf-8")
     _tasks[task_id] = {
         "task_id": task_id,
@@ -949,8 +2116,34 @@ def test_download_results_excludes_large_intermediate_assets(tmp_path):
             names = set(archive.namelist())
         assert "ai_ready/sample_ai_ready.parquet" in names
         assert "msdt/sample_fp_msdt.parquet" in names
+        assert "fragpipe/fragger.params" in names
+        assert "fragpipe/Default.workflow" in names
+        assert "workflows/Default.workflow" in names
         assert ".download_cache/results-compressed.zip" not in names
         assert "assets/downloads/sample.raw" not in names
         assert "fragpipe/exp/sample.pin" not in names
     finally:
         _tasks.pop(task_id, None)
+
+
+def test_zip_output_rebuilds_cached_archive_missing_parameter_files(tmp_path):
+    output_dir = tmp_path / "result"
+    (output_dir / "msdt").mkdir(parents=True)
+    (output_dir / "fragpipe").mkdir()
+    msdt_path = output_dir / "msdt" / "sample_fp_msdt.parquet"
+    params_path = output_dir / "fragpipe" / "fragger.params"
+    msdt_path.write_text("msdt", encoding="utf-8")
+    params_path.write_text("search_enzyme_name_1 = stricttrypsin", encoding="utf-8")
+
+    zip_path = output_dir / ".download_cache" / "results-compressed.zip"
+    zip_path.parent.mkdir()
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.write(msdt_path, "msdt/sample_fp_msdt.parquet")
+
+    rebuilt = _zip_output_dir(output_dir)
+
+    assert rebuilt == zip_path
+    with zipfile.ZipFile(rebuilt) as archive:
+        names = set(archive.namelist())
+    assert "msdt/sample_fp_msdt.parquet" in names
+    assert "fragpipe/fragger.params" in names

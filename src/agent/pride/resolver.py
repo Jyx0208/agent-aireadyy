@@ -10,6 +10,10 @@ from agent.models import InputTask, ProjectCandidate, ProjectResolution
 from agent.pride.client import PrideClient
 
 
+_ARCHIVE_SUFFIXES = (".zip", ".tar.gz", ".tgz")
+_MASS_SPEC_CONTAINER_SUFFIXES = (".d", ".raw", ".wiff")
+
+
 def _candidate_sort_key(candidate: ProjectCandidate) -> tuple[int, float, date]:
     anchor_date = candidate.publication_date or candidate.submission_date or date.max
     return (-candidate.match_score, -candidate.metadata_consistency, anchor_date)
@@ -24,16 +28,25 @@ def resolve_primary_project(candidates: list[ProjectCandidate]) -> ProjectResolu
     alternatives = ordered[1:]
 
     reasons = [f"Selected {primary.project_accession} by highest match score"]
+    equally_strong = [
+        candidate
+        for candidate in alternatives
+        if candidate.match_score == primary.match_score and candidate.metadata_consistency == primary.metadata_consistency
+    ]
     if alternatives and primary.match_score == alternatives[0].match_score:
         if primary.metadata_consistency > alternatives[0].metadata_consistency:
             reasons.append("metadata consistency wins before date comparison")
         else:
             reasons.append("earliest project date wins when score and consistency are equal")
+    if equally_strong:
+        reasons.append("multiple equally strong project matches require manual review")
 
     confidence = min(1.0, primary.match_score / 100 + primary.metadata_consistency / 2)
-    needs_review = primary.match_type == "prefix" or primary.match_score < 90
-    if needs_review:
+    needs_review = primary.match_type == "prefix" or primary.match_score < 90 or bool(equally_strong)
+    if primary.match_type == "prefix" or primary.match_score < 90:
         reasons.append("manual review required for non-exact project match")
+    elif equally_strong:
+        reasons.append("manual review required for ambiguous exact project match")
     return ProjectResolution(
         primary_project=primary,
         alternative_projects=alternatives,
@@ -61,12 +74,25 @@ def _normalized_variants(task: InputTask) -> list[tuple[str, str]]:
     return deduped
 
 
+def _unwrap_archive_name(file_name: str) -> str:
+    for archive_suffix in _ARCHIVE_SUFFIXES:
+        if not file_name.endswith(archive_suffix):
+            continue
+        unwrapped = file_name[: -len(archive_suffix)]
+        if unwrapped.endswith(_MASS_SPEC_CONTAINER_SUFFIXES):
+            return unwrapped
+    return file_name
+
+
 def _score_file_match(target_name: str, file_name: str, variant_type: str) -> tuple[int, str] | None:
     target = target_name.lower()
     candidate = file_name.lower()
     if candidate == target:
         return 100, "exact file match"
-    candidate_stem = PurePath(candidate).stem
+    logical_candidate = _unwrap_archive_name(candidate)
+    if logical_candidate == target:
+        return 100, "exact file match via archive wrapper"
+    candidate_stem = PurePath(logical_candidate).stem
     if variant_type == "stem" and candidate_stem == target:
         return 90, "stem file match"
     if variant_type == "prefix" and candidate.startswith(target):
@@ -87,12 +113,16 @@ def _metadata_consistency(project: dict[str, Any]) -> float:
     return sum(checks) / len(checks)
 
 
-def find_project_candidates(client: PrideClient, task: InputTask) -> list[ProjectCandidate]:
+def find_project_candidates(
+    client: PrideClient,
+    task: InputTask,
+    max_files_per_project: int | None = None,
+) -> list[ProjectCandidate]:
     candidates: dict[str, ProjectCandidate] = {}
     for query, query_type in _normalized_variants(task):
         for project in client.search_projects(query):
             accession = project["accession"]
-            files = client.list_project_files(accession, keyword=query)
+            files = client.list_project_files(accession, keyword=query, max_files=max_files_per_project)
             for file_record in files:
                 scored = _score_file_match(query, file_record.get("fileName", ""), query_type)
                 if not scored:
@@ -114,9 +144,13 @@ def find_project_candidates(client: PrideClient, task: InputTask) -> list[Projec
     return list(candidates.values())
 
 
-def resolve_input_to_project(client: PrideClient, raw_input: str) -> ProjectResolution:
+def resolve_input_to_project(
+    client: PrideClient,
+    raw_input: str,
+    max_files_per_project: int | None = None,
+) -> ProjectResolution:
     task = normalize_input(raw_input)
-    candidates = find_project_candidates(client, task)
+    candidates = find_project_candidates(client, task, max_files_per_project=max_files_per_project)
     return resolve_primary_project(candidates)
 
 

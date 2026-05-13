@@ -103,7 +103,7 @@ def _enzyme_config(attributes: AttributeSet) -> dict[str, Any]:
             "restrict": "P",
             "c_terminal": True,
         }
-    if "lys" in enzyme and "c" in enzyme:
+    if "lysc" in normalized:
         return {
             "missed_cleavages": missed_cleavages,
             "min_len": 5,
