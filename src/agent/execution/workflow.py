@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +10,66 @@ from agent.models import AttributeSet
 
 
 _TOLERANCE_RE = re.compile(r"^\s*(?P<value>[+-]?\d+(?:\.\d+)?)\s*(?P<unit>ppm|da)?\s*$", re.IGNORECASE)
+_WORKFLOW_OVERRIDE_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_WORKFLOW_OVERRIDE_HINT_KEYS = (
+    "workflow_parameter_overrides",
+    "fragpipe_workflow_overrides",
+    "msfragger_parameter_overrides",
+)
+_ALLOWED_WORKFLOW_OVERRIDE_PREFIXES = ("msfragger.",)
+_ALLOWED_WORKFLOW_OVERRIDE_KEYS = frozenset(
+    {
+        "msfragger.allowed_missed_cleavage_1",
+        "msfragger.allowed_missed_cleavage_2",
+        "msfragger.calibrate_mass",
+        "msfragger.digest_max_length",
+        "msfragger.digest_min_length",
+        "msfragger.fragment_ion_series",
+        "msfragger.fragment_mass_tolerance",
+        "msfragger.fragment_mass_units",
+        "msfragger.mass_offsets",
+        "msfragger.mass_offsets_detailed",
+        "msfragger.max_fragment_charge",
+        "msfragger.max_variable_mods_combinations",
+        "msfragger.max_variable_mods_per_peptide",
+        "msfragger.min_fragments_modelling",
+        "msfragger.min_matched_fragments",
+        "msfragger.min_sequence_matches",
+        "msfragger.misc.fragger.digest-mass-hi",
+        "msfragger.misc.fragger.digest-mass-lo",
+        "msfragger.misc.fragger.enzyme-dropdown-1",
+        "msfragger.misc.fragger.enzyme-dropdown-2",
+        "msfragger.num_enzyme_termini",
+        "msfragger.precursor_mass_lower",
+        "msfragger.precursor_mass_mode",
+        "msfragger.precursor_mass_units",
+        "msfragger.precursor_mass_upper",
+        "msfragger.precursor_true_tolerance",
+        "msfragger.precursor_true_units",
+        "msfragger.search_enzyme_cut_1",
+        "msfragger.search_enzyme_cut_2",
+        "msfragger.search_enzyme_name_1",
+        "msfragger.search_enzyme_name_2",
+        "msfragger.search_enzyme_nocut_1",
+        "msfragger.search_enzyme_nocut_2",
+        "msfragger.search_enzyme_sense_1",
+        "msfragger.search_enzyme_sense_2",
+    }
+)
+_ENZYME_DROPDOWN_ALIASES = {
+    "argc": "argc",
+    "arg-c": "argc",
+    "arg c": "argc",
+    "aspn": "aspn",
+    "asp-n": "aspn",
+    "asp n": "aspn",
+    "lysc": "lysc",
+    "lys-c": "lysc",
+    "lys c": "lysc",
+    "stricttrypsin": "stricttrypsin",
+    "strict trypsin": "stricttrypsin",
+    "trypsin": "stricttrypsin",
+}
 
 
 def _parse_tolerance(value: Any) -> tuple[str, str] | None:
@@ -21,6 +83,32 @@ def _parse_tolerance(value: Any) -> tuple[str, str] | None:
     return amount, "1" if unit == "ppm" else "0"
 
 
+def _parse_nonnegative_int_hint(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value >= 0 and value.is_integer() else None
+
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        numeric = float(text)
+    except ValueError:
+        numeric = None
+    if numeric is not None:
+        return int(numeric) if numeric >= 0 and numeric.is_integer() else None
+
+    matches = [int(match.group(0)) for match in re.finditer(r"\d+", text)]
+    if not matches:
+        return None
+    return max(matches)
+
+
 def _upsert_workflow_value(lines: list[str], key: str, value: Any) -> None:
     prefix = f"{key}="
     rendered = f"{key}={value}"
@@ -29,6 +117,16 @@ def _upsert_workflow_value(lines: list[str], key: str, value: Any) -> None:
             lines[index] = rendered
             return
     lines.append(rendered)
+
+
+def _configured_fragpipe_ram_gb() -> int | None:
+    raw = os.getenv("AGENT_FRAGPIPE_RAM_GB", "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return None
 
 
 def _search_hint_overrides(attributes: AttributeSet) -> dict[str, Any]:
@@ -61,14 +159,109 @@ def _search_hint_overrides(attributes: AttributeSet) -> dict[str, Any]:
         overrides["msfragger.fragment_mass_units"] = unit
 
     missed = hints.get("missed_cleavages")
-    if missed not in (None, ""):
-        overrides["msfragger.allowed_missed_cleavage_1"] = int(missed)
+    missed_value = _parse_nonnegative_int_hint(missed)
+    if missed_value is not None:
+        overrides["msfragger.allowed_missed_cleavage_1"] = missed_value
     return overrides
+
+
+def _render_workflow_override_value(value: Any) -> str | None:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float):
+        return str(value)
+    if isinstance(value, str):
+        rendered = value.strip()
+        if "\n" in rendered or "\r" in rendered:
+            return None
+        return rendered
+    return None
+
+
+def _iter_workflow_override_items(raw: Any):
+    if isinstance(raw, Mapping):
+        yield from raw.items()
+        return
+    if isinstance(raw, list | tuple):
+        for item in raw:
+            if not isinstance(item, Mapping):
+                continue
+            key = item.get("key") or item.get("name") or item.get("parameter")
+            if "value" not in item:
+                continue
+            yield key, item.get("value")
+
+
+def _workflow_parameter_overrides(attributes: AttributeSet) -> dict[str, str]:
+    hints = attributes.search_parameter_hints.value
+    if not isinstance(hints, dict):
+        return {}
+
+    overrides: dict[str, str] = {}
+    for hint_key in _WORKFLOW_OVERRIDE_HINT_KEYS:
+        raw = hints.get(hint_key)
+        if raw in (None, ""):
+            continue
+        for key, value in _iter_workflow_override_items(raw):
+            key_text = str(key or "").strip()
+            if not key_text:
+                continue
+            if not _WORKFLOW_OVERRIDE_KEY_RE.match(key_text):
+                continue
+            if not key_text.startswith(_ALLOWED_WORKFLOW_OVERRIDE_PREFIXES):
+                continue
+            if key_text not in _ALLOWED_WORKFLOW_OVERRIDE_KEYS:
+                continue
+            rendered = _render_workflow_override_value(value)
+            if rendered is None:
+                continue
+            overrides[key_text] = rendered
+    _sync_enzyme_dropdown_overrides(overrides)
+    return overrides
+
+
+def _enzyme_dropdown_value(enzyme_name: Any) -> str | None:
+    rendered = _render_workflow_override_value(enzyme_name)
+    if not rendered or rendered == "null":
+        return None
+    normalized = re.sub(r"[^a-z0-9]+", "", rendered.lower())
+    for alias, value in _ENZYME_DROPDOWN_ALIASES.items():
+        if re.sub(r"[^a-z0-9]+", "", alias.lower()) == normalized:
+            return value
+    return None
+
+
+def _sync_enzyme_dropdown_overrides(overrides: dict[str, str]) -> None:
+    for slot in ("1", "2"):
+        name_key = f"msfragger.search_enzyme_name_{slot}"
+        dropdown_key = f"msfragger.misc.fragger.enzyme-dropdown-{slot}"
+        if name_key not in overrides or dropdown_key in overrides:
+            continue
+        dropdown = _enzyme_dropdown_value(overrides[name_key])
+        if dropdown is not None:
+            overrides[dropdown_key] = dropdown
+
+
+def _detected_known_enzymes(normalized: str, enzyme_text: str) -> set[str]:
+    detected: set[str] = set()
+    if "aspn" in normalized:
+        detected.add("aspn")
+    if "argc" in normalized:
+        detected.add("argc")
+    if "lysc" in normalized:
+        detected.add("lysc")
+    if "trypsin" in enzyme_text:
+        detected.add("trypsin")
+    return detected
 
 
 def _enzyme_overrides(attributes: AttributeSet) -> dict[str, Any]:
     enzyme = str(attributes.enzyme.value or "").lower()
     normalized = re.sub(r"[^a-z0-9]+", "", enzyme)
+    if len(_detected_known_enzymes(normalized, enzyme)) > 1:
+        return {}
     if "aspn" in normalized:
         return {
             "msfragger.search_enzyme_name_1": "aspn",
@@ -85,7 +278,7 @@ def _enzyme_overrides(attributes: AttributeSet) -> dict[str, Any]:
             "msfragger.search_enzyme_sense_1": "C",
             "msfragger.misc.fragger.enzyme-dropdown-1": "argc",
         }
-    if "lys" in enzyme and "c" in enzyme:
+    if "lysc" in normalized:
         return {
             "msfragger.search_enzyme_name_1": "lysc",
             "msfragger.search_enzyme_cut_1": "K",
@@ -188,6 +381,19 @@ def _modification_overrides(attributes: AttributeSet) -> dict[str, Any]:
     return overrides
 
 
+def _is_isobaric_label_workflow(source: Path) -> bool:
+    workflow_name = source.name.lower()
+    return "tmt" in workflow_name or "itraq" in workflow_name
+
+
+def _quantitation_overrides(source: Path) -> dict[str, Any]:
+    if not _is_isobaric_label_workflow(source):
+        return {}
+    return {
+        "tmtintegrator.run-tmtintegrator": "false",
+    }
+
+
 def materialize_workflow_with_attributes(
     source: Path,
     destination: Path,
@@ -196,10 +402,18 @@ def materialize_workflow_with_attributes(
     lines = source.read_text(encoding="utf-8").splitlines()
     for key, value in _enzyme_overrides(attributes).items():
         _upsert_workflow_value(lines, key, value)
-    for key, value in _modification_overrides(attributes).items():
-        _upsert_workflow_value(lines, key, value)
+    if not _is_isobaric_label_workflow(source):
+        for key, value in _modification_overrides(attributes).items():
+            _upsert_workflow_value(lines, key, value)
     for key, value in _search_hint_overrides(attributes).items():
         _upsert_workflow_value(lines, key, value)
+    for key, value in _workflow_parameter_overrides(attributes).items():
+        _upsert_workflow_value(lines, key, value)
+    for key, value in _quantitation_overrides(source).items():
+        _upsert_workflow_value(lines, key, value)
+    ram_gb = _configured_fragpipe_ram_gb()
+    if ram_gb is not None:
+        _upsert_workflow_value(lines, "workflow.ram", ram_gb)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return destination

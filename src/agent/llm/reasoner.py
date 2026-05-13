@@ -15,6 +15,19 @@ from agent.models import AttributeSet, AttributeValue, ProjectContext
 ReportFn = Callable[[Any], None]
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_write(text: str) -> None:
+    if not _env_flag("AGENT_LLM_DEBUG"):
+        return
+    import sys
+
+    sys.stderr.write(text)
+    sys.stderr.flush()
+
+
 class LLMReasoner(Protocol):
     def confirm_search_parameters(
         self,
@@ -169,7 +182,13 @@ def _no_sdrf_attribute_prompt(context: ProjectContext, attributes: AttributeSet)
         "fixed_mods, variable_mods, fractionation_hint, search_parameter_hints.\n\n"
         "search_parameter_hints.value 必须包含: missed_cleavages, precursor_tol, fragment_tol, "
         "min_peaks, max_variable_mods, data_family, "
-        "recommended_workflow_name, recommended_fasta_name, recommended_fasta_url, recommended_fasta_source.\n\n"
+        "recommended_workflow_name, recommended_fasta_name, recommended_fasta_url, recommended_fasta_source, "
+        "workflow_parameter_overrides.\n"
+        "workflow_parameter_overrides: object；仅填写需要写入所选 workflow 的 msfragger.* 参数；不需要微调时返回 {}。\n"
+        "常用可调 key: msfragger.allowed_missed_cleavage_1, msfragger.misc.fragger.digest-mass-lo, msfragger.misc.fragger.digest-mass-hi, "
+        "msfragger.search_enzyme_name_1/2, msfragger.search_enzyme_cut_1/2, msfragger.search_enzyme_sense_1/2, msfragger.num_enzyme_termini。\n"
+        "多酶切时必须显式微调 workflow 酶切参数。例如 Trypsin + Arg-C：slot 1 保持 stricttrypsin/KR/C，slot 2 设置 Arg-C/R/C，"
+        "msfragger.num_enzyme_termini=2；有依据时可将 missed cleavages 调到 3-4，并收紧 digest mass/length 范围。\n\n"
         "## DDA/DIA 判断（最关键）\n\n"
         "你必须根据以下信息判断数据采集模式（acquisition_mode）是 DDA 还是 DIA：\n\n"
         "### 判断依据\n"
@@ -243,6 +262,7 @@ def _no_sdrf_attribute_prompt(context: ProjectContext, attributes: AttributeSet)
         "## 输出要求\n"
         "- acquisition_mode: 'DDA' 或 'DIA'（必须明确）\n"
         "- recommended_workflow_name: 必须从上述列表中选择，格式如 'Default.workflow'\n"
+        "- workflow_parameter_overrides: 必须放在 search_parameter_hints.value 中，使用精确 FragPipe key，例如 msfragger.search_enzyme_name_2。\n"
         "- Use source='llm_confirmed'. Prefer normalized values. Do not invent unsupported values.\n\n"
         f"Project context:\n{_metadata_context_text(context)}\n\n"
         f"Current attributes:\n{json.dumps(current, ensure_ascii=False)}"
@@ -258,7 +278,13 @@ def _sdrf_attribute_prompt(context: ProjectContext, attributes: AttributeSet) ->
         "fixed_mods, variable_mods, fractionation_hint, search_parameter_hints.\n\n"
         "search_parameter_hints.value 必须包含: missed_cleavages, precursor_tol, fragment_tol, "
         "min_peaks, max_variable_mods, data_family, "
-        "recommended_workflow_name, recommended_fasta_name, recommended_fasta_url, recommended_fasta_source.\n\n"
+        "recommended_workflow_name, recommended_fasta_name, recommended_fasta_url, recommended_fasta_source, "
+        "workflow_parameter_overrides.\n"
+        "workflow_parameter_overrides: object；仅填写需要写入所选 workflow 的 msfragger.* 参数；不需要微调时返回 {}。\n"
+        "常用可调 key: msfragger.allowed_missed_cleavage_1, msfragger.misc.fragger.digest-mass-lo, msfragger.misc.fragger.digest-mass-hi, "
+        "msfragger.search_enzyme_name_1/2, msfragger.search_enzyme_cut_1/2, msfragger.search_enzyme_sense_1/2, msfragger.num_enzyme_termini。\n"
+        "多酶切时必须显式微调 workflow 酶切参数。例如 Trypsin + Arg-C：slot 1 保持 stricttrypsin/KR/C，slot 2 设置 Arg-C/R/C，"
+        "msfragger.num_enzyme_termini=2；有依据时可将 missed cleavages 调到 3-4，并收紧 digest mass/length 范围。\n\n"
         "## DDA/DIA 判断（最关键）\n\n"
         "你必须根据 SDRF 行中的信息判断数据采集模式（acquisition_mode）是 DDA 还是 DIA：\n\n"
         "### 判断依据\n"
@@ -299,6 +325,7 @@ def _sdrf_attribute_prompt(context: ProjectContext, attributes: AttributeSet) ->
         "## 输出要求\n"
         "- acquisition_mode: 'DDA' 或 'DIA'（必须明确）\n"
         "- recommended_workflow_name: 必须从上述列表中选择\n"
+        "- workflow_parameter_overrides: 必须放在 search_parameter_hints.value 中，使用精确 FragPipe key，例如 msfragger.search_enzyme_name_2。\n"
         "- Use source='llm_confirmed'. Prefer normalized values over raw NT=/AC= strings.\n"
         "- Do not invent parameters not grounded in SDRF rows or metadata.\n\n"
         f"Project context:\n{_metadata_context_text(context, include_project_files=False)}\n\n"
@@ -343,7 +370,6 @@ class OpenAICompatibleReasoner:
         raise RuntimeError("大模型请求失败：未收到 HTTP 响应。")
 
     def _stream_chat_completion(self, payload: dict[str, Any], report: Callable | None = None) -> str:
-        import sys
         # 暂停 spinner，避免 \r 覆盖流式输出
         if report is not None:
             report({"kind": "activity_stop", "message": ""})
@@ -354,8 +380,7 @@ class OpenAICompatibleReasoner:
         for attempt in range(3):
             full_content = ""
             full_reasoning = ""
-            sys.stderr.write(f"[调试] 开始流式请求 attempt={attempt+1}, model={self.model}, timeout={self.timeout}s\n")
-            sys.stderr.flush()
+            _debug_write(f"[调试] 开始流式请求 attempt={attempt+1}, model={self.model}, timeout={self.timeout}s\n")
             try:
                 with httpx.stream(
                     "POST",
@@ -364,8 +389,7 @@ class OpenAICompatibleReasoner:
                     json=stream_payload,
                     timeout=stream_timeout,
                 ) as response:
-                    sys.stderr.write(f"[调试] 已连接, status={response.status_code}\n")
-                    sys.stderr.flush()
+                    _debug_write(f"[调试] 已连接, status={response.status_code}\n")
                     response.raise_for_status()
                     for line in response.iter_lines():
                         if not line or not line.startswith("data: "):
@@ -380,29 +404,24 @@ class OpenAICompatibleReasoner:
                             content = delta.get("content", "")
                             if reasoning:
                                 full_reasoning += reasoning
-                                sys.stderr.write(f"\033[90m{reasoning}\033[0m")
-                                sys.stderr.flush()
+                                _debug_write(f"\033[90m{reasoning}\033[0m")
                             if content:
                                 full_content += content
-                                sys.stderr.write(content)
-                                sys.stderr.flush()
+                                _debug_write(content)
                         except (json.JSONDecodeError, KeyError, IndexError):
                             continue
                 if full_reasoning or full_content:
-                    sys.stderr.write("\n")
-                    sys.stderr.flush()
+                    _debug_write("\n")
                 return full_content
             except httpx.HTTPStatusError as exc:
                 last_error = exc
                 if exc.response.status_code < 500:
                     raise
-                sys.stderr.write(f"\n[重试 {attempt+1}/3] 服务器错误 {exc.response.status_code}，重试中...\n")
-                sys.stderr.flush()
+                _debug_write(f"\n[重试 {attempt+1}/3] 服务器错误 {exc.response.status_code}，重试中...\n")
                 time.sleep(2)
             except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
                 last_error = exc
-                sys.stderr.write(f"\n[重试 {attempt+1}/3] 请求超时，重试中...\n")
-                sys.stderr.flush()
+                _debug_write(f"\n[重试 {attempt+1}/3] 请求超时，重试中...\n")
                 time.sleep(2)
         if last_error is not None:
             raise last_error
@@ -413,11 +432,9 @@ class OpenAICompatibleReasoner:
         context: ProjectContext,
         attributes: AttributeSet,
     ) -> Mapping[str, AttributeValue]:
-        import sys
         prompt = _sdrf_attribute_prompt(context, attributes) if context.sdrf_rows else _no_sdrf_attribute_prompt(context, attributes)
-        sys.stderr.write(f"\n[调试] prompt 长度={len(prompt)} 字符\n")
-        sys.stderr.write(f"[调试] prompt 内容:\n{'='*60}\n{prompt}\n{'='*60}\n")
-        sys.stderr.flush()
+        _debug_write(f"\n[调试] prompt 长度={len(prompt)} 字符\n")
+        _debug_write(f"[调试] prompt 内容:\n{'='*60}\n{prompt}\n{'='*60}\n")
         payload: dict[str, Any] = {
             "model": self.model,
             "response_format": {"type": "json_object"},
@@ -441,8 +458,7 @@ class OpenAICompatibleReasoner:
         try:
             content = self._stream_chat_completion(payload)
         except httpx.HTTPStatusError as exc:
-            sys.stderr.write(f"[调试] JSON模式失败 status={exc.response.status_code}, 尝试无JSON模式\n")
-            sys.stderr.flush()
+            _debug_write(f"[调试] JSON模式失败 status={exc.response.status_code}, 尝试无JSON模式\n")
             if exc.response.status_code < 500:
                 raise
             fallback_payload = dict(payload)
@@ -509,7 +525,7 @@ def confirm_no_sdrf_parameters(
             "必须配置大模型 API 才能运行。未找到 SDRF 行时需要大模型推断搜库参数。\n"
             "请设置环境变量 AGENT_LLM_API_KEY。\n"
             "示例配置：\n"
-            "  AGENT_LLM_API_KEY=your_api_key\n"
+            "  AGENT_LLM_API_KEY=your_deepseek_api_key\n"
             "  AGENT_LLM_BASE_URL=https://api.deepseek.com\n"
             "  AGENT_LLM_MODEL=deepseek-v4-flash"
         )
@@ -528,8 +544,17 @@ def confirm_no_sdrf_parameters(
         return _mark_no_sdrf_llm_blocked(attributes, reason)
     merged = attributes.model_dump()
     # LLM 可能返回 search_parameter_hints 子字段作为顶层 key
-    _hint_keys = {"recommended_workflow_name", "recommended_fasta_name", "recommended_fasta_url",
-                  "recommended_fasta_source", "workflow_rationale", "database"}
+    _hint_keys = {
+        "recommended_workflow_name",
+        "recommended_fasta_name",
+        "recommended_fasta_url",
+        "recommended_fasta_source",
+        "workflow_rationale",
+        "workflow_parameter_overrides",
+        "fragpipe_workflow_overrides",
+        "msfragger_parameter_overrides",
+        "database",
+    }
     extra_hints: dict[str, Any] = {}
     for key in _hint_keys:
         if key in updates and key not in AttributeSet.model_fields:
@@ -582,7 +607,7 @@ def confirm_sdrf_parameters(
             "必须配置大模型 API 才能运行。有 SDRF 行时需要大模型汇总 workflow 属性。\n"
             "请设置环境变量 AGENT_LLM_API_KEY。\n"
             "示例配置：\n"
-            "  AGENT_LLM_API_KEY=your_api_key\n"
+            "  AGENT_LLM_API_KEY=your_deepseek_api_key\n"
             "  AGENT_LLM_BASE_URL=https://api.deepseek.com\n"
             "  AGENT_LLM_MODEL=deepseek-v4-flash"
         )
@@ -601,8 +626,17 @@ def confirm_sdrf_parameters(
 
     merged = attributes.model_dump()
     # LLM 可能返回 search_parameter_hints 子字段（如 recommended_workflow_name）作为顶层 key
-    _hint_keys = {"recommended_workflow_name", "recommended_fasta_name", "recommended_fasta_url",
-                  "recommended_fasta_source", "workflow_rationale", "database"}
+    _hint_keys = {
+        "recommended_workflow_name",
+        "recommended_fasta_name",
+        "recommended_fasta_url",
+        "recommended_fasta_source",
+        "workflow_rationale",
+        "workflow_parameter_overrides",
+        "fragpipe_workflow_overrides",
+        "msfragger_parameter_overrides",
+        "database",
+    }
     extra_hints: dict[str, Any] = {}
     for key in _hint_keys:
         if key in updates and key not in AttributeSet.model_fields:

@@ -73,6 +73,20 @@ def test_docker_runner_maps_container_runs_path_for_host_docker(monkeypatch, tmp
     assert f"{host_runs.resolve() / 'task_out'}:/workspace" in cmd
 
 
+def test_docker_runner_passes_fragpipe_java_heap_to_converter_container(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("AGENT_FRAGPIPE_RAM_GB", "6")
+    task_root = tmp_path / "task_out"
+    task_root.mkdir(parents=True)
+    config_path = task_root / "converter_config.docker.json"
+    config_path.write_text("{}", encoding="utf-8")
+
+    runner = DockerMSDTConverterRunner(image="guomics2017/msdt-converter:v1.3")
+    cmd = runner.build_command(SimpleNamespace(task_root=task_root, converter_config_path=config_path))
+
+    assert "-e" in cmd
+    assert "_JAVA_OPTIONS=-Xmx6G" in cmd
+
+
 def test_docker_runner_writes_container_compatible_config(tmp_path: Path):
     task_root = tmp_path / "task_out"
     task_root.mkdir(parents=True, exist_ok=True)

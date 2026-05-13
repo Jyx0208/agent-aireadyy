@@ -303,7 +303,7 @@ runs\<task>\
 - 推荐 FASTA 名称、来源和下载 URL，例如 UniProt proteome。
 - 在缺少明确 FASTA 时，基于物种推荐常用 UniProt proteome。
 
-如果没有设置 `AGENT_LLM_API_KEY`，程序仍会尽量使用规则和 PRIDE 元数据，但 FASTA/参数推断会更保守。
+CLI 流水线**必须**配置 `AGENT_LLM_API_KEY` 才能运行；未配置时 `start.ps1` 会直接报错退出，`python -m agent.cli ...` 也会抛 `ValueError`。Web 模式不从 `.env` 读 API Key，每次提交任务时在页面上填写。
 
 ## FASTA 选择逻辑
 

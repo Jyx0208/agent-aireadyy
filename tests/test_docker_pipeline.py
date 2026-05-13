@@ -111,6 +111,10 @@ def test_run_pride_dda_msdt_docker_executes_runner(tmp_path: Path, monkeypatch):
 
         def run(self, bundle):
             called["bundle"] = bundle
+            bundle.plan.rawspectrum_output_path.parent.mkdir(parents=True, exist_ok=True)
+            bundle.plan.rawspectrum_output_path.write_text("rawspectrum", encoding="utf-8")
+            bundle.plan.expected_pin_path.parent.mkdir(parents=True, exist_ok=True)
+            bundle.plan.expected_pin_path.write_text("pin", encoding="utf-8")
             bundle.plan.output_paths["fp_msdt"].parent.mkdir(parents=True, exist_ok=True)
             pd.DataFrame({"scan": [1], "label": ["PEPTIDE"]}).to_parquet(bundle.plan.output_paths["fp_msdt"])
             return subprocess.CompletedProcess(args=["docker"], returncode=0, stdout="ok", stderr="")
@@ -202,7 +206,7 @@ def test_run_pride_dda_msdt_docker_marks_failed_when_msdt_output_missing(tmp_pat
     )
 
     assert manifest.status == "failed"
-    assert any("MSDT output missing" in note for note in manifest.notes)
+    assert any("Missing required output" in note and "MSDT parquet" in note for note in manifest.notes)
 
 
 def test_docker_runner_uses_materialized_workflow_path_in_config(tmp_path: Path):

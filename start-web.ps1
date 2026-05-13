@@ -1,0 +1,17 @@
+param(
+    [int]$Port = 8000,
+    [string]$Host = "127.0.0.1",
+    [switch]$UseConda,
+    [string]$CondaEnvName = "agent-aiready"
+)
+
+$ErrorActionPreference = "Stop"
+$RepoRoot = $PSScriptRoot
+Set-Location $RepoRoot
+
+$ArgsForWeb = @("-Port", $Port, "-Host", $Host)
+if ($UseConda) {
+    $ArgsForWeb += @("-UseConda", "-CondaEnvName", $CondaEnvName)
+}
+
+& (Join-Path $RepoRoot "scripts\run_web.ps1") @ArgsForWeb

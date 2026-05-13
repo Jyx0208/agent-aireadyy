@@ -163,3 +163,25 @@ def test_infer_attributes_marks_instrument_ambiguous_when_project_has_multiple_i
     assert attrs.instrument_name.conflict_flag is True
     assert attrs.instrument_family.conflict_flag is True
     assert attrs.instrument_family.value == "unknown"
+
+
+def test_infer_attributes_uses_cid_file_name_to_disambiguate_orbitrap_project_instruments():
+    context = ProjectContext(
+        project_accession="PXD000900",
+        file_name="HeLa_ArgC-Try_CID_1.raw",
+        metadata={
+            "instruments": MetadataValue(
+                value=["LTQ Orbitrap Elite", "Q Exactive"],
+                source="pride.instruments",
+                source_level="project",
+                completeness=1.0,
+            ),
+        },
+    )
+
+    attrs = infer_attributes(context)
+
+    assert attrs.instrument_name.value == "LTQ Orbitrap Elite"
+    assert attrs.instrument_name.source == "file_name_instrument_rule"
+    assert attrs.instrument_name.conflict_flag is False
+    assert attrs.instrument_family.value == "orbitrap"

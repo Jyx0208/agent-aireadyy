@@ -1,6 +1,8 @@
 param(
     [switch]$NoDev,
 
+    [switch]$Web,
+
     [switch]$UseConda,
 
     [string]$CondaEnvName = "agent-aiready",
@@ -64,11 +66,21 @@ Write-Host "Upgrading pip"
 & $Python -m pip install -U pip
 
 if ($NoDev) {
-    Write-Host "Installing package"
-    & $Python -m pip install .
+    if ($Web) {
+        Write-Host "Installing package with web dependencies"
+        & $Python -m pip install ".[web]"
+    } else {
+        Write-Host "Installing package"
+        & $Python -m pip install .
+    }
 } else {
-    Write-Host "Installing package with dev dependencies"
-    & $Python -m pip install -e ".[dev]"
+    if ($Web) {
+        Write-Host "Installing package with dev and web dependencies"
+        & $Python -m pip install -e ".[dev,web]"
+    } else {
+        Write-Host "Installing package with dev dependencies"
+        & $Python -m pip install -e ".[dev]"
+    }
 }
 
 Write-Host "Checking CLI import"

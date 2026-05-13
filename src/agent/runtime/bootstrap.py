@@ -39,5 +39,9 @@ def bootstrap_msdt_converter_from_zip(zip_bytes: bytes, destination: str | Path)
     final_root = destination / "MSDT-Converter"
     if final_root.exists():
         shutil.rmtree(final_root)
-    temp_extract_dir.rename(final_root)
+    try:
+        temp_extract_dir.replace(final_root)
+    except OSError:
+        shutil.copytree(temp_extract_dir, final_root)
+        shutil.rmtree(temp_extract_dir, ignore_errors=True)
     return final_root

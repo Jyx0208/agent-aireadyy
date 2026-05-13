@@ -38,6 +38,19 @@ class DockerMSDTConverterRunner:
     def _sage_search_result_path(self, bundle: MaterializedTaskBundle) -> Path:
         return self._sage_workdir(bundle) / f"{bundle.plan.source_data_path.stem}_search_result.tsv"
 
+    @staticmethod
+    def _fragpipe_java_options() -> str | None:
+        raw = os.getenv("AGENT_FRAGPIPE_RAM_GB", "").strip()
+        if not raw:
+            return None
+        try:
+            ram_gb = int(raw)
+        except ValueError:
+            return None
+        if ram_gb <= 0:
+            return None
+        return f"-Xmx{ram_gb}G"
+
     def write_container_config(self, bundle: MaterializedTaskBundle) -> Path:
         is_mgf = bundle.plan.raw_data_type == "mgf"
         is_mzml = bundle.plan.raw_data_type == "mzml"
@@ -121,7 +134,7 @@ class DockerMSDTConverterRunner:
 
     def build_command(self, bundle: MaterializedTaskBundle) -> list[str]:
         task_root = docker_host_mount_path(bundle.task_root)
-        container_config_path = f"/workspace/{bundle.converter_config_path.name}"
+        container_config_path = self._container_path(bundle, bundle.converter_config_path)
         command = [
             "docker",
             "run",
@@ -131,6 +144,9 @@ class DockerMSDTConverterRunner:
             "-e",
             f"TZ={os.getenv('AGENT_MSDT_DOCKER_TZ') or os.getenv('TZ') or 'Asia/Shanghai'}",
         ]
+        java_options = self._fragpipe_java_options()
+        if java_options:
+            command.extend(["-e", f"_JAVA_OPTIONS={java_options}"])
         if os.name != "nt" and Path("/etc/localtime").exists():
             command.extend(["-v", "/etc/localtime:/etc/localtime:ro"])
         command.extend(

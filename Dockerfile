@@ -15,6 +15,7 @@ COPY pyproject.toml ./
 COPY README.md ./
 COPY src/ src/
 COPY profiles/ profiles/
+COPY scripts/ scripts/
 
 RUN pip install --no-cache-dir -e ".[web]" fastapi "uvicorn[standard]" python-dotenv
 

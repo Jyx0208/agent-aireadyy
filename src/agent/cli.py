@@ -127,10 +127,10 @@ def _build_reporter(output_dir: Path | None = None) -> ConsoleReporter:
     return ConsoleReporter(log_path=log_path)
 
 
-def _msdt_docker_command(output_dir: Path) -> str:
+def _msdt_docker_command(output_dir: Path, image: str = "guomics2017/msdt-converter:v1.3") -> str:
     return (
         f'docker run --rm -v "{Path(output_dir).resolve()}:/workspace" '
-        "guomics2017/msdt-converter:v1.3 -config /workspace/converter_config.json"
+        f"{image} -config /workspace/converter_config.json"
     )
 
 
@@ -314,7 +314,7 @@ def prepare_pride_msdt_docker_input(
         raise typer.Exit(1)
 
     if no_run:
-        typer.echo(f"输入包已准备完成。手动运行 Docker：{_msdt_docker_command(output_dir)}")
+        typer.echo(f"输入包已准备完成。手动运行 Docker：{_msdt_docker_command(output_dir, image)}")
         return
 
     typer.echo("输入包已准备完成，开始运行 MSDT-Converter Docker...")

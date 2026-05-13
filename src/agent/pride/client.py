@@ -35,7 +35,13 @@ class PrideClient:
         response.raise_for_status()
         return response.json()
 
-    def list_project_files(self, accession: str, keyword: str | None = None, page_size: int = 1000) -> list[dict[str, Any]]:
+    def list_project_files(
+        self,
+        accession: str,
+        keyword: str | None = None,
+        page_size: int = 1000,
+        max_files: int | None = None,
+    ) -> list[dict[str, Any]]:
         # The PRIDE Archive v2 API caps file-list pages at 100 entries even when a
         # larger pageSize is requested, so we page explicitly until the last batch.
         effective_page_size = max(1, min(page_size, 100))
@@ -54,6 +60,8 @@ class PrideClient:
             if not batch:
                 break
             files.extend(batch)
+            if max_files is not None and len(files) >= max_files:
+                return files[:max(0, max_files)]
             if len(batch) < effective_page_size:
                 break
             page += 1
