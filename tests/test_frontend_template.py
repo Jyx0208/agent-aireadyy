@@ -27,6 +27,7 @@ def test_frontend_template_labels_primary_form_controls():
     for control_id in [
         "inputValue",
         "submitter",
+        "repositorySelect",
         "cfgApiKey",
         "cfgBaseUrl",
         "cfgModel",
@@ -56,6 +57,8 @@ def test_frontend_template_exposes_batch_excel_workflow():
     assert 'for="batchInput"' in html
     assert 'id="batchSubmitter"' in html
     assert 'for="batchSubmitter"' in html
+    assert 'id="batchRepository"' in html
+    assert 'for="batchRepository"' in html
     assert 'id="batchJobs"' in html
     assert 'id="batchStartBtn"' in html
     assert "startBatch()" in html
@@ -63,6 +66,38 @@ def test_frontend_template_exposes_batch_excel_workflow():
     assert "downloadBatchAudit" in html
     assert "/api/batches/parameters" in html
     assert "/api/batches/" in html
+
+
+def test_frontend_template_exposes_batch_run_mode_and_resource_policy():
+    html = _html()
+
+    assert 'data-run-mode="prepare"' in html
+    assert 'id="singleResourcePolicy"' in html
+    assert 'for="singleResourcePolicy"' in html
+    assert 'id="batchRunMode"' in html
+    assert 'for="batchRunMode"' in html
+    assert 'id="batchResourcePolicy"' in html
+    assert 'for="batchResourcePolicy"' in html
+    assert "resource_policy:document.getElementById('singleResourcePolicy').value" in html
+    assert "run_mode:document.getElementById('batchRunMode').value" in html
+    assert "resource_policy:document.getElementById('batchResourcePolicy').value" in html
+    assert "runPreflight(payload)" in html
+    assert "/api/preflight" in html
+    assert "Prepare input package" in html
+
+
+def test_frontend_template_exposes_repository_selection_for_single_and_batch():
+    html = _html()
+
+    assert 'id="repositorySelect"' in html
+    assert 'id="batchRepository"' in html
+    assert 'value="auto"' in html
+    assert 'value="pride"' in html
+    assert 'value="massive"' in html
+    assert 'value="iprox"' in html
+    assert "repository:document.getElementById('repositorySelect').value" in html
+    assert "repository:document.getElementById('batchRepository').value" in html
+    assert "repositoryLabel" in html
 
 
 def test_frontend_template_uses_workflow_tabs_and_status_cards():

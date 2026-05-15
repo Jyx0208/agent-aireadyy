@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import json
 from pathlib import Path
 from typing import Any
 
@@ -15,13 +16,19 @@ from agent.ai_ready.exporter import export_ai_ready_bundle
 from agent.assets.preparer import AssetPreparationError
 from agent.execution.bundle import materialize_dda_task_bundle
 from agent.input.normalizer import normalize_input, safe_output_stem
+from agent.oneclick.preflight import normalize_run_mode, run_preflight
 from agent.orchestrator.pipeline import AgentService, ReviewRequiredError
 from agent.progress import render_download_progress
+from agent.repositories.registry import RepositoryRegistry
 from agent.runtime.bootstrap import bootstrap_msdt_converter
 from agent.runtime.toolchain import detect_toolchain
 from agent.utils import write_json
 
 app = typer.Typer(help="PRIDE-first AI-ready data agent aligned with MSDT-Converter.")
+
+
+def json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2)
 
 class ConsoleReporter:
     def __init__(self, log_path: Path | None = None) -> None:
@@ -158,6 +165,64 @@ def resolve_project(input_value: str) -> None:
     typer.echo(resolution.model_dump_json(indent=2))
 
 
+@app.command("resolve-dataset")
+def resolve_dataset(
+    input_value: str,
+    repository: str = typer.Option("auto", "--repository", "-r", help="Repository: auto, pride, massive, or iprox."),
+) -> None:
+    registry = RepositoryRegistry()
+    adapter = registry.choose(repository, input_value)
+    resolution = adapter.resolve_project(input_value)
+    payload: dict[str, Any] = {
+        "repository": adapter.name,
+        "resolution": resolution.model_dump(mode="json"),
+    }
+    if resolution.primary_project:
+        project = adapter.get_project(resolution.primary_project.project_accession)
+        files = adapter.list_project_files(project)
+        payload["project"] = project.model_dump(mode="json")
+        payload["file_count"] = len(files)
+        payload["files_preview"] = [file.model_dump(mode="json") for file in files[:20]]
+    typer.echo(json_dumps(payload))
+
+
+@app.command("sync-repository-index")
+def sync_repository_index(
+    repository: str = typer.Option(..., "--repository", "-r", help="Repository to index. Currently supports iprox."),
+    year: str | None = typer.Option(None, "--year", help="Sync iProX project IDs published in a year, for example 2025."),
+    month: str | None = typer.Option(None, "--month", help="Sync iProX project IDs published in a month, for example 2025-05."),
+    day: str | None = typer.Option(None, "--day", help="Sync iProX project IDs published on a day, for example 2025-05-09."),
+    xml_dir: Path | None = typer.Option(None, "--xml-dir", help="Import local ProteomeXchange XML files into the repository index."),
+    limit: int | None = typer.Option(None, "--limit", help="Limit the number of remote projects to index."),
+) -> None:
+    registry = RepositoryRegistry()
+    adapter = registry.get(repository)
+    if repository != "iprox":
+        raise typer.BadParameter("sync-repository-index currently supports iProX only.")
+
+    reporter = _build_reporter()
+    if xml_dir is not None:
+        xml_paths = sorted(path for path in xml_dir.glob("*.xml") if path.is_file())
+        if not xml_paths:
+            raise typer.BadParameter(f"No XML files found in {xml_dir}.")
+        sync_from_xml = getattr(adapter, "sync_index_from_xml_files", None)
+        if sync_from_xml is None:
+            raise typer.BadParameter("Selected repository does not support XML index import.")
+        summary = sync_from_xml(xml_paths, report=reporter)
+        typer.echo(json_dumps(summary))
+        return
+
+    selected = [(name, value) for name, value in (("year", year), ("month", month), ("day", day)) if value]
+    if len(selected) != 1:
+        raise typer.BadParameter("Provide exactly one of --xml-dir, --year, --month, or --day.")
+    sync_by_date = getattr(adapter, "sync_index_by_date", None)
+    if sync_by_date is None:
+        raise typer.BadParameter("Selected repository does not support date index sync.")
+    granularity, value = selected[0]
+    summary = sync_by_date(granularity, value, limit=limit, report=reporter)
+    typer.echo(json_dumps(summary))
+
+
 @app.command("infer-attributes")
 def infer_attributes(input_value: str) -> None:
     service = AgentService(reporter=_build_reporter())
@@ -272,6 +337,49 @@ def prepare_msdt_docker_input(input_value: str, source_data_path: Path, output_d
     typer.echo(f"请使用下面的命令运行 MSDT-Converter Docker：{_msdt_docker_command(output_dir)}")
 
 
+@app.command("prepare-repository-msdt-docker-input")
+def prepare_repository_msdt_docker_input(
+    input_value: str,
+    output_dir: Path | None = typer.Argument(None, help="Output directory. Auto-generated from input file name if not specified."),
+    repository: str = typer.Option("auto", "--repository", "-r", help="Repository: auto, pride, massive, or iprox."),
+    reviewed_fasta_path: Path | None = typer.Option(None, help="Human-reviewed local FASTA path to use instead of inferred/default FASTA."),
+    reviewed_fasta_url: str | None = typer.Option(None, help="Human-reviewed FASTA URL to download and use."),
+    no_run: bool = typer.Option(False, "--no-run", help="Only prepare input, do not run Docker."),
+    image: str = typer.Option("guomics2017/msdt-converter:v1.3", help="Docker image for MSDT-Converter."),
+) -> None:
+    if output_dir is None:
+        output_dir = Path("runs") / safe_output_stem(input_value)
+    service = AgentService(reporter=_build_reporter(output_dir))
+    task = normalize_input(input_value)
+    try:
+        bundle, _, _ = service.prepare_repository_msdt_docker_input(
+            task=task,
+            output_dir=output_dir,
+            repository=repository,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+        )
+    except (AssetPreparationError, ReviewRequiredError):
+        typer.echo(_review_message(output_dir), err=True)
+        raise typer.Exit(1)
+
+    if no_run:
+        typer.echo(f"Input package is ready. Run Docker manually: {_msdt_docker_command(output_dir, image)}")
+        return
+
+    typer.echo("Input package is ready; starting MSDT-Converter Docker...")
+    from agent.msdt_converter.docker_runner import DockerMSDTConverterRunner
+
+    runner = DockerMSDTConverterRunner(image=image, report=service.reporter)
+    docker_result = runner.run(bundle)
+    if docker_result.returncode == 0:
+        typer.echo("MSDT-Converter Docker completed.")
+    else:
+        typer.echo(f"MSDT-Converter Docker failed with return code: {docker_result.returncode}", err=True)
+        typer.echo(docker_result.stderr, err=True)
+        raise typer.Exit(1)
+
+
 @app.command("prepare-pride-msdt-docker-input")
 def prepare_pride_msdt_docker_input(
     input_value: str,
@@ -368,6 +476,98 @@ def _review_message(output_dir: Path) -> str:
         "当前输入包需要人工复核，暂不能运行 MSDT-Converter Docker。"
         f"请查看 {output_dir / 'review_queue.json'} 和 {output_dir / 'task_state.json'}。"
     )
+
+
+@app.command("one-click-run")
+def one_click_run(
+    input_value: str,
+    output_dir: Path | None = typer.Argument(None, help="Output directory. Auto-generated from input file name if not specified."),
+    repository: str = typer.Option("auto", "--repository", "-r", help="Repository: auto, pride, massive, or iprox."),
+    mode: str = typer.Option("full", "--mode", "-m", help="Run mode: parameters, prepare, or full."),
+    resource_policy: str = typer.Option("balanced", "--resource-policy", help="Preflight disk policy: fast, balanced, or conservative."),
+    reviewed_fasta_path: Path | None = typer.Option(None, help="Human-reviewed local FASTA path to use instead of inferred/default FASTA."),
+    reviewed_fasta_url: str | None = typer.Option(None, help="Human-reviewed FASTA URL to download and use."),
+    image: str = typer.Option("guomics2017/msdt-converter:v1.3", help="Docker image for MSDT-Converter."),
+    skip_preflight: bool = typer.Option(False, "--skip-preflight", help="Skip local Docker/disk/iProX preflight checks."),
+) -> None:
+    run_mode = normalize_run_mode(mode)
+    if output_dir is None:
+        output_dir = Path("runs") / safe_output_stem(input_value)
+
+    if not skip_preflight:
+        preflight = run_preflight(
+            inputs=[input_value],
+            run_mode=run_mode,
+            repository=repository,
+            output_root=output_dir.parent,
+            resource_policy=resource_policy,
+        )
+        typer.echo(json_dumps({"preflight": preflight}))
+        if preflight.get("status") == "blocked":
+            raise typer.Exit(1)
+
+    service = AgentService(reporter=_build_reporter(output_dir))
+    task = normalize_input(input_value)
+    try:
+        if run_mode == "parameters":
+            result = service.plan_dda_run_from_repository(
+                task=task,
+                output_dir=output_dir,
+                repository=repository,
+            )
+            service.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
+            if result.plan.needs_review:
+                typer.echo(_review_message(output_dir), err=True)
+                raise typer.Exit(1)
+            typer.echo(
+                json_dumps(
+                    {
+                        "status": "completed",
+                        "mode": run_mode,
+                        "output_dir": str(output_dir),
+                        "workflow": str(result.plan.fragpipe_workflow_path),
+                        "fasta": str(result.plan.fasta_path),
+                    }
+                )
+            )
+            return
+
+        bundle, _, _ = service.prepare_repository_msdt_docker_input(
+            task=task,
+            output_dir=output_dir,
+            repository=repository,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+        )
+    except (AssetPreparationError, ReviewRequiredError):
+        typer.echo(_review_message(output_dir), err=True)
+        raise typer.Exit(1)
+
+    if run_mode == "prepare":
+        typer.echo(
+            json_dumps(
+                {
+                    "status": "completed",
+                    "mode": run_mode,
+                    "output_dir": str(output_dir),
+                    "converter_config": str(bundle.converter_config_path),
+                    "workflow": str(bundle.materialized_workflow_path),
+                    "fasta": str(bundle.materialized_fasta_path),
+                    "docker_command": _msdt_docker_command(output_dir, image),
+                }
+            )
+        )
+        return
+
+    from agent.msdt_converter.docker_runner import DockerMSDTConverterRunner
+
+    runner = DockerMSDTConverterRunner(image=image, report=service.reporter)
+    docker_result = runner.run(bundle)
+    if docker_result.returncode != 0:
+        typer.echo(f"MSDT-Converter Docker failed with return code: {docker_result.returncode}", err=True)
+        typer.echo(docker_result.stderr, err=True)
+        raise typer.Exit(1)
+    typer.echo(json_dumps({"status": "completed", "mode": run_mode, "output_dir": str(output_dir)}))
 
 
 @app.command("run-dda-msdt")

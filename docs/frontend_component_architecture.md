@@ -1,81 +1,89 @@
 # Frontend Component Architecture
 
-## Component Architecture
+## Overview
 
-The current production-minimal frontend is a single HTML template with inline CSS and JavaScript so the release remains easy to unzip and run. The page is organized as a small component system:
+The UI is a single-page operational console built from one HTML template, inline CSS, and inline JavaScript. This keeps deployment simple while still providing a production-grade workflow surface.
 
-- App shell: light operational dashboard header, language switch, server status, and responsive layout.
-- Status cards: high-level queue/history/storage metrics for fast situational awareness.
-- Workflow tabs: explicit switch between single-file runs and batch Excel planning.
-- Single task panel: one PRIDE file, run mode, FASTA preference, and API settings.
-- Batch panel: multiline input, bounded parallelism, batch status, per-item status, and Excel download.
-- Run monitor: stepper, live logs, review panel, blocked issues, result download.
-- History panel: active single-file tasks, retained single-file results, active batch Excel jobs, and completed batch reports with consistent primary actions.
-- Inline alert region: validation and setup problems are announced without browser popups.
+## Component Model
 
-## Props Design
+### App Shell
 
-The inline `UI` helpers act like small view components. Each helper accepts plain data and returns escaped HTML:
+- page header
+- language toggle
+- server health summary
+- responsive content layout
 
-- `UI.emptyState(message)`
-  - `message`: human-readable empty/error state text.
+### Workbench Area
+
+- single-file task panel
+- batch Excel panel
+- preflight summary
+- run control state
+
+### Runtime Area
+
+- stepper
+- live logs
+- review panel
+- blocked issue list
+- result download controls
+
+### History Area
+
+- active tasks
+- retained results
+- batch jobs
+- download actions
+
+## Reusable UI Helpers
+
+The template uses small render helpers instead of a framework. Each helper takes plain data and returns escaped HTML.
+
 - `UI.statusPill(status, label)`
-  - `status`: one of `queued`, `running`, `completed`, `failed`, `blocked`, `needs_review`.
-  - `label`: visible label. Defaults to `status`.
 - `UI.metricCard(label, value, meta)`
-  - `label`: short metric name.
-  - `value`: primary value.
-  - `meta`: secondary explanation.
 - `UI.helperText(title, body)`
-  - `title`: short leading phrase.
-  - `body`: supporting text.
-- `UI.actionButton(label, handler, ariaLabel)`
-  - `label`: visible button label.
-  - `handler`: existing inline click handler string.
-  - `ariaLabel`: accessible label for context-specific actions.
+- `UI.emptyState(message)`
 - `UI.taskRow(item, options)`
-  - `item`: task/history object from the API.
-  - `options.meta`: already formatted secondary text.
-  - `options.actions`: button HTML.
 - `UI.batchItem(item)`
-  - `item.input`: PRIDE file name.
-  - `item.status`: batch item status.
 - `UI.reviewItem(item)`
-  - `item.label`, `item.value`, `item.source`, `item.confidence`, `item.conflict`.
 
-All helpers escape user-visible values before rendering.
+## Accessibility
 
-## Implementation Notes
+- labeled form controls
+- `role="tablist"` / `role="tab"` / `role="tabpanel"`
+- `role="status"` for passive updates
+- `role="alert"` for validation failures
+- `aria-busy` for long-running actions
+- focus-visible states on interactive controls
 
-- The workflow tabs use `role="tablist"`, `role="tab"`, `role="tabpanel"`, `aria-selected`, and `aria-controls`.
-- Form controls have labels, invalid states, and focus-visible outlines.
-- Live status regions use `role="status"` and `aria-live="polite"`.
-- Validation failures use the `formAlert` region with `role="alert"`, `aria-live="assertive"`, and `aria-atomic="true"`.
-- Busy actions use `setButtonBusy`, which sets both `disabled` and `aria-busy`.
-- The layout collapses from dashboard columns to single-column mobile panels under `1100px`, then tightens spacing under `720px`.
-- Batch mode is parameter-only by design, so it avoids RAW downloads, Docker, mzML conversion, and large intermediate outputs.
-- Batch Excel jobs are shown in Project History. Active batches reopen the batch panel for tracking; completed batches expose the Excel download action directly.
-- Project History is rebuilt from `project_history.json`, `task_history.json` files, and batch manifests. The index is written atomically with a `.bak` fallback so refreshes, restarts, and interrupted updates do not leave the panel empty.
+## Responsive Behavior
 
-## Usage Examples
+- desktop: two-column operational layout
+- tablet: stacked workbench and history sections
+- mobile: single-column layout with compact controls
 
-Single file:
+## Interaction Model
 
-1. Choose `Single file`.
-2. Enter one PRIDE file name.
-3. Select `Parameters only` for quick validation or `Full workflow` for execution.
-4. Start the task and monitor logs/review issues.
+### Single-file flow
 
-Batch Excel:
+1. Select repository and run mode.
+2. Run preflight.
+3. Submit task.
+4. Monitor logs and review state.
+5. Download the ZIP if the run is complete.
 
-1. Choose `Batch Excel`.
-2. Paste one file name per line.
-3. Pick a small parallel job count, normally `2-4`.
-4. Click `Run batch Excel`.
-5. Download `benchmark_results.xlsx` when the status turns ready.
+### Batch flow
 
-History:
+1. Paste one file per line.
+2. Select repository, mode, and resource policy.
+3. Run preflight.
+4. Launch the batch.
+5. Watch per-item progress and download the Excel report.
 
-1. Use the right-side history list to return to running, failed, blocked, or completed work.
-2. Use `Inspect` for failures and `Download` when retained result files are available.
-3. Use `Track batch` to reopen an active batch Excel job, or `Download Excel` for a completed report.
+## Production Notes
+
+- Batch mode is intentionally lightweight by default.
+- Parameter-only mode avoids large downloads.
+- Preflight runs before the expensive operations start.
+- The history panel is rebuilt from disk-backed manifests so refreshes do not erase status.
+

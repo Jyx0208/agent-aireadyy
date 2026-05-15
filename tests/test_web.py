@@ -214,6 +214,72 @@ def test_build_review_summary_shows_normalized_plan_fasta_over_raw_llm_name(tmp_
     assert items["recommended_fasta_source"]["source"] == "plan"
 
 
+def test_parameter_audit_records_repository_and_transfer_metadata(tmp_path):
+    result = SimpleNamespace(
+        resolution=SimpleNamespace(
+            primary_project=SimpleNamespace(
+                repository="massive",
+                project_accession="MSV000000001",
+                native_accession="MSV000000001",
+                px_accession="PXD000001",
+                matched_file="raw/sample.raw",
+                match_type="exact",
+                match_score=100,
+            ),
+            needs_review=False,
+        ),
+        context=SimpleNamespace(repository="massive", native_accession="MSV000000001", px_accession="PXD000001"),
+        attributes=SimpleNamespace(
+            acquisition_mode=_value("DDA"),
+            species=_value("Homo sapiens"),
+            instrument_name=_value("Orbitrap"),
+            enzyme=_value("Trypsin"),
+            labeling_strategy=_value("label-free"),
+            fixed_mods=_value(["Carbamidomethyl C"]),
+            variable_mods=_value(["Oxidation M"]),
+            search_parameter_hints=_value({"recommended_workflow_name": "Default.workflow"}),
+        ),
+        asset=SimpleNamespace(
+            repository="massive",
+            original_file_name="sample.raw",
+            matched_project_file="raw/sample.raw",
+            logical_path="raw/sample.raw",
+            resolved_asset_type="raw",
+            download_url="ftp://massive.ucsd.edu/MSV000000001/raw/sample.raw",
+            download_urls=["ftp://massive.ucsd.edu/MSV000000001/raw/sample.raw"],
+            transfer_method="ftp",
+            expected_size_bytes=123,
+            requires_conversion=True,
+        ),
+        plan=SimpleNamespace(
+            source_file_name="sample.raw",
+            source_data_path=tmp_path / "assets" / "prepared" / "sample.mzML",
+            fragpipe_workflow_path=None,
+            fasta_path=tmp_path / "fasta" / "human.fasta",
+            fasta_selection_mode="inferred",
+            fasta_download_url="https://example.test/human.fasta",
+            raw_data_type="mzml",
+            thread_num=2,
+            manifest_path=tmp_path / "fragpipe" / "fragpipe-files.fp-manifest",
+            expected_pin_path=tmp_path / "fragpipe" / "exp" / "sample_edited.pin",
+            output_paths={"fp_msdt": tmp_path / "msdt" / "sample_fp_msdt.parquet"},
+            rawspectrum_output_path=tmp_path / "rawspectrum" / "sample_rawspectrum.parquet",
+            needs_review=False,
+            blocking_issues=[],
+        ),
+    )
+
+    audit = web_app._write_parameter_audit_files(tmp_path, "batch1", 1, "sample.raw", result)
+
+    assert audit["repository"] == "massive"
+    assert audit["project"]["repository"] == "massive"
+    assert audit["project"]["native_accession"] == "MSV000000001"
+    assert audit["project"]["px_accession"] == "PXD000001"
+    assert audit["input"]["logical_path"] == "raw/sample.raw"
+    assert audit["input"]["transfer_method"] == "ftp"
+    assert audit["input"]["download_urls"] == ["ftp://massive.ucsd.edu/MSV000000001/raw/sample.raw"]
+
+
 def test_build_review_summary_includes_user_choices_for_multi_species_and_instruments(tmp_path):
     result = SimpleNamespace(
         attributes=SimpleNamespace(
@@ -471,6 +537,7 @@ def test_create_task_persists_run_mode_and_language(monkeypatch, tmp_path):
                 "input_value": "sample.raw",
                 "submitter": "Alice",
                 "run_mode": "parameters",
+                "resource_policy": "fast",
                 "ui_language": "zh",
                 "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
             }
@@ -480,16 +547,49 @@ def test_create_task_persists_run_mode_and_language(monkeypatch, tmp_path):
     task_id = result.get("task_id")
     try:
         assert result["run_mode"] == "parameters"
+        assert result["resource_policy"] == "fast"
         assert result["ui_language"] == "zh"
         assert _tasks[task_id]["run_mode"] == "parameters"
+        assert _tasks[task_id]["resource_policy"] == "fast"
         assert _tasks[task_id]["ui_language"] == "zh"
         detail = asyncio.run(get_task(task_id))
         assert detail["run_mode"] == "parameters"
+        assert detail["resource_policy"] == "fast"
         assert detail["ui_language"] == "zh"
         history = json.loads((tmp_path / "sample" / "task_history.json").read_text(encoding="utf-8"))
         assert history["run_mode"] == "parameters"
+        assert history["resource_policy"] == "fast"
         assert history["ui_language"] == "zh"
         assert "sk-secret" not in json.dumps(history)
+    finally:
+        if task_id:
+            _tasks.pop(task_id, None)
+
+
+def test_create_task_persists_repository_selection(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr("agent.web.app._check_llm_api", _llm_ok, raising=False)
+    monkeypatch.setattr("agent.web.app._start_pipeline_thread", lambda _task_id: None)
+
+    result = asyncio.run(
+        _create_task_inner(
+            {
+                "input_value": "MSV000000001.raw",
+                "submitter": "Alice",
+                "repository": "massive",
+                "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
+            }
+        )
+    )
+
+    task_id = result.get("task_id")
+    try:
+        assert result["repository"] == "massive"
+        assert _tasks[task_id]["repository"] == "massive"
+        detail = asyncio.run(get_task(task_id))
+        assert detail["repository"] == "massive"
+        history = json.loads((tmp_path / "MSV000000001" / "task_history.json").read_text(encoding="utf-8"))
+        assert history["repository"] == "massive"
     finally:
         if task_id:
             _tasks.pop(task_id, None)
@@ -577,7 +677,7 @@ def test_run_parameter_batch_writes_excel_and_manifest(monkeypatch, tmp_path):
         def __init__(self, **_kwargs):
             self.reporter = _kwargs.get("reporter")
 
-        def plan_dda_run_from_pride(self, task, output_dir, **_kwargs):
+        def plan_dda_run_from_repository(self, task, output_dir, **_kwargs):
             output_dir = Path(output_dir)
             if callable(self.reporter):
                 self.reporter(f"planned {task.file_name}")
@@ -785,8 +885,236 @@ def test_public_batch_record_localizes_english_log_tail_and_events(tmp_path):
     assert not web_app._contains_cjk(visible_text)
 
 
+def test_create_parameter_batch_persists_repository_in_public_record_and_manifest(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr("agent.web.app._check_llm_api", _llm_ok, raising=False)
+    monkeypatch.setattr(web_app, "_start_parameter_batch_thread", lambda _batch_id: None)
+
+    result = asyncio.run(
+        web_app.create_parameter_batch(
+            {
+                "inputs": ["sample.raw"],
+                "submitter": "Alice",
+                "repository": "iprox",
+                "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
+            }
+        )
+    )
+
+    batch_id = result.get("batch_id")
+    try:
+        assert result["repository"] == "iprox"
+        with web_app._batches_lock:
+            batch = dict(web_app._batches[batch_id])
+        assert batch["repository"] == "iprox"
+        manifest = json.loads((Path(batch["output_dir"]) / "batch_manifest.json").read_text(encoding="utf-8"))
+        assert manifest["repository"] == "iprox"
+        assert "llm_config" not in manifest
+    finally:
+        if batch_id:
+            with web_app._batches_lock:
+                web_app._batches.pop(batch_id, None)
+
+
+def test_create_batch_persists_run_mode_and_resource_policy(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr("agent.web.app._run_llm_check", _llm_ok, raising=False)
+    monkeypatch.setattr(web_app, "_start_parameter_batch_thread", lambda _batch_id: None)
+
+    result = asyncio.run(
+        web_app.create_parameter_batch(
+            {
+                "inputs": ["sample.raw"],
+                "submitter": "Alice",
+                "repository": "massive",
+                "run_mode": "prepare",
+                "resource_policy": "conservative",
+                "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
+            }
+        )
+    )
+
+    batch_id = result.get("batch_id")
+    try:
+        assert result["run_mode"] == "prepare"
+        assert result["resource_policy"] == "conservative"
+        with web_app._batches_lock:
+            batch = dict(web_app._batches[batch_id])
+        assert batch["run_mode"] == "prepare"
+        assert batch["resource_policy"] == "conservative"
+        manifest = json.loads((Path(batch["output_dir"]) / "batch_manifest.json").read_text(encoding="utf-8"))
+        assert manifest["run_mode"] == "prepare"
+        assert manifest["resource_policy"] == "conservative"
+    finally:
+        if batch_id:
+            with web_app._batches_lock:
+                web_app._batches.pop(batch_id, None)
+
+
+def test_preflight_endpoint_accepts_single_and_batch_inputs(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_preflight(**kwargs):
+        captured.update(kwargs)
+        return {"status": "ok", "blocking_issues": [], "checks": []}
+
+    monkeypatch.setattr(web_app, "run_preflight", fake_preflight)
+
+    result = asyncio.run(
+        web_app.preflight(
+            {
+                "input_value": "single.raw",
+                "inputs": ["batch.raw"],
+                "repository": "massive",
+                "run_mode": "prepare",
+                "resource_policy": "fast",
+            }
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert captured["inputs"] == ["batch.raw"]
+    assert captured["run_mode"] == "prepare"
+    assert captured["repository"] == "massive"
+    assert captured["resource_policy"] == "fast"
+    assert captured["output_root"] == tmp_path
+
+
+def test_prepare_batch_item_generates_input_package_without_docker_run(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    docker_calls: list[str] = []
+
+    def attr(value):
+        return {"value": value, "confidence": 1.0, "source": "test", "evidence_excerpt": "", "conflict_flag": False}
+
+    class FakeService:
+        def __init__(self, **_kwargs):
+            self.reporter = _kwargs.get("reporter")
+
+        def prepare_repository_msdt_docker_input(self, task, output_dir, **_kwargs):
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            workflow = output_dir / "workflows" / "Default.workflow"
+            workflow.parent.mkdir(parents=True, exist_ok=True)
+            workflow.write_text("msfragger.search_enzyme_name_1=stricttrypsin\n", encoding="utf-8")
+            fasta = output_dir / "fasta" / "human.fasta"
+            fasta.parent.mkdir(parents=True, exist_ok=True)
+            fasta.write_text(">P1\nPEPTIDE\n", encoding="utf-8")
+            prepared = output_dir / "assets" / "prepared" / f"{Path(task.file_name).stem}.mzML"
+            prepared.parent.mkdir(parents=True, exist_ok=True)
+            prepared.write_text("<mzML />", encoding="utf-8")
+            plan = SimpleNamespace(
+                task_id=task.task_id,
+                source_file_name=task.file_name,
+                source_data_path=prepared,
+                fragpipe_workflow_path=workflow,
+                fasta_path=fasta,
+                fasta_selection_mode="inferred",
+                fasta_download_url="https://example.test/human.fasta",
+                raw_data_type="mzml",
+                thread_num=2,
+                manifest_path=output_dir / "fragpipe" / "fragpipe-files.fp-manifest",
+                expected_pin_path=output_dir / "fragpipe" / "exp" / f"{Path(task.file_name).stem}_edited.pin",
+                output_paths={"fp_msdt": output_dir / "msdt" / f"{Path(task.file_name).stem}_fp_msdt.parquet"},
+                rawspectrum_output_path=output_dir / "rawspectrum" / f"{Path(task.file_name).stem}_rawspectrum.parquet",
+                needs_review=False,
+                blocking_issues=[],
+            )
+            result = SimpleNamespace(
+                resolution=SimpleNamespace(
+                    primary_project=SimpleNamespace(
+                        repository="massive",
+                        project_accession="MSVTEST",
+                        matched_file=task.file_name,
+                        match_type="exact",
+                        match_score=100,
+                    ),
+                    needs_review=False,
+                    resolution_confidence=1.0,
+                ),
+                context=SimpleNamespace(repository="massive", metadata={}, project_files=[]),
+                attributes=SimpleNamespace(
+                    acquisition_mode=SimpleNamespace(**attr("DDA")),
+                    species=SimpleNamespace(**attr("Homo sapiens")),
+                    instrument_name=SimpleNamespace(**attr("Orbitrap")),
+                    enzyme=SimpleNamespace(**attr("Trypsin")),
+                    labeling_strategy=SimpleNamespace(**attr("label-free")),
+                    fixed_mods=SimpleNamespace(**attr(["Carbamidomethyl C"])),
+                    variable_mods=SimpleNamespace(**attr(["Oxidation M"])),
+                    search_parameter_hints=SimpleNamespace(**attr({"recommended_workflow_name": "Default.workflow"})),
+                ),
+                asset=SimpleNamespace(
+                    repository="massive",
+                    original_file_name=task.file_name,
+                    matched_project_file=task.file_name,
+                    resolved_asset_type="raw",
+                    download_url="ftp://massive/sample.raw",
+                    download_urls=["ftp://massive/sample.raw"],
+                    transfer_method="ftp",
+                    expected_size_bytes=123,
+                    requires_conversion=True,
+                ),
+                plan=plan,
+            )
+            (output_dir / "project_resolution.json").write_text(
+                json.dumps({"primary_project": {"project_accession": "MSVTEST", "matched_file": task.file_name, "match_type": "exact", "match_score": 100}}),
+                encoding="utf-8",
+            )
+            (output_dir / "metadata.json").write_text(json.dumps({"metadata": {}}), encoding="utf-8")
+            (output_dir / "attributes.json").write_text(json.dumps({"species": attr("Homo sapiens")}), encoding="utf-8")
+            (output_dir / "decision_trace.json").write_text(json.dumps({"source_file_name": task.file_name}), encoding="utf-8")
+            (output_dir / "asset_resolution.json").write_text(json.dumps({"original_file_name": task.file_name}), encoding="utf-8")
+            (output_dir / "converter_config.json").write_text(json.dumps({"input": str(prepared)}), encoding="utf-8")
+            bundle = SimpleNamespace(plan=plan, converter_config_path=output_dir / "converter_config.json", materialized_workflow_path=workflow, materialized_fasta_path=fasta, task_root=output_dir)
+            return bundle, result, prepared
+
+    class FakeDockerRunner:
+        def __init__(self, *_args, **_kwargs):
+            docker_calls.append("init")
+
+        def run(self, _bundle):
+            docker_calls.append("run")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("agent.orchestrator.pipeline.AgentService", FakeService)
+    monkeypatch.setattr("agent.msdt_converter.docker_runner.DockerMSDTConverterRunner", FakeDockerRunner)
+
+    batch_id = "prepare_batch"
+    item_dir = tmp_path / "_batches" / batch_id / "items" / "001_sample"
+    batch = {
+        "batch_id": batch_id,
+        "status": "running",
+        "created_at": web_app._now_iso(),
+        "updated_at": web_app._now_iso(),
+        "repository": "massive",
+        "run_mode": "prepare",
+        "resource_policy": "balanced",
+        "output_dir": str(tmp_path / "_batches" / batch_id),
+        "excel_path": str(tmp_path / "_batches" / batch_id / "benchmark_results.xlsx"),
+        "items": [{"index": 1, "input": "sample.raw", "status": "queued", "output_dir": str(item_dir)}],
+        "llm_config": {"api_key": "sk-test", "base_url": "https://api.example.com", "model": "m1", "timeout": "120"},
+    }
+    with web_app._batches_lock:
+        web_app._batches[batch_id] = batch
+    try:
+        result = web_app._run_parameter_batch_item(batch_id, 0)
+        detail = asyncio.run(web_app.get_parameter_batch(batch_id))
+
+        assert result["status"] == "completed"
+        assert docker_calls == []
+        assert detail["run_mode"] == "prepare"
+        assert detail["items"][0]["status"] == "completed"
+        assert (item_dir / "converter_config.json").exists()
+        assert (item_dir / "parameter_audit.json").exists()
+    finally:
+        with web_app._batches_lock:
+            web_app._batches.pop(batch_id, None)
+
+
 def test_parameter_batch_uses_mzml_probe_for_unresolved_instrument_and_cleans_large_files(monkeypatch, tmp_path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    planner_calls = []
 
     def attr(value, source="test", confidence=1.0, conflict_flag=False):
         return {"value": value, "confidence": confidence, "source": source, "evidence_excerpt": "", "conflict_flag": conflict_flag}
@@ -795,7 +1123,8 @@ def test_parameter_batch_uses_mzml_probe_for_unresolved_instrument_and_cleans_la
         def __init__(self, **_kwargs):
             self.reporter = _kwargs.get("reporter")
 
-        def plan_dda_run_from_pride(self, task, output_dir, **_kwargs):
+        def plan_dda_run_from_repository(self, task, output_dir, **_kwargs):
+            planner_calls.append(_kwargs.get("repository"))
             output_dir = Path(output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
             workflow = output_dir / "template.workflow"
@@ -901,6 +1230,7 @@ def test_parameter_batch_uses_mzml_probe_for_unresolved_instrument_and_cleans_la
         "status": "running",
         "created_at": web_app._now_iso(),
         "updated_at": web_app._now_iso(),
+        "repository": "massive",
         "output_dir": str(tmp_path / "_batches" / batch_id),
         "excel_path": str(tmp_path / "_batches" / batch_id / "benchmark_results.xlsx"),
         "items": [{"index": 1, "input": "probe.raw", "status": "queued", "output_dir": str(output_dir)}],
@@ -912,6 +1242,8 @@ def test_parameter_batch_uses_mzml_probe_for_unresolved_instrument_and_cleans_la
         result = web_app._run_parameter_batch_item(batch_id, 0)
         detail = asyncio.run(web_app.get_parameter_batch(batch_id))
         assert result["status"] == "completed"
+        assert planner_calls == ["massive"]
+        assert detail["repository"] == "massive"
         assert detail["items"][0]["status"] == "completed"
         assert (output_dir / "parameter_audit.json").exists()
         assert not (output_dir / "assets" / "downloads" / "probe.raw").exists()
@@ -1184,7 +1516,7 @@ def test_parameter_only_mode_stops_after_planning_without_full_execution(monkeyp
         def __init__(self, **_kwargs):
             pass
 
-        def plan_dda_run_from_pride(self, **_kwargs):
+        def plan_dda_run_from_repository(self, **_kwargs):
             calls.append("plan")
             return result
 
@@ -1333,6 +1665,160 @@ def test_parameter_only_mode_stops_after_planning_without_full_execution(monkeyp
         _tasks.pop(task_id, None)
 
 
+def test_prepare_mode_generates_input_package_without_running_docker(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr(web_app, "_start_ready_queued_tasks", lambda: [])
+
+    calls: list[str] = []
+    output_dir = tmp_path / "prepare-sample"
+    template_workflow = tmp_path / "Default.workflow"
+    template_workflow.write_text("msfragger.search_enzyme_name_1=stricttrypsin\n", encoding="utf-8")
+    prepared_path = output_dir / "assets" / "prepared" / "sample.mzML"
+    fasta_path = output_dir / "fasta" / "uniprot_human.fasta"
+
+    plan = SimpleNamespace(
+        task_id="prepare-sample",
+        source_file_name="sample.raw",
+        source_data_path=prepared_path,
+        fragpipe_workflow_path=template_workflow,
+        manifest_path=output_dir / "fragpipe" / "fragpipe-files.fp-manifest",
+        fasta_path=fasta_path,
+        fasta_selection_mode="inferred",
+        fasta_download_url="https://example.test/human.fasta",
+        raw_data_type="mzml",
+        converter_config_path=output_dir / "converter_config.json",
+        rawspectrum_output_path=output_dir / "rawspectrum" / "sample_rawspectrum.parquet",
+        expected_pin_path=output_dir / "fragpipe" / "exp" / "sample_edited.pin",
+        output_paths={"fp_msdt": output_dir / "msdt" / "sample_fp_msdt.parquet"},
+        thread_num=2,
+        needs_review=False,
+        blocking_issues=[],
+    )
+    result = SimpleNamespace(
+        resolution=SimpleNamespace(
+            primary_project=SimpleNamespace(project_accession="PXDTEST", matched_file="sample.raw"),
+            resolution_confidence=1.0,
+        ),
+        context=SimpleNamespace(metadata={}, project_files=[]),
+        attributes=SimpleNamespace(
+            acquisition_mode=_value("DDA"),
+            species=_value("Homo sapiens"),
+            instrument_name=_value("Orbitrap Fusion"),
+            enzyme=_value("Trypsin"),
+            fixed_mods=_value(["C[57.02]"]),
+            variable_mods=_value(["M[15.99]"]),
+            search_parameter_hints=_value({"recommended_workflow_name": "Default.workflow"}),
+        ),
+        plan=plan,
+        asset=SimpleNamespace(
+            original_file_name="sample.raw",
+            matched_project_file="sample.raw",
+            download_url="https://example.test/sample.raw",
+            resolved_asset_type="raw",
+            requires_conversion=True,
+            expected_size_bytes=123456,
+        ),
+    )
+
+    class FakeService:
+        def __init__(self, **_kwargs):
+            pass
+
+        def plan_dda_run_from_repository(self, **_kwargs):
+            calls.append("plan")
+            return result
+
+        def _can_retry_with_mzml_instrument(self, _plan):
+            return False
+
+        def prepare_asset(self, _asset):
+            calls.append("prepare_asset")
+            prepared_path.parent.mkdir(parents=True, exist_ok=True)
+            prepared_path.write_text("<mzML />", encoding="utf-8")
+            return prepared_path
+
+        def write_task_bundle(self, output_dir_arg, *_args, **_kwargs):
+            calls.append("write_task_bundle")
+            output = Path(output_dir_arg)
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "metadata.json").write_text("{}", encoding="utf-8")
+            (output / "project_resolution.json").write_text(
+                json.dumps({"primary_project": {"project_accession": "PXDTEST", "matched_file": "sample.raw"}}),
+                encoding="utf-8",
+            )
+            (output / "attributes.json").write_text(json.dumps({"species": _value("Homo sapiens").__dict__}), encoding="utf-8")
+            (output / "asset_resolution.json").write_text(json.dumps({"original_file_name": "sample.raw"}), encoding="utf-8")
+            (output / "decision_trace.json").write_text(json.dumps({"source_file_name": "sample.raw"}), encoding="utf-8")
+
+    def fake_materialize_dda_task_bundle(**kwargs):
+        calls.append("materialize")
+        output = Path(kwargs["output_dir"])
+        workflow = output / "workflows" / "Default.workflow"
+        workflow.parent.mkdir(parents=True, exist_ok=True)
+        workflow.write_text("msfragger.search_enzyme_name_1=stricttrypsin\n", encoding="utf-8")
+        fasta_path.parent.mkdir(parents=True, exist_ok=True)
+        fasta_path.write_text(">P1\nPEPTIDE\n", encoding="utf-8")
+        return SimpleNamespace(
+            plan=plan,
+            converter_config_path=output / "converter_config.json",
+            materialized_workflow_path=workflow,
+            materialized_fasta_path=fasta_path,
+            task_root=output,
+        )
+
+    class FakeDockerRunner:
+        def __init__(self, *_args, **_kwargs):
+            calls.append("docker_init")
+
+        def write_container_config(self, bundle):
+            calls.append("write_container_config")
+            bundle.converter_config_path.write_text(json.dumps({"config": "prepared"}), encoding="utf-8")
+
+        def run(self, _bundle):
+            raise AssertionError("prepare mode must not run Docker")
+
+    monkeypatch.setattr("agent.orchestrator.pipeline.AgentService", FakeService)
+    monkeypatch.setattr("agent.execution.bundle.materialize_dda_task_bundle", fake_materialize_dda_task_bundle)
+    monkeypatch.setattr("agent.msdt_converter.docker_runner.DockerMSDTConverterRunner", FakeDockerRunner)
+
+    task_id = "prepare-mode"
+    _tasks[task_id] = {
+        "task_id": task_id,
+        "input_value": "sample.raw",
+        "project_key": "sample",
+        "submitter": "Alice",
+        "output_dir": str(output_dir),
+        "status": "running",
+        "created_at": "2026-05-09T00:00:00+00:00",
+        "started_at": "2026-05-09T00:00:00+00:00",
+        "logs": deque(maxlen=100),
+        "step": 0,
+        "total_steps": 5,
+        "blocking_issues": [],
+        "prefer_project_fasta": False,
+        "run_mode": "prepare",
+        "ui_language": "en",
+        "resource_policy": "balanced",
+        "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1", "timeout": "1200"},
+    }
+
+    try:
+        web_app._run_pipeline(task_id)
+
+        assert calls == ["plan", "prepare_asset", "materialize", "write_task_bundle", "docker_init", "write_container_config"]
+        assert _tasks[task_id]["status"] == "completed"
+        assert _tasks[task_id]["step"] == 5
+        assert (output_dir / "converter_config.json").exists()
+        assert (output_dir / "parameter_audit.json").exists()
+        assert (output_dir / "msdt_input_manifest.json").exists()
+        state = json.loads((output_dir / "task_state.json").read_text(encoding="utf-8"))
+        assert state["stage"] == "packaging"
+        detail = asyncio.run(get_task(task_id))
+        assert detail["can_download"] is True
+    finally:
+        _tasks.pop(task_id, None)
+
+
 def test_pipeline_failure_persists_structured_error_without_traceback(monkeypatch, tmp_path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setattr(web_app, "_start_ready_queued_tasks", lambda: [])
@@ -1344,7 +1830,7 @@ def test_pipeline_failure_persists_structured_error_without_traceback(monkeypatc
         def __init__(self, **_kwargs):
             pass
 
-        def plan_dda_run_from_pride(self, **_kwargs):
+        def plan_dda_run_from_repository(self, **_kwargs):
             raise RuntimeError("permission denied while trying to connect to the docker API")
 
     monkeypatch.setattr("agent.orchestrator.pipeline.AgentService", FakeService)

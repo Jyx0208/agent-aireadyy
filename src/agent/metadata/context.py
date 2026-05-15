@@ -138,9 +138,26 @@ def build_project_context(
             sdrf_rows = select_sdrf_rows_for_file(load_sdrf_rows(client.download_text(download_url)), file_name)
 
     return ProjectContext(
+        repository="pride",
         project_accession=project_accession,
+        px_accession=project_accession,
         file_name=file_name,
         metadata=metadata,
         sdrf_rows=sdrf_rows,
         project_files=project_files,
+        evidence_documents=[
+            {
+                "source": "pride.project",
+                "text": " ".join(
+                    str(value or "")
+                    for value in (
+                        project.get("title"),
+                        project.get("projectDescription"),
+                        project.get("sampleProcessingProtocol"),
+                        project.get("dataProcessingProtocol"),
+                    )
+                ),
+            }
+        ],
+        raw_project_metadata=project,
     )

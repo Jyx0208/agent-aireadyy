@@ -13,3 +13,4 @@ def test_python_module_cli_entrypoint_shows_help():
     )
 
     assert "PRIDE-first AI-ready data agent" in result.stdout
+    assert "one-click-run" in result.stdout

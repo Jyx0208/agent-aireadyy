@@ -144,7 +144,10 @@ def _coerce_attribute(value: Any) -> AttributeValue | None:
 
 def _metadata_context_text(context: ProjectContext, include_project_files: bool = True) -> str:
     lines = [
+        f"repository: {context.repository}",
         f"project_accession: {context.project_accession}",
+        f"native_accession: {context.native_accession or ''}",
+        f"px_accession: {context.px_accession or ''}",
         f"target_file: {context.file_name}",
     ]
     for key, metadata in context.metadata.items():
@@ -170,6 +173,15 @@ def _metadata_context_text(context: ProjectContext, include_project_files: bool 
             lines.append("parameter_or_workflow_files: " + "; ".join(parameter_like[:40]))
         if fasta_like:
             lines.append("fasta_files: " + "; ".join(fasta_like[:40]))
+    if context.evidence_documents:
+        evidence_lines = []
+        for document in context.evidence_documents[:12]:
+            source = str(document.get("source") or "repository.evidence")
+            text = str(document.get("text") or document.get("value") or "")
+            if text.strip():
+                evidence_lines.append(f"{source}: {text[:2000]}")
+        if evidence_lines:
+            lines.append("evidence_documents:\n" + "\n".join(evidence_lines))
     return "\n".join(lines)
 
 
@@ -517,7 +529,7 @@ def confirm_no_sdrf_parameters(
         return attributes
 
     if report is not None:
-        report("\u672a\u627e\u5230 SDRF \u884c\uff1b\u5c06\u7ed3\u5408 PRIDE \u9879\u76ee\u63cf\u8ff0\u3001\u534f\u8bae\u3001\u6587\u4ef6\u540d\u548c\u53c2\u6570/FASTA \u6587\u4ef6\u7ebf\u7d22\u63a8\u65ad\u641c\u5e93\u53c2\u6570\u3002")
+        report("未找到 SDRF 行；将结合 repository 元数据、项目描述、协议、文件名、证据文档和参数/FASTA 文件线索推断搜库参数。")
 
     reasoner = llm_reasoner or default_llm_reasoner()
     if reasoner is None:

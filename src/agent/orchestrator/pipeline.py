@@ -23,6 +23,7 @@ from agent.msdt_converter.docker_runner import DockerMSDTConverterRunner
 from agent.msdt_converter.runner import MSDTConverterRunner
 from agent.pride.client import PrideClient
 from agent.pride.resolver import resolve_input_to_project
+from agent.repositories.registry import RepositoryRegistry
 from agent.utils import write_json
 
 
@@ -34,10 +35,12 @@ class AgentService:
     def __init__(
         self,
         pride_client: PrideClient | None = None,
+        repository_registry: RepositoryRegistry | None = None,
         reporter: Callable[[str], None] | None = None,
         llm_reasoner: LLMReasoner | None = None,
     ):
         self.pride_client = pride_client or PrideClient()
+        self.repositories = repository_registry or RepositoryRegistry(pride_client=self.pride_client)
         self.reporter = reporter
         self.llm_reasoner = llm_reasoner
 
@@ -219,17 +222,26 @@ class AgentService:
         )
 
     def resolve_project(self, raw_input: str) -> ProjectResolution:
-        self._report(f"[1/5] 正在根据文件名解析 PRIDE 项目：{raw_input}")
-        self._report({"kind": "activity_start", "label": "正在查询 PRIDE Archive API 并匹配项目/文件…"})
+        return self.resolve_project_from_repository(raw_input, repository="pride")
+
+    def resolve_project_from_repository(self, raw_input: str, repository: str = "auto") -> ProjectResolution:
+        adapter = self.repositories.choose(repository, raw_input)
+        self._report(f"[1/5] 正在根据输入解析 {adapter.name} 项目：{raw_input}")
+        self._report({"kind": "activity_start", "label": f"Querying {adapter.name} metadata and matching project/files..."})
         try:
-            return resolve_input_to_project(self.pride_client, raw_input)
+            return adapter.resolve_project(raw_input)
         finally:
-            self._report({"kind": "activity_stop", "message": "PRIDE 查询完成。"})
+            self._report({"kind": "activity_stop", "message": f"{adapter.name} query completed."})
 
     def build_context(self, resolution: ProjectResolution, file_name: str) -> ProjectContext:
+        return self.build_context_from_repository(resolution, file_name, repository="pride")
+
+    def build_context_from_repository(self, resolution: ProjectResolution, file_name: str, repository: str = "auto") -> ProjectContext:
         if not resolution.primary_project:
             raise ValueError("无法构建项目上下文：缺少主项目。")
-        return build_project_context(self.pride_client, resolution.primary_project.project_accession, file_name)
+        adapter_name = repository if repository != "auto" else resolution.primary_project.repository
+        adapter = self.repositories.get(adapter_name)
+        return adapter.build_project_context(resolution, file_name)
 
     def infer_attributes(self, context: ProjectContext):
         attributes = infer_attributes(context)
@@ -359,15 +371,18 @@ class AgentService:
         return result.model_copy(update={"attributes": attributes, "plan": plan})
 
     def resolve_asset(self, task: InputTask, context: ProjectContext, output_dir: str | Path) -> FileAsset:
-        return resolve_file_asset(task=task, context=context, work_dir=output_dir)
+        adapter = self.repositories.get(context.repository)
+        return adapter.resolve_file_asset(task=task, context=context, work_dir=output_dir)
 
     def download_asset(self, asset: FileAsset) -> Path:
-        return download_file_asset(self.pride_client, asset, report=self.reporter)
+        adapter = self.repositories.get(asset.repository)
+        return download_file_asset(adapter, asset, report=self.reporter)
 
     def prepare_asset(self, asset: FileAsset, converter: RawToMzMLConverter | None = None) -> Path:
         primary = converter or RawToMzMLConverter(report=self.reporter)
         fallback = DockerPwizConverter(report=self.reporter)
-        return prepare_file_asset(self.pride_client, asset, primary, fallback_converter=fallback, report=self.reporter)
+        adapter = self.repositories.get(asset.repository)
+        return prepare_file_asset(adapter, asset, primary, fallback_converter=fallback, report=self.reporter)
 
     def plan_dda_run(
         self,
@@ -393,6 +408,62 @@ class AgentService:
         self._report_plan_summary(plan)
         self._last_attributes = attributes
         return resolution, context, plan
+
+    def plan_dda_run_from_repository(
+        self,
+        task: InputTask,
+        output_dir: str | Path,
+        repository: str = "auto",
+        reviewed_fasta_path: str | Path | None = None,
+        reviewed_fasta_url: str | None = None,
+        reviewed_fasta_name: str | None = None,
+        prefer_project_fasta: bool = False,
+    ) -> PridePlanResult:
+        resolution = self.resolve_project_from_repository(task.original_input, repository=repository)
+        if resolution.primary_project:
+            self._report(f"已选择主项目：{resolution.primary_project.project_accession} ({resolution.primary_project.repository})")
+        else:
+            self._report("未能解析到主项目。")
+        self._report_resolution_summary(resolution)
+        context = self.build_context_from_repository(resolution, task.file_name, repository=repository) if resolution.primary_project else ProjectContext(
+            repository="pride",
+            project_accession="unknown",
+            file_name=task.file_name,
+        )
+        self._report(f"[2/5] 项目上下文已准备完成。SDRF 行数：{len(context.sdrf_rows)}")
+        self._report_metadata_summary(context)
+        asset = self.resolve_asset(task, context, output_dir)
+        self._report(
+            f"[3/5] 已解析数据文件：{asset.matched_project_file or '未知'} "
+            f"（类型={asset.resolved_asset_type}，是否需要转换={asset.requires_conversion}）"
+        )
+        self._report_asset_summary(asset)
+        attributes = self.infer_attributes(context)
+        self._report(f"[4/5] 文件属性推断完成。采集模式={attributes.acquisition_mode.value}")
+        self._report_attribute_summary(attributes)
+        source_data_path = asset.prepared_path or asset.local_path or Path(output_dir) / "assets" / "prepared" / f"{task.stem}.mzML"
+        plan = plan_dda_execution(
+            task_id=task.task_id,
+            source_file_name=task.file_name,
+            source_data_path=source_data_path,
+            project_resolution=resolution,
+            attributes=attributes,
+            output_dir=output_dir,
+            project_context=context,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+            reviewed_fasta_name=reviewed_fasta_name,
+            prefer_project_fasta=prefer_project_fasta,
+        )
+        self._report(f"[5/5] DDA 执行计划已生成。workflow={plan.fragpipe_workflow_path.name}")
+        self._report_plan_summary(plan)
+        return PridePlanResult(
+            resolution=resolution,
+            context=context,
+            asset=asset,
+            attributes=attributes,
+            plan=plan,
+        )
 
     def plan_dda_run_from_pride(
         self,
@@ -655,6 +726,65 @@ class AgentService:
             ),
         )
         return manifest
+
+    def prepare_repository_msdt_docker_input(
+        self,
+        task: InputTask,
+        output_dir: str | Path,
+        repository: str = "auto",
+        reviewed_fasta_path: str | Path | None = None,
+        reviewed_fasta_url: str | None = None,
+        reviewed_fasta_name: str | None = None,
+        prefer_project_fasta: bool = False,
+    ):
+        if repository == "pride":
+            return self.prepare_pride_msdt_docker_input(
+                task=task,
+                output_dir=output_dir,
+                reviewed_fasta_path=reviewed_fasta_path,
+                reviewed_fasta_url=reviewed_fasta_url,
+                reviewed_fasta_name=reviewed_fasta_name,
+                prefer_project_fasta=prefer_project_fasta,
+            )
+        result = self.plan_dda_run_from_repository(
+            task=task,
+            output_dir=output_dir,
+            repository=repository,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+            reviewed_fasta_name=reviewed_fasta_name,
+            prefer_project_fasta=prefer_project_fasta,
+        )
+        output_dir = Path(output_dir)
+        if result.plan.needs_review:
+            self.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
+            message = f"当前计划需要人工复核，暂不下载或准备数据文件。原因：{result.plan.blocking_issues}"
+            self._report(message)
+            raise ReviewRequiredError(message)
+        prepared_path = self.prepare_asset(result.asset)
+        bundle = materialize_dda_task_bundle(
+            task=task,
+            project_resolution=result.resolution,
+            project_context=result.context,
+            attributes=result.attributes,
+            source_data_path=prepared_path,
+            output_dir=output_dir,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+            reviewed_fasta_name=reviewed_fasta_name,
+            prefer_project_fasta=prefer_project_fasta,
+            report=self.reporter,
+        )
+        self.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, bundle.plan, asset=result.asset)
+        docker_runner = DockerMSDTConverterRunner(image="guomics2017/msdt-converter:v1.3", report=self.reporter)
+        if hasattr(docker_runner, "write_container_config"):
+            docker_runner.write_container_config(bundle)
+        self._report(
+            "MSDT-Converter 输入包已生成："
+            f"workflow={bundle.materialized_workflow_path}；fasta={bundle.materialized_fasta_path}；"
+            f"converter_config={bundle.converter_config_path}"
+        )
+        return bundle, result, prepared_path
 
     def prepare_pride_msdt_docker_input(
         self,

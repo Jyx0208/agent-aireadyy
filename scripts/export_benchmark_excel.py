@@ -45,13 +45,20 @@ SUPPORT_COLUMNS = [
 ]
 
 AUDIT_COLUMNS = [
+    "Repository",
+    "Native accession",
+    "PX accession",
     "Acquisition mode",
     "Labeling strategy",
     "Actual input file",
+    "Matched repository file",
     "Matched PRIDE file",
+    "Logical path",
     "Project match type",
     "Project match score",
+    "Download URL",
     "PRIDE download URL",
+    "Transfer method",
     "Expected size bytes",
     "Requires conversion",
     "Raw data type",
@@ -300,7 +307,37 @@ def _audit_fields(
         decision_trace.get("fragpipe_workflow_path"),
         workflow_path,
     )
+    repository = _first_text(
+        parameter_audit.get("repository"),
+        _nested(parameter_audit, "project", "repository"),
+        primary.get("repository"),
+        project.get("repository"),
+    )
+    native_accession = _first_text(
+        _nested(parameter_audit, "project", "native_accession"),
+        primary.get("native_accession"),
+        project.get("native_accession"),
+    )
+    px_accession = _first_text(
+        _nested(parameter_audit, "project", "px_accession"),
+        primary.get("px_accession"),
+        project.get("px_accession"),
+    )
+    matched_repository_file = _first_text(
+        _nested(parameter_audit, "input", "matched_project_file"),
+        asset.get("matched_project_file"),
+        primary.get("matched_file"),
+    )
+    download_url = _first_text(
+        _nested(parameter_audit, "input", "download_url"),
+        asset.get("download_url"),
+        _nested(parameter_audit, "input", "download_urls"),
+        asset.get("download_urls"),
+    )
     return {
+        "Repository": repository,
+        "Native accession": native_accession,
+        "PX accession": px_accession,
         "Acquisition mode": _as_text(_attr_value(attributes, "acquisition_mode")),
         "Labeling strategy": _as_text(_attr_value(attributes, "labeling_strategy")),
         "Actual input file": _first_text(
@@ -309,14 +346,14 @@ def _audit_fields(
             decision_trace.get("source_file_name"),
             file_name,
         ),
-        "Matched PRIDE file": _first_text(
-            _nested(parameter_audit, "input", "matched_project_file"),
-            asset.get("matched_project_file"),
-            primary.get("matched_file"),
-        ),
+        "Matched repository file": matched_repository_file,
+        "Matched PRIDE file": matched_repository_file,
+        "Logical path": _first_text(_nested(parameter_audit, "input", "logical_path"), asset.get("logical_path")),
         "Project match type": _as_text(primary.get("match_type")),
         "Project match score": _as_text(primary.get("match_score")),
-        "PRIDE download URL": _first_text(_nested(parameter_audit, "input", "download_url"), asset.get("download_url")),
+        "Download URL": download_url,
+        "PRIDE download URL": download_url,
+        "Transfer method": _first_text(_nested(parameter_audit, "input", "transfer_method"), asset.get("transfer_method")),
         "Expected size bytes": _first_text(asset.get("expected_size_bytes"), _nested(parameter_audit, "input", "expected_size_bytes")),
         "Requires conversion": _first_text(asset.get("requires_conversion"), _nested(parameter_audit, "input", "requires_conversion")),
         "Raw data type": _first_text(_nested(parameter_audit, "plan", "raw_data_type"), decision_trace.get("raw_data_type")),

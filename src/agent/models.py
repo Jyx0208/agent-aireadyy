@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 SourceType = Literal["local_path", "url", "file_name"]
 TaskStatus = Literal["resolved", "needs_review", "blocked", "completed", "failed"]
+RepositoryName = Literal["pride", "iprox", "massive"]
 
 
 class JsonModel(BaseModel):
@@ -37,10 +38,13 @@ class MetadataValue(JsonModel):
 
 
 class ProjectCandidate(JsonModel):
+    repository: RepositoryName = "pride"
     project_accession: str
     matched_file: str
     match_type: str
     match_score: int
+    native_accession: str | None = None
+    px_accession: str | None = None
     publication_date: date | None = None
     submission_date: date | None = None
     evidence: list[str] = Field(default_factory=list)
@@ -66,19 +70,31 @@ class ProjectResolution(JsonModel):
 
 
 class ProjectContext(JsonModel):
+    repository: RepositoryName = "pride"
     project_accession: str
+    native_accession: str | None = None
+    px_accession: str | None = None
     file_name: str
     metadata: dict[str, MetadataValue] = Field(default_factory=dict)
     sdrf_rows: list[dict[str, Any]] = Field(default_factory=list)
     project_files: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_documents: list[dict[str, Any]] = Field(default_factory=list)
+    raw_project_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class FileAsset(JsonModel):
+    repository: RepositoryName = "pride"
     original_file_name: str
     resolved_asset_type: Literal["mzml", "mzxml", "tims", "raw", "wiff", "mgf", "mzid", "unknown"]
     project_accession: str | None = None
+    native_project_accession: str | None = None
     matched_project_file: str | None = None
+    logical_path: str | None = None
+    file_category: str | None = None
+    file_format: str | None = None
     download_url: str | None = None
+    download_urls: list[str] = Field(default_factory=list)
+    transfer_method: Literal["https", "ftp", "aspera", "webdav", "unknown"] = "unknown"
     local_path: Path | None = None
     prepared_path: Path | None = None
     expected_size_bytes: int | None = None

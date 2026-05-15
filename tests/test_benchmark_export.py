@@ -203,7 +203,10 @@ def test_benchmark_export_includes_actual_parameter_audit_fields(tmp_path: Path)
         json.dumps(
             {
                 "primary_project": {
+                    "repository": "massive",
                     "project_accession": "PXD000900",
+                    "native_accession": "MSV000000001",
+                    "px_accession": "PXD000900",
                     "matched_file": "HeLa_ArgC-Try_CID_1.raw",
                     "match_type": "exact",
                     "match_score": 100,
@@ -214,7 +217,15 @@ def test_benchmark_export_includes_actual_parameter_audit_fields(tmp_path: Path)
         encoding="utf-8",
     )
     (run_dir / "metadata.json").write_text(
-        json.dumps({"project_accession": "PXD000900", "metadata": {"organisms": {"value": ["Homo sapiens"]}}}),
+        json.dumps(
+            {
+                "repository": "massive",
+                "project_accession": "PXD000900",
+                "native_accession": "MSV000000001",
+                "px_accession": "PXD000900",
+                "metadata": {"organisms": {"value": ["Homo sapiens"]}},
+            }
+        ),
         encoding="utf-8",
     )
     (run_dir / "attributes.json").write_text(
@@ -272,7 +283,10 @@ def test_benchmark_export_includes_actual_parameter_audit_fields(tmp_path: Path)
             {
                 "original_file_name": "HeLa_ArgC-Try_CID_1.raw",
                 "matched_project_file": "HeLa_ArgC-Try_CID_1.raw",
+                "logical_path": "raw/HeLa_ArgC-Try_CID_1.raw",
                 "download_url": "https://ftp.pride.ebi.ac.uk/pride/data/archive/2014/04/PXD000900/HeLa_ArgC-Try_CID_1.raw",
+                "download_urls": ["https://ftp.pride.ebi.ac.uk/pride/data/archive/2014/04/PXD000900/HeLa_ArgC-Try_CID_1.raw"],
+                "transfer_method": "https",
                 "resolved_asset_type": "raw",
                 "requires_conversion": True,
                 "expected_size_bytes": 1800891778,
@@ -287,8 +301,15 @@ def test_benchmark_export_includes_actual_parameter_audit_fields(tmp_path: Path)
 
     row = summarize_source(ResultSource(label="HeLa_ArgC-Try_CID_1.raw", path=run_dir))
 
+    assert row["Repository"] == "massive"
+    assert row["Native accession"] == "MSV000000001"
+    assert row["PX accession"] == "PXD000900"
     assert row["Actual input file"] == "HeLa_ArgC-Try_CID_1.raw"
+    assert row["Matched repository file"] == "HeLa_ArgC-Try_CID_1.raw"
     assert row["Matched PRIDE file"] == "HeLa_ArgC-Try_CID_1.raw"
+    assert row["Logical path"] == "raw/HeLa_ArgC-Try_CID_1.raw"
+    assert row["Transfer method"] == "https"
+    assert row["Download URL"].startswith("https://ftp.pride.ebi.ac.uk/")
     assert row["PRIDE download URL"].startswith("https://ftp.pride.ebi.ac.uk/")
     assert row["Raw data type"] == "mzml"
     assert row["Actual source data path"].endswith("HeLa_ArgC-Try_CID_1.mzML")
@@ -309,7 +330,10 @@ def test_benchmark_excel_writes_audit_columns(tmp_path: Path):
             {
                 "Input file": "sample.raw",
                 "Project": "PXDTEST",
+                "Repository": "pride",
                 "Actual input file": "sample.raw",
+                "Matched repository file": "sample.raw",
+                "Download URL": "https://example.test/sample.raw",
                 "Workflow path": "runs/sample/workflows/Default.workflow",
                 "Converter config": "runs/sample/converter_config.json",
             }
@@ -321,6 +345,8 @@ def test_benchmark_excel_writes_audit_columns(tmp_path: Path):
         sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
 
     assert "Actual input file" in sheet
+    assert "Matched repository file" in sheet
+    assert "Download URL" in sheet
     assert "Workflow path" in sheet
     assert "Converter config" in sheet
     assert "runs/sample/workflows/Default.workflow" in sheet

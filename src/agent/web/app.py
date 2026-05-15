@@ -22,6 +22,7 @@ import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
 from agent.input.normalizer import safe_output_stem
+from agent.oneclick.preflight import normalize_resource_policy, normalize_run_mode, run_preflight
 from agent.progress import render_download_progress
 from agent.web.history import history_timestamp, merge_project_history_records, with_history_identity
 
@@ -60,8 +61,9 @@ _DOWNLOAD_FRAGPIPE_PARAMETER_FILES = {"fragger.params", "msbooster_params.txt"}
 _MAX_PERSISTED_LOGS = 2000
 _INTERRUPTED_HISTORY_MESSAGE = "服务重启或任务被手动停止，任务已中断。"
 _RUN_MODE_FULL = "full"
+_RUN_MODE_PREPARE = "prepare"
 _RUN_MODE_PARAMETERS = "parameters"
-_RUN_MODES = {_RUN_MODE_FULL, _RUN_MODE_PARAMETERS}
+_RUN_MODES = {_RUN_MODE_FULL, _RUN_MODE_PREPARE, _RUN_MODE_PARAMETERS}
 _UI_LANGUAGES = {"en", "zh"}
 
 # 默认配置（不从 .env 加载，由用户在页面填写）
@@ -110,12 +112,37 @@ def _clean_submitter(value: Any) -> str:
 
 
 def _clean_run_mode(value: Any) -> str:
-    mode = _clean_text(value).lower().replace("-", "_")
-    if mode in {"parameters", "parameter", "parameter_only", "params", "plan", "planning"}:
-        return _RUN_MODE_PARAMETERS
-    if mode in {"full", "workflow", "full_workflow", "run", "run_full"}:
-        return _RUN_MODE_FULL
-    return _RUN_MODE_FULL
+    return normalize_run_mode(value, default=_RUN_MODE_FULL)
+
+
+def _clean_batch_run_mode(value: Any) -> str:
+    return normalize_run_mode(value, default=_RUN_MODE_PARAMETERS)
+
+
+def _clean_resource_policy(value: Any) -> str:
+    return normalize_resource_policy(value)
+
+
+def _run_mode_label(value: Any) -> str:
+    mode = _clean_run_mode(value)
+    if mode == _RUN_MODE_PARAMETERS:
+        return "Parameters only"
+    if mode == _RUN_MODE_PREPARE:
+        return "Prepare input package"
+    return "Full workflow"
+
+
+def _clean_repository(value: Any, default: str = "pride") -> str:
+    repository = _clean_text(value).lower().replace("-", "_")
+    if repository in {"auto", "all"}:
+        return "auto"
+    if repository in {"pride", "px", "proteomexchange"}:
+        return "pride"
+    if repository in {"massive", "massive_ucsd", "msv", "gnps"}:
+        return "massive"
+    if repository in {"iprox", "ipx"}:
+        return "iprox"
+    return default
 
 
 def _clean_ui_language(value: Any) -> str:
@@ -765,6 +792,7 @@ def _write_parameter_audit_files(output_dir: Path, batch_id: str, index: int, in
     output_dir.mkdir(parents=True, exist_ok=True)
     resolution = getattr(result, "resolution", None)
     primary = getattr(resolution, "primary_project", None)
+    context = getattr(result, "context", None)
     attributes = getattr(result, "attributes", None)
     plan = getattr(result, "plan", None)
     asset = getattr(result, "asset", None)
@@ -781,6 +809,21 @@ def _write_parameter_audit_files(output_dir: Path, batch_id: str, index: int, in
         value = getattr(asset, name, None)
         return value if value not in (None, "") else asset_payload.get(name)
 
+    def first_field(*values: Any) -> Any:
+        for value in values:
+            if value not in (None, ""):
+                return value
+        return None
+
+    repository = _clean_repository(
+        first_field(
+            getattr(context, "repository", None),
+            getattr(primary, "repository", None),
+            asset_field("repository"),
+            asset_payload.get("repository"),
+        )
+    )
+
     materialized_workflow = _materialize_parameter_workflow(output_dir, attributes, plan) if attributes is not None and plan is not None else None
     converter_config = output_dir / "converter_config.json"
     _rewrite_converter_config_workflow(converter_config, materialized_workflow)
@@ -791,10 +834,14 @@ def _write_parameter_audit_files(output_dir: Path, batch_id: str, index: int, in
     audit = {
         "batch_id": batch_id,
         "index": index,
+        "repository": repository,
         "input_value": input_value,
         "generated_at": _now_iso(),
         "project": {
+            "repository": repository,
             "accession": getattr(primary, "project_accession", None),
+            "native_accession": first_field(getattr(primary, "native_accession", None), getattr(context, "native_accession", None)),
+            "px_accession": first_field(getattr(primary, "px_accession", None), getattr(context, "px_accession", None)),
             "matched_file": getattr(primary, "matched_file", None),
             "match_type": getattr(primary, "match_type", None),
             "match_score": getattr(primary, "match_score", None),
@@ -803,8 +850,11 @@ def _write_parameter_audit_files(output_dir: Path, batch_id: str, index: int, in
         "input": {
             "original_file_name": asset_field("original_file_name") or getattr(plan, "source_file_name", None),
             "matched_project_file": asset_field("matched_project_file") or getattr(primary, "matched_file", None),
+            "logical_path": asset_field("logical_path"),
             "asset_type": asset_field("resolved_asset_type"),
             "download_url": asset_field("download_url"),
+            "download_urls": asset_field("download_urls") or [],
+            "transfer_method": asset_field("transfer_method"),
             "expected_size_bytes": asset_field("expected_size_bytes"),
             "requires_conversion": asset_field("requires_conversion"),
         },
@@ -859,6 +909,7 @@ def _write_parameter_audit_files(output_dir: Path, batch_id: str, index: int, in
     manifest = {
         "package_type": "parameter_only_msdt_input_preview",
         "generated_at": _now_iso(),
+        "repository": audit.get("repository"),
         "input_file": audit.get("input", {}).get("original_file_name"),
         "project_accession": audit.get("project", {}).get("accession"),
         "run_without_full_execution": True,
@@ -971,6 +1022,9 @@ def _public_batch_record(batch: dict[str, Any]) -> dict[str, Any]:
         "needs_review_items": sum(1 for item in items if item.get("status") in {"needs_review", "blocked"}),
         "jobs": batch.get("jobs", 1),
         "ui_language": ui_language,
+        "repository": _clean_repository(batch.get("repository")),
+        "run_mode": _clean_batch_run_mode(batch.get("run_mode")),
+        "resource_policy": _clean_resource_policy(batch.get("resource_policy")),
         "fasta_preference": "project" if batch.get("prefer_project_fasta") else "llm",
         "output_dir": str(output_dir),
         "excel_path": str(excel_path),
@@ -1017,7 +1071,7 @@ def _batch_history_record(batch: dict[str, Any]) -> dict[str, Any]:
             "result_id": batch_id,
             "name": "Batch Excel report",
             "input_value": "Batch Excel report",
-            "run_mode": _RUN_MODE_PARAMETERS,
+            "run_mode": _clean_batch_run_mode(batch.get("run_mode")),
             "file_count": file_count,
             "size_bytes": size_bytes,
         }
@@ -1222,7 +1276,9 @@ def _public_task_record_locked(task_id: str, task: dict[str, Any], *, include_lo
         "review_summary": task.get("review_summary"),
         "fasta_preference": "project" if task.get("prefer_project_fasta") else "llm",
         "run_mode": _clean_run_mode(task.get("run_mode")),
+        "resource_policy": _clean_resource_policy(task.get("resource_policy")),
         "ui_language": _clean_ui_language(task.get("ui_language")),
+        "repository": _clean_repository(task.get("repository")),
         "can_download": can_download,
     }
     if include_logs:
@@ -1499,7 +1555,9 @@ def _task_detail_from_history(task_id: str, record: dict[str, Any]) -> dict[str,
         "review_summary": record.get("review_summary"),
         "fasta_preference": record.get("fasta_preference", "llm"),
         "run_mode": _clean_run_mode(record.get("run_mode")),
+        "resource_policy": _clean_resource_policy(record.get("resource_policy")),
         "ui_language": _clean_ui_language(record.get("ui_language")),
+        "repository": _clean_repository(record.get("repository")),
         "can_download": can_download,
         "archived": True,
         "queue_position": 0,
@@ -1558,6 +1616,7 @@ def _list_public_results() -> list[dict[str, Any]]:
                 "task_updated_at": history.get("updated_at"),
                 "run_mode": _clean_run_mode(history.get("run_mode")),
                 "ui_language": _clean_ui_language(history.get("ui_language")),
+                "repository": _clean_repository(history.get("repository")),
                 "file_updated_at": file_updated_at,
                 "result_updated_at": result_updated_at,
                 "updated_at": result_updated_at,
@@ -2483,6 +2542,8 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
         llm_config = dict(batch["llm_config"])
         prefer_project_fasta = bool(batch.get("prefer_project_fasta"))
         ui_language = _clean_ui_language(batch.get("ui_language"))
+        repository = _clean_repository(batch.get("repository"))
+        run_mode = _clean_batch_run_mode(batch.get("run_mode"))
 
     input_value = str(item["input"])
     output_dir = Path(item["output_dir"])
@@ -2496,9 +2557,69 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
         reporter = BatchFileReporter(output_dir, ui_language=ui_language)
         service = AgentService(reporter=reporter, llm_reasoner=_task_llm_reasoner(llm_config))
         task = normalize_input(input_value)
-        result = service.plan_dda_run_from_pride(
+        if run_mode in {_RUN_MODE_PREPARE, _RUN_MODE_FULL}:
+            bundle, result, prepared_path = service.prepare_repository_msdt_docker_input(
+                task=task,
+                output_dir=output_dir,
+                repository=repository,
+                prefer_project_fasta=prefer_project_fasta,
+            )
+            _write_parameter_audit_files(output_dir, batch_id, index, input_value, result)
+            project_error = _primary_project_error(result)
+            if project_error:
+                raise RuntimeError(project_error)
+            if run_mode == _RUN_MODE_FULL:
+                from agent.audit.review import build_task_state_snapshot, write_task_state
+                from agent.execution.outputs import execution_failure_reasons
+                from agent.msdt_converter.docker_runner import DockerMSDTConverterRunner
+
+                _append_batch_event(batch_id, "info", f"{input_value} running MSDT-Converter Docker.", item_index=index)
+                docker_runner = DockerMSDTConverterRunner(image="guomics2017/msdt-converter:v1.3", report=reporter)
+                docker_result = docker_runner.run(bundle)
+                failure_reasons = execution_failure_reasons(
+                    bundle.plan,
+                    docker_result.returncode,
+                    docker_result.stdout,
+                    docker_result.stderr,
+                )
+                if failure_reasons:
+                    raise RuntimeError("; ".join(failure_reasons))
+                project_accession = result.resolution.primary_project.project_accession if result.resolution.primary_project else None
+                write_task_state(
+                    output_dir / "task_state.json",
+                    build_task_state_snapshot(
+                        task_id=task.task_id,
+                        status="completed",
+                        stage="execution",
+                        source_file=task.file_name,
+                        project_accession=project_accession,
+                        notes=[],
+                    ),
+                )
+                _zip_output_dir(output_dir, report=reporter)
+            else:
+                from agent.audit.review import build_task_state_snapshot, write_task_state
+
+                project_accession = result.resolution.primary_project.project_accession if result.resolution.primary_project else None
+                write_task_state(
+                    output_dir / "task_state.json",
+                    build_task_state_snapshot(
+                        task_id=task.task_id,
+                        status="completed",
+                        stage="packaging",
+                        source_file=task.file_name,
+                        project_accession=project_accession,
+                        notes=["Prepare input package mode completed; Docker execution was not run."],
+                    ),
+                )
+            _update_batch_item(batch_id, index, status="completed", finished_at=_now_iso(), error="", run_mode=run_mode)
+            _append_batch_event(batch_id, "info", f"{input_value} {run_mode} completed", item_index=index)
+            return {"status": "completed", "error": ""}
+
+        result = service.plan_dda_run_from_repository(
             task=task,
             output_dir=output_dir,
+            repository=repository,
             prefer_project_fasta=prefer_project_fasta,
         )
         if (
@@ -2637,6 +2758,9 @@ async def create_parameter_batch(body: dict[str, Any]):
         return {"error": f"Too many batch inputs: {len(inputs)}; maximum is {max_items}."}
     submitter = _clean_submitter(body.get("submitter"))
     ui_language = _clean_ui_language(body.get("ui_language"))
+    repository = _clean_repository(body.get("repository"))
+    run_mode = _clean_batch_run_mode(body.get("run_mode"))
+    resource_policy = _clean_resource_policy(body.get("resource_policy"))
     fasta_preference = _clean_text(body.get("fasta_preference")).lower()
     prefer_project_fasta = fasta_preference == "project" or body.get("prefer_project_fasta") is True
     llm_config = body.get("llm_config", {})
@@ -2670,6 +2794,9 @@ async def create_parameter_batch(body: dict[str, Any]):
         "updated_at": _now_iso(),
         "jobs": jobs,
         "ui_language": ui_language,
+        "repository": repository,
+        "run_mode": run_mode,
+        "resource_policy": resource_policy,
         "prefer_project_fasta": prefer_project_fasta,
         "output_dir": str(batch_dir),
         "excel_path": str(batch_dir / _BATCH_EXCEL_FILE),
@@ -2749,6 +2876,24 @@ async def download_parameter_batch_audit(batch_id: str):
     )
 
 
+@app.post("/api/preflight")
+async def preflight(body: dict[str, Any]):
+    inputs = _clean_batch_inputs(body)
+    if not inputs:
+        single = _clean_text(body.get("input_value"))
+        if single:
+            inputs = [single]
+    if not inputs:
+        return {"status": "blocked", "blocking_issues": ["No input files were provided."], "checks": []}
+    return run_preflight(
+        inputs=inputs,
+        run_mode=_clean_run_mode(body.get("run_mode")),
+        repository=_clean_repository(body.get("repository"), default="auto"),
+        output_root=_runs_dir,
+        resource_policy=_clean_resource_policy(body.get("resource_policy")),
+    )
+
+
 @app.post("/api/tasks")
 async def create_task(body: dict[str, Any]):
     try:
@@ -2765,7 +2910,9 @@ async def _create_task_inner(body: dict[str, Any]):
     fasta_preference = _clean_text(body.get("fasta_preference")).lower()
     prefer_project_fasta = fasta_preference == "project" or body.get("prefer_project_fasta") is True
     run_mode = _clean_run_mode(body.get("run_mode"))
+    resource_policy = _clean_resource_policy(body.get("resource_policy"))
     ui_language = _clean_ui_language(body.get("ui_language"))
+    repository = _clean_repository(body.get("repository"))
 
     # 应用用户填写的 LLM 配置
     llm_config = body.get("llm_config", {})
@@ -2798,7 +2945,9 @@ async def _create_task_inner(body: dict[str, Any]):
             "blocking_issues": [],
             "prefer_project_fasta": prefer_project_fasta,
             "run_mode": run_mode,
+            "resource_policy": resource_policy,
             "ui_language": ui_language,
+            "repository": repository,
             "llm_config": dict(config),
         }
         queue_state = _queue_state_locked(task_id)
@@ -2825,7 +2974,9 @@ async def _create_task_inner(body: dict[str, Any]):
         "output_dir": str(output_dir),
         "status": status,
         "run_mode": run_mode,
+        "resource_policy": resource_policy,
         "ui_language": ui_language,
+        "repository": repository,
         **queue_state,
     }
 
@@ -3005,7 +3156,9 @@ def _run_pipeline(task_id: str):
     llm_config = task.get("llm_config")
     prefer_project_fasta = bool(task.get("prefer_project_fasta"))
     run_mode = _clean_run_mode(task.get("run_mode"))
+    repository = _clean_repository(task.get("repository"))
     parameter_only = run_mode == _RUN_MODE_PARAMETERS
+    prepare_only = run_mode == _RUN_MODE_PREPARE
     review_overrides = dict(task.get("review_overrides") or {})
     if not isinstance(llm_config, dict):
         _set_task_terminal_status(task_id, "failed")
@@ -3022,7 +3175,7 @@ def _run_pipeline(task_id: str):
         _log(task_id, "info", f"任务开始：{input_value}")
         _log(task_id, "info", f"输出目录：{output_dir}")
         _log(task_id, "info", f"LLM 模型：{llm_config['model']}  Base URL：{llm_config['base_url']}")
-        _log(task_id, "info", f"运行模式：{'仅搜参数' if parameter_only else '完整流程'}")
+        _log(task_id, "info", f"运行模式：{_run_mode_label(run_mode)}")
 
         # ── 步骤 1 ──
         _step(task_id, 1, "[1/5] 解析 PRIDE 项目")
@@ -3034,9 +3187,10 @@ def _run_pipeline(task_id: str):
 
         _log(task_id, "info", "正在查询 PRIDE API 并调用大模型推断参数…")
         with StderrCapture(task_id):
-            result = service.plan_dda_run_from_pride(
+            result = service.plan_dda_run_from_repository(
                 task=task_obj,
                 output_dir=output_dir,
+                repository=repository,
                 prefer_project_fasta=prefer_project_fasta,
             )
         if review_overrides:
@@ -3146,6 +3300,38 @@ def _run_pipeline(task_id: str):
                 report=reporter,
             )
         service.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, bundle.plan, asset=result.asset)
+        if prepare_only:
+            _step(task_id, 4, "[4/5] Package MSDT-Converter input")
+            from agent.msdt_converter.docker_runner import DockerMSDTConverterRunner
+
+            docker_runner = DockerMSDTConverterRunner(image="guomics2017/msdt-converter:v1.3", report=reporter)
+            docker_runner.write_container_config(bundle)
+            try:
+                from agent.audit.review import build_task_state_snapshot, write_task_state
+
+                project_accession = result.resolution.primary_project.project_accession if result.resolution.primary_project else None
+                _write_parameter_audit_files(output_dir, task_id, 1, input_value, result)
+                write_task_state(
+                    output_dir / "task_state.json",
+                    build_task_state_snapshot(
+                        task_id=task_obj.task_id,
+                        status="completed",
+                        stage="packaging",
+                        source_file=task_obj.file_name,
+                        project_accession=project_accession,
+                        notes=["Prepare input package mode completed; Docker execution was not run."],
+                    ),
+                )
+                _write_task_runtime_log(task_id, output_dir)
+                _log(task_id, "info", "Prepared input package generated: converter_config, workflow, FASTA reference, decision_trace, attributes, parameter_audit and runtime.log.")
+                _log(task_id, "info", "Compressing input-package ZIP; large RAW/mzML payload files remain in the run directory and are not duplicated in the ZIP.")
+                _zip_output_dir(output_dir, report=lambda message: _log(task_id, "info", message))
+                _log(task_id, "info", "Input-package ZIP is ready to download.")
+            except Exception as audit_exc:
+                _log(task_id, "debug", f"Failed to write prepare-mode audit files: {audit_exc}")
+            _step(task_id, 5, "[5/5] Input package ready")
+            _set_task_terminal_status(task_id, "completed")
+            return
         _log(task_id, "info", f"输入包已生成：{output_dir}")
         _log(task_id, "info", f"converter_config：{bundle.converter_config_path}")
         _log(task_id, "info", f"workflow：{bundle.materialized_workflow_path}")
@@ -3291,7 +3477,9 @@ async def get_task(task_id: str):
         "review_summary": task.get("review_summary"),
         "fasta_preference": "project" if task.get("prefer_project_fasta") else "llm",
         "run_mode": _clean_run_mode(task.get("run_mode")),
+        "resource_policy": _clean_resource_policy(task.get("resource_policy")),
         "ui_language": _clean_ui_language(task.get("ui_language")),
+        "repository": _clean_repository(task.get("repository")),
         "can_download": can_download,
         "archived": False,
         **queue_state,

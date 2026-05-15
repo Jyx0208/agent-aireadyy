@@ -35,7 +35,7 @@ h1{font-size:1.38rem;letter-spacing:0}
 .section-eyebrow{font-size:.72rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
 .main-input{display:flex;gap:10px;margin-bottom:10px}
 .main-input input{flex:1;min-width:0;padding:12px 14px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);color:var(--text)}
-.main-input input:focus,.form-row input:focus,.review-actions select:focus{border-color:var(--accent)}
+.main-input input:focus,.form-row input:focus,.form-row select:focus,.review-actions select:focus{border-color:var(--accent)}
 .btn{border:0;border-radius:var(--radius);padding:11px 16px;font-size:.86rem;font-weight:650;cursor:pointer;transition:.15s background,.15s border-color,.15s color}
 .btn:disabled{opacity:.55;cursor:not-allowed}
 .btn-primary{background:var(--primary);color:#fff}
@@ -46,7 +46,7 @@ h1{font-size:1.38rem;letter-spacing:0}
 .btn-small{padding:7px 10px;font-size:.78rem}
 .form-row{display:grid;grid-template-columns:104px minmax(0,1fr);gap:10px;align-items:center;margin-bottom:9px}
 .form-row label{text-align:right;color:var(--muted);font-size:.8rem}
-.form-row input{width:100%;padding:9px 11px;background:var(--surface);border:1px solid var(--line);border-radius:6px;color:var(--text)}
+.form-row input,.form-row select{width:100%;padding:9px 11px;background:var(--surface);border:1px solid var(--line);border-radius:6px;color:var(--text)}
 .form-row input.error,.main-input input[aria-invalid="true"]{border-color:var(--red);background:var(--danger-soft)}
 .mode-row{display:grid;grid-template-columns:104px minmax(0,1fr);gap:10px;align-items:start;margin:11px 0 9px}
 .mode-label{text-align:right;color:var(--muted);font-size:.8rem;padding-top:8px}
@@ -255,15 +255,34 @@ footer{padding:4px 0 4px;color:var(--soft);font-size:.74rem;text-align:center}
         <label for="submitter" data-i18n="submitter">Submitter *</label>
         <input type="text" id="submitter" aria-required="true" aria-invalid="false" autocomplete="name" data-i18n-placeholder="submitterPlaceholder" placeholder="Name or lab member">
       </div>
+      <div class="form-row">
+        <label for="repositorySelect" data-i18n="repository">Repository</label>
+        <select id="repositorySelect" aria-describedby="repositoryHelp">
+          <option value="auto" data-i18n="repositoryAuto">Auto</option>
+          <option value="pride">PRIDE</option>
+          <option value="massive">MassIVE</option>
+          <option value="iprox">iProX</option>
+        </select>
+      </div>
+      <div class="mode-help" id="repositoryHelp" data-i18n="repositoryHelp">Auto detects MSV/IPX/PXD where possible. Choose a repository when you already know the source.</div>
       <div class="mode-row">
         <div class="mode-label" data-i18n="runMode">Run mode</div>
         <div class="mode-control">
           <div class="segmented" role="radiogroup" aria-label="Run mode" aria-describedby="runModeHelp">
             <button type="button" role="radio" aria-checked="true" data-run-mode="full" onclick="setRunMode('full')" data-i18n="modeFull">Full workflow</button>
+            <button type="button" role="radio" aria-checked="false" data-run-mode="prepare" onclick="setRunMode('prepare')" data-i18n="modePrepare">Prepare input package</button>
             <button type="button" role="radio" aria-checked="false" data-run-mode="parameters" onclick="setRunMode('parameters')" data-i18n="modeParameters">Parameters only</button>
           </div>
           <div class="mode-help" id="runModeHelp"></div>
         </div>
+      </div>
+      <div class="form-row">
+        <label for="singleResourcePolicy" data-i18n="resourcePolicy">Resource policy</label>
+        <select id="singleResourcePolicy">
+          <option value="balanced" data-i18n="policyBalanced">Balanced</option>
+          <option value="conservative" data-i18n="policyConservative">Conservative</option>
+          <option value="fast" data-i18n="policyFast">Fast</option>
+        </select>
       </div>
       <label class="option-row">
         <input type="checkbox" id="preferProjectFasta">
@@ -280,13 +299,40 @@ footer{padding:4px 0 4px;color:var(--soft);font-size:.74rem;text-align:center}
         <div class="pane-title">
           <div>
             <h3 id="batchTitle" data-i18n="batchTitle">Batch Excel Report</h3>
-            <p class="batch-help" id="batchHelp" data-i18n="batchHelp">Paste one PRIDE file name per line. This runs parameter planning only and generates a benchmark Excel report.</p>
+            <p class="batch-help" id="batchHelp" data-i18n="batchHelp">Paste one file name per line. Choose parameter audit, input package preparation, or full execution, then export a benchmark Excel report.</p>
           </div>
           <span class="status-pill queued" data-i18n="modeParameters">Parameters only</span>
         </div>
         <div class="form-row">
           <label for="batchSubmitter" data-i18n="batchSubmitter">Batch submitter *</label>
           <input type="text" id="batchSubmitter" aria-required="true" aria-invalid="false" autocomplete="name" data-i18n-placeholder="submitterPlaceholder" placeholder="Name or lab member">
+        </div>
+        <div class="form-row">
+          <label for="batchRepository" data-i18n="repository">Repository</label>
+          <select id="batchRepository" aria-describedby="batchRepositoryHelp">
+            <option value="auto" data-i18n="repositoryAuto">Auto</option>
+            <option value="pride">PRIDE</option>
+            <option value="massive">MassIVE</option>
+            <option value="iprox">iProX</option>
+          </select>
+        </div>
+        <div class="mode-help" id="batchRepositoryHelp" data-i18n="repositoryHelp">Auto detects MSV/IPX/PXD where possible. Choose a repository when you already know the source.</div>
+        <div class="form-row">
+          <label for="batchRunMode" data-i18n="runMode">Run mode</label>
+          <select id="batchRunMode" aria-describedby="batchRunModeHelp">
+            <option value="parameters" data-i18n="modeParameters">Parameters only</option>
+            <option value="prepare" data-i18n="modePrepare">Prepare input package</option>
+            <option value="full" data-i18n="modeFull">Full workflow</option>
+          </select>
+        </div>
+        <div class="mode-help" id="batchRunModeHelp" data-i18n="batchRunModeHelp">Choose whether batch items only infer parameters, prepare MSDT input packages, or run Docker end to end.</div>
+        <div class="form-row">
+          <label for="batchResourcePolicy" data-i18n="resourcePolicy">Resource policy</label>
+          <select id="batchResourcePolicy">
+            <option value="balanced" data-i18n="policyBalanced">Balanced</option>
+            <option value="conservative" data-i18n="policyConservative">Conservative</option>
+            <option value="fast" data-i18n="policyFast">Fast</option>
+          </select>
         </div>
         <label class="sr-only" for="batchInput" data-i18n="batchTitle">Batch Excel Report</label>
         <textarea class="batch-input" id="batchInput" aria-describedby="batchHelp" aria-invalid="false" spellcheck="false" data-i18n-placeholder="batchPlaceholder" placeholder="sample_a.raw&#10;sample_b.raw"></textarea>
@@ -408,15 +454,25 @@ const I18N={
     runningBtn:'Running...',
     submitter:'Submitter *',
     submitterPlaceholder:'Name or lab member',
+    repository:'Repository',
+    repositoryAuto:'Auto',
+    repositoryHelp:'Auto detects MSV/IPX/PXD where possible. Choose a repository when you already know the source. iProX full downloads may require Aspera or a synced index.',
     runMode:'Run mode',
     modeFull:'Full workflow',
+    modePrepare:'Prepare input package',
     modeParameters:'Parameters only',
     modeFullHelp:'Download or convert the data file, generate inputs, run Docker, and package downloadable results.',
+    modePrepareHelp:'Download or convert the data file and generate the exact MSDT-Converter input package without running Docker.',
     modeParametersHelp:'Resolve the PRIDE project and infer workflow, FASTA, digestion, modifications, species, and instrument. No raw download or Docker run.',
     preferFasta:'Use the project FASTA when PRIDE provides one; otherwise use the inferred UniProt FASTA.',
     examples:'Examples',
     batchTitle:'Batch Excel Report',
-    batchHelp:'Paste one PRIDE file name per line. This runs parameter planning only and generates a benchmark Excel report.',
+    batchHelp:'Paste one file name per line. Choose parameter audit, input package preparation, or full execution, then export a benchmark Excel report.',
+    batchRunModeHelp:'Choose whether batch items only infer parameters, prepare MSDT input packages, or run Docker end to end.',
+    resourcePolicy:'Resource policy',
+    policyBalanced:'Balanced',
+    policyConservative:'Conservative',
+    policyFast:'Fast',
     batchPlaceholder:'20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.raw\nHeLa_ArgC-Try_CID_1.raw',
     batchSubmitter:'Batch submitter *',
     batchJobs:'Parallel jobs',
@@ -479,7 +535,8 @@ const I18N={
     statusBar:{pending:'Waiting',queued:'Queued',running:'Running',completed:'Completed',failed:'Failed',blocked:'Needs review'},
     action:{watch:'Watch',inspect:'Inspect',download:'Download',view:'View'},
     batchAction:{watch:'Track batch',download:'Download Excel',view:'Open batch'},
-    mode:{full:'Full workflow',parameters:'Parameters only'},
+    mode:{full:'Full workflow',prepare:'Prepare input package',parameters:'Parameters only'},
+    repositoryLabel:{auto:'Auto',pride:'PRIDE',massive:'MassIVE',iprox:'iProX'},
     timeSource:{started_at:'Started',created_at:'Created',finished_at:'Finished',updated_at:'Updated',history_time:'Recorded'},
     duration:'duration',
     queue:(pos,len,running,max)=>`Task queued at position ${pos}/${len}. Server is running ${running}/${max} tasks and will start this one automatically.`,
@@ -501,6 +558,7 @@ const I18N={
     filesCleaned:'download files cleaned',
     fileCount:n=>`${n} files`,
     stepFull:['1 Resolve','2 Download','3 Bundle','4 Docker','5 Results'],
+    stepPrepare:['1 Resolve','2 Download','3 Bundle','4 Package','5 Complete'],
     stepParams:['1 Resolve','2 Infer','3 Plan','4 Review','5 Complete']
   },
   zh:{
@@ -525,9 +583,15 @@ const I18N={
     submitterPlaceholder:'姓名或课题组成员',
     runMode:'运行模式',
     modeFull:'完整流程',
+    modePrepare:'准备输入包',
     modeParameters:'仅搜参数',
     modeFullHelp:'下载或转换数据文件，生成输入包，运行 Docker，并打包可下载结果。',
     modeParametersHelp:'只解析 PRIDE 项目并推断 workflow、FASTA、酶切、修饰、物种和仪器；不下载 RAW，不运行 Docker。',
+    batchRunModeHelp:'选择批量任务只推断参数、准备 MSDT 输入包，或完整运行 Docker。',
+    resourcePolicy:'资源策略',
+    policyBalanced:'均衡',
+    policyConservative:'保守',
+    policyFast:'快速',
     preferFasta:'PRIDE 原项目提供 FASTA 时优先使用；否则使用按物种推断的 UniProt FASTA。',
     examples:'示例',
     apiConfig:'API 配置',
@@ -602,6 +666,13 @@ const I18N={
   }
 };
 
+Object.assign(I18N.zh,{
+  repository:'数据库',
+  repositoryAuto:'自动',
+  repositoryHelp:'自动模式会尽量识别 MSV/IPX/PXD。已知来源时请直接选择对应数据库；iProX 完整下载可能需要 Aspera 或本地索引。',
+  repositoryLabel:{auto:'自动',pride:'PRIDE',massive:'MassIVE',iprox:'iProX'}
+});
+
 function t(key){return I18N[currentLanguage][key]??I18N.en[key]??key}
 function tf(key,...args){const v=t(key);return typeof v==='function'?v(...args):v}
 function fill(v){document.getElementById('inputValue').value=v}
@@ -616,7 +687,8 @@ function timeSourceText(k){return t('timeSource')[k]||t('timeSource').history_ti
 function historyStatusText(s){return t('status')[s]||s||t('unknown')}
 function actionText(a){return t('action')[a]||t('action').view}
 function batchActionText(a){return t('batchAction')[a]||t('batchAction').view}
-function modeText(m){return t('mode')[m]||t('mode').full}
+function modeText(m){return t('mode')[m]||I18N.en.mode[m]||t('mode').full}
+function repositoryLabel(value){const labels=t('repositoryLabel')||I18N.en.repositoryLabel;return labels[value]||labels.pride}
 function statusText(s){return t('statusBar')[s]||s||t('unknown')}
 
 const UI={
@@ -695,8 +767,15 @@ function toggleConfig(){
 }
 
 function applyStepLabels(){
-  const labels=currentRunMode==='parameters'?t('stepParams'):t('stepFull');
+  const key=currentRunMode==='parameters'?'stepParams':(currentRunMode==='prepare'?'stepPrepare':'stepFull');
+  const labels=t(key)||I18N.en[key]||I18N.en.stepFull;
   document.querySelectorAll('.step-item').forEach((el,idx)=>{el.textContent=labels[idx]||''});
+}
+
+function runModeHelpText(){
+  if(currentRunMode==='parameters')return t('modeParametersHelp');
+  if(currentRunMode==='prepare')return t('modePrepareHelp')||I18N.en.modePrepareHelp;
+  return t('modeFullHelp');
 }
 
 function setLanguage(lang){
@@ -710,7 +789,7 @@ function setLanguage(lang){
   });
   document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.dataset.i18n)});
   document.querySelectorAll('[data-i18n-placeholder]').forEach(el=>{el.placeholder=t(el.dataset.i18nPlaceholder)});
-  document.getElementById('runModeHelp').textContent=currentRunMode==='parameters'?t('modeParametersHelp'):t('modeFullHelp');
+  document.getElementById('runModeHelp').textContent=runModeHelpText();
   const startBtn=document.getElementById('startBtn');
   if(startBtn.disabled){
     const status=document.getElementById('statusDot').className.replace('status-dot','').trim();
@@ -727,7 +806,7 @@ function setLanguage(lang){
 }
 
 function setRunMode(mode,persist=true){
-  currentRunMode=(mode==='parameters')?'parameters':'full';
+  currentRunMode=(mode==='parameters'||mode==='prepare'||mode==='full')?mode:'full';
   if(persist)localStorage.setItem('runMode',currentRunMode);
   document.querySelectorAll('[data-run-mode]').forEach(btn=>{
     const active=btn.dataset.runMode===currentRunMode;
@@ -735,7 +814,7 @@ function setRunMode(mode,persist=true){
     btn.setAttribute('aria-checked',active?'true':'false');
     btn.tabIndex=active?0:-1;
   });
-  document.getElementById('runModeHelp').textContent=currentRunMode==='parameters'?t('modeParametersHelp'):t('modeFullHelp');
+  document.getElementById('runModeHelp').textContent=runModeHelpText();
   applyStepLabels();
 }
 
@@ -796,7 +875,7 @@ async function loadResults(){
       return;
     }
     const metaLine=item=>{
-      const parts=[item.submitter||t('notProvided'),historyStatusText(item.status),modeText(item.run_mode||'full')];
+      const parts=[item.submitter||t('notProvided'),repositoryLabel(item.repository||'pride'),historyStatusText(item.status),modeText(item.run_mode||'full')];
       if(item.kind==='batch'&&item.item_count!==undefined)parts.push((item.item_count||0)+' files');
       const tValue=formatHistoryTime(item);
       if(tValue)parts.push(timeSourceText(item.time_label)+' '+tValue);
@@ -915,15 +994,25 @@ async function startBatch(){
   status.className='batch-status';
   renderBatchItems(inputs.map((value,index)=>({input:value,status:index===0?'queued':'queued'})));
   renderBatchEvents({events:[{ts:now(),level:'info',message:t('batchCreating')}],items:[]});
+  const payload={
+    inputs,
+    submitter:document.getElementById('batchSubmitter').value.trim(),
+    repository:document.getElementById('batchRepository').value,
+    run_mode:document.getElementById('batchRunMode').value,
+    resource_policy:document.getElementById('batchResourcePolicy').value,
+    jobs:parseInt(document.getElementById('batchJobs').value||'3',10),
+    fasta_preference:document.getElementById('preferProjectFasta').checked?'project':'llm',
+    ui_language:currentLanguage,
+    llm_config:collectConfig()
+  };
   try{
-    const payload={
-      inputs,
-      submitter:document.getElementById('batchSubmitter').value.trim(),
-      jobs:parseInt(document.getElementById('batchJobs').value||'3',10),
-      fasta_preference:document.getElementById('preferProjectFasta').checked?'project':'llm',
-      ui_language:currentLanguage,
-      llm_config:collectConfig()
-    };
+    const preflight=await runPreflight(payload);
+    if(preflight.status==='blocked'){
+      status.textContent=preflight.blocking_issues&&preflight.blocking_issues.length?preflight.blocking_issues.join('; '):'Preflight failed.';
+      status.className='batch-status error';
+      setButtonBusy(btn,false,t('startBatch'));
+      return;
+    }
     const resp=await fetch('/api/batches/parameters',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     const data=await resp.json();
     if(data.error){status.textContent=data.error;status.className='batch-status error';setButtonBusy(btn,false,t('startBatch'));return}
@@ -935,6 +1024,11 @@ async function startBatch(){
     status.className='batch-status error';
     setButtonBusy(btn,false,t('startBatch'));
   }
+}
+
+async function runPreflight(payload){
+  const resp=await fetch('/api/preflight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  return await resp.json();
 }
 
 function downloadBatchExcel(){
@@ -1242,11 +1336,23 @@ async function startTask(){
     const payload={
       input_value:input,
       submitter:document.getElementById('submitter').value.trim(),
+      repository:document.getElementById('repositorySelect').value,
       fasta_preference:fastaPreference,
       run_mode:currentRunMode,
+      resource_policy:document.getElementById('singleResourcePolicy').value,
       ui_language:currentLanguage,
       llm_config:collectConfig()
     };
+    const preflight=await runPreflight(payload);
+    if(preflight.status==='blocked'){
+      const message=preflight.blocking_issues&&preflight.blocking_issues.length?preflight.blocking_issues.join('; '):'Preflight failed.';
+      receiveLog({type:'log',level:'error',message,ts:now()});
+      showFormAlert(message);
+      setStatus('failed');stopTimer();setButtonBusy(btn,false,t('start'));return;
+    }
+    if(preflight.warnings&&preflight.warnings.length){
+      receiveLog({type:'log',level:'info',message:preflight.warnings.join('; '),ts:now()});
+    }
     const resp=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     data=await resp.json();
   }catch(e){
