@@ -108,9 +108,18 @@ def _download_without_client(download_url: str, target_path: Path, report: Calla
     emit(report, f"下载完成：{target_path}")
 
 
+def _candidate_download_urls(asset: FileAsset) -> list[str]:
+    urls: list[str] = []
+    for url in [asset.download_url, *list(asset.download_urls or [])]:
+        text = str(url or "").strip()
+        if text and text not in urls:
+            urls.append(text)
+    return urls
+
+
 def download_file_asset(client, asset: FileAsset, report: Callable[[str], None] | None = None) -> Path:
-    download_url = asset.download_url or (asset.download_urls[0] if asset.download_urls else None)
-    if not download_url:
+    download_urls = _candidate_download_urls(asset)
+    if not download_urls:
         raise ValueError("无法下载文件资产：缺少下载 URL。")
     if not asset.local_path:
         raise ValueError("无法下载文件资产：缺少本地目标路径。")
@@ -130,14 +139,24 @@ def download_file_asset(client, asset: FileAsset, report: Callable[[str], None] 
     download_target = cache_path or asset.local_path
     download_target.parent.mkdir(parents=True, exist_ok=True)
     emit(report, f"正在下载数据文件 {asset.matched_project_file or asset.original_file_name} -> {download_target}")
-    if hasattr(client, "download_to_path"):
-        client.download_to_path(download_url, download_target, report=report)
-    elif hasattr(client, "download_binary") and not download_url.startswith("ftp://"):
-        payload = client.download_binary(download_url)
-        download_target.write_bytes(payload)
-        emit(report, f"下载完成：{download_target}")
-    else:
-        _download_without_client(download_url, download_target, report=report)
+    for index, download_url in enumerate(download_urls, start=1):
+        try:
+            if len(download_urls) > 1:
+                emit(report, f"尝试下载源 {index}/{len(download_urls)}：{download_url}")
+            if hasattr(client, "download_to_path"):
+                client.download_to_path(download_url, download_target, report=report)
+            elif hasattr(client, "download_binary") and not download_url.startswith("ftp://"):
+                payload = client.download_binary(download_url)
+                download_target.write_bytes(payload)
+                emit(report, f"下载完成：{download_target}")
+            else:
+                _download_without_client(download_url, download_target, report=report)
+            break
+        except Exception as exc:
+            _unlink_file(download_target)
+            if index >= len(download_urls):
+                raise
+            emit(report, f"下载源失败，尝试下一个备选源：{exc}")
 
     if not _matches_expected_size(download_target, asset.expected_size_bytes):
         actual = download_target.stat().st_size if download_target.exists() else 0

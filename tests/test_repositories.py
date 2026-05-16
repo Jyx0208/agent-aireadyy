@@ -8,19 +8,26 @@ from agent.input.normalizer import normalize_input
 from agent.metadata.canonical import CanonicalFile, CanonicalProject
 from agent.models import FileAsset, ProjectContext
 from agent.repositories.index import RepositoryIndex
-from agent.repositories.iprox_adapter import IproxAdapter
 from agent.repositories.massive_adapter import MassiveAdapter
 from agent.repositories.matching import canonical_files_to_project_file_records
 from agent.repositories.pride_adapter import PrideAdapter
 from agent.repositories.registry import RepositoryRegistry
 
 
-def test_cli_exposes_repository_index_sync_command():
+def test_cli_does_not_expose_iprox_support():
     cli_text = Path("src/agent/cli.py").read_text(encoding="utf-8")
 
-    assert '@app.command("sync-repository-index")' in cli_text
-    assert "--xml-dir" in cli_text
-    assert "--year" in cli_text
+    assert "sync-repository-index" not in cli_text
+    assert "iprox" not in cli_text.lower()
+
+
+def test_default_registry_supports_only_pride_and_massive():
+    registry = RepositoryRegistry()
+
+    assert [adapter.name for adapter in registry.adapters] == ["pride", "massive"]
+    assert RepositoryRegistry.supported_names() == ("pride", "massive")
+    with pytest.raises(ValueError, match="Unknown repository 'iprox'"):
+        registry.get("iprox")
 
 
 def test_registry_rejects_duplicate_adapter_names():
@@ -94,7 +101,7 @@ def test_massive_adapter_maps_native_and_px_accessions_and_prioritizes_raw(tmp_p
     assert matched is not None
     assert matched.file_category == "raw"
     assert asset.repository == "massive"
-    assert asset.transfer_method == "ftp"
+    assert asset.transfer_method == "https"
     assert asset.local_path == tmp_path / "assets" / "downloads" / "sample.raw"
 
 
@@ -147,8 +154,156 @@ def test_massive_adapter_resolves_file_name_from_dataset_cache_and_builds_ftp_ur
     assert context.project_files[0]["logicalPath"] == "datasets/68064/srm_74_3.raw"
     assert asset.matched_project_file == "srm_74_3.raw"
     assert asset.logical_path == "datasets/68064/srm_74_3.raw"
-    assert asset.download_url == "ftp://massive.ucsd.edu/v01/MSV000068064/datasets/68064/srm_74_3.raw"
-    assert asset.transfer_method == "ftp"
+    assert asset.download_url == "https://massive.ucsd.edu/ProteoSAFe/DownloadResultFile?file=f.MSV000068064/datasets/68064/srm_74_3.raw"
+    assert asset.download_urls[1] == "ftp://massive.ucsd.edu/v01/MSV000068064/datasets/68064/srm_74_3.raw"
+    assert asset.transfer_method == "https"
+
+
+def test_massive_client_filename_search_uses_fast_cache_fallbacks():
+    from agent.repositories.massive_adapter import MassiveClient
+
+    class FakeMassiveClient(MassiveClient):
+        def __init__(self):
+            self.calls: list[str] = []
+
+        def _datasetcache_csv(self, sql: str):
+            self.calls.append(sql)
+            if "collection=" in sql:
+                return [{"dataset": "MSV000001", "filepath": "raw/sample.raw", "collection": "sample.raw"}]
+            raise AssertionError(f"Unexpected slow query before indexed fallback: {sql}")
+
+    client = FakeMassiveClient()
+
+    rows = client.find_files_by_name_from_cache("sample.raw")
+
+    assert rows == [{"dataset": "MSV000001", "filepath": "raw/sample.raw", "collection": "sample.raw"}]
+    assert client.calls
+    assert all("lower(" not in sql.lower() for sql in client.calls)
+
+
+def test_massive_adapter_keeps_datasetcache_match_when_project_metadata_is_unavailable(tmp_path: Path):
+    class FakeMassiveClient:
+        def get_dataset(self, accession: str):
+            raise RuntimeError("MassIVE PROXI unavailable")
+
+        def query_datasets(self, accession: str):
+            raise RuntimeError("MassIVE QueryDatasets unavailable")
+
+        def find_files_by_name_from_cache(self, file_name: str, limit: int = 200):
+            return [
+                {
+                    "dataset": "MSV000099999",
+                    "filepath": "raw/sample.raw",
+                    "collection": "raw",
+                    "size": "1234",
+                }
+            ]
+
+        def list_dataset_files_from_cache(self, accession: str, limit: int = 5000):
+            return [
+                {
+                    "dataset": accession,
+                    "filepath": "raw/sample.raw",
+                    "collection": "raw",
+                    "size": "1234",
+                }
+            ]
+
+    adapter = MassiveAdapter(client=FakeMassiveClient())
+
+    resolution = adapter.resolve_project("sample.raw")
+    context = adapter.build_project_context(resolution, "sample.raw")
+    asset = adapter.resolve_file_asset(normalize_input("sample.raw"), context, tmp_path)
+
+    assert resolution.primary_project is not None
+    assert resolution.primary_project.project_accession == "MSV000099999"
+    assert context.project_accession == "MSV000099999"
+    assert asset.matched_project_file == "sample.raw"
+    assert asset.download_url == "https://massive.ucsd.edu/ProteoSAFe/DownloadResultFile?file=f.MSV000099999/raw/sample.raw"
+    assert asset.download_urls[1] == "ftp://massive.ucsd.edu/MSV000099999/raw/sample.raw"
+
+
+def test_massive_adapter_resolves_f_msv_path_without_datasetcache_hit(tmp_path: Path):
+    class FakeMassiveClient:
+        def get_dataset(self, accession: str):
+            assert accession == "MSV000101852"
+            return {
+                "accession": [{"name": "MassIVE dataset identifier", "value": "MSV000101852"}],
+                "datasetLink": [{"name": "Dataset FTP location", "value": "ftp://massive.ucsd.edu/v01/MSV000101852"}],
+                "title": "MassIVE explicit-path dataset",
+                "species": [[{"name": "taxonomy: scientific name", "value": "Homo sapiens"}]],
+                "instruments": [{"name": "Orbitrap Exploris 480"}],
+            }
+
+        def query_datasets(self, accession: str):
+            raise AssertionError("PROXI dataset lookup should succeed")
+
+        def find_files_by_name_from_cache(self, file_name: str, limit: int = 200):
+            raise AssertionError("Explicit MSV path should not need global filename search")
+
+        def list_dataset_files_from_cache(self, accession: str, limit: int = 5000):
+            return []
+
+    adapter = MassiveAdapter(client=FakeMassiveClient())
+    raw_input = "f.MSV000101852/raw/20240920_Ex480_Evo_CDS_2-Biotin_KO3.raw"
+
+    resolution = adapter.resolve_project(raw_input)
+    context = adapter.build_project_context(resolution, normalize_input(raw_input).file_name)
+    asset = adapter.resolve_file_asset(normalize_input(raw_input), context, tmp_path)
+
+    assert resolution.primary_project is not None
+    assert resolution.primary_project.project_accession == "MSV000101852"
+    assert resolution.primary_project.matched_file == "20240920_Ex480_Evo_CDS_2-Biotin_KO3.raw"
+    assert context.project_files[0]["logicalPath"] == "raw/20240920_Ex480_Evo_CDS_2-Biotin_KO3.raw"
+    assert asset.matched_project_file == "20240920_Ex480_Evo_CDS_2-Biotin_KO3.raw"
+    assert asset.logical_path == "raw/20240920_Ex480_Evo_CDS_2-Biotin_KO3.raw"
+    assert asset.download_url == "https://massive.ucsd.edu/ProteoSAFe/DownloadResultFile?file=f.MSV000101852/raw/20240920_Ex480_Evo_CDS_2-Biotin_KO3.raw"
+    assert asset.download_urls[1] == "ftp://massive.ucsd.edu/v01/MSV000101852/raw/20240920_Ex480_Evo_CDS_2-Biotin_KO3.raw"
+    assert asset.transfer_method == "https"
+
+
+def test_massive_adapter_prefers_https_downloadresultfile_over_ftp_for_datasetcache_files():
+    adapter = MassiveAdapter(client=None)
+    project = adapter.map_project(
+        {
+            "accession": [{"name": "MassIVE dataset identifier", "value": "MSV000101852"}],
+            "datasetLink": [{"name": "Dataset FTP location", "value": "ftp://massive.ucsd.edu/v13/MSV000101852"}],
+            "title": "MassIVE dataset",
+        },
+        "MSV000101852",
+    )
+
+    file = adapter.map_file({"filepath": "raw/sample.raw", "collection": "raw"}, project)
+
+    assert file.download_urls == [
+        "https://massive.ucsd.edu/ProteoSAFe/DownloadResultFile?file=f.MSV000101852/raw/sample.raw",
+        "ftp://massive.ucsd.edu/v13/MSV000101852/raw/sample.raw",
+    ]
+    assert file.transfer_method == "https"
+
+
+def test_massive_client_downloads_ftp_urls_with_urllib(tmp_path: Path, monkeypatch):
+    from agent.repositories import massive_adapter
+    from agent.repositories.massive_adapter import MassiveClient
+
+    calls: list[tuple[str, Path]] = []
+
+    def fake_urlretrieve(url: str, filename: str | Path):
+        target = Path(filename)
+        calls.append((url, target))
+        target.write_bytes(b"raw-bytes")
+        return str(target), {}
+
+    monkeypatch.setattr(massive_adapter.urllib.request, "urlretrieve", fake_urlretrieve)
+    target = tmp_path / "sample.raw"
+    logs: list[str] = []
+
+    downloaded = MassiveClient().download_to_path("ftp://massive.ucsd.edu/v13/MSV000101852/raw/sample.raw", target, report=logs.append)
+
+    assert downloaded == target
+    assert target.read_bytes() == b"raw-bytes"
+    assert calls == [("ftp://massive.ucsd.edu/v13/MSV000101852/raw/sample.raw", target)]
+    assert logs
 
 
 def test_massive_adapter_maps_proxi_cv_metadata_to_canonical_project():
@@ -204,131 +359,10 @@ def test_massive_adapter_ignores_null_cv_metadata_and_classifies_datasetcache_ra
     assert project.organisms == []
     assert project.instruments == []
     assert file.file_category == "raw"
-    assert file.download_urls == ["ftp://massive.ucsd.edu/v01/MSV000068064/datasets/68064/srm_74_3.raw"]
-
-
-def test_iprox_index_resolves_exact_file_candidate(tmp_path: Path):
-    index = RepositoryIndex(tmp_path / "iprox.sqlite")
-    project = CanonicalProject(
-        repository="iprox",
-        primary_accession="IPX000001",
-        native_accession="IPX000001",
-        px_accession="PXD999999",
-        title="iProX dataset",
-    )
-    file = CanonicalFile(
-        repository="iprox",
-        project_accession="IPX000001",
-        file_name="sample.raw",
-        logical_path="raw/sample.raw",
-        transfer_method="aspera",
-        download_urls=["user@download.iprox.org:/data/iprox/IPX000001/raw/sample.raw"],
-    )
-    index.upsert_project(project)
-    index.replace_files("iprox", "IPX000001", [file])
-    adapter = IproxAdapter(client=None, index=index)
-
-    resolution = adapter.resolve_project("sample.raw")
-    context = adapter.build_project_context(resolution, "sample.raw")
-    asset = adapter.resolve_file_asset(normalize_input("sample.raw"), context, tmp_path)
-
-    assert resolution.primary_project is not None
-    assert resolution.primary_project.repository == "iprox"
-    assert resolution.primary_project.project_accession == "IPX000001"
-    assert context.repository == "iprox"
-    assert asset.transfer_method == "aspera"
-    assert "ascp" in adapter.aspera_command(asset, tmp_path)
-
-
-def test_iprox_adapter_imports_px_xml_into_file_index(tmp_path: Path):
-    index = RepositoryIndex(tmp_path / "iprox.sqlite")
-    xml_path = tmp_path / "PX_IPX000001.xml"
-    xml_path.write_text(
-        """<?xml version="1.0" encoding="UTF-8"?>
-        <ProteomeXchangeDataset id="PXD999999">
-          <DatasetIdentifierList>
-            <DatasetIdentifier repository="iProX" accession="IPX000001"/>
-            <DatasetIdentifier repository="ProteomeXchange" accession="PXD999999"/>
-          </DatasetIdentifierList>
-          <DatasetSummary>
-            <title>iProX XML dataset</title>
-            <speciesList><cvParam name="taxonomy: scientific name" value="Homo sapiens"/></speciesList>
-            <instrumentList><cvParam name="Orbitrap Fusion"/></instrumentList>
-          </DatasetSummary>
-          <DatasetFileList>
-            <DatasetFile id="FILE_1" name="sample.raw">
-              <cvParam name="Associated raw file URI" value="aspera://download.iprox.org/data/iprox/IPX000001/raw/sample.raw"/>
-            </DatasetFile>
-            <DatasetFile id="FILE_2" name="result.mzML">
-              <cvParam name="Associated peak list file URI" value="https://example.test/result.mzML"/>
-            </DatasetFile>
-          </DatasetFileList>
-        </ProteomeXchangeDataset>
-        """,
-        encoding="utf-8",
-    )
-    adapter = IproxAdapter(client=None, index=index)
-
-    summary = adapter.sync_index_from_xml_files([xml_path])
-    resolution = adapter.resolve_project("sample.raw")
-    context = adapter.build_project_context(resolution, "sample.raw")
-    asset = adapter.resolve_file_asset(normalize_input("sample.raw"), context, tmp_path)
-
-    assert summary["projects"] == 1
-    assert summary["files"] == 2
-    assert resolution.primary_project is not None
-    assert resolution.primary_project.project_accession == "IPX000001"
-    assert context.px_accession == "PXD999999"
-    assert asset.transfer_method == "aspera"
-    assert asset.logical_path == "raw/sample.raw"
-
-
-def test_iprox_adapter_syncs_project_ids_from_official_date_api(tmp_path: Path):
-    class FakeIproxClient:
-        def list_project_ids_by_date(self, granularity: str, value: str):
-            assert granularity == "year"
-            assert value == "2020"
-            return ["IPX000001", "IPX000002"]
-
-        def get_dataset(self, accession: str):
-            return {
-                "accession": accession,
-                "title": f"Project {accession}",
-                "species": "Homo sapiens",
-                "dataFiles": [{"fileName": f"{accession}.raw", "filePath": f"raw/{accession}.raw"}],
-            }
-
-    index = RepositoryIndex(tmp_path / "iprox.sqlite")
-    adapter = IproxAdapter(client=FakeIproxClient(), index=index)
-
-    summary = adapter.sync_index_by_date("year", "2020", limit=1)
-
-    assert summary["projects"] == 1
-    assert summary["files"] == 1
-    assert index.get_project("iprox", "IPX000001").title == "Project IPX000001"
-    assert index.find_files_by_name("iprox", "IPX000001.raw")[0].logical_path == "raw/IPX000001.raw"
-
-
-def test_iprox_adapter_indexes_project_xml_placeholder_when_date_sync_has_no_file_list(tmp_path: Path):
-    class FakeIproxClient:
-        def list_project_ids_by_date(self, granularity: str, value: str):
-            return ["IPX000001"]
-
-        def get_dataset(self, accession: str):
-            return {"accession": accession, "title": "Project without PROXI files", "dataFiles": []}
-
-    index = RepositoryIndex(tmp_path / "iprox.sqlite")
-    adapter = IproxAdapter(client=FakeIproxClient(), index=index)
-
-    summary = adapter.sync_index_by_date("year", "2020", limit=1)
-    xml_file = index.find_files_by_name("iprox", "PX_IPX000001.xml")[0]
-
-    assert summary["projects"] == 1
-    assert summary["files"] == 1
-    assert summary["xml_placeholders"] == 1
-    assert xml_file.logical_path == "PX_IPX000001.xml"
-    assert xml_file.transfer_method == "aspera"
-    assert xml_file.download_urls == ["<iprox_username>@download.iprox.org:/data/iprox/IPX000001/PX_IPX000001.xml"]
+    assert file.download_urls == [
+        "https://massive.ucsd.edu/ProteoSAFe/DownloadResultFile?file=f.MSV000068064/datasets/68064/srm_74_3.raw",
+        "ftp://massive.ucsd.edu/v01/MSV000068064/datasets/68064/srm_74_3.raw",
+    ]
 
 
 def test_repository_index_round_trips_files(tmp_path: Path):
@@ -357,12 +391,12 @@ def test_download_layer_blocks_aspera_without_adapter_command(tmp_path: Path):
     from agent.assets.downloader import download_file_asset
 
     asset = FileAsset(
-        repository="iprox",
+        repository="pride",
         original_file_name="sample.raw",
         resolved_asset_type="raw",
-        project_accession="IPX000001",
+        project_accession="PXD000001",
         matched_project_file="sample.raw",
-        download_url="user@download.iprox.org:/data/iprox/IPX000001/sample.raw",
+        download_url="user@example.test:/data/sample.raw",
         transfer_method="aspera",
         local_path=tmp_path / "sample.raw",
     )

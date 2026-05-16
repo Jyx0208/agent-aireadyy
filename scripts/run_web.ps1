@@ -1,6 +1,7 @@
 param(
     [int]$Port = 8000,
-    [string]$Host = "127.0.0.1",
+    [Alias("Host")]
+    [string]$ListenHost = "127.0.0.1",
     [switch]$UseConda,
     [string]$CondaEnvName = "agent-aiready",
     [switch]$SkipSetupCheck
@@ -60,11 +61,15 @@ function Ensure-WebSetup {
 Ensure-EnvFile
 $Python = Ensure-WebSetup
 $Url = "http://localhost:$Port"
+if (-not $env:AGENT_WEB_FULL_WORKFLOW_ENABLED) {
+    $env:AGENT_WEB_FULL_WORKFLOW_ENABLED = "0"
+}
 
 Write-Host "Starting PRIDE AI-ready Agent Web..." -ForegroundColor Green
 Write-Host "Open: $Url" -ForegroundColor Cyan
+Write-Host "Full workflow enabled: $env:AGENT_WEB_FULL_WORKFLOW_ENABLED" -ForegroundColor Cyan
 Write-Host "Press Ctrl+C to stop." -ForegroundColor Yellow
 Write-Host ""
 
 Start-Process $Url
-& $Python -m uvicorn agent.web.app:app --host $Host --port $Port
+& $Python -m uvicorn agent.web.app:app --host $ListenHost --port $Port

@@ -4,7 +4,7 @@ PRIDE AI-ready Agent is a production-oriented proteomics workflow system that tu
 
 ## What It Does
 
-- Resolves PRIDE, MassIVE, and iProX projects through a repository adapter layer.
+- Resolves PRIDE and MassIVE projects through a repository adapter layer.
 - Infers project metadata, species, instrument, digestion, modifications, and search parameters.
 - Builds actual FragPipe and MSDT-Converter inputs, including workflow and FASTA selection.
 - Supports three run modes for single-file and batch use:

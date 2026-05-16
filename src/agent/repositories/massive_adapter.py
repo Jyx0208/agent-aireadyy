@@ -3,9 +3,10 @@ from __future__ import annotations
 import csv
 import io
 import re
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -96,8 +97,59 @@ def _plain_text_values(*values: Any) -> list[str]:
     return out
 
 
+def _sql_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _sql_like_pattern(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _metadata_values(value: Any, source: str) -> list[CanonicalMetadataValue]:
     return [CanonicalMetadataValue(value=item, source=source) for item in _list_text(value)]
+
+
+_MASSIVE_ACCESSION_RE = re.compile(r"(?:^|[^\w])(?:f\.)?((?:R)?MSV\d{6,}|PXD\d{6,})\b", re.IGNORECASE)
+_MASSIVE_EXPLICIT_PATH_PREFIX = "massive.input_logical_path="
+
+
+def _extract_massive_accession(value: str) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    direct = re.match(r"^(?:R)?MSV\d{6,}$|^PXD\d{6,}$", text, flags=re.IGNORECASE)
+    if direct:
+        return direct.group(0).upper()
+    match = _MASSIVE_ACCESSION_RE.search(text)
+    return match.group(1).upper() if match else None
+
+
+def _massive_path_text(raw_input: str) -> str:
+    parsed = urlparse(raw_input)
+    path = parsed.path if parsed.scheme and parsed.netloc else raw_input
+    return path.replace("\\", "/").strip()
+
+
+def _extract_massive_logical_path(raw_input: str, accession: str | None) -> str | None:
+    if not accession:
+        return None
+    path = _massive_path_text(raw_input)
+    match = re.search(re.escape(accession), path, flags=re.IGNORECASE)
+    if not match:
+        return None
+    logical_path = path[match.end() :].lstrip("/")
+    if not logical_path:
+        return None
+    return logical_path.split("?", 1)[0].split("#", 1)[0].strip("/") or None
+
+
+def _massive_download_result_url(accession: str | None, logical_path: str | None) -> str | None:
+    if not accession or not logical_path:
+        return None
+    if not accession.upper().startswith(("MSV", "RMSV")):
+        return None
+    file_param = quote(f"f.{accession}/{logical_path.lstrip('/')}", safe="/")
+    return f"https://massive.ucsd.edu/ProteoSAFe/DownloadResultFile?file={file_param}"
 
 
 class MassiveClient:
@@ -144,9 +196,10 @@ class MassiveClient:
             out.append(row)
         return out
 
-    def _datasetcache_csv(self, sql: str) -> list[dict[str, Any]]:
+    def _datasetcache_csv(self, sql: str, timeout: float | None = None) -> list[dict[str, Any]]:
         url = "https://datasetcache.gnps2.org/datasette/database.csv?sql=" + quote(sql)
-        response = self._client.get(url)
+        request_timeout = httpx.Timeout(timeout, read=timeout) if timeout else None
+        response = self._client.get(url, timeout=request_timeout)
         response.raise_for_status()
         text = response.text.lstrip("\ufeff\r\n")
         if not text.strip():
@@ -156,22 +209,87 @@ class MassiveClient:
     def list_dataset_files_from_cache(self, accession: str, limit: int = 5000) -> list[dict[str, Any]]:
         safe_accession = accession.replace("'", "''")
         sql = f"select * from filename where dataset='{safe_accession}' limit {int(limit)}"
-        return self._datasetcache_csv(sql)
+        return self._safe_datasetcache_csv(sql, timeout=30.0)
 
     def find_files_by_name_from_cache(self, file_name: str, limit: int = 200) -> list[dict[str, Any]]:
-        safe_name = file_name.replace("'", "''").lower()
-        sql = (
-            "select * from filename where "
-            f"lower(filepath)= '{safe_name}' or "
-            f"lower(filepath) like '%/{safe_name}' or "
-            f"lower(filepath) like '%/{safe_name}/%' "
-            f"limit {int(limit)}"
-        )
-        return self._datasetcache_csv(sql)
+        clean_name = PurePathCompat.name(file_name)
+        if not clean_name:
+            return []
+        limit = int(limit)
+        variants = [clean_name]
+        rows: list[dict[str, Any]] = []
+
+        # Fast indexed lookups first. The datasetcache table has indexes on
+        # collection and filepath; the previous lower(filepath) suffix scan can
+        # time out or return HTTP 500 on normal file-name searches.
+        for name in variants:
+            quoted_name = _sql_string(name)
+            sql = (
+                "select * from filename where "
+                f"collection={quoted_name} or update_name={quoted_name} or filepath={quoted_name} "
+                f"limit {limit}"
+            )
+            query_rows = self._safe_datasetcache_csv(sql, timeout=10.0)
+            if query_rows:
+                rows.extend(query_rows)
+                return self._dedupe_cache_rows(rows)[:limit]
+
+        # Last resort: suffix search for MassIVE paths such as
+        # datasets/68064/sample.raw/_HEADER.TXT. Keep this separate and short so
+        # a slow remote scan cannot block the whole planning flow.
+        for name in variants[:1]:
+            pattern = _sql_like_pattern(name)
+            suffix_queries = [
+                f"select * from filename where filepath like {_sql_string('%/' + pattern + '/%')} escape '\\' limit {limit}",
+                f"select * from filename where filepath like {_sql_string('%/' + pattern)} escape '\\' limit {limit}",
+            ]
+            for sql in suffix_queries:
+                query_rows = self._safe_datasetcache_csv(sql, timeout=8.0)
+                if query_rows:
+                    rows.extend(query_rows)
+                    return self._dedupe_cache_rows(rows)[:limit]
+        return self._dedupe_cache_rows(rows)[:limit]
+
+    def _safe_datasetcache_csv(self, sql: str, timeout: float | None = None) -> list[dict[str, Any]]:
+        try:
+            try:
+                return self._datasetcache_csv(sql, timeout=timeout)
+            except TypeError:
+                # Test doubles and older injected clients may expose the old
+                # single-argument hook.
+                return self._datasetcache_csv(sql)  # type: ignore[call-arg]
+        except (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            httpx.HTTPStatusError,
+        ):
+            return []
+
+    @staticmethod
+    def _dedupe_cache_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[tuple[str, str, str]] = set()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            key = (
+                str(row.get("dataset") or ""),
+                str(row.get("filepath") or ""),
+                str(row.get("usi") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+        return out
 
     def download_to_path(self, url: str, target_path: str | Path, report: Callable | None = None) -> Path:
         target_path = Path(target_path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
+        if url.startswith("ftp://"):
+            urllib.request.urlretrieve(url, target_path)
+            if report:
+                report(f"Download complete: {target_path}")
+            return target_path
         with self._client.stream("GET", url) as response:
             response.raise_for_status()
             with target_path.open("wb") as handle:
@@ -191,15 +309,20 @@ class MassiveAdapter:
         self.file_index_csv_url = file_index_csv_url
 
     def can_handle_accession(self, value: str) -> bool:
-        return value.upper().startswith(("MSV", "RMSV", "PXD"))
+        return _extract_massive_accession(value) is not None
 
     def resolve_project(self, raw_input: str) -> ProjectResolution:
         task = normalize_input(raw_input)
-        if self.can_handle_accession(task.file_name):
-            project = self.get_project(task.file_name)
+        explicit_accession = _extract_massive_accession(raw_input) or _extract_massive_accession(task.file_name)
+        explicit_logical_path = _extract_massive_logical_path(raw_input, explicit_accession)
+        if explicit_accession:
+            project = self.get_project(explicit_accession)
             matched_file = task.file_name
-            match_type = "accession"
+            match_type = "accession_path" if explicit_logical_path else "accession"
             evidence = ["MassIVE accession input"]
+            if explicit_logical_path:
+                evidence.append("MassIVE explicit file path input")
+                evidence.append(f"{_MASSIVE_EXPLICIT_PATH_PREFIX}{explicit_logical_path}")
         else:
             raw_files = self.client.find_files_by_name_from_cache(task.file_name)
             files_by_project: dict[str, list[dict[str, Any]]] = {}
@@ -242,18 +365,46 @@ class MassiveAdapter:
         return resolve_primary_project([candidate])
 
     def get_project(self, accession: str) -> CanonicalProject:
+        errors: list[str] = []
         try:
             raw = self.client.get_dataset(accession)
-        except Exception:
-            raw = self.client.query_datasets(accession)
+        except Exception as exc:
+            errors.append(f"proxi: {type(exc).__name__}: {exc}")
+            try:
+                raw = self.client.query_datasets(accession)
+            except Exception as fallback_exc:
+                errors.append(f"querydatasets: {type(fallback_exc).__name__}: {fallback_exc}")
+                raw = {
+                    "accession": accession,
+                    "dataset": accession,
+                    "title": f"MassIVE dataset {accession}",
+                    "remote_metadata_status": "unavailable",
+                    "remote_metadata_errors": errors,
+                }
         return self.map_project(raw, accession)
 
     def list_project_files(self, project: CanonicalProject) -> list[CanonicalFile]:
         raw_files = self._raw_file_records(project.raw_metadata)
         if not raw_files and hasattr(self.client, "list_dataset_files_from_csv"):
-            raw_files = self.client.list_dataset_files_from_csv(project.primary_accession, self.file_index_csv_url)
+            try:
+                raw_files = self.client.list_dataset_files_from_csv(project.primary_accession, self.file_index_csv_url)
+            except (
+                httpx.TimeoutException,
+                httpx.NetworkError,
+                httpx.RemoteProtocolError,
+                httpx.HTTPStatusError,
+            ):
+                raw_files = []
         if not raw_files and hasattr(self.client, "list_dataset_files_from_cache"):
-            raw_files = self.client.list_dataset_files_from_cache(project.primary_accession)
+            try:
+                raw_files = self.client.list_dataset_files_from_cache(project.primary_accession)
+            except (
+                httpx.TimeoutException,
+                httpx.NetworkError,
+                httpx.RemoteProtocolError,
+                httpx.HTTPStatusError,
+            ):
+                raw_files = []
         return self._dedupe_files([self.map_file(record, project) for record in raw_files])
 
     def match_file(self, task: InputTask, files: list[CanonicalFile]) -> CanonicalFile | None:
@@ -263,7 +414,7 @@ class MassiveAdapter:
         if resolution.primary_project is None:
             raise ValueError("Cannot build MassIVE context without a primary project.")
         project = self.get_project(resolution.primary_project.project_accession)
-        files = self.list_project_files(project)
+        files = self._dedupe_files(self._explicit_files_from_resolution(resolution, project) + self.list_project_files(project))
         metadata = {
             "title": MetadataValue(value=project.title, source="massive.title", source_level="project", completeness=1.0 if project.title else 0.0),
             "projectDescription": MetadataValue(value=project.description, source="massive.description", source_level="project", completeness=1.0 if project.description else 0.0),
@@ -289,6 +440,29 @@ class MassiveAdapter:
             evidence_documents=evidence,
             raw_project_metadata=project.raw_metadata,
         )
+
+    def _explicit_files_from_resolution(self, resolution: ProjectResolution, project: CanonicalProject) -> list[CanonicalFile]:
+        primary = resolution.primary_project
+        if primary is None:
+            return []
+        files: list[CanonicalFile] = []
+        for evidence in primary.evidence:
+            if not evidence.startswith(_MASSIVE_EXPLICIT_PATH_PREFIX):
+                continue
+            logical_path = evidence[len(_MASSIVE_EXPLICIT_PATH_PREFIX) :].strip().replace("\\", "/").strip("/")
+            if not logical_path:
+                continue
+            files.append(
+                self.map_file(
+                    {
+                        "dataset": project.primary_accession,
+                        "filepath": logical_path,
+                        "collection": logical_path.split("/", 1)[0] if "/" in logical_path else None,
+                    },
+                    project,
+                )
+            )
+        return files
 
     def resolve_file_asset(self, task: InputTask, context: ProjectContext, work_dir: str | Path) -> FileAsset:
         project = CanonicalProject(
@@ -384,19 +558,33 @@ class MassiveAdapter:
         if category and category.lower() not in MASSIVE_COLLECTION_PRIORITY and asset_type != "unknown":
             category = asset_type
         public_locations = raw.get("publicFileLocations")
-        public_url = None
-        if isinstance(public_locations, list) and public_locations:
-            first_location = public_locations[0]
-            public_url = first_location.get("value") if isinstance(first_location, dict) else str(first_location)
-        url = _first_text(raw.get("download_url"), raw.get("url"), raw.get("ftp_url"), public_url)
+        public_urls: list[str] = []
+        if isinstance(public_locations, list):
+            for location in public_locations:
+                public_url = location.get("value") if isinstance(location, dict) else str(location)
+                if public_url:
+                    public_urls.append(public_url)
+        url = _first_text(raw.get("download_url"), raw.get("url"), raw.get("ftp_url"), *public_urls)
         base_ftp = _first_text(project.raw_metadata.get("ftp_url"), project.raw_metadata.get("ftpDownloadURL"), project.raw_metadata.get("dataset_ftp_url"))
         if not url and base_ftp and logical_path:
             url = f"{base_ftp.rstrip('/')}/{logical_path.lstrip('/')}"
         if not url and logical_path and project.native_accession:
             url = f"ftp://massive.ucsd.edu/{project.native_accession}/{logical_path.lstrip('/')}"
+        download_urls = _dedupe_text(
+            [
+                item
+                for item in [
+                    _massive_download_result_url(project.native_accession or project.primary_accession, logical_path),
+                    url,
+                    *public_urls,
+                ]
+                if item
+            ]
+        )
+        primary_url = download_urls[0] if download_urls else None
         transfer = "unknown"
-        if url:
-            transfer = "ftp" if url.startswith("ftp://") else "https" if url.startswith(("http://", "https://")) else "unknown"
+        if primary_url:
+            transfer = "ftp" if primary_url.startswith("ftp://") else "https" if primary_url.startswith(("http://", "https://")) else "unknown"
         return CanonicalFile(
             repository=self.name,
             project_accession=project.primary_accession,
@@ -406,7 +594,7 @@ class MassiveAdapter:
             file_format=_first_text(raw.get("file_format"), raw.get("format")),
             size_bytes=self._to_int(_first_text(raw.get("size_bytes"), raw.get("fileSizeBytes"), raw.get("filesize"), raw.get("size"))),
             checksum=_first_text(raw.get("checksum"), raw.get("md5")),
-            download_urls=[url] if url else [],
+            download_urls=download_urls,
             transfer_method=transfer,
             raw_record=raw,
         )

@@ -57,6 +57,7 @@ def _same_value(left: Any, right: Any) -> bool:
     def normalized(value: Any) -> str:
         text = _flatten(value).strip().lower()
         text = re.sub(r"\s*\([^)]*\)", "", text)
+        text = re.sub(r"\s*<[^>]*>", "", text)
         text = re.sub(r"[^a-z0-9]+", " ", text)
         return " ".join(text.split())
 

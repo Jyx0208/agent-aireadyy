@@ -50,7 +50,7 @@ Responsibilities:
 
 Responsibilities:
 
-- resolve PRIDE, MassIVE, and iProX through one adapter interface
+- resolve PRIDE and MassIVE through one adapter interface
 - map external metadata into canonical project/file objects
 - hide API-specific differences from downstream planning
 
@@ -152,4 +152,3 @@ Responsibilities:
 - batch and single-file parity
 - clear run modes
 - downloadable artifacts for verification
-

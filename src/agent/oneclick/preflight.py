@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import shutil
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -39,7 +38,6 @@ def run_preflight(
     disk_usage: Callable[[Path], Any] = shutil.disk_usage,
     env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    env = env if env is not None else os.environ
     mode = normalize_run_mode(run_mode)
     policy = normalize_resource_policy(resource_policy)
     output_root = Path(output_root)
@@ -65,14 +63,6 @@ def run_preflight(
             checks.append({"name": "msconvert", "status": "ok", "message": "Local msconvert is available."})
         else:
             checks.append({"name": "msconvert", "status": "warning", "message": "Local msconvert is missing; Docker ProteoWizard fallback will be used."})
-
-    if _requires_iprox_aspera(repository, inputs, mode):
-        if not _has_aspera_credentials(env):
-            issue = "iProX prepare/full runs require Aspera credentials or a pre-synced PX XML index."
-            blocking.append(issue)
-            checks.append({"name": "iprox_aspera", "status": "blocked", "message": issue})
-        else:
-            checks.append({"name": "iprox_aspera", "status": "ok", "message": "iProX Aspera credentials are configured."})
 
     disk_required = _required_disk_bytes(mode, policy)
     try:
@@ -106,21 +96,6 @@ def run_preflight(
         "warnings": warnings,
         "required_disk_bytes": disk_required,
     }
-
-
-def _requires_iprox_aspera(repository: str, inputs: list[str], mode: str) -> bool:
-    if mode == "parameters":
-        return False
-    repo = str(repository or "").strip().lower()
-    if repo == "iprox":
-        return True
-    if repo == "auto":
-        return any(str(item).strip().upper().startswith("IPX") for item in inputs)
-    return False
-
-
-def _has_aspera_credentials(env: Mapping[str, str]) -> bool:
-    return bool(str(env.get("IPROX_ASPERA_USERNAME") or "").strip())
 
 
 def _required_disk_bytes(mode: str, policy: str) -> int:

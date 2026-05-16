@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 SourceType = Literal["local_path", "url", "file_name"]
 TaskStatus = Literal["resolved", "needs_review", "blocked", "completed", "failed"]
-RepositoryName = Literal["pride", "iprox", "massive"]
+RepositoryName = Literal["pride", "massive"]
 
 
 class JsonModel(BaseModel):

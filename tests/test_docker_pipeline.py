@@ -47,6 +47,27 @@ def _reviewed_fasta(tmp_path: Path) -> Path:
     return path
 
 
+def _write_minimal_dda_mzml(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<mzML xmlns="http://psi.hupo.org/ms/mzml">
+  <run id="run1">
+    <spectrumList count="2">
+      <spectrum id="scan=1">
+        <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="1"/>
+      </spectrum>
+      <spectrum id="scan=2">
+        <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2"/>
+      </spectrum>
+    </spectrumList>
+  </run>
+</mzML>
+""",
+        encoding="utf-8",
+    )
+
+
 def test_run_pride_dda_msdt_docker_executes_runner(tmp_path: Path, monkeypatch):
     service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
     task = normalize_input("WT_5_Lys-c.raw")
@@ -96,8 +117,7 @@ def test_run_pride_dda_msdt_docker_executes_runner(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(service, "resolve_asset", lambda *args, **kwargs: asset)
 
     def fake_prepare_asset(asset_to_prepare, converter=None):
-        asset_to_prepare.local_path.parent.mkdir(parents=True, exist_ok=True)
-        asset_to_prepare.local_path.write_bytes(b"mzml-bytes")
+        _write_minimal_dda_mzml(asset_to_prepare.local_path)
         return asset_to_prepare.local_path
 
     monkeypatch.setattr(service, "prepare_asset", fake_prepare_asset)
@@ -184,8 +204,7 @@ def test_run_pride_dda_msdt_docker_marks_failed_when_msdt_output_missing(tmp_pat
     monkeypatch.setattr(service, "resolve_asset", lambda *args, **kwargs: asset)
 
     def fake_prepare_asset(asset_to_prepare, converter=None):
-        asset_to_prepare.local_path.parent.mkdir(parents=True, exist_ok=True)
-        asset_to_prepare.local_path.write_bytes(b"mzml-bytes")
+        _write_minimal_dda_mzml(asset_to_prepare.local_path)
         return asset_to_prepare.local_path
 
     monkeypatch.setattr(service, "prepare_asset", fake_prepare_asset)
@@ -239,8 +258,7 @@ def test_docker_runner_uses_materialized_workflow_path_in_config(tmp_path: Path)
         project_files=[],
     )
     source_data_path = tmp_path / "task_out" / "assets" / "prepared" / "WT_5_Lys-c.mzML"
-    source_data_path.parent.mkdir(parents=True, exist_ok=True)
-    source_data_path.write_text("mzml", encoding="utf-8")
+    _write_minimal_dda_mzml(source_data_path)
 
     bundle = materialize_dda_task_bundle(
         task=task,

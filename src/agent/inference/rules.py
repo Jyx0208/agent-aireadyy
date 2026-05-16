@@ -9,6 +9,22 @@ from agent.models import AttributeSet, AttributeValue, ProjectContext
 
 _DIA_RE = re.compile(r"\bDIA\b|SWATH|data[- ]independent|sequential window acquisition", re.IGNORECASE)
 _DDA_RE = re.compile(r"\bDDA\b|data[- ]dependent|tandem mass tag|itraq|silac", re.IGNORECASE)
+_NON_PROTEOMICS_RE = re.compile(
+    r"DatasetType\s*:\s*Metabolomics|"
+    r"\bmetabolomics?\b|\bmetabolites?\b|\bmetabolome\b|"
+    r"\blipidomics?\b|\bsmall[- ]molecules?\b|"
+    r"\buntargeted\b|\bnon[- ]targeted\b|untarget[_/-]|"
+    r"\bHILIC\s*(?:pos|positive|neg|negative)?\b|HILICpos|HILICneg",
+    re.IGNORECASE,
+)
+_DATASET_TYPE_METABOLOMICS_RE = re.compile(r"DatasetType\s*:\s*Metabolomics", re.IGNORECASE)
+_DATASET_TYPE_PROTEOMICS_RE = re.compile(r"DatasetType\s*:\s*Proteomics", re.IGNORECASE)
+_TARGET_PROTEOMICS_RE = re.compile(
+    r"\bproteomics?\b|\bproteome\b|\bpeptides?\b|\bprotein\b|"
+    r"\btrypsin\b|\blys[- ]?c\b|\barg[- ]?c\b|\basp[- ]?n\b|"
+    r"\bphospho\b|\bTMT\b|\biTRAQ\b|\bSILAC\b",
+    re.IGNORECASE,
+)
 
 
 def _flatten(value: Any) -> str:
@@ -41,6 +57,43 @@ def _metadata_text(context: ProjectContext) -> str:
     return "\n".join(chunks)
 
 
+def _target_file_text(context: ProjectContext) -> str:
+    chunks = [context.file_name]
+    target_name = context.file_name.lower()
+    for record in context.project_files:
+        file_name = str(record.get("fileName") or "")
+        logical_path = str(record.get("logicalPath") or "")
+        if file_name.lower() == target_name or target_name in logical_path.lower():
+            chunks.append(file_name)
+            chunks.append(logical_path)
+            chunks.append(_flatten(record.get("fileCategory")))
+    return "\n".join(chunk for chunk in chunks if chunk)
+
+
+def _evidence_text(context: ProjectContext) -> str:
+    chunks = [_metadata_text(context), _target_file_text(context)]
+    for document in context.evidence_documents:
+        chunks.append(_flatten(document))
+    return "\n".join(chunk for chunk in chunks if chunk)
+
+
+def non_proteomics_evidence(context: ProjectContext | None) -> str | None:
+    if context is None:
+        return None
+    target_text = _target_file_text(context)
+    target_match = _NON_PROTEOMICS_RE.search(target_text)
+    if target_match and not _TARGET_PROTEOMICS_RE.search(target_text):
+        return target_text[:400]
+
+    text = _evidence_text(context)
+    if _DATASET_TYPE_METABOLOMICS_RE.search(text) and not _DATASET_TYPE_PROTEOMICS_RE.search(text):
+        return text[:400]
+    metadata_match = _NON_PROTEOMICS_RE.search(text)
+    if metadata_match and not _TARGET_PROTEOMICS_RE.search(text):
+        return text[:400]
+    return None
+
+
 def _first_sdrf_value(rows: list[dict[str, Any]], patterns: tuple[str, ...]) -> str | None:
     for row in rows:
         for key, value in row.items():
@@ -60,7 +113,24 @@ def _attribute(value: Any, confidence: float, source: str, evidence_excerpt: str
     )
 
 
+def _metadata_source(context: ProjectContext, key: str, fallback: str) -> str:
+    metadata = context.metadata.get(key)
+    if metadata is not None and metadata.source:
+        return metadata.source
+    return fallback
+
+
 def _infer_acquisition_mode(context: ProjectContext) -> AttributeValue:
+    unsupported_evidence = non_proteomics_evidence(context)
+    if unsupported_evidence:
+        return _attribute(
+            "unsupported",
+            0.95,
+            "unsupported_assay_rule",
+            unsupported_evidence,
+            conflict=True,
+        )
+
     sdrf_value = _first_sdrf_value(context.sdrf_rows, ("acquisition method", "data acquisition"))
     if sdrf_value:
         normalized = sdrf_value.upper()
@@ -94,18 +164,19 @@ def _infer_species(context: ProjectContext) -> AttributeValue:
 
     organisms = context.metadata.get("organisms")
     if organisms and organisms.value:
+        source = _metadata_source(context, "organisms", f"{context.repository}.organisms")
         if isinstance(organisms.value, list) and organisms.value:
             unique_values = [str(value) for value in dict.fromkeys(organisms.value) if str(value).strip()]
             if len(unique_values) > 1:
                 return _attribute(
                     "; ".join(unique_values),
                     0.5,
-                    "pride.organisms",
+                    source,
                     _flatten(unique_values),
                     conflict=True,
                 )
-            return _attribute(organisms.value[0], 0.9, "pride.organisms", str(organisms.value[0]))
-        return _attribute(organisms.value, 0.9, "pride.organisms", _flatten(organisms.value))
+            return _attribute(organisms.value[0], 0.9, source, str(organisms.value[0]))
+        return _attribute(organisms.value, 0.9, source, _flatten(organisms.value))
     return _attribute("unknown", 0.0, "none", "")
 
 
@@ -116,6 +187,7 @@ def _infer_instrument_name(context: ProjectContext) -> AttributeValue:
 
     instruments = context.metadata.get("instruments")
     if instruments and instruments.value:
+        source = _metadata_source(context, "instruments", f"{context.repository}.instruments")
         if isinstance(instruments.value, list) and instruments.value:
             unique_values = [str(value) for value in dict.fromkeys(instruments.value) if str(value).strip()]
             if len(unique_values) > 1:
@@ -125,12 +197,12 @@ def _infer_instrument_name(context: ProjectContext) -> AttributeValue:
                 return _attribute(
                     "; ".join(unique_values),
                     0.5,
-                    "pride.instruments",
+                    source,
                     _flatten(unique_values),
                     conflict=True,
                 )
-            return _attribute(instruments.value[0], 0.9, "pride.instruments", str(instruments.value[0]))
-        return _attribute(instruments.value, 0.9, "pride.instruments", _flatten(instruments.value))
+            return _attribute(instruments.value[0], 0.9, source, str(instruments.value[0]))
+        return _attribute(instruments.value, 0.9, source, _flatten(instruments.value))
     return _attribute("unknown", 0.0, "none", "")
 
 
@@ -247,9 +319,25 @@ def infer_attributes(context: ProjectContext) -> AttributeSet:
     enzyme = _infer_enzyme(context)
     labeling_strategy = _infer_labeling(context)
     fractionation_hint = _infer_fractionation(context)
-    search_parameter_hints = _infer_search_hints(str(instrument_family.value))
-    fixed_mods = _infer_fixed_mods(str(enzyme.value))
-    variable_mods = _infer_variable_mods(str(enzyme.value))
+    unsupported_evidence = non_proteomics_evidence(context)
+    if unsupported_evidence:
+        search_parameter_hints = _attribute(
+            {
+                "data_family": "metabolomics",
+                "recommended_workflow_name": None,
+                "workflow_parameter_overrides": {},
+            },
+            0.95,
+            "unsupported_assay_rule",
+            unsupported_evidence,
+            conflict=True,
+        )
+        fixed_mods = _attribute([], 0.95, "unsupported_assay_rule", unsupported_evidence)
+        variable_mods = _attribute([], 0.95, "unsupported_assay_rule", unsupported_evidence)
+    else:
+        search_parameter_hints = _infer_search_hints(str(instrument_family.value))
+        fixed_mods = _infer_fixed_mods(str(enzyme.value))
+        variable_mods = _infer_variable_mods(str(enzyme.value))
 
     return AttributeSet(
         acquisition_mode=acquisition_mode,

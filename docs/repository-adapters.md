@@ -6,7 +6,7 @@ The repository layer isolates upstream database differences from the rest of the
 
 ## Rule
 
-Do not push MassIVE or iProX logic into the PRIDE client. Each repository gets its own adapter, and every adapter maps into the same canonical internal model.
+Do not push MassIVE logic into the PRIDE client. Each supported repository gets its own adapter, and every adapter maps into the same canonical internal model.
 
 ## Canonical Model
 
@@ -41,16 +41,9 @@ PRIDE remains the default first-class source. Existing PRIDE commands continue t
 - primary transport: FTP
 - metadata often comes from PROXI or dataset cache records
 
-### iProX
-
-- native accession: `IPX...`
-- aliases: `PXD...`
-- primary transport: Aspera or synced XML/index data
-- local SQLite index is the safe production path for file resolution
-
 ## Index Strategy
 
-iProX and MassIVE can be indexed locally to reduce repeated remote lookups. The index stores:
+MassIVE can be indexed locally to reduce repeated remote lookups. The index stores:
 
 - project accession
 - native accession
@@ -75,15 +68,11 @@ iProX and MassIVE can be indexed locally to reduce repeated remote lookups. The 
 ```powershell
 python -m agent.cli resolve-dataset srm_74_3.raw -r massive
 python -m agent.cli resolve-dataset MSV000000001 -r massive
-python -m agent.cli resolve-dataset IPX000001 -r iprox
 python -m agent.cli resolve-dataset PXD000001 -r pride
-python -m agent.cli sync-repository-index -r iprox --xml-dir .\iprox_xml
 ```
 
 ## Production Guidance
 
 - PRIDE is fully supported today.
 - MassIVE is usable when the dataset metadata or dataset cache is available.
-- iProX is usable when the local index or XML import path is used.
 - The adapter layer is the correct place for future repository-specific fixes.
-

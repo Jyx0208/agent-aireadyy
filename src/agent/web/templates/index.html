@@ -261,16 +261,15 @@ footer{padding:4px 0 4px;color:var(--soft);font-size:.74rem;text-align:center}
           <option value="auto" data-i18n="repositoryAuto">Auto</option>
           <option value="pride">PRIDE</option>
           <option value="massive">MassIVE</option>
-          <option value="iprox">iProX</option>
         </select>
       </div>
-      <div class="mode-help" id="repositoryHelp" data-i18n="repositoryHelp">Auto detects MSV/IPX/PXD where possible. Choose a repository when you already know the source.</div>
+      <div class="mode-help" id="repositoryHelp" data-i18n="repositoryHelp">Auto detects MSV/PXD where possible. Choose a repository when you already know the source.</div>
       <div class="mode-row">
         <div class="mode-label" data-i18n="runMode">Run mode</div>
         <div class="mode-control">
           <div class="segmented" role="radiogroup" aria-label="Run mode" aria-describedby="runModeHelp">
-            <button type="button" role="radio" aria-checked="true" data-run-mode="full" onclick="setRunMode('full')" data-i18n="modeFull">Full workflow</button>
-            <button type="button" role="radio" aria-checked="false" data-run-mode="prepare" onclick="setRunMode('prepare')" data-i18n="modePrepare">Prepare input package</button>
+            <button type="button" role="radio" aria-checked="false" data-run-mode="full" onclick="setRunMode('full')" data-i18n="modeFull" disabled aria-disabled="true">Full workflow</button>
+            <button type="button" role="radio" aria-checked="true" data-run-mode="prepare" onclick="setRunMode('prepare')" data-i18n="modePrepare">Prepare input package</button>
             <button type="button" role="radio" aria-checked="false" data-run-mode="parameters" onclick="setRunMode('parameters')" data-i18n="modeParameters">Parameters only</button>
           </div>
           <div class="mode-help" id="runModeHelp"></div>
@@ -288,6 +287,11 @@ footer{padding:4px 0 4px;color:var(--soft);font-size:.74rem;text-align:center}
         <input type="checkbox" id="preferProjectFasta">
         <span data-i18n="preferFasta">Use the project FASTA when PRIDE provides one; otherwise use the inferred UniProt FASTA.</span>
       </label>
+      <div class="form-row">
+        <label for="reviewedFasta" data-i18n="reviewedFasta">Reviewed FASTA URL / local path</label>
+        <input type="text" id="reviewedFasta" autocomplete="off" data-i18n-placeholder="reviewedFastaPlaceholder" placeholder="Optional: https://.../reference.fasta or C:\path\reference.fasta">
+      </div>
+      <div class="mode-help" data-i18n="reviewedFastaHelp">Use this when environmental or non-model samples do not have an automatic reference FASTA.</div>
       <div class="examples">
         <span data-i18n="examples">Examples</span>
         <button onclick="fill('P17_severe_NoPOTS.raw')">P17_severe_NoPOTS.raw</button>
@@ -313,16 +317,15 @@ footer{padding:4px 0 4px;color:var(--soft);font-size:.74rem;text-align:center}
             <option value="auto" data-i18n="repositoryAuto">Auto</option>
             <option value="pride">PRIDE</option>
             <option value="massive">MassIVE</option>
-            <option value="iprox">iProX</option>
           </select>
         </div>
-        <div class="mode-help" id="batchRepositoryHelp" data-i18n="repositoryHelp">Auto detects MSV/IPX/PXD where possible. Choose a repository when you already know the source.</div>
+        <div class="mode-help" id="batchRepositoryHelp" data-i18n="repositoryHelp">Auto detects MSV/PXD where possible. Choose a repository when you already know the source.</div>
         <div class="form-row">
           <label for="batchRunMode" data-i18n="runMode">Run mode</label>
           <select id="batchRunMode" aria-describedby="batchRunModeHelp">
             <option value="parameters" data-i18n="modeParameters">Parameters only</option>
             <option value="prepare" data-i18n="modePrepare">Prepare input package</option>
-            <option value="full" data-i18n="modeFull">Full workflow</option>
+            <option value="full" data-i18n="modeFull" disabled>Full workflow</option>
           </select>
         </div>
         <div class="mode-help" id="batchRunModeHelp" data-i18n="batchRunModeHelp">Choose whether batch items only infer parameters, prepare MSDT input packages, or run Docker end to end.</div>
@@ -428,7 +431,8 @@ footer{padding:4px 0 4px;color:var(--soft);font-size:.74rem;text-align:center}
 <script>
 let taskId=null,ws=null,currentFilter='all',allLogs=[],startTime=null,timerInterval=null,renderScheduled=false;
 let currentLanguage='en';
-let currentRunMode='full';
+let currentRunMode='prepare';
+let fullWorkflowEnabled=false;
 let lastReviewSummary=null;
 let currentBatchId=null,batchPollTimer=null;
 let currentWorkflowTab='single';
@@ -456,7 +460,10 @@ const I18N={
     submitterPlaceholder:'Name or lab member',
     repository:'Repository',
     repositoryAuto:'Auto',
-    repositoryHelp:'Auto detects MSV/IPX/PXD where possible. Choose a repository when you already know the source. iProX full downloads may require Aspera or a synced index.',
+    repositoryHelp:'Auto detects MSV/PXD where possible. Choose a repository when you already know the source.',
+    reviewedFasta:'Reviewed FASTA URL / local path',
+    reviewedFastaPlaceholder:'Optional: https://.../reference.fasta or C:\\path\\reference.fasta',
+    reviewedFastaHelp:'Use this when environmental or non-model samples do not have an automatic reference FASTA.',
     runMode:'Run mode',
     modeFull:'Full workflow',
     modePrepare:'Prepare input package',
@@ -536,7 +543,7 @@ const I18N={
     action:{watch:'Watch',inspect:'Inspect',download:'Download',view:'View'},
     batchAction:{watch:'Track batch',download:'Download Excel',view:'Open batch'},
     mode:{full:'Full workflow',prepare:'Prepare input package',parameters:'Parameters only'},
-    repositoryLabel:{auto:'Auto',pride:'PRIDE',massive:'MassIVE',iprox:'iProX'},
+    repositoryLabel:{auto:'Auto',pride:'PRIDE',massive:'MassIVE'},
     timeSource:{started_at:'Started',created_at:'Created',finished_at:'Finished',updated_at:'Updated',history_time:'Recorded'},
     duration:'duration',
     queue:(pos,len,running,max)=>`Task queued at position ${pos}/${len}. Server is running ${running}/${max} tasks and will start this one automatically.`,
@@ -669,8 +676,11 @@ const I18N={
 Object.assign(I18N.zh,{
   repository:'数据库',
   repositoryAuto:'自动',
-  repositoryHelp:'自动模式会尽量识别 MSV/IPX/PXD。已知来源时请直接选择对应数据库；iProX 完整下载可能需要 Aspera 或本地索引。',
-  repositoryLabel:{auto:'自动',pride:'PRIDE',massive:'MassIVE',iprox:'iProX'}
+  repositoryHelp:'自动模式会尽量识别 MSV/PXD。已知来源时请直接选择对应数据库。',
+  reviewedFasta:'人工确认 FASTA URL / 本地路径',
+  reviewedFastaPlaceholder:'可选：https://.../reference.fasta 或 C:\\path\\reference.fasta',
+  reviewedFastaHelp:'环境样本或非模式物种无法自动选择参考 FASTA 时，在这里提供真实 FASTA。',
+  repositoryLabel:{auto:'自动',pride:'PRIDE',massive:'MassIVE'}
 });
 
 function t(key){return I18N[currentLanguage][key]??I18N.en[key]??key}
@@ -778,6 +788,23 @@ function runModeHelpText(){
   return t('modeFullHelp');
 }
 
+function coerceRunMode(mode){
+  const normalized=(mode==='parameters'||mode==='prepare'||mode==='full')?mode:'prepare';
+  return normalized==='full'&&!fullWorkflowEnabled?'prepare':normalized;
+}
+
+function updateFullWorkflowAvailability(enabled){
+  fullWorkflowEnabled=!!enabled;
+  const fullButton=document.querySelector('[data-run-mode="full"]');
+  if(fullButton){
+    fullButton.disabled=!fullWorkflowEnabled;
+    fullButton.setAttribute('aria-disabled',fullWorkflowEnabled?'false':'true');
+  }
+  const fullOption=document.querySelector('#batchRunMode option[value="full"]');
+  if(fullOption)fullOption.disabled=!fullWorkflowEnabled;
+  if(!fullWorkflowEnabled&&currentRunMode==='full')setRunMode('prepare',false);
+}
+
 function setLanguage(lang){
   currentLanguage=(lang==='zh')?'zh':'en';
   document.documentElement.lang=currentLanguage==='zh'?'zh-CN':'en';
@@ -806,7 +833,7 @@ function setLanguage(lang){
 }
 
 function setRunMode(mode,persist=true){
-  currentRunMode=(mode==='parameters'||mode==='prepare'||mode==='full')?mode:'full';
+  currentRunMode=coerceRunMode(mode);
   if(persist)localStorage.setItem('runMode',currentRunMode);
   document.querySelectorAll('[data-run-mode]').forEach(btn=>{
     const active=btn.dataset.runMode===currentRunMode;
@@ -841,6 +868,8 @@ async function loadConfig(){
     document.getElementById('configToggle').setAttribute('aria-expanded','true');
     document.getElementById('configStatus').textContent='';
     document.getElementById('resultRetention').textContent=tf('retention',retentionMinutes(d),d.max_result_projects||4);
+    updateFullWorkflowAvailability(!!d.full_workflow_enabled);
+    setRunMode(localStorage.getItem('runMode')||(fullWorkflowEnabled?'full':'prepare'),false);
     updateServerStatus(d);
   }catch(e){}
 }
@@ -853,6 +882,7 @@ async function loadHealth(){
 }
 
 function updateServerStatus(d){
+  if(d&&Object.prototype.hasOwnProperty.call(d,'full_workflow_enabled'))updateFullWorkflowAvailability(!!d.full_workflow_enabled);
   const running=d.running_tasks||0,queued=d.queued_tasks||0,max=d.max_concurrent_tasks||1;
   document.getElementById('serverStatus').textContent=tf('serverStatus',running,queued,max);
   document.getElementById('metricRunning').innerHTML=UI.metricCard('Running',running+'/'+max,'Active workflow slots');
@@ -1338,6 +1368,7 @@ async function startTask(){
       submitter:document.getElementById('submitter').value.trim(),
       repository:document.getElementById('repositorySelect').value,
       fasta_preference:fastaPreference,
+      reviewed_fasta:document.getElementById('reviewedFasta').value,
       run_mode:currentRunMode,
       resource_policy:document.getElementById('singleResourcePolicy').value,
       ui_language:currentLanguage,
@@ -1414,7 +1445,7 @@ async function downloadResults(){
   }
 }
 
-setRunMode(localStorage.getItem('runMode')||'full');
+setRunMode(localStorage.getItem('runMode')||'prepare');
 setWorkflowTab(localStorage.getItem('workflowTab')||'single',false);
 setLanguage(localStorage.getItem('uiLanguage')||'en');
 loadConfig();

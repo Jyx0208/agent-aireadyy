@@ -38,6 +38,27 @@ def _value(value, confidence=0.9, source="test", conflict_flag=False):
     )
 
 
+def _write_minimal_dda_mzml(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<mzML xmlns="http://psi.hupo.org/ms/mzml">
+  <run id="run1">
+    <spectrumList count="2">
+      <spectrum id="scan=1">
+        <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="1"/>
+      </spectrum>
+      <spectrum id="scan=2">
+        <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2"/>
+      </spectrum>
+    </spectrumList>
+  </run>
+</mzML>
+""",
+        encoding="utf-8",
+    )
+
+
 def datetime_from_timestamp(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, UTC).isoformat()
 
@@ -46,6 +67,28 @@ def test_strip_ansi_removes_llm_color_codes():
     raw = "\x1b[0m\x1b[90mrecommended\x1b[0m_fasta_url"
 
     assert _strip_ansi(raw) == "recommended_fasta_url"
+
+
+def test_strip_ansi_preserves_bracketed_metadata_sources():
+    assert _strip_ansi("[massive.organisms, 0.90]") == "[massive.organisms, 0.90]"
+
+
+def test_english_log_localizes_missing_fasta_review_issue():
+    task_id = "english-fasta-review"
+    _tasks[task_id] = {"logs": deque(maxlen=5), "ui_language": "en"}
+    try:
+        web_app._log(
+            task_id,
+            "error",
+            "[阻断] 未找到可以从 UniProt 下载的真实 FASTA（物种：environmental samples <Bacillariophyta>）。默认占位 FASTA 不能用于真实搜库；请让 LLM 给出 UniProt proteome ID，或指定项目 FASTA。",
+        )
+
+        message = _tasks[task_id]["logs"][0]["message"]
+        assert "No real UniProt FASTA" in message
+        assert "environmental samples <Bacillariophyta>" in message
+        assert not web_app._contains_cjk(message)
+    finally:
+        _tasks.pop(task_id, None)
 
 
 def test_download_progress_is_throttled_but_completion_is_logged(monkeypatch):
@@ -494,6 +537,31 @@ def test_create_task_accepts_numeric_timeout_from_browser_payload(monkeypatch):
             _tasks.pop(task_id, None)
 
 
+def test_create_task_persists_reviewed_fasta_input(monkeypatch):
+    monkeypatch.setattr("agent.web.app._check_llm_api", _llm_ok, raising=False)
+    monkeypatch.setattr("agent.web.app._start_pipeline_thread", lambda _task_id: None)
+    monkeypatch.delenv("AGENT_LLM_API_KEY", raising=False)
+
+    result = asyncio.run(
+        _create_task_inner(
+            {
+                "input_value": "sample.raw",
+                "reviewed_fasta": "https://example.test/reference.fasta",
+                "llm_config": {"api_key": "sk-test"},
+            }
+        )
+    )
+
+    task_id = result.get("task_id")
+    try:
+        assert "error" not in result
+        assert _tasks[task_id]["reviewed_fasta_url"] == "https://example.test/reference.fasta"
+        assert _tasks[task_id]["reviewed_fasta_path"] is None
+    finally:
+        if task_id:
+            _tasks.pop(task_id, None)
+
+
 def test_create_task_persists_submitter_history_without_api_key(monkeypatch, tmp_path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setattr("agent.web.app._check_llm_api", _llm_ok, raising=False)
@@ -599,6 +667,7 @@ def test_create_task_defaults_to_full_workflow_and_english(monkeypatch, tmp_path
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setattr("agent.web.app._check_llm_api", _llm_ok, raising=False)
     monkeypatch.setattr("agent.web.app._start_pipeline_thread", lambda _task_id: None)
+    monkeypatch.setenv("AGENT_WEB_FULL_WORKFLOW_ENABLED", "1")
 
     result = asyncio.run(
         _create_task_inner(
@@ -618,6 +687,32 @@ def test_create_task_defaults_to_full_workflow_and_english(monkeypatch, tmp_path
         assert result["ui_language"] == "en"
         assert _tasks[task_id]["run_mode"] == "full"
         assert _tasks[task_id]["ui_language"] == "en"
+    finally:
+        if task_id:
+            _tasks.pop(task_id, None)
+
+
+def test_create_task_downgrades_full_workflow_when_disabled(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr("agent.web.app._check_llm_api", _llm_ok, raising=False)
+    monkeypatch.setattr("agent.web.app._start_pipeline_thread", lambda _task_id: None)
+    monkeypatch.setenv("AGENT_WEB_FULL_WORKFLOW_ENABLED", "0")
+
+    result = asyncio.run(
+        _create_task_inner(
+            {
+                "input_value": "sample.raw",
+                "submitter": "Alice",
+                "run_mode": "full",
+                "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
+            }
+        )
+    )
+
+    task_id = result.get("task_id")
+    try:
+        assert result["run_mode"] == "prepare"
+        assert _tasks[task_id]["run_mode"] == "prepare"
     finally:
         if task_id:
             _tasks.pop(task_id, None)
@@ -885,7 +980,7 @@ def test_public_batch_record_localizes_english_log_tail_and_events(tmp_path):
     assert not web_app._contains_cjk(visible_text)
 
 
-def test_create_parameter_batch_persists_repository_in_public_record_and_manifest(monkeypatch, tmp_path):
+def test_create_parameter_batch_normalizes_unsupported_repository_to_default(monkeypatch, tmp_path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setattr("agent.web.app._check_llm_api", _llm_ok, raising=False)
     monkeypatch.setattr(web_app, "_start_parameter_batch_thread", lambda _batch_id: None)
@@ -903,12 +998,12 @@ def test_create_parameter_batch_persists_repository_in_public_record_and_manifes
 
     batch_id = result.get("batch_id")
     try:
-        assert result["repository"] == "iprox"
+        assert result["repository"] == "pride"
         with web_app._batches_lock:
             batch = dict(web_app._batches[batch_id])
-        assert batch["repository"] == "iprox"
+        assert batch["repository"] == "pride"
         manifest = json.loads((Path(batch["output_dir"]) / "batch_manifest.json").read_text(encoding="utf-8"))
-        assert manifest["repository"] == "iprox"
+        assert manifest["repository"] == "pride"
         assert "llm_config" not in manifest
     finally:
         if batch_id:
@@ -945,6 +1040,35 @@ def test_create_batch_persists_run_mode_and_resource_policy(monkeypatch, tmp_pat
         manifest = json.loads((Path(batch["output_dir"]) / "batch_manifest.json").read_text(encoding="utf-8"))
         assert manifest["run_mode"] == "prepare"
         assert manifest["resource_policy"] == "conservative"
+    finally:
+        if batch_id:
+            with web_app._batches_lock:
+                web_app._batches.pop(batch_id, None)
+
+
+def test_create_batch_downgrades_full_workflow_when_disabled(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr("agent.web.app._run_llm_check", _llm_ok, raising=False)
+    monkeypatch.setattr(web_app, "_start_parameter_batch_thread", lambda _batch_id: None)
+    monkeypatch.setenv("AGENT_WEB_FULL_WORKFLOW_ENABLED", "0")
+
+    result = asyncio.run(
+        web_app.create_parameter_batch(
+            {
+                "inputs": ["sample.raw"],
+                "submitter": "Alice",
+                "run_mode": "full",
+                "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
+            }
+        )
+    )
+
+    batch_id = result.get("batch_id")
+    try:
+        assert result["run_mode"] == "prepare"
+        with web_app._batches_lock:
+            batch = dict(web_app._batches[batch_id])
+        assert batch["run_mode"] == "prepare"
     finally:
         if batch_id:
             with web_app._batches_lock:
@@ -1002,8 +1126,7 @@ def test_prepare_batch_item_generates_input_package_without_docker_run(monkeypat
             fasta.parent.mkdir(parents=True, exist_ok=True)
             fasta.write_text(">P1\nPEPTIDE\n", encoding="utf-8")
             prepared = output_dir / "assets" / "prepared" / f"{Path(task.file_name).stem}.mzML"
-            prepared.parent.mkdir(parents=True, exist_ok=True)
-            prepared.write_text("<mzML />", encoding="utf-8")
+            _write_minimal_dda_mzml(prepared)
             plan = SimpleNamespace(
                 task_id=task.task_id,
                 source_file_name=task.file_name,
@@ -1194,7 +1317,7 @@ def test_parameter_batch_uses_mzml_probe_for_unresolved_instrument_and_cleans_la
             asset.local_path.parent.mkdir(parents=True, exist_ok=True)
             asset.prepared_path.parent.mkdir(parents=True, exist_ok=True)
             asset.local_path.write_bytes(b"raw")
-            asset.prepared_path.write_text("<mzML />", encoding="utf-8")
+            _write_minimal_dda_mzml(asset.prepared_path)
             return asset.prepared_path
 
         def replan_with_mzml_instrument(self, result, prepared_path, task, output_dir, **_kwargs):
@@ -1733,9 +1856,11 @@ def test_prepare_mode_generates_input_package_without_running_docker(monkeypatch
 
         def prepare_asset(self, _asset):
             calls.append("prepare_asset")
-            prepared_path.parent.mkdir(parents=True, exist_ok=True)
-            prepared_path.write_text("<mzML />", encoding="utf-8")
+            _write_minimal_dda_mzml(prepared_path)
             return prepared_path
+
+        def validate_prepared_data_for_plan(self, result_arg, _prepared_path):
+            return result_arg
 
         def write_task_bundle(self, output_dir_arg, *_args, **_kwargs):
             calls.append("write_task_bundle")

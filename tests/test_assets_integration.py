@@ -9,10 +9,12 @@ from agent.models import (
     AttributeValue,
     FileAsset,
     MetadataValue,
+    PridePlanResult,
     ProjectCandidate,
     ProjectContext,
     ProjectResolution,
 )
+from agent.decision.dda import plan_dda_execution
 from agent.orchestrator.pipeline import AgentService, ReviewRequiredError
 
 
@@ -83,6 +85,80 @@ def _reviewed_fasta(tmp_path: Path) -> Path:
     path = tmp_path / "reviewed_reference.fasta"
     path.write_text(">sp|P1|REVIEWED_TEST\nMPEPTIDEK\n", encoding="utf-8")
     return path
+
+
+def _write_minimal_dda_mzml(path: Path, instrument: str = "Q Exactive HF") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"""<?xml version="1.0" encoding="UTF-8"?>
+<mzML xmlns="http://psi.hupo.org/ms/mzml">
+  <instrumentConfigurationList count="1">
+    <instrumentConfiguration id="IC1">
+      <cvParam cvRef="MS" accession="MS:1002523" name="{instrument}" value=""/>
+      <componentList count="1">
+        <analyzer order="1">
+          <cvParam cvRef="MS" accession="MS:1000484" name="orbitrap" value=""/>
+        </analyzer>
+      </componentList>
+    </instrumentConfiguration>
+  </instrumentConfigurationList>
+  <run id="run1">
+    <spectrumList count="2">
+      <spectrum id="scan=1">
+        <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="1"/>
+      </spectrum>
+      <spectrum id="scan=2">
+        <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2"/>
+      </spectrum>
+    </spectrumList>
+  </run>
+</mzML>
+""",
+        encoding="utf-8",
+    )
+
+
+def test_validate_prepared_data_blocks_ms1_only_mzml_before_fragpipe(tmp_path: Path):
+    mzml = tmp_path / "ms1_only.mzML"
+    mzml.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<mzML xmlns="http://psi.hupo.org/ms/mzml">
+  <run id="run1">
+    <spectrumList count="1">
+      <spectrum id="scan=1">
+        <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="1"/>
+      </spectrum>
+    </spectrumList>
+  </run>
+</mzML>
+""",
+        encoding="utf-8",
+    )
+    attributes = _attributes()
+    resolution = ProjectResolution.empty()
+    context = ProjectContext(project_accession="PXD000001", file_name="sample.raw")
+    plan = plan_dda_execution(
+        task_id="task-ms1-only",
+        source_file_name="sample.raw",
+        source_data_path=mzml,
+        project_resolution=resolution,
+        attributes=attributes,
+        output_dir=tmp_path,
+        project_context=context,
+    )
+    result = PridePlanResult(
+        resolution=resolution,
+        context=context,
+        asset=FileAsset(original_file_name="sample.raw", resolved_asset_type="raw"),
+        attributes=attributes,
+        plan=plan,
+    )
+    service = AgentService(llm_reasoner=_DummyReasoner())
+
+    updated = service.validate_prepared_data_for_plan(result, mzml)
+
+    assert updated.plan.needs_review is True
+    assert any("no MS2 spectra" in issue for issue in updated.plan.blocking_issues)
 
 
 def test_plan_dda_run_from_pride_asset_uses_resolved_prepared_path(tmp_path: Path, monkeypatch):
@@ -180,8 +256,7 @@ def test_prepare_pride_msdt_docker_input_uses_only_file_name(tmp_path: Path, mon
 
     def fake_prepare_asset(asset):
         prepared_path = tmp_path / "task_out" / "assets" / "downloads" / "WT_5_Lys-c.mzML"
-        prepared_path.parent.mkdir(parents=True, exist_ok=True)
-        prepared_path.write_text("mzml", encoding="utf-8")
+        _write_minimal_dda_mzml(prepared_path)
         return prepared_path
 
     monkeypatch.setattr(
@@ -256,8 +331,7 @@ def test_prepare_pride_msdt_docker_input_continues_after_search_parameter_confir
 
     def fake_prepare_asset(asset):
         prepared_path = tmp_path / "task_out" / "assets" / "downloads" / "WT_5_Lys-c.mzML"
-        prepared_path.parent.mkdir(parents=True, exist_ok=True)
-        prepared_path.write_text("mzml", encoding="utf-8")
+        _write_minimal_dda_mzml(prepared_path)
         return prepared_path
 
     monkeypatch.setattr(service, "prepare_asset", fake_prepare_asset)
@@ -303,8 +377,7 @@ def test_prepare_pride_msdt_docker_input_auto_downloads_species_fasta(tmp_path: 
 
     def fake_prepare_asset(asset):
         prepared_path = tmp_path / "task_out" / "assets" / "downloads" / "mouse.mzML"
-        prepared_path.parent.mkdir(parents=True, exist_ok=True)
-        prepared_path.write_text("mzml", encoding="utf-8")
+        _write_minimal_dda_mzml(prepared_path)
         return prepared_path
 
     class FakePrideClient:
@@ -359,8 +432,7 @@ def test_prepare_pride_msdt_docker_input_confirms_llm_proteome_id_fasta(tmp_path
 
     def fake_prepare_asset(asset):
         prepared_path = tmp_path / "task_out" / "assets" / "downloads" / "mouse.mzML"
-        prepared_path.parent.mkdir(parents=True, exist_ok=True)
-        prepared_path.write_text("mzml", encoding="utf-8")
+        _write_minimal_dda_mzml(prepared_path)
         return prepared_path
 
     class FakePrideClient:
@@ -439,18 +511,7 @@ def test_prepare_pride_msdt_docker_input_uses_mzml_instrument_for_multi_instrume
 
     def fake_prepare_asset(asset):
         prepared = tmp_path / "task_out" / "assets" / "prepared" / "PRF_Q_2024_D_KLIO_1166_65810.mzML"
-        prepared.parent.mkdir(parents=True, exist_ok=True)
-        prepared.write_text(
-            """<mzML xmlns="http://psi.hupo.org/ms/mzml">
-  <instrumentConfigurationList count="1">
-    <instrumentConfiguration id="IC1">
-      <cvParam cvRef="MS" accession="MS:1002523" name="Q Exactive HF" value=""/>
-      <componentList count="1"><analyzer order="1"><cvParam cvRef="MS" accession="MS:1000484" name="orbitrap"/></analyzer></componentList>
-    </instrumentConfiguration>
-  </instrumentConfigurationList>
-</mzML>""",
-            encoding="utf-8",
-        )
+        _write_minimal_dda_mzml(prepared, instrument="Q Exactive HF")
         return prepared
 
     class FakePrideClient:

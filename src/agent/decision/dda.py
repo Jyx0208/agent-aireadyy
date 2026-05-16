@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.parse import urlparse
 
+from agent.inference.rules import non_proteomics_evidence
 from agent.models import AttributeSet, AttributeValue, DdaExecutionPlan, ProjectContext, ProjectResolution
 from agent.pride.client import PrideClient
 
@@ -254,6 +255,16 @@ def _is_uniprot_url(url: str) -> bool:
     return host == "uniprot.org" or host.endswith(".uniprot.org")
 
 
+def _is_direct_fasta_url(url: str) -> bool:
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    if path.endswith("/"):
+        return False
+    if path.endswith((".fasta", ".fa", ".faa", ".fasta.gz", ".fa.gz", ".faa.gz")):
+        return True
+    return "format=fasta" in parsed.query.lower()
+
+
 def _llm_recommended_fasta_choice(attributes: AttributeSet, output_dir: Path) -> tuple[Path | None, str | None]:
     hints = _hint_mapping(attributes)
     species_matches = _known_uniprot_matches(str(attributes.species.value))
@@ -278,6 +289,8 @@ def _llm_recommended_fasta_choice(attributes: AttributeSet, output_dir: Path) ->
         elif species_url:
             fasta_name = species_file_name
             fasta_url = species_url
+        elif not _is_direct_fasta_url(fasta_url):
+            return None, None
         else:
             fasta_name = species_file_name
         return _reviewed_fasta_choice(output_dir, reviewed_fasta_url=fasta_url, reviewed_fasta_name=fasta_name)
@@ -467,6 +480,15 @@ def _is_resolved_instrument_context(project_context: ProjectContext | None, attr
 
 def _context_blocking_issues(project_context: ProjectContext | None, attributes: AttributeSet) -> list[str]:
     issues: list[str] = []
+    unsupported_evidence = non_proteomics_evidence(project_context)
+    if unsupported_evidence:
+        issues.append(
+            "Unsupported assay type: repository metadata or the selected file path indicates "
+            "metabolomics/small-molecule LC-MS rather than bottom-up proteomics. "
+            "FragPipe/MSFragger FASTA + enzyme workflows are not applicable to this dataset. "
+            f"Evidence: {unsupported_evidence[:300]}"
+        )
+        return issues
     experiment_types = " | ".join(_metadata_values(project_context, "experimentTypes")).lower()
     if "top-down" in experiment_types or "top down" in experiment_types:
         issues.append("当前 bottom-up MSDT 搜库流程不支持 Top-down 蛋白质组学项目。")
@@ -586,9 +608,14 @@ def plan_dda_execution(
             fasta_file_name, fasta_mode, inferred_fasta_url = _species_fasta_choice(str(decision_attributes.species.value))
             fasta_path = output_dir / "fasta" / fasta_file_name
             project_fasta_url = inferred_fasta_url
+    context_issues = _context_blocking_issues(project_context, decision_attributes)
+    unsupported_assay = any(issue.startswith("Unsupported assay type:") for issue in context_issues)
     # 必须由大模型推荐 workflow，不使用规则推断
     workflow_name = _llm_confirmed_workflow_name(attributes, workspace_root)
-    if not workflow_name:
+    if unsupported_assay:
+        blocking_issues = context_issues
+        workflow_name = workflow_name or ""
+    elif not workflow_name:
         llm_workflow = _workflow_name_from_llm(attributes)
         if llm_workflow:
             blocking_issues = [f"大模型推荐的 workflow '{llm_workflow}' 不存在于 profiles/fragpipe/ 目录中。请检查 workflow 名称是否正确。"]
@@ -597,18 +624,19 @@ def plan_dda_execution(
         workflow_name = ""  # 设置为空，后续会因为 blocking_issues 而被阻止
     else:
         blocking_issues = _blocking_issues(decision_attributes, workflow_name, raw_data_type)
-    blocking_issues.extend(fasta_issues)
-    blocking_issues.extend(_context_blocking_issues(project_context, decision_attributes))
-    blocking_issues.extend(
-        _fasta_blocking_issues(
-            project_context,
-            decision_attributes,
-            fasta_path,
-            fasta_mode,
-            raw_data_type,
-            fasta_download_url=project_fasta_url,
+    if not unsupported_assay:
+        blocking_issues.extend(fasta_issues)
+        blocking_issues.extend(context_issues)
+        blocking_issues.extend(
+            _fasta_blocking_issues(
+                project_context,
+                decision_attributes,
+                fasta_path,
+                fasta_mode,
+                raw_data_type,
+                fasta_download_url=project_fasta_url,
+            )
         )
-    )
     if accept_search_parameter_review:
         blocking_issues = [issue for issue in blocking_issues if "搜库参数需要人工复核" not in issue]
 

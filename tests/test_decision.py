@@ -613,6 +613,140 @@ def test_plan_dda_execution_requires_review_for_no_sdrf_unsupported_species_defa
     assert any("占位" in issue for issue in plan.blocking_issues)
 
 
+def test_plan_dda_execution_rejects_uniprot_directory_fasta_hint_for_environmental_sample(tmp_path: Path):
+    attributes = _dda_attributes()
+    attributes.species = AttributeValue(
+        value="environmental samples <Bacillariophyta>",
+        confidence=0.9,
+        source="massive.organisms",
+        evidence_excerpt="MassIVE species metadata.",
+        conflict_flag=False,
+    )
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "recommended_workflow_name": "Default.workflow",
+            "recommended_fasta_name": "uniprot-environmental.fasta",
+            "recommended_fasta_url": "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/",
+            "recommended_fasta_source": "UniProt Environmental",
+        },
+        confidence=0.8,
+        source="llm_confirmed",
+        evidence_excerpt="LLM recommended a UniRef directory.",
+        conflict_flag=False,
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-environmental-fasta",
+        source_file_name="RN5_neg.mzML",
+        source_data_path=tmp_path / "RN5_neg.mzML",
+        project_resolution=ProjectResolution.empty(),
+        project_context=ProjectContext(
+            repository="massive",
+            project_accession="MSV000101857",
+            file_name="RN5_neg.mzML",
+            metadata={
+                "organisms": MetadataValue(
+                    value=["environmental samples <Bacillariophyta>"],
+                    source="massive.organisms",
+                    source_level="project",
+                    completeness=1.0,
+                )
+            },
+            sdrf_rows=[],
+        ),
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.fasta_selection_mode == "defaulted"
+    assert plan.fasta_download_url is None
+    assert plan.needs_review is True
+    assert any("真实 FASTA" in issue and "environmental samples" in issue for issue in plan.blocking_issues)
+
+
+def test_plan_dda_execution_blocks_massive_metabolomics_without_proteomics_noise(tmp_path: Path):
+    attributes = _dda_attributes()
+    attributes.acquisition_mode = AttributeValue(
+        value="unsupported",
+        confidence=0.95,
+        source="unsupported_assay_rule",
+        evidence_excerpt="DatasetType:Metabolomics",
+        conflict_flag=True,
+    )
+    attributes.species = AttributeValue(
+        value="Homo sapiens; Trypanosoma cruzi",
+        confidence=0.5,
+        source="massive.organisms",
+        evidence_excerpt="MassIVE project-level species",
+        conflict_flag=True,
+    )
+    attributes.enzyme = AttributeValue(
+        value="unknown",
+        confidence=0.0,
+        source="none",
+        evidence_excerpt="",
+        conflict_flag=False,
+    )
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "data_family": "metabolomics",
+            "recommended_workflow_name": None,
+            "workflow_parameter_overrides": {},
+        },
+        confidence=0.95,
+        source="unsupported_assay_rule",
+        evidence_excerpt="DatasetType:Metabolomics",
+        conflict_flag=True,
+    )
+    context = ProjectContext(
+        repository="massive",
+        project_accession="MSV000101849",
+        file_name="pos_inf_non_8629_male_65_192_B_H9.raw",
+        metadata={
+            "projectDescription": MetadataValue(
+                value="Untargeted HILIC positive LC-MS metabolomics data for small-molecule biomarkers.",
+                source="massive.description",
+                source_level="project",
+                completeness=1.0,
+            ),
+            "keywords": MetadataValue(
+                value=["metabolomics", "DatasetType:Metabolomics"],
+                source="massive.keywords",
+                source_level="project",
+                completeness=1.0,
+            ),
+            "organisms": MetadataValue(
+                value=["Homo sapiens", "Trypanosoma cruzi"],
+                source="massive.organisms",
+                source_level="project",
+                completeness=1.0,
+            ),
+        },
+        project_files=[
+            {
+                "fileName": "pos_inf_non_8629_male_65_192_B_H9.raw",
+                "logicalPath": "raw/Untarget_HILICpos_raw/pos_inf_non_8629_male_65_192_B_H9.raw",
+            }
+        ],
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-metabolomics",
+        source_file_name="pos_inf_non_8629_male_65_192_B_H9.raw",
+        source_data_path=tmp_path / "pos_inf_non_8629_male_65_192_B_H9.mzML",
+        project_resolution=ProjectResolution.empty(),
+        project_context=context,
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is True
+    assert len(plan.blocking_issues) == 1
+    assert "Unsupported assay type" in plan.blocking_issues[0]
+    assert "metabolomics/small-molecule LC-MS" in plan.blocking_issues[0]
+    assert "缺少必需属性" not in plan.blocking_issues[0]
+
+
 def test_plan_dda_execution_uses_existing_llm_recommended_workflow(tmp_path: Path):
     attributes = _dda_attributes()
     attributes.search_parameter_hints = AttributeValue(

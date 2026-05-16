@@ -72,7 +72,7 @@ _DEFAULT_CONFIG = {
     "model": "deepseek-v4-flash",
     "timeout": "1200",
 }
-_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\[(?:\d{1,3};?)*m")
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\[\d{1,3}(?:;\d{1,3})*m")
 _CJK_RE = re.compile(r"[\u3400-\u9fff\u3000-\u303f\uff00-\uffef]")
 def _app_timezone():
     timezone_name = os.getenv("TZ", "Asia/Shanghai")
@@ -103,6 +103,19 @@ def _clean_text(value: Any) -> str:
     return str(value).strip()
 
 
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _full_workflow_enabled() -> bool:
+    if _env_flag("AGENT_DISABLE_FULL_WORKFLOW", default=False):
+        return False
+    return _env_flag("AGENT_WEB_FULL_WORKFLOW_ENABLED", default=False)
+
+
 def _clean_submitter(value: Any) -> str:
     submitter = _clean_text(value)
     submitter = re.sub(r"[\x00-\x1f\x7f]+", " ", submitter).strip()
@@ -112,15 +125,31 @@ def _clean_submitter(value: Any) -> str:
 
 
 def _clean_run_mode(value: Any) -> str:
-    return normalize_run_mode(value, default=_RUN_MODE_FULL)
+    default = _RUN_MODE_FULL if _full_workflow_enabled() else _RUN_MODE_PREPARE
+    mode = normalize_run_mode(value, default=default)
+    if mode == _RUN_MODE_FULL and not _full_workflow_enabled():
+        return _RUN_MODE_PREPARE
+    return mode
 
 
 def _clean_batch_run_mode(value: Any) -> str:
-    return normalize_run_mode(value, default=_RUN_MODE_PARAMETERS)
+    mode = normalize_run_mode(value, default=_RUN_MODE_PARAMETERS)
+    if mode == _RUN_MODE_FULL and not _full_workflow_enabled():
+        return _RUN_MODE_PREPARE
+    return mode
 
 
 def _clean_resource_policy(value: Any) -> str:
     return normalize_resource_policy(value)
+
+
+def _clean_reviewed_fasta(value: Any) -> tuple[str | None, str | None]:
+    fasta = _clean_text(value)
+    if not fasta:
+        return None, None
+    if re.match(r"(?i)^(https?|ftp)://", fasta):
+        return None, fasta
+    return fasta, None
 
 
 def _run_mode_label(value: Any) -> str:
@@ -140,8 +169,6 @@ def _clean_repository(value: Any, default: str = "pride") -> str:
         return "pride"
     if repository in {"massive", "massive_ucsd", "msv", "gnps"}:
         return "massive"
-    if repository in {"iprox", "ipx"}:
-        return "iprox"
     return default
 
 
@@ -336,6 +363,23 @@ def _ascii_fallback(text: str, level: str = "") -> str:
     return "Backend message omitted in English mode because it was not localized."
 
 
+def _english_fasta_review_message(text: str) -> str | None:
+    if "UniProt" not in text or "FASTA" not in text:
+        return None
+    if "proteome ID" not in text and "占位" not in text and "鍗犱綅" not in text:
+        return None
+    species_match = re.search(r"environmental samples(?:\s*<[^>]+>)?", text, re.IGNORECASE)
+    if species_match:
+        species = species_match.group(0).strip()
+    else:
+        species = "the selected sample"
+    prefix = "[blocked] " if "[阻断]" in text or "[blocked]" in text else ""
+    return (
+        f"{prefix}No real UniProt FASTA could be selected for species: {species}. "
+        "Provide a reviewed FASTA URL or local FASTA path before running the full workflow."
+    )
+
+
 def _to_english_log_message(message: Any, level: str = "") -> str:
     text = _redact_secrets(message).strip()
     if not text:
@@ -345,6 +389,9 @@ def _to_english_log_message(message: Any, level: str = "") -> str:
     for old, new in sorted(_EN_LOG_REPLACEMENTS, key=lambda item: len(item[0]), reverse=True):
         text = text.replace(old, new)
     text = _english_punctuation(text)
+    fasta_review = _english_fasta_review_message(text)
+    if fasta_review:
+        return fasta_review
     if not _contains_cjk(text):
         return text
     if str(level).lower() == "llm":
@@ -2299,6 +2346,7 @@ async def health():
         "per_task_api_keys": True,
         "result_retention_seconds": _result_retention_seconds(),
         "max_result_projects": _max_result_projects(),
+        "full_workflow_enabled": _full_workflow_enabled(),
         **queue_state,
     }
 
@@ -2317,6 +2365,7 @@ async def get_config():
         "timeout": os.getenv("AGENT_LLM_TIMEOUT") or _DEFAULT_CONFIG["timeout"],
         "result_retention_seconds": _result_retention_seconds(),
         "max_result_projects": _max_result_projects(),
+        "full_workflow_enabled": _full_workflow_enabled(),
         **queue_state,
     }
 
@@ -2763,6 +2812,16 @@ async def create_parameter_batch(body: dict[str, Any]):
     resource_policy = _clean_resource_policy(body.get("resource_policy"))
     fasta_preference = _clean_text(body.get("fasta_preference")).lower()
     prefer_project_fasta = fasta_preference == "project" or body.get("prefer_project_fasta") is True
+    reviewed_fasta_path, reviewed_fasta_url = _clean_reviewed_fasta(body.get("reviewed_fasta"))
+    explicit_reviewed_fasta_path = _clean_text(body.get("reviewed_fasta_path"))
+    explicit_reviewed_fasta_url = _clean_text(body.get("reviewed_fasta_url"))
+    if explicit_reviewed_fasta_path:
+        reviewed_fasta_path = explicit_reviewed_fasta_path
+        reviewed_fasta_url = None
+    if explicit_reviewed_fasta_url:
+        reviewed_fasta_url = explicit_reviewed_fasta_url
+        reviewed_fasta_path = None
+    reviewed_fasta_name = _clean_text(body.get("reviewed_fasta_name")) or None
     llm_config = body.get("llm_config", {})
     if not isinstance(llm_config, dict):
         llm_config = {}
@@ -2928,6 +2987,16 @@ async def _create_task_inner(body: dict[str, Any]):
 
     task_id = uuid.uuid4().hex[:12]
     project_key = _project_key_for_input(input_value)
+    reviewed_fasta_path, reviewed_fasta_url = _clean_reviewed_fasta(body.get("reviewed_fasta"))
+    explicit_reviewed_fasta_path = _clean_text(body.get("reviewed_fasta_path"))
+    explicit_reviewed_fasta_url = _clean_text(body.get("reviewed_fasta_url"))
+    if explicit_reviewed_fasta_path:
+        reviewed_fasta_path = explicit_reviewed_fasta_path
+        reviewed_fasta_url = None
+    if explicit_reviewed_fasta_url:
+        reviewed_fasta_url = explicit_reviewed_fasta_url
+        reviewed_fasta_path = None
+    reviewed_fasta_name = _clean_text(body.get("reviewed_fasta_name")) or None
 
     with _tasks_lock:
         output_dir = _next_output_dir_locked(project_key, task_id)
@@ -2944,6 +3013,9 @@ async def _create_task_inner(body: dict[str, Any]):
             "total_steps": 5,
             "blocking_issues": [],
             "prefer_project_fasta": prefer_project_fasta,
+            "reviewed_fasta_path": reviewed_fasta_path,
+            "reviewed_fasta_url": reviewed_fasta_url,
+            "reviewed_fasta_name": reviewed_fasta_name,
             "run_mode": run_mode,
             "resource_policy": resource_policy,
             "ui_language": ui_language,
@@ -3155,6 +3227,9 @@ def _run_pipeline(task_id: str):
     output_dir = Path(task["output_dir"])
     llm_config = task.get("llm_config")
     prefer_project_fasta = bool(task.get("prefer_project_fasta"))
+    reviewed_fasta_path = _clean_text(task.get("reviewed_fasta_path")) or None
+    reviewed_fasta_url = _clean_text(task.get("reviewed_fasta_url")) or None
+    reviewed_fasta_name = _clean_text(task.get("reviewed_fasta_name")) or None
     run_mode = _clean_run_mode(task.get("run_mode"))
     repository = _clean_repository(task.get("repository"))
     parameter_only = run_mode == _RUN_MODE_PARAMETERS
@@ -3178,19 +3253,23 @@ def _run_pipeline(task_id: str):
         _log(task_id, "info", f"运行模式：{_run_mode_label(run_mode)}")
 
         # ── 步骤 1 ──
-        _step(task_id, 1, "[1/5] 解析 PRIDE 项目")
+        repository_label = repository.upper() if repository != "auto" else "Auto"
+        _step(task_id, 1, f"[1/5] Resolve {repository_label} project")
         _log(task_id, "info", "正在初始化 AgentService…")
         service = AgentService(reporter=reporter, llm_reasoner=_task_llm_reasoner(llm_config))
         _log(task_id, "info", "AgentService 初始化完成")
         task_obj = normalize_input(input_value)
         _log(task_id, "info", f"输入规范化：{task_obj.file_name}")
 
-        _log(task_id, "info", "正在查询 PRIDE API 并调用大模型推断参数…")
+        _log(task_id, "info", f"Querying {repository_label} metadata and inferring parameters with the LLM...")
         with StderrCapture(task_id):
             result = service.plan_dda_run_from_repository(
                 task=task_obj,
                 output_dir=output_dir,
                 repository=repository,
+                reviewed_fasta_path=reviewed_fasta_path,
+                reviewed_fasta_url=reviewed_fasta_url,
+                reviewed_fasta_name=reviewed_fasta_name,
                 prefer_project_fasta=prefer_project_fasta,
             )
         if review_overrides:
@@ -3200,10 +3279,13 @@ def _run_pipeline(task_id: str):
                 task_obj,
                 output_dir,
                 prefer_project_fasta=prefer_project_fasta,
+                reviewed_fasta_path=reviewed_fasta_path,
+                reviewed_fasta_url=reviewed_fasta_url,
+                reviewed_fasta_name=reviewed_fasta_name,
             )
             _log(task_id, "info", "已应用人工复核选择，重新生成执行计划。")
         _set_review_summary(task_id, result)
-        _log(task_id, "info", "PRIDE 查询和大模型推断完成")
+        _log(task_id, "info", f"{repository_label} metadata query and LLM inference completed")
 
         primary = result.resolution.primary_project
         if primary:
@@ -3231,6 +3313,9 @@ def _run_pipeline(task_id: str):
                 prepared_path,
                 task_obj,
                 output_dir,
+                reviewed_fasta_path=reviewed_fasta_path,
+                reviewed_fasta_url=reviewed_fasta_url,
+                reviewed_fasta_name=reviewed_fasta_name,
                 prefer_project_fasta=prefer_project_fasta,
             )
             _set_review_summary(task_id, result)
@@ -3248,7 +3333,7 @@ def _run_pipeline(task_id: str):
 
         if parameter_only:
             _step(task_id, 5, "[5/5] 参数推断完成")
-            _log(task_id, "info", "仅搜参数模式：已完成 PRIDE 项目解析、文件属性推断、workflow/FASTA/搜库参数计划生成。")
+            _log(task_id, "info", f"Parameter-only mode completed: {repository_label} project resolution, file attribute inference, workflow/FASTA/search-parameter planning, and audit package generation are complete.")
             service.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
             try:
                 from agent.audit.review import build_task_state_snapshot, write_task_state
@@ -3287,6 +3372,16 @@ def _run_pipeline(task_id: str):
 
         # ── 步骤 3 ──
         _step(task_id, 3, "[3/5] 生成 MSDT-Converter 输入包")
+        result = service.validate_prepared_data_for_plan(result, prepared_path)
+        if result.plan.needs_review:
+            task["blocking_issues"] = result.plan.blocking_issues
+            for issue in result.plan.blocking_issues:
+                _log(task_id, "error", f"[闃绘柇] {issue}")
+            service.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
+            _set_review_summary(task_id, result)
+            _set_task_terminal_status(task_id, "blocked")
+            return
+
         from agent.execution.bundle import materialize_dda_task_bundle
         with StderrCapture(task_id):
             bundle = materialize_dda_task_bundle(
@@ -3296,6 +3391,9 @@ def _run_pipeline(task_id: str):
                 attributes=result.attributes,
                 source_data_path=prepared_path,
                 output_dir=output_dir,
+                reviewed_fasta_path=reviewed_fasta_path,
+                reviewed_fasta_url=reviewed_fasta_url,
+                reviewed_fasta_name=reviewed_fasta_name,
                 prefer_project_fasta=prefer_project_fasta,
                 report=reporter,
             )

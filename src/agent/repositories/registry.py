@@ -5,7 +5,6 @@ from typing import Iterable
 from agent.models import RepositoryName
 from agent.pride.client import PrideClient
 from agent.repositories.base import RepositoryAdapter
-from agent.repositories.iprox_adapter import IproxAdapter
 from agent.repositories.massive_adapter import MassiveAdapter
 from agent.repositories.pride_adapter import PrideAdapter
 
@@ -19,7 +18,6 @@ class RepositoryRegistry:
         self.adapters: list[RepositoryAdapter] = list(adapters) if adapters is not None else [
             PrideAdapter(pride_client),
             MassiveAdapter(),
-            IproxAdapter(),
         ]
         seen: set[str] = set()
         for adapter in self.adapters:
@@ -49,4 +47,4 @@ class RepositoryRegistry:
 
     @staticmethod
     def supported_names() -> tuple[RepositoryName, ...]:
-        return ("pride", "massive", "iprox")
+        return ("pride", "massive")

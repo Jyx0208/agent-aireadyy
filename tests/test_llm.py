@@ -63,6 +63,19 @@ class SpeciesAliasReasoner:
         }
 
 
+class EnvironmentalSpeciesReasoner:
+    def confirm_search_parameters(self, context, attributes):
+        return {
+            "species": AttributeValue(
+                value="environmental samples",
+                confidence=0.8,
+                source="llm_confirmed",
+                evidence_excerpt="Environmental sample metadata.",
+                conflict_flag=False,
+            )
+        }
+
+
 class HighConfidenceLlmReasoner:
     def confirm_search_parameters(self, context, attributes):
         return {
@@ -194,6 +207,29 @@ def test_llm_confirmation_treats_parenthetical_species_alias_as_same_value():
     confirmed = confirm_no_sdrf_parameters(context, base, llm_reasoner=SpeciesAliasReasoner())
 
     assert confirmed.species.value == "Mus musculus"
+    assert confirmed.species.conflict_flag is False
+
+
+def test_llm_confirmation_treats_angle_bracket_taxonomy_as_compatible_species_alias():
+    context = ProjectContext(
+        repository="massive",
+        project_accession="MSV000101857",
+        file_name="RN5_neg.mzML",
+        metadata={
+            "organisms": MetadataValue(
+                value=["environmental samples <Bacillariophyta>"],
+                source="massive.organisms",
+                source_level="project",
+                completeness=1.0,
+            )
+        },
+        sdrf_rows=[],
+    )
+
+    base = infer_attributes(context)
+    confirmed = confirm_no_sdrf_parameters(context, base, llm_reasoner=EnvironmentalSpeciesReasoner())
+
+    assert confirmed.species.value == "environmental samples"
     assert confirmed.species.conflict_flag is False
 
 

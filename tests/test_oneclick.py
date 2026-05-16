@@ -60,11 +60,11 @@ def test_preflight_full_run_blocks_without_docker_daemon_or_converter(tmp_path: 
     assert any("msconvert" in issue for issue in report["blocking_issues"])
 
 
-def test_preflight_iprox_prepare_requires_aspera_credentials(tmp_path: Path):
+def test_preflight_does_not_run_iprox_specific_checks(tmp_path: Path):
     report = run_preflight(
         inputs=["IPX000001"],
         run_mode="prepare",
-        repository="iprox",
+        repository="auto",
         output_root=tmp_path,
         toolchain_detector=lambda: _toolchain(
             docker_cli_available=True,
@@ -75,8 +75,10 @@ def test_preflight_iprox_prepare_requires_aspera_credentials(tmp_path: Path):
         env={},
     )
 
-    assert report["status"] == "blocked"
-    assert any("Aspera" in issue for issue in report["blocking_issues"])
+    assert report["status"] == "ok"
+    assert report["blocking_issues"] == []
+    assert all("iprox" not in check["name"].lower() for check in report["checks"])
+    assert all("Aspera" not in issue for issue in report["blocking_issues"])
 
 
 def test_preflight_conservative_policy_requires_more_disk_space(tmp_path: Path):

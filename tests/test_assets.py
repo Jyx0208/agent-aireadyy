@@ -391,6 +391,47 @@ def test_download_file_asset_redownloads_cache_with_wrong_size(tmp_path: Path, m
     assert events == [("download", "https://ftp.pride.ebi.ac.uk/pride/data/archive/sample.raw")]
 
 
+def test_download_file_asset_tries_alternate_urls_when_primary_fails(tmp_path: Path, monkeypatch):
+    events: list[str] = []
+    monkeypatch.setenv("AGENT_REPOSITORY_CACHE_DIR", str(tmp_path / "cache"))
+
+    class FakeClient:
+        def download_to_path(self, url: str, target_path: Path, report=None) -> Path:
+            events.append(url)
+            if "primary" in url:
+                raise OSError("primary mirror unavailable")
+            target_path.write_bytes(b"raw-bytes")
+            return target_path
+
+    asset = FileAsset(
+        repository="massive",
+        original_file_name="sample.raw",
+        resolved_asset_type="raw",
+        project_accession="MSV000001",
+        matched_project_file="sample.raw",
+        download_url="https://massive.ucsd.edu/primary/sample.raw",
+        download_urls=[
+            "https://massive.ucsd.edu/primary/sample.raw",
+            "ftp://massive.ucsd.edu/v01/MSV000001/raw/sample.raw",
+        ],
+        transfer_method="https",
+        local_path=tmp_path / "run" / "assets" / "downloads" / "sample.raw",
+        prepared_path=tmp_path / "run" / "assets" / "prepared" / "sample.mzML",
+        expected_size_bytes=len(b"raw-bytes"),
+        requires_conversion=True,
+        asset_confidence=1.0,
+        match_type="exact",
+    )
+
+    downloaded = download_file_asset(FakeClient(), asset)
+
+    assert downloaded.read_bytes() == b"raw-bytes"
+    assert events == [
+        "https://massive.ucsd.edu/primary/sample.raw",
+        "ftp://massive.ucsd.edu/v01/MSV000001/raw/sample.raw",
+    ]
+
+
 def test_resolve_file_asset_prefers_http_compatible_url_over_aspera(tmp_path: Path):
     task = normalize_input("sample.raw")
     context = _project_context(

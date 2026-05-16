@@ -13,8 +13,8 @@ from agent.assets.resolver import resolve_file_asset
 from agent.decision.dda import plan_dda_execution
 from agent.execution.bundle import materialize_dda_task_bundle
 from agent.execution.outputs import execution_failure_reasons
-from agent.inference.rules import infer_attributes
-from agent.inference.mzml_metadata import infer_instrument_family_from_name, parse_mzml_instrument
+from agent.inference.rules import infer_attributes, non_proteomics_evidence
+from agent.inference.mzml_metadata import dda_mzml_search_blocking_issue, infer_instrument_family_from_name, parse_mzml_instrument
 from agent.llm.reasoner import LLMReasoner, confirm_no_sdrf_parameters, confirm_sdrf_parameters
 from agent.metadata.context import build_project_context
 from agent.models import AttributeValue, DdaExecutionPlan, FileAsset, InputTask, PridePlanResult, ProjectContext, ProjectResolution, RunManifest
@@ -113,6 +113,33 @@ class AgentService:
     @staticmethod
     def _runtime_log_path(output_dir: str | Path) -> Path:
         return Path(output_dir) / "logs" / "runtime.log"
+
+    @staticmethod
+    def _prepared_data_blocking_issue(plan: DdaExecutionPlan, prepared_path: str | Path) -> str | None:
+        if plan.raw_data_type not in {"mzml", "wiff2mzml"}:
+            return None
+        path = Path(prepared_path)
+        if path.suffix.lower() != ".mzml" and not path.name.lower().endswith(".mzml.gz"):
+            return None
+        return dda_mzml_search_blocking_issue(path)
+
+    def validate_prepared_data_for_plan(
+        self,
+        result: PridePlanResult,
+        prepared_path: str | Path,
+    ) -> PridePlanResult:
+        issue = self._prepared_data_blocking_issue(result.plan, prepared_path)
+        if not issue:
+            return result
+        plan = result.plan.model_copy(
+            update={
+                "source_data_path": Path(prepared_path),
+                "needs_review": True,
+                "blocking_issues": [*result.plan.blocking_issues, issue],
+            }
+        )
+        self._report(f"Prepared data validation blocked FragPipe execution: {issue}")
+        return result.model_copy(update={"plan": plan})
 
     @staticmethod
     def _write_run_log(output_dir: str | Path, stdout: str, stderr: str = "") -> Path:
@@ -245,6 +272,13 @@ class AgentService:
 
     def infer_attributes(self, context: ProjectContext):
         attributes = infer_attributes(context)
+        unsupported_evidence = non_proteomics_evidence(context)
+        if unsupported_evidence:
+            self._report(
+                "Unsupported assay type detected: repository metadata or file path indicates "
+                f"metabolomics/small-molecule LC-MS, not bottom-up proteomics. Evidence: {unsupported_evidence[:240]}"
+            )
+            return attributes
         attributes = confirm_sdrf_parameters(
             context,
             attributes,
@@ -298,6 +332,9 @@ class AgentService:
         task: InputTask,
         output_dir: str | Path,
         prefer_project_fasta: bool = False,
+        reviewed_fasta_path: str | Path | None = None,
+        reviewed_fasta_url: str | None = None,
+        reviewed_fasta_name: str | None = None,
     ) -> PridePlanResult:
         attributes = self._attributes_with_review_overrides(result.attributes, overrides)
         if attributes is result.attributes:
@@ -315,6 +352,9 @@ class AgentService:
             attributes=attributes,
             output_dir=output_dir,
             project_context=result.context,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+            reviewed_fasta_name=reviewed_fasta_name,
             prefer_project_fasta=prefer_project_fasta,
         )
         return result.model_copy(update={"attributes": attributes, "plan": plan})
@@ -762,6 +802,12 @@ class AgentService:
             self._report(message)
             raise ReviewRequiredError(message)
         prepared_path = self.prepare_asset(result.asset)
+        result = self.validate_prepared_data_for_plan(result, prepared_path)
+        if result.plan.needs_review:
+            self.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
+            message = f"Prepared data validation requires review before FragPipe execution: {result.plan.blocking_issues}"
+            self._report(message)
+            raise ReviewRequiredError(message)
         bundle = materialize_dda_task_bundle(
             task=task,
             project_resolution=result.resolution,
@@ -896,6 +942,19 @@ class AgentService:
                 ),
             )
             raise
+        result = self.validate_prepared_data_for_plan(result, prepared_path)
+        if result.plan.needs_review:
+            self.write_task_bundle(
+                output_dir,
+                result.resolution,
+                result.context,
+                result.attributes,
+                result.plan,
+                asset=result.asset,
+            )
+            message = f"Prepared data validation requires review before FragPipe execution: {result.plan.blocking_issues}"
+            self._report(message)
+            raise ReviewRequiredError(message)
         bundle = materialize_dda_task_bundle(
             task=task,
             project_resolution=result.resolution,

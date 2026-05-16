@@ -168,7 +168,7 @@ def resolve_project(input_value: str) -> None:
 @app.command("resolve-dataset")
 def resolve_dataset(
     input_value: str,
-    repository: str = typer.Option("auto", "--repository", "-r", help="Repository: auto, pride, massive, or iprox."),
+    repository: str = typer.Option("auto", "--repository", "-r", help="Repository: auto, pride, or massive."),
 ) -> None:
     registry = RepositoryRegistry()
     adapter = registry.choose(repository, input_value)
@@ -184,43 +184,6 @@ def resolve_dataset(
         payload["file_count"] = len(files)
         payload["files_preview"] = [file.model_dump(mode="json") for file in files[:20]]
     typer.echo(json_dumps(payload))
-
-
-@app.command("sync-repository-index")
-def sync_repository_index(
-    repository: str = typer.Option(..., "--repository", "-r", help="Repository to index. Currently supports iprox."),
-    year: str | None = typer.Option(None, "--year", help="Sync iProX project IDs published in a year, for example 2025."),
-    month: str | None = typer.Option(None, "--month", help="Sync iProX project IDs published in a month, for example 2025-05."),
-    day: str | None = typer.Option(None, "--day", help="Sync iProX project IDs published on a day, for example 2025-05-09."),
-    xml_dir: Path | None = typer.Option(None, "--xml-dir", help="Import local ProteomeXchange XML files into the repository index."),
-    limit: int | None = typer.Option(None, "--limit", help="Limit the number of remote projects to index."),
-) -> None:
-    registry = RepositoryRegistry()
-    adapter = registry.get(repository)
-    if repository != "iprox":
-        raise typer.BadParameter("sync-repository-index currently supports iProX only.")
-
-    reporter = _build_reporter()
-    if xml_dir is not None:
-        xml_paths = sorted(path for path in xml_dir.glob("*.xml") if path.is_file())
-        if not xml_paths:
-            raise typer.BadParameter(f"No XML files found in {xml_dir}.")
-        sync_from_xml = getattr(adapter, "sync_index_from_xml_files", None)
-        if sync_from_xml is None:
-            raise typer.BadParameter("Selected repository does not support XML index import.")
-        summary = sync_from_xml(xml_paths, report=reporter)
-        typer.echo(json_dumps(summary))
-        return
-
-    selected = [(name, value) for name, value in (("year", year), ("month", month), ("day", day)) if value]
-    if len(selected) != 1:
-        raise typer.BadParameter("Provide exactly one of --xml-dir, --year, --month, or --day.")
-    sync_by_date = getattr(adapter, "sync_index_by_date", None)
-    if sync_by_date is None:
-        raise typer.BadParameter("Selected repository does not support date index sync.")
-    granularity, value = selected[0]
-    summary = sync_by_date(granularity, value, limit=limit, report=reporter)
-    typer.echo(json_dumps(summary))
 
 
 @app.command("infer-attributes")
@@ -341,7 +304,7 @@ def prepare_msdt_docker_input(input_value: str, source_data_path: Path, output_d
 def prepare_repository_msdt_docker_input(
     input_value: str,
     output_dir: Path | None = typer.Argument(None, help="Output directory. Auto-generated from input file name if not specified."),
-    repository: str = typer.Option("auto", "--repository", "-r", help="Repository: auto, pride, massive, or iprox."),
+    repository: str = typer.Option("auto", "--repository", "-r", help="Repository: auto, pride, or massive."),
     reviewed_fasta_path: Path | None = typer.Option(None, help="Human-reviewed local FASTA path to use instead of inferred/default FASTA."),
     reviewed_fasta_url: str | None = typer.Option(None, help="Human-reviewed FASTA URL to download and use."),
     no_run: bool = typer.Option(False, "--no-run", help="Only prepare input, do not run Docker."),
@@ -482,13 +445,13 @@ def _review_message(output_dir: Path) -> str:
 def one_click_run(
     input_value: str,
     output_dir: Path | None = typer.Argument(None, help="Output directory. Auto-generated from input file name if not specified."),
-    repository: str = typer.Option("auto", "--repository", "-r", help="Repository: auto, pride, massive, or iprox."),
+    repository: str = typer.Option("auto", "--repository", "-r", help="Repository: auto, pride, or massive."),
     mode: str = typer.Option("full", "--mode", "-m", help="Run mode: parameters, prepare, or full."),
     resource_policy: str = typer.Option("balanced", "--resource-policy", help="Preflight disk policy: fast, balanced, or conservative."),
     reviewed_fasta_path: Path | None = typer.Option(None, help="Human-reviewed local FASTA path to use instead of inferred/default FASTA."),
     reviewed_fasta_url: str | None = typer.Option(None, help="Human-reviewed FASTA URL to download and use."),
     image: str = typer.Option("guomics2017/msdt-converter:v1.3", help="Docker image for MSDT-Converter."),
-    skip_preflight: bool = typer.Option(False, "--skip-preflight", help="Skip local Docker/disk/iProX preflight checks."),
+    skip_preflight: bool = typer.Option(False, "--skip-preflight", help="Skip local Docker and disk preflight checks."),
 ) -> None:
     run_mode = normalize_run_mode(mode)
     if output_dir is None:

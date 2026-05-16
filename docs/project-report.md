@@ -19,7 +19,7 @@ Manual proteomics pipeline setup is slow, error-prone, and difficult to audit. T
 
 The system solves these problems by combining:
 
-- repository adapters for PRIDE, MassIVE, and iProX
+- repository adapters for PRIDE and MassIVE
 - canonical metadata normalization
 - LLM-assisted parameter inference with explicit evidence
 - preflight checks before expensive execution
@@ -73,4 +73,3 @@ input -> repository adapter -> canonical metadata -> parameter inference
 ## Presentation Angle
 
 The project is not just a data downloader. It is a controlled, auditable workflow planner that turns fragile proteomics setup into a repeatable engineering system.
-

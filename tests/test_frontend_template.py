@@ -28,6 +28,7 @@ def test_frontend_template_labels_primary_form_controls():
         "inputValue",
         "submitter",
         "repositorySelect",
+        "reviewedFasta",
         "cfgApiKey",
         "cfgBaseUrl",
         "cfgModel",
@@ -79,11 +80,20 @@ def test_frontend_template_exposes_batch_run_mode_and_resource_policy():
     assert 'id="batchResourcePolicy"' in html
     assert 'for="batchResourcePolicy"' in html
     assert "resource_policy:document.getElementById('singleResourcePolicy').value" in html
+    assert "reviewed_fasta:document.getElementById('reviewedFasta').value" in html
     assert "run_mode:document.getElementById('batchRunMode').value" in html
     assert "resource_policy:document.getElementById('batchResourcePolicy').value" in html
     assert "runPreflight(payload)" in html
     assert "/api/preflight" in html
     assert "Prepare input package" in html
+
+
+def test_frontend_template_disables_full_workflow_by_default_for_demo_server():
+    html = _html()
+
+    assert 'data-run-mode="full" onclick="setRunMode(\'full\')" data-i18n="modeFull" disabled aria-disabled="true"' in html
+    assert '<option value="full" data-i18n="modeFull" disabled>Full workflow</option>' in html
+    assert "let fullWorkflowEnabled=false" in html
 
 
 def test_frontend_template_exposes_repository_selection_for_single_and_batch():
@@ -94,7 +104,9 @@ def test_frontend_template_exposes_repository_selection_for_single_and_batch():
     assert 'value="auto"' in html
     assert 'value="pride"' in html
     assert 'value="massive"' in html
-    assert 'value="iprox"' in html
+    assert 'value="iprox"' not in html
+    assert "iProX" not in html
+    assert "IPX" not in html
     assert "repository:document.getElementById('repositorySelect').value" in html
     assert "repository:document.getElementById('batchRepository').value" in html
     assert "repositoryLabel" in html
