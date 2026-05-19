@@ -168,6 +168,9 @@ def _infer_species(context: ProjectContext) -> AttributeValue:
         if isinstance(organisms.value, list) and organisms.value:
             unique_values = [str(value) for value in dict.fromkeys(organisms.value) if str(value).strip()]
             if len(unique_values) > 1:
+                file_level = _file_name_species_hint(context.file_name, unique_values)
+                if file_level is not None:
+                    return file_level
                 return _attribute(
                     "; ".join(unique_values),
                     0.5,
@@ -178,6 +181,31 @@ def _infer_species(context: ProjectContext) -> AttributeValue:
             return _attribute(organisms.value[0], 0.9, source, str(organisms.value[0]))
         return _attribute(organisms.value, 0.9, source, _flatten(organisms.value))
     return _attribute("unknown", 0.0, "none", "")
+
+
+def _file_name_species_hint(file_name: str, organisms: list[str]) -> AttributeValue | None:
+    normalized_file = file_name.lower()
+    candidates = [(organism, organism.lower()) for organism in organisms]
+    hints = [
+        (("yeast", "s_cerevisiae", "saccharomyces"), ("saccharomyces", "cerevisiae")),
+        (("mouse", "mice", "murine"), ("mus musculus", "mouse")),
+        (("human", "hela", "homo"), ("homo sapiens", "human")),
+        (("ecoli", "e_coli", "e-coli", "escherichia"), ("escherichia coli", "e. coli")),
+        (("rat", "rattus"), ("rattus norvegicus", "rat")),
+        (("arabidopsis", "thaliana"), ("arabidopsis thaliana",)),
+    ]
+    for file_patterns, organism_patterns in hints:
+        if not any(pattern in normalized_file for pattern in file_patterns):
+            continue
+        for organism, lowered in candidates:
+            if any(pattern in lowered for pattern in organism_patterns):
+                return _attribute(
+                    organism,
+                    0.9,
+                    "file_name_species_rule",
+                    f"File name '{file_name}' disambiguates project species: {', '.join(organisms)}",
+                )
+    return None
 
 
 def _infer_instrument_name(context: ProjectContext) -> AttributeValue:

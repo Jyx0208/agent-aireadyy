@@ -168,12 +168,27 @@ h1{font-size:1.38rem;letter-spacing:0}
 .file-list{max-height:180px;overflow:auto;font-family:"Cascadia Code",Consolas,monospace;font-size:.76rem;color:var(--muted);line-height:1.7}
 .download-status{display:block;margin-top:8px;font-size:.78rem;color:var(--muted)}
 .download-status.error{color:var(--red)}
-.status-cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.status-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
 .system-summary{margin:0}
 .metric-card{min-height:78px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:12px;box-shadow:0 8px 24px rgba(15,23,42,.05)}
 .metric-label{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
 .metric-value{font-size:1.25rem;font-weight:750;margin-top:3px}
 .metric-meta{font-size:.72rem;color:var(--soft);margin-top:2px;overflow-wrap:anywhere}
+.gauge-card{display:grid;gap:6px;justify-items:stretch}
+.gauge-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+.gauge-card .metric-value{margin-top:0;font-size:1.02rem}
+.gauge-dial{position:relative;width:112px;height:70px;overflow:visible;margin:2px auto 0}
+.gauge-svg{display:block;width:112px;height:70px;overflow:visible}
+.gauge-arc{fill:none;stroke-width:10;stroke-linecap:round}
+.gauge-low{stroke:#059669;stroke-dasharray:60 100;stroke-dashoffset:0}
+.gauge-mid{stroke:#d97706;stroke-dasharray:25 100;stroke-dashoffset:-60}
+.gauge-high{stroke:#dc2626;stroke-dasharray:15 100;stroke-dashoffset:-85}
+.gauge-needle{stroke:#111827;stroke-width:3;stroke-linecap:round;transform-origin:60px 58px;transform-box:view-box;transform:rotate(var(--gauge-rotation,-90deg));transition:transform .55s cubic-bezier(.2,.8,.2,1)}
+.gauge-hub{fill:#111827;stroke:var(--surface);stroke-width:3;filter:drop-shadow(0 2px 4px rgba(15,23,42,.22))}
+.gauge-card.low .metric-value{color:#047857}
+.gauge-card.medium .metric-value{color:#b45309}
+.gauge-card.high .metric-value{color:#b91c1c}
+@media(prefers-reduced-motion:reduce){.gauge-needle{transition:none}}
 .workflow-tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}
 .workflow-tab{display:grid;gap:3px;text-align:left;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);color:var(--text);padding:11px 12px;cursor:pointer;min-height:72px}
 .workflow-tab strong{font-size:.86rem}
@@ -215,6 +230,9 @@ footer{padding:4px 0 4px;color:var(--soft);font-size:.74rem;text-align:center}
   <section class="status-cards system-summary" aria-label="System summary">
     <div class="metric-card" id="metricRunning"></div>
     <div class="metric-card" id="metricQueued"></div>
+    <div class="metric-card" id="metricCpu"></div>
+    <div class="metric-card" id="metricMemory"></div>
+    <div class="metric-card" id="metricDisk"></div>
     <div class="metric-card" id="metricHistory"></div>
     <div class="metric-card" id="metricStorage"></div>
   </section>
@@ -261,9 +279,10 @@ footer{padding:4px 0 4px;color:var(--soft);font-size:.74rem;text-align:center}
           <option value="auto" data-i18n="repositoryAuto">Auto</option>
           <option value="pride">PRIDE</option>
           <option value="massive">MassIVE</option>
+          <option value="iprox">iProX</option>
         </select>
       </div>
-      <div class="mode-help" id="repositoryHelp" data-i18n="repositoryHelp">Auto detects MSV/PXD where possible. Choose a repository when you already know the source.</div>
+      <div class="mode-help" id="repositoryHelp" data-i18n="repositoryHelp">Auto detects PXD/MSV/IPX where possible. Choose a repository when you already know the source.</div>
       <div class="mode-row">
         <div class="mode-label" data-i18n="runMode">Run mode</div>
         <div class="mode-control">
@@ -317,9 +336,10 @@ footer{padding:4px 0 4px;color:var(--soft);font-size:.74rem;text-align:center}
             <option value="auto" data-i18n="repositoryAuto">Auto</option>
             <option value="pride">PRIDE</option>
             <option value="massive">MassIVE</option>
+            <option value="iprox">iProX</option>
           </select>
         </div>
-        <div class="mode-help" id="batchRepositoryHelp" data-i18n="repositoryHelp">Auto detects MSV/PXD where possible. Choose a repository when you already know the source.</div>
+        <div class="mode-help" id="batchRepositoryHelp" data-i18n="repositoryHelp">Auto detects PXD/MSV/IPX where possible. Choose a repository when you already know the source.</div>
         <div class="form-row">
           <label for="batchRunMode" data-i18n="runMode">Run mode</label>
           <select id="batchRunMode" aria-describedby="batchRunModeHelp">
@@ -436,6 +456,8 @@ let fullWorkflowEnabled=false;
 let lastReviewSummary=null;
 let currentBatchId=null,batchPollTimer=null;
 let currentWorkflowTab='single';
+const HEALTH_REFRESH_MS=2000;
+let healthPollActive=false;
 
 const I18N={
   en:{
@@ -460,7 +482,7 @@ const I18N={
     submitterPlaceholder:'Name or lab member',
     repository:'Repository',
     repositoryAuto:'Auto',
-    repositoryHelp:'Auto detects MSV/PXD where possible. Choose a repository when you already know the source.',
+    repositoryHelp:'Auto detects PXD/MSV/IPX where possible. Choose a repository when you already know the source.',
     reviewedFasta:'Reviewed FASTA URL / local path',
     reviewedFastaPlaceholder:'Optional: https://.../reference.fasta or C:\\path\\reference.fasta',
     reviewedFastaHelp:'Use this when environmental or non-model samples do not have an automatic reference FASTA.',
@@ -534,6 +556,12 @@ const I18N={
     logCount:n=>`${n} logs`,
     serverStatus:(running,queued,max)=>`Running ${running}/${max}, queued ${queued}`,
     retention:(retention,maxProjects)=>`Results are retained for about ${retention} minutes; latest ${maxProjects} downloadable projects are kept.`,
+    systemCpu:'CPU',
+    systemMemory:'Memory',
+    systemDisk:'Disk',
+    systemCores:cores=>`${cores} cores`,
+    systemHost:'host',
+    systemContainer:'container',
     historyMeta:(total,active,failed,downloadable,size,minutes)=>`History ${total} · active ${active} · failed ${failed} · downloadable ${downloadable} · storage ${size} · files expire after about ${minutes} minutes; API keys are never shared.`,
     unknown:'Unknown',
     notProvided:'Not provided',
@@ -543,7 +571,7 @@ const I18N={
     action:{watch:'Watch',inspect:'Inspect',download:'Download',view:'View'},
     batchAction:{watch:'Track batch',download:'Download Excel',view:'Open batch'},
     mode:{full:'Full workflow',prepare:'Prepare input package',parameters:'Parameters only'},
-    repositoryLabel:{auto:'Auto',pride:'PRIDE',massive:'MassIVE'},
+    repositoryLabel:{auto:'Auto',pride:'PRIDE',massive:'MassIVE',iprox:'iProX'},
     timeSource:{started_at:'Started',created_at:'Created',finished_at:'Finished',updated_at:'Updated',history_time:'Recorded'},
     duration:'duration',
     queue:(pos,len,running,max)=>`Task queued at position ${pos}/${len}. Server is running ${running}/${max} tasks and will start this one automatically.`,
@@ -639,6 +667,12 @@ const I18N={
     logCount:n=>`${n} 条日志`,
     serverStatus:(running,queued,max)=>`运行 ${running}/${max}，排队 ${queued}`,
     retention:(retention,maxProjects)=>`结果约 ${retention} 分钟后清理；最多保留 ${maxProjects} 个可下载项目。`,
+    systemCpu:'CPU',
+    systemMemory:'内存',
+    systemDisk:'磁盘',
+    systemCores:cores=>`${cores} 核`,
+    systemHost:'主机',
+    systemContainer:'容器',
     historyMeta:(total,active,failed,downloadable,size,minutes)=>`历史 ${total} 条 · 运行中 ${active} · 失败 ${failed} · 可下载 ${downloadable} · 占用 ${size} · 文件约 ${minutes} 分钟后清理；API Key 不共享。`,
     unknown:'未知',
     notProvided:'未填写',
@@ -676,11 +710,11 @@ const I18N={
 Object.assign(I18N.zh,{
   repository:'数据库',
   repositoryAuto:'自动',
-  repositoryHelp:'自动模式会尽量识别 MSV/PXD。已知来源时请直接选择对应数据库。',
+  repositoryHelp:'自动模式会尽量识别 PXD/MSV/IPX。已知来源时请直接选择对应数据库。',
   reviewedFasta:'人工确认 FASTA URL / 本地路径',
   reviewedFastaPlaceholder:'可选：https://.../reference.fasta 或 C:\\path\\reference.fasta',
   reviewedFastaHelp:'环境样本或非模式物种无法自动选择参考 FASTA 时，在这里提供真实 FASTA。',
-  repositoryLabel:{auto:'自动',pride:'PRIDE',massive:'MassIVE'}
+  repositoryLabel:{auto:'自动',pride:'PRIDE',massive:'MassIVE',iprox:'iProX'}
 });
 
 function t(key){return I18N[currentLanguage][key]??I18N.en[key]??key}
@@ -690,6 +724,12 @@ function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').
 function jsArg(value){return JSON.stringify(String(value??'')).replace(/'/g,'&#39;')}
 function now(){const d=new Date();return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0')}
 function formatSize(n){if(n>1024*1024*1024)return(n/1024/1024/1024).toFixed(1)+' GB';if(n>1024*1024)return(n/1024/1024).toFixed(1)+' MB';if(n>1024)return(n/1024).toFixed(1)+' KB';return(n||0)+' B'}
+function formatPercent(n){const v=Number(n);return Number.isFinite(v)?v.toFixed(1)+'%':t('unknown')}
+function gaugePercent(n){const v=Number(n);return Number.isFinite(v)?Math.max(0,Math.min(100,v)):null}
+function gaugeRotation(percent){const v=gaugePercent(percent);return ((v===null?0:v)*1.8-90).toFixed(1)}
+function gaugeTone(percent){const v=gaugePercent(percent);if(v===null)return'unknown';if(v>=85)return'high';if(v>=65)return'medium';return'low'}
+function systemScope(scope){if(scope==='container')return t('systemContainer');if(scope==='host')return t('systemHost');return''}
+function usageMeta(used,total,scope){const parts=[];if(Number.isFinite(Number(used))&&Number.isFinite(Number(total))&&Number(total)>0)parts.push(formatSize(Number(used))+' / '+formatSize(Number(total)));const s=systemScope(scope);if(s)parts.push(s);return parts.join(' · ')||t('unknown')}
 function retentionMinutes(d){return Math.max(1,Math.round((d.retention_seconds||1800)/60))}
 function formatHistoryTime(item){const v=item.history_time||item.updated_at||item.finished_at||item.started_at||item.created_at||'';if(!v)return'';const d=new Date(v);return isNaN(d.getTime())?String(v):d.toLocaleString(currentLanguage==='zh'?'zh-CN':'en-US',{hour12:false})}
 function formatDuration(sec){if(sec===null||sec===undefined)return'';const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=Math.floor(sec%60);if(currentLanguage==='zh'){if(h>0)return h+'小时'+String(m).padStart(2,'0')+'分';if(m>0)return m+'分'+String(s).padStart(2,'0')+'秒';return s+'秒'}if(h>0)return h+'h '+String(m).padStart(2,'0')+'m';if(m>0)return m+'m '+String(s).padStart(2,'0')+'s';return s+'s'}
@@ -714,6 +754,12 @@ const UI={
   },
   metricCard(label,value,meta){
     return '<div class="metric-label">'+esc(label)+'</div><div class="metric-value">'+esc(value)+'</div><div class="metric-meta">'+esc(meta||'')+'</div>';
+  },
+  gaugeCard(label,value,meta,percent){
+    const rotation=gaugeRotation(percent);
+    const tone=gaugeTone(percent);
+    const arc='M 12 58 A 48 48 0 0 1 108 58';
+    return '<div class="gauge-card '+esc(tone)+'" aria-label="'+esc(label)+' '+esc(value)+'"><div class="gauge-head"><div class="metric-label">'+esc(label)+'</div><div class="metric-value">'+esc(value)+'</div></div><div class="gauge-dial" aria-hidden="true"><svg class="gauge-svg" viewBox="0 0 120 72" role="img" focusable="false"><path class="gauge-arc gauge-low" pathLength="100" d="'+arc+'"></path><path class="gauge-arc gauge-mid" pathLength="100" d="'+arc+'"></path><path class="gauge-arc gauge-high" pathLength="100" d="'+arc+'"></path><line class="gauge-needle" x1="60" y1="58" x2="60" y2="20" style="--gauge-rotation:'+esc(rotation)+'deg"></line><circle class="gauge-hub" cx="60" cy="58" r="5"></circle></svg></div><div class="metric-meta">'+esc(meta||'')+'</div></div>';
   },
   helperText(title,body){
     return '<div class="helper-text"><strong>'+esc(title)+'</strong> '+esc(body||'')+'</div>';
@@ -881,12 +927,34 @@ async function loadHealth(){
   }catch(e){}
 }
 
+async function pollHealth(){
+  if(healthPollActive)return;
+  healthPollActive=true;
+  try{
+    await loadHealth();
+  }finally{
+    healthPollActive=false;
+    setTimeout(pollHealth,HEALTH_REFRESH_MS);
+  }
+}
+
+function renderSystemMetrics(metrics){
+  const m=metrics||{},cpu=m.cpu||{},memory=m.memory||{},disk=m.disk||{};
+  const cores=cpu.effective_cores||cpu.logical_cores;
+  const coreText=cores?tf('systemCores',cores):t('unknown');
+  const loadText=cpu.load_1m!==null&&cpu.load_1m!==undefined?'load '+cpu.load_1m:coreText;
+  document.getElementById('metricCpu').innerHTML=UI.gaugeCard(t('systemCpu'),formatPercent(cpu.load_percent),loadText,cpu.load_percent);
+  document.getElementById('metricMemory').innerHTML=UI.gaugeCard(t('systemMemory'),formatPercent(memory.used_percent),usageMeta(memory.used_bytes,memory.total_bytes,memory.scope),memory.used_percent);
+  document.getElementById('metricDisk').innerHTML=UI.gaugeCard(t('systemDisk'),formatPercent(disk.used_percent),usageMeta(disk.used_bytes,disk.total_bytes,''),disk.used_percent);
+}
+
 function updateServerStatus(d){
   if(d&&Object.prototype.hasOwnProperty.call(d,'full_workflow_enabled'))updateFullWorkflowAvailability(!!d.full_workflow_enabled);
   const running=d.running_tasks||0,queued=d.queued_tasks||0,max=d.max_concurrent_tasks||1;
   document.getElementById('serverStatus').textContent=tf('serverStatus',running,queued,max);
   document.getElementById('metricRunning').innerHTML=UI.metricCard('Running',running+'/'+max,'Active workflow slots');
   document.getElementById('metricQueued').innerHTML=UI.metricCard('Queued',queued,'Waiting to start');
+  renderSystemMetrics(d.system_metrics);
 }
 
 async function loadResults(){
@@ -1449,7 +1517,7 @@ setRunMode(localStorage.getItem('runMode')||'prepare');
 setWorkflowTab(localStorage.getItem('workflowTab')||'single',false);
 setLanguage(localStorage.getItem('uiLanguage')||'en');
 loadConfig();
-setInterval(loadHealth,5000);
+pollHealth();
 setInterval(loadResults,30000);
 </script>
 </body>

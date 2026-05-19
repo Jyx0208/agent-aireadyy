@@ -104,9 +104,9 @@ def test_frontend_template_exposes_repository_selection_for_single_and_batch():
     assert 'value="auto"' in html
     assert 'value="pride"' in html
     assert 'value="massive"' in html
-    assert 'value="iprox"' not in html
-    assert "iProX" not in html
-    assert "IPX" not in html
+    assert 'value="iprox"' in html
+    assert "iProX" in html
+    assert "IPX" in html
     assert "repository:document.getElementById('repositorySelect').value" in html
     assert "repository:document.getElementById('batchRepository').value" in html
     assert "repositoryLabel" in html
@@ -122,6 +122,60 @@ def test_frontend_template_uses_workflow_tabs_and_status_cards():
     assert 'id="batchTaskPanel"' in html
     assert 'class="status-cards system-summary"' in html
     assert "setWorkflowTab(" in html
+
+
+def test_frontend_template_exposes_device_performance_metrics():
+    html = _html()
+
+    for metric_id in ["metricCpu", "metricMemory", "metricDisk"]:
+        assert f'id="{metric_id}"' in html
+
+    assert "formatPercent(" in html
+    assert "renderSystemMetrics(" in html
+    assert "d.system_metrics" in html
+    assert "systemCpu" in html
+    assert "systemMemory" in html
+    assert "systemDisk" in html
+
+
+def test_frontend_template_renders_performance_metrics_as_animated_gauges():
+    html = _html()
+
+    assert ".gauge-dial" in html
+    assert ".gauge-needle" in html
+    assert ".gauge-card" in html
+    assert "prefers-reduced-motion" in html
+    assert "gaugeRotation(" in html
+    assert "gaugeTone(" in html
+    assert "gaugeCard(label,value,meta,percent)" in html
+    assert "UI.gaugeCard(t('systemCpu')" in html
+    assert "aria-label=\"'+esc(label)+' '+esc(value)+'\"" in html
+
+
+def test_frontend_template_polls_performance_metrics_without_overlapping_requests():
+    html = _html()
+
+    assert "const HEALTH_REFRESH_MS=2000" in html
+    assert "let healthPollActive=false" in html
+    assert "async function pollHealth()" in html
+    assert "if(healthPollActive)return" in html
+    assert "setTimeout(pollHealth,HEALTH_REFRESH_MS)" in html
+    assert "setInterval(loadHealth,5000)" not in html
+
+
+def test_frontend_template_uses_unclipped_semicircle_gauges():
+    html = _html()
+
+    assert ".gauge-dial{position:relative;width:112px;height:70px;overflow:visible" in html
+    assert 'viewBox="0 0 120 72"' in html
+    assert 'class="gauge-svg"' in html
+    assert 'class="gauge-arc gauge-low"' in html
+    assert 'class="gauge-arc gauge-mid"' in html
+    assert 'class="gauge-arc gauge-high"' in html
+    assert "bottom:-42px" not in html
+    assert ".gauge-dial{position:relative;height:50px;overflow:hidden" not in html
+    assert "conic-gradient(" not in html
+    assert "gaugeRotation(percent){const v=gaugePercent(percent);return ((v===null?0:v)*1.8-90).toFixed(1)}" in html
 
 
 def test_frontend_template_uses_light_operational_app_shell():

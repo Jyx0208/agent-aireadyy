@@ -19,7 +19,7 @@ COPY scripts/ scripts/
 
 RUN pip install --no-cache-dir -e ".[web]" fastapi "uvicorn[standard]" python-dotenv
 
-RUN useradd -m agent
+RUN mkdir -p /app/data && useradd -m agent
 USER agent
 
 EXPOSE 8000

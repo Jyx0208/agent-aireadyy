@@ -990,7 +990,7 @@ def test_create_parameter_batch_normalizes_unsupported_repository_to_default(mon
             {
                 "inputs": ["sample.raw"],
                 "submitter": "Alice",
-                "repository": "iprox",
+                "repository": "unknownrepo",
                 "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
             }
         )
@@ -1009,6 +1009,12 @@ def test_create_parameter_batch_normalizes_unsupported_repository_to_default(mon
         if batch_id:
             with web_app._batches_lock:
                 web_app._batches.pop(batch_id, None)
+
+
+def test_clean_repository_accepts_iprox_aliases():
+    assert web_app._clean_repository("iprox") == "iprox"
+    assert web_app._clean_repository("iProX") == "iprox"
+    assert web_app._clean_repository("IPX") == "iprox"
 
 
 def test_create_batch_persists_run_mode_and_resource_policy(monkeypatch, tmp_path):
@@ -2588,6 +2594,24 @@ def test_queue_scheduler_starts_next_task_after_slot_frees(monkeypatch):
 
 def test_task_detail_and_health_include_queue_information(monkeypatch):
     monkeypatch.setenv("AGENT_MAX_CONCURRENT_TASKS", "1")
+    monkeypatch.setattr(
+        "agent.web.app.collect_system_metrics",
+        lambda root: {
+            "cpu": {"logical_cores": 8, "load_percent": 12.5, "load_1m": 1.0},
+            "memory": {
+                "total_bytes": 16_000,
+                "used_bytes": 4_000,
+                "available_bytes": 12_000,
+                "used_percent": 25.0,
+            },
+            "disk": {
+                "total_bytes": 100_000,
+                "used_bytes": 40_000,
+                "free_bytes": 60_000,
+                "used_percent": 40.0,
+            },
+        },
+    )
     running = "running-task"
     queued = "queued-task"
     _tasks[running] = {
@@ -2616,6 +2640,10 @@ def test_task_detail_and_health_include_queue_information(monkeypatch):
         assert detail["queue_length"] == 1
         assert status["running_tasks"] == 1
         assert status["queued_tasks"] == 1
+        assert status["system_metrics"]["cpu"]["logical_cores"] == 8
+        assert status["system_metrics"]["cpu"]["load_percent"] == 12.5
+        assert status["system_metrics"]["memory"]["used_percent"] == 25.0
+        assert status["system_metrics"]["disk"]["free_bytes"] == 60_000
     finally:
         _tasks.pop(running, None)
         _tasks.pop(queued, None)

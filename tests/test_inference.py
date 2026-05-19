@@ -346,6 +346,34 @@ def test_infer_attributes_marks_species_ambiguous_when_project_has_multiple_orga
     assert "Escherichia coli" in str(attrs.species.value)
 
 
+def test_infer_attributes_uses_file_name_to_disambiguate_common_project_species():
+    context = ProjectContext(
+        repository="iprox",
+        project_accession="IPX0000753001",
+        file_name="Yeast_R3.raw",
+        metadata={
+            "organisms": MetadataValue(
+                value=["Mus musculus", "Saccharomyces cerevisiae"],
+                source="iprox.project_xml",
+                source_level="project",
+                completeness=1.0,
+            ),
+            "instruments": MetadataValue(
+                value=["Q Exactive"],
+                source="iprox.project_xml",
+                source_level="project",
+                completeness=1.0,
+            ),
+        },
+    )
+
+    attrs = infer_attributes(context)
+
+    assert attrs.species.value == "Saccharomyces cerevisiae"
+    assert attrs.species.source == "file_name_species_rule"
+    assert attrs.species.conflict_flag is False
+
+
 def test_infer_attributes_marks_instrument_ambiguous_when_project_has_multiple_instruments_without_sdrf():
     context = ProjectContext(
         project_accession="PXD000006",

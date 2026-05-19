@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from agent.input.normalizer import safe_output_stem
 from agent.oneclick.preflight import normalize_resource_policy, normalize_run_mode, run_preflight
 from agent.progress import render_download_progress
+from agent.runtime.system_metrics import collect_system_metrics
 from agent.web.history import history_timestamp, merge_project_history_records, with_history_identity
 
 
@@ -169,6 +170,8 @@ def _clean_repository(value: Any, default: str = "pride") -> str:
         return "pride"
     if repository in {"massive", "massive_ucsd", "msv", "gnps"}:
         return "massive"
+    if repository in {"iprox", "ipx"}:
+        return "iprox"
     return default
 
 
@@ -2347,6 +2350,7 @@ async def health():
         "result_retention_seconds": _result_retention_seconds(),
         "max_result_projects": _max_result_projects(),
         "full_workflow_enabled": _full_workflow_enabled(),
+        "system_metrics": collect_system_metrics(_runs_dir),
         **queue_state,
     }
 

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import zipfile
+from xml.sax.saxutils import escape
 
 import pytest
 
 from agent.input.normalizer import normalize_input
 from agent.metadata.canonical import CanonicalFile, CanonicalProject
-from agent.models import FileAsset, ProjectContext
+from agent.models import FileAsset, ProjectCandidate, ProjectContext, ProjectResolution
+from agent.orchestrator.pipeline import AgentService
 from agent.repositories.index import RepositoryIndex
 from agent.repositories.massive_adapter import MassiveAdapter
 from agent.repositories.matching import canonical_files_to_project_file_records
@@ -14,20 +17,311 @@ from agent.repositories.pride_adapter import PrideAdapter
 from agent.repositories.registry import RepositoryRegistry
 
 
-def test_cli_does_not_expose_iprox_support():
+IPROX_HEADERS = [
+    "id",
+    "project_id",
+    "file_name",
+    "file_path",
+    "file_size",
+    "statue",
+    "checksum",
+    "org_file_path",
+    "down_url",
+    "is_dia",
+    "is_dda",
+    "file_type",
+    "is_raw",
+]
+
+
+def _write_iprox_xlsx(path: Path, rows: list[list[str]]) -> Path:
+    values: list[str] = []
+    indexes: dict[str, int] = {}
+
+    def shared_index(value: str) -> int:
+        if value not in indexes:
+            indexes[value] = len(values)
+            values.append(value)
+        return indexes[value]
+
+    table = [IPROX_HEADERS, *rows]
+    row_xml: list[str] = []
+    for row_index, row in enumerate(table, start=1):
+        cells: list[str] = []
+        for col_index, value in enumerate(row, start=1):
+            col = ""
+            cursor = col_index
+            while cursor:
+                cursor, rem = divmod(cursor - 1, 26)
+                col = chr(ord("A") + rem) + col
+            cells.append(f'<c r="{col}{row_index}" t="s"><v>{shared_index(value)}</v></c>')
+        row_xml.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+
+    shared_xml = "".join(f"<si><t>{escape(value)}</t></si>" for value in values)
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+</Types>""",
+        )
+        archive.writestr(
+            "_rels/.rels",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>""",
+        )
+        archive.writestr(
+            "xl/workbook.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>""",
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>""",
+        )
+        archive.writestr(
+            "xl/sharedStrings.xml",
+            f"""<?xml version="1.0" encoding="UTF-8"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{len(values)}" uniqueCount="{len(values)}">{shared_xml}</sst>""",
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            f"""<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>{''.join(row_xml)}</sheetData>
+</worksheet>""",
+        )
+    return path
+
+
+def _sample_iprox_xlsx(tmp_path: Path) -> Path:
+    return _write_iprox_xlsx(
+        tmp_path / "iprox.xlsx",
+        [
+            [
+                "1",
+                "IPX0015463001",
+                "OsGF14f interacting proteins.raw",
+                "/IPX0015463000/IPX0015463001/OsGF14f interacting proteins.raw",
+                "780276859",
+                "1",
+                "c467",
+                "raw/OsGF14f interacting proteins.raw",
+                "https://download.iprox.cn/IPX0015463000/IPX0015463001/OsGF14f interacting proteins.raw",
+                "0",
+                "1",
+                "raw",
+                "1",
+            ],
+            [
+                "2",
+                "IPX0015463001",
+                "IPX0015463001.xml",
+                "/IPX0015463000/IPX0015463001/IPX0015463001.xml",
+                "123",
+                "1",
+                "abc",
+                "metadata/IPX0015463001.xml",
+                "https://download.iprox.cn/IPX0015463000/IPX0015463001/IPX0015463001.xml",
+                "0",
+                "0",
+                "xml",
+                "0",
+            ],
+        ],
+    )
+
+
+def test_cli_exposes_iprox_support():
     cli_text = Path("src/agent/cli.py").read_text(encoding="utf-8")
 
     assert "sync-repository-index" not in cli_text
-    assert "iprox" not in cli_text.lower()
+    assert "iprox" in cli_text.lower()
 
 
-def test_default_registry_supports_only_pride_and_massive():
+def test_default_registry_supports_pride_massive_and_iprox():
     registry = RepositoryRegistry()
 
-    assert [adapter.name for adapter in registry.adapters] == ["pride", "massive"]
-    assert RepositoryRegistry.supported_names() == ("pride", "massive")
-    with pytest.raises(ValueError, match="Unknown repository 'iprox'"):
-        registry.get("iprox")
+    assert [adapter.name for adapter in registry.adapters] == ["pride", "massive", "iprox"]
+    assert RepositoryRegistry.supported_names() == ("pride", "massive", "iprox")
+    assert registry.get("iprox").name == "iprox"
+    assert registry.choose("auto", "https://download.iprox.cn/IPX0015463000/IPX0015463001/sample.raw").name == "iprox"
+
+
+def _repository_resolution(repository: str, accession: str, confidence: float, match_score: int = 100) -> ProjectResolution:
+    return ProjectResolution(
+        primary_project=ProjectCandidate(
+            repository=repository,
+            project_accession=accession,
+            native_accession=accession,
+            matched_file="shared.raw",
+            match_type="exact",
+            match_score=match_score,
+            metadata_consistency=confidence,
+        ),
+        resolution_confidence=confidence,
+        resolution_reason=f"{repository} matched shared.raw",
+        needs_review=False,
+    )
+
+
+def test_agent_auto_repository_queries_all_adapters_and_selects_highest_confidence():
+    calls: list[str] = []
+
+    class Adapter:
+        def __init__(self, name: str, resolution: ProjectResolution):
+            self.name = name
+            self._resolution = resolution
+
+        def can_handle_accession(self, value: str) -> bool:
+            return False
+
+        def resolve_project(self, raw_input: str) -> ProjectResolution:
+            calls.append(self.name)
+            return self._resolution
+
+    registry = RepositoryRegistry(
+        adapters=[
+            Adapter("pride", _repository_resolution("pride", "PXD_LOW", 0.55)),
+            Adapter("massive", ProjectResolution.empty()),
+            Adapter("iprox", _repository_resolution("iprox", "IPX_HIGH", 0.96)),
+        ]
+    )
+    service = AgentService(repository_registry=registry, llm_reasoner=object())
+
+    resolution = service.resolve_project_from_repository("shared.raw", repository="auto")
+
+    assert calls == ["pride", "massive", "iprox"]
+    assert resolution.primary_project is not None
+    assert resolution.primary_project.repository == "iprox"
+    assert resolution.primary_project.project_accession == "IPX_HIGH"
+    assert resolution.alternative_projects[0].repository == "pride"
+    assert "highest resolution confidence" in resolution.resolution_reason
+
+
+def test_iprox_xlsx_index_streams_project_rows(tmp_path: Path):
+    from agent.repositories.iprox_adapter import IproxXlsxIndex
+
+    index = IproxXlsxIndex(_sample_iprox_xlsx(tmp_path))
+
+    records = index.records_for_project("IPX0015463001")
+
+    assert len(records) == 2
+    assert records[0].project_id == "IPX0015463001"
+    assert records[0].file_name == "OsGF14f interacting proteins.raw"
+    assert records[0].download_url == "https://download.iprox.cn/IPX0015463000/IPX0015463001/OsGF14f interacting proteins.raw"
+    assert records[0].is_raw is True
+
+
+def test_iprox_adapter_resolves_file_name_from_spreadsheet(tmp_path: Path):
+    from agent.repositories.iprox_adapter import IproxAdapter
+
+    adapter = IproxAdapter(index_path=_sample_iprox_xlsx(tmp_path))
+
+    resolution = adapter.resolve_project("OsGF14f interacting proteins.raw")
+    context = adapter.build_project_context(resolution, "OsGF14f interacting proteins.raw")
+    asset = adapter.resolve_file_asset(normalize_input("OsGF14f interacting proteins.raw"), context, tmp_path)
+
+    assert resolution.primary_project is not None
+    assert resolution.primary_project.repository == "iprox"
+    assert resolution.primary_project.project_accession == "IPX0015463001"
+    assert resolution.primary_project.matched_file == "OsGF14f interacting proteins.raw"
+    assert resolution.primary_project.match_type == "exact"
+    assert context.repository == "iprox"
+    assert context.metadata["experimentTypes"].value == ["DDA"]
+    assert context.project_files[0]["fileName"] == "OsGF14f interacting proteins.raw"
+    assert asset.repository == "iprox"
+    assert asset.matched_project_file == "OsGF14f interacting proteins.raw"
+    assert asset.download_url == "https://download.iprox.cn/IPX0015463000/IPX0015463001/OsGF14f interacting proteins.raw"
+    assert asset.transfer_method == "https"
+
+
+def test_iprox_adapter_merges_project_xml_metadata_into_context(tmp_path: Path):
+    from agent.repositories.iprox_adapter import IproxAdapter
+
+    metadata_cache = tmp_path / "iprox-metadata"
+    metadata_cache.mkdir()
+    (metadata_cache / "IPX0015463001.xml").write_text(
+        """<iProXDataset id="IPX0015463000" formatVersion="2.0">
+  <DatasetSummary announceDate="2020-01-02" title="Instrument-rich iProX project">
+    <Description>Yeast DDA proteomics data.</Description>
+  </DatasetSummary>
+  <SpeciesList>
+    <Species><cvParam name="taxonomy: scientific name" value="Saccharomyces cerevisiae"/></Species>
+  </SpeciesList>
+  <InstrumentList>
+    <Instrument id="Instrument_1"><cvParam name="Q Exactive"/></Instrument>
+  </InstrumentList>
+  <KeywordList>
+    <cvParam name="submitter keyword" value="Q Exactive, DDA"/>
+  </KeywordList>
+</iProXDataset>""",
+        encoding="utf-8",
+    )
+    adapter = IproxAdapter(index_path=_sample_iprox_xlsx(tmp_path), metadata_cache_dir=metadata_cache)
+
+    resolution = adapter.resolve_project("OsGF14f interacting proteins.raw")
+    context = adapter.build_project_context(resolution, "OsGF14f interacting proteins.raw")
+
+    assert context.metadata["title"].value == "Instrument-rich iProX project"
+    assert context.metadata["projectDescription"].value == "Yeast DDA proteomics data."
+    assert context.metadata["organisms"].value == ["Saccharomyces cerevisiae"]
+    assert context.metadata["instruments"].value == ["Q Exactive"]
+    assert "Q Exactive" in context.evidence_documents[0]["text"]
+
+
+def test_iprox_download_to_path_reports_chunk_progress(monkeypatch, tmp_path: Path):
+    from agent.repositories import iprox_adapter
+    from agent.repositories.iprox_adapter import IproxAdapter
+
+    payload = b"a" * 4096 + b"b" * 2048
+
+    class FakeResponse:
+        headers = {"Content-Length": str(len(payload))}
+
+        def __init__(self) -> None:
+            self.offset = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size: int = -1) -> bytes:
+            if self.offset >= len(payload):
+                return b""
+            if size is None or size < 0:
+                size = len(payload) - self.offset
+            chunk = payload[self.offset : self.offset + min(size, 2048)]
+            self.offset += len(chunk)
+            return chunk
+
+    monkeypatch.setattr(iprox_adapter.urllib.request, "urlopen", lambda *args, **kwargs: FakeResponse())
+    events: list[object] = []
+
+    output = IproxAdapter(index_path=_sample_iprox_xlsx(tmp_path)).download_to_path(
+        "https://download.iprox.cn/IPX001/sample raw.raw",
+        tmp_path / "sample.raw",
+        report=events.append,
+    )
+
+    assert output.read_bytes() == payload
+    progress_events = [event for event in events if isinstance(event, dict) and event.get("kind") == "download_progress"]
+    assert progress_events
+    assert progress_events[0]["downloaded"] == 2048
+    assert progress_events[0]["total"] == len(payload)
+    assert progress_events[-1]["complete"] is True
+    assert progress_events[-1]["downloaded"] == len(payload)
 
 
 def test_registry_rejects_duplicate_adapter_names():

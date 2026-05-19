@@ -252,11 +252,20 @@ class AgentService:
         return self.resolve_project_from_repository(raw_input, repository="pride")
 
     def resolve_project_from_repository(self, raw_input: str, repository: str = "auto") -> ProjectResolution:
-        adapter = self.repositories.choose(repository, raw_input)
+        if repository == "auto":
+            names = ", ".join(adapter.name for adapter in self.repositories.adapters)
+            self._report(f"[1/5] Auto resolving repository for input: {raw_input}")
+            self._report({"kind": "activity_start", "label": f"Querying all repositories ({names}) and selecting the highest-confidence match..."})
+            try:
+                return self.repositories.resolve_project(repository, raw_input)
+            finally:
+                self._report({"kind": "activity_stop", "message": "Auto repository query completed."})
+
+        adapter = self.repositories.get(repository)
         self._report(f"[1/5] 正在根据输入解析 {adapter.name} 项目：{raw_input}")
         self._report({"kind": "activity_start", "label": f"Querying {adapter.name} metadata and matching project/files..."})
         try:
-            return adapter.resolve_project(raw_input)
+            return self.repositories.resolve_project(repository, raw_input)
         finally:
             self._report({"kind": "activity_stop", "message": f"{adapter.name} query completed."})
 

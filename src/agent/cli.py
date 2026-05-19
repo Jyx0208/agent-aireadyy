@@ -168,11 +168,14 @@ def resolve_project(input_value: str) -> None:
 @app.command("resolve-dataset")
 def resolve_dataset(
     input_value: str,
-    repository: str = typer.Option("auto", "--repository", "-r", help="Repository: auto, pride, or massive."),
+    repository: str = typer.Option("auto", "--repository", "-r", help="Repository: auto, pride, massive, or iprox."),
 ) -> None:
     registry = RepositoryRegistry()
-    adapter = registry.choose(repository, input_value)
-    resolution = adapter.resolve_project(input_value)
+    resolution = registry.resolve_project(repository, input_value)
+    if resolution.primary_project:
+        adapter = registry.get(resolution.primary_project.repository)
+    else:
+        adapter = registry.choose(repository, input_value)
     payload: dict[str, Any] = {
         "repository": adapter.name,
         "resolution": resolution.model_dump(mode="json"),
@@ -304,7 +307,7 @@ def prepare_msdt_docker_input(input_value: str, source_data_path: Path, output_d
 def prepare_repository_msdt_docker_input(
     input_value: str,
     output_dir: Path | None = typer.Argument(None, help="Output directory. Auto-generated from input file name if not specified."),
-    repository: str = typer.Option("auto", "--repository", "-r", help="Repository: auto, pride, or massive."),
+    repository: str = typer.Option("auto", "--repository", "-r", help="Repository: auto, pride, massive, or iprox."),
     reviewed_fasta_path: Path | None = typer.Option(None, help="Human-reviewed local FASTA path to use instead of inferred/default FASTA."),
     reviewed_fasta_url: str | None = typer.Option(None, help="Human-reviewed FASTA URL to download and use."),
     no_run: bool = typer.Option(False, "--no-run", help="Only prepare input, do not run Docker."),
@@ -445,7 +448,7 @@ def _review_message(output_dir: Path) -> str:
 def one_click_run(
     input_value: str,
     output_dir: Path | None = typer.Argument(None, help="Output directory. Auto-generated from input file name if not specified."),
-    repository: str = typer.Option("auto", "--repository", "-r", help="Repository: auto, pride, or massive."),
+    repository: str = typer.Option("auto", "--repository", "-r", help="Repository: auto, pride, massive, or iprox."),
     mode: str = typer.Option("full", "--mode", "-m", help="Run mode: parameters, prepare, or full."),
     resource_policy: str = typer.Option("balanced", "--resource-policy", help="Preflight disk policy: fast, balanced, or conservative."),
     reviewed_fasta_path: Path | None = typer.Option(None, help="Human-reviewed local FASTA path to use instead of inferred/default FASTA."),
