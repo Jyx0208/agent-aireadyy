@@ -321,6 +321,22 @@ def test_parameter_audit_records_repository_and_transfer_metadata(tmp_path):
     assert audit["input"]["logical_path"] == "raw/sample.raw"
     assert audit["input"]["transfer_method"] == "ftp"
     assert audit["input"]["download_urls"] == ["ftp://massive.ucsd.edu/MSV000000001/raw/sample.raw"]
+    manifest = json.loads((tmp_path / "msdt_input_manifest.json").read_text(encoding="utf-8"))
+    assert "agent_observation.json" not in manifest["audit_files"]
+    assert "agent_plan.json" not in manifest["audit_files"]
+    assert "agent_decision_trace.json" not in manifest["audit_files"]
+
+
+def test_agent_audit_package_does_not_fail_task_when_reporter_fails(monkeypatch, tmp_path):
+    def fail_audit(*_args, **_kwargs):
+        raise RuntimeError("audit writer failed")
+
+    def fail_report(_message):
+        raise RuntimeError("reporter failed")
+
+    monkeypatch.setattr("agent.agent_core.audit.write_agent_audit_for_result", fail_audit)
+
+    web_app._write_agent_audit_package(tmp_path, SimpleNamespace(), report=fail_report)
 
 
 def test_build_review_summary_includes_user_choices_for_multi_species_and_instruments(tmp_path):
@@ -920,11 +936,18 @@ def test_run_parameter_batch_writes_excel_and_manifest(monkeypatch, tmp_path):
         audit = json.loads(audit_path.read_text(encoding="utf-8"))
         assert audit["workflow"]["name"] == "Default.workflow"
         assert audit["input"]["download_url"] == "https://example.test/sample_a.raw"
+        item_dir = tmp_path / "_batches" / batch_id / "items" / "001_sample_a"
+        assert (item_dir / "agent_observation.json").exists()
+        assert (item_dir / "agent_plan.json").exists()
+        assert (item_dir / "agent_decision_trace.json").exists()
         audit_response = asyncio.run(web_app.download_parameter_batch_audit(batch_id))
         assert audit_response.path.endswith("_audit.zip")
         with zipfile.ZipFile(audit_response.path) as archive:
             names = set(archive.namelist())
         assert "items/001_sample_a/parameter_audit.json" in names
+        assert "items/001_sample_a/agent_observation.json" in names
+        assert "items/001_sample_a/agent_plan.json" in names
+        assert "items/001_sample_a/agent_decision_trace.json" in names
         assert "items/001_sample_a/logs/runtime.log" in names
         with zipfile.ZipFile(excel_path) as archive:
             sheet = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
@@ -1236,6 +1259,290 @@ def test_prepare_batch_item_generates_input_package_without_docker_run(monkeypat
         assert detail["items"][0]["status"] == "completed"
         assert (item_dir / "converter_config.json").exists()
         assert (item_dir / "parameter_audit.json").exists()
+        assert (item_dir / "agent_observation.json").exists()
+        assert (item_dir / "agent_plan.json").exists()
+        assert (item_dir / "agent_decision_trace.json").exists()
+    finally:
+        with web_app._batches_lock:
+            web_app._batches.pop(batch_id, None)
+
+
+def test_full_batch_item_packages_agent_audit_files(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.delenv("AGENT_DISABLE_FULL_WORKFLOW", raising=False)
+    monkeypatch.setenv("AGENT_WEB_FULL_WORKFLOW_ENABLED", "true")
+    docker_calls: list[str] = []
+
+    def attr(value):
+        return {"value": value, "confidence": 1.0, "source": "test", "evidence_excerpt": "", "conflict_flag": False}
+
+    class FakeService:
+        def __init__(self, **_kwargs):
+            self.reporter = _kwargs.get("reporter")
+
+        def prepare_repository_msdt_docker_input(self, task, output_dir, **_kwargs):
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            workflow = output_dir / "workflows" / "Default.workflow"
+            workflow.parent.mkdir(parents=True, exist_ok=True)
+            workflow.write_text("msfragger.search_enzyme_name_1=stricttrypsin\n", encoding="utf-8")
+            fasta = output_dir / "fasta" / "human.fasta"
+            fasta.parent.mkdir(parents=True, exist_ok=True)
+            fasta.write_text(">P1\nPEPTIDE\n", encoding="utf-8")
+            prepared = output_dir / "assets" / "prepared" / f"{Path(task.file_name).stem}.mzML"
+            _write_minimal_dda_mzml(prepared)
+            plan = SimpleNamespace(
+                task_id=task.task_id,
+                source_file_name=task.file_name,
+                source_data_path=prepared,
+                fragpipe_workflow_path=workflow,
+                fasta_path=fasta,
+                fasta_selection_mode="inferred",
+                fasta_download_url="https://example.test/human.fasta",
+                raw_data_type="mzml",
+                thread_num=2,
+                manifest_path=output_dir / "fragpipe" / "fragpipe-files.fp-manifest",
+                expected_pin_path=output_dir / "fragpipe" / "exp" / f"{Path(task.file_name).stem}_edited.pin",
+                output_paths={"fp_msdt": output_dir / "msdt" / f"{Path(task.file_name).stem}_fp_msdt.parquet"},
+                rawspectrum_output_path=output_dir / "rawspectrum" / f"{Path(task.file_name).stem}_rawspectrum.parquet",
+                needs_review=False,
+                blocking_issues=[],
+            )
+            result = SimpleNamespace(
+                resolution=SimpleNamespace(
+                    primary_project=SimpleNamespace(
+                        repository="massive",
+                        project_accession="MSVTEST",
+                        matched_file=task.file_name,
+                        match_type="exact",
+                        match_score=100,
+                    ),
+                    needs_review=False,
+                    resolution_confidence=1.0,
+                ),
+                context=SimpleNamespace(repository="massive", metadata={}, project_files=[]),
+                attributes=SimpleNamespace(
+                    acquisition_mode=SimpleNamespace(**attr("DDA")),
+                    species=SimpleNamespace(**attr("Homo sapiens")),
+                    instrument_name=SimpleNamespace(**attr("Orbitrap")),
+                    enzyme=SimpleNamespace(**attr("Trypsin")),
+                    labeling_strategy=SimpleNamespace(**attr("label-free")),
+                    fixed_mods=SimpleNamespace(**attr(["Carbamidomethyl C"])),
+                    variable_mods=SimpleNamespace(**attr(["Oxidation M"])),
+                    search_parameter_hints=SimpleNamespace(**attr({"recommended_workflow_name": "Default.workflow"})),
+                ),
+                asset=SimpleNamespace(
+                    repository="massive",
+                    original_file_name=task.file_name,
+                    matched_project_file=task.file_name,
+                    resolved_asset_type="raw",
+                    download_url="ftp://massive/sample.raw",
+                    download_urls=["ftp://massive/sample.raw"],
+                    transfer_method="ftp",
+                    expected_size_bytes=123,
+                    requires_conversion=True,
+                ),
+                plan=plan,
+            )
+            (output_dir / "project_resolution.json").write_text(
+                json.dumps({"primary_project": {"project_accession": "MSVTEST", "matched_file": task.file_name, "match_type": "exact", "match_score": 100}}),
+                encoding="utf-8",
+            )
+            (output_dir / "metadata.json").write_text(json.dumps({"metadata": {}}), encoding="utf-8")
+            (output_dir / "attributes.json").write_text(json.dumps({"species": attr("Homo sapiens")}), encoding="utf-8")
+            (output_dir / "decision_trace.json").write_text(json.dumps({"source_file_name": task.file_name}), encoding="utf-8")
+            (output_dir / "asset_resolution.json").write_text(json.dumps({"original_file_name": task.file_name}), encoding="utf-8")
+            (output_dir / "converter_config.json").write_text(json.dumps({"input": str(prepared)}), encoding="utf-8")
+            bundle = SimpleNamespace(plan=plan, converter_config_path=output_dir / "converter_config.json", materialized_workflow_path=workflow, materialized_fasta_path=fasta, task_root=output_dir)
+            return bundle, result, prepared
+
+    class FakeDockerRunner:
+        def __init__(self, *_args, **_kwargs):
+            docker_calls.append("init")
+
+        def run(self, bundle):
+            docker_calls.append("run")
+            plan = bundle.plan
+            plan.rawspectrum_output_path.parent.mkdir(parents=True, exist_ok=True)
+            plan.rawspectrum_output_path.write_text("rawspectrum", encoding="utf-8")
+            plan.expected_pin_path.parent.mkdir(parents=True, exist_ok=True)
+            plan.expected_pin_path.write_text("pin", encoding="utf-8")
+            plan.output_paths["fp_msdt"].parent.mkdir(parents=True, exist_ok=True)
+            plan.output_paths["fp_msdt"].write_text("msdt", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("agent.orchestrator.pipeline.AgentService", FakeService)
+    monkeypatch.setattr("agent.msdt_converter.docker_runner.DockerMSDTConverterRunner", FakeDockerRunner)
+
+    batch_id = "full_batch"
+    item_dir = tmp_path / "_batches" / batch_id / "items" / "001_sample"
+    batch = {
+        "batch_id": batch_id,
+        "status": "running",
+        "created_at": web_app._now_iso(),
+        "updated_at": web_app._now_iso(),
+        "repository": "massive",
+        "run_mode": "full",
+        "resource_policy": "balanced",
+        "output_dir": str(tmp_path / "_batches" / batch_id),
+        "excel_path": str(tmp_path / "_batches" / batch_id / "benchmark_results.xlsx"),
+        "items": [{"index": 1, "input": "sample.raw", "status": "queued", "output_dir": str(item_dir)}],
+        "llm_config": {"api_key": "sk-test", "base_url": "https://api.example.com", "model": "m1", "timeout": "120"},
+    }
+    with web_app._batches_lock:
+        web_app._batches[batch_id] = batch
+    try:
+        result = web_app._run_parameter_batch_item(batch_id, 0)
+
+        assert result["status"] == "completed"
+        assert docker_calls == ["init", "run"]
+        assert (item_dir / "agent_observation.json").exists()
+        assert (item_dir / "agent_plan.json").exists()
+        assert (item_dir / "agent_decision_trace.json").exists()
+        manifest = json.loads((item_dir / "msdt_input_manifest.json").read_text(encoding="utf-8"))
+        assert "agent_observation.json" in manifest["audit_files"]
+        assert "agent_plan.json" in manifest["audit_files"]
+        assert "agent_decision_trace.json" in manifest["audit_files"]
+        zip_path = item_dir / ".download_cache" / "results-compressed.zip"
+        assert zip_path.exists()
+        with zipfile.ZipFile(zip_path) as archive:
+            names = set(archive.namelist())
+        assert "agent_observation.json" in names
+        assert "agent_plan.json" in names
+        assert "agent_decision_trace.json" in names
+    finally:
+        with web_app._batches_lock:
+            web_app._batches.pop(batch_id, None)
+
+
+def test_full_batch_item_failure_writes_recovery_audit(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.delenv("AGENT_DISABLE_FULL_WORKFLOW", raising=False)
+    monkeypatch.setenv("AGENT_WEB_FULL_WORKFLOW_ENABLED", "true")
+
+    def attr(value):
+        return {"value": value, "confidence": 1.0, "source": "test", "evidence_excerpt": "", "conflict_flag": False}
+
+    class FakeService:
+        def __init__(self, **_kwargs):
+            self.reporter = _kwargs.get("reporter")
+
+        def prepare_repository_msdt_docker_input(self, task, output_dir, **_kwargs):
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            workflow = output_dir / "workflows" / "Default.workflow"
+            workflow.parent.mkdir(parents=True, exist_ok=True)
+            workflow.write_text("msfragger.search_enzyme_name_1=stricttrypsin\n", encoding="utf-8")
+            fasta = output_dir / "fasta" / "human.fasta"
+            fasta.parent.mkdir(parents=True, exist_ok=True)
+            fasta.write_text(">P1\nPEPTIDE\n", encoding="utf-8")
+            prepared = output_dir / "assets" / "prepared" / f"{Path(task.file_name).stem}.mzML"
+            _write_minimal_dda_mzml(prepared)
+            plan = SimpleNamespace(
+                task_id=task.task_id,
+                source_file_name=task.file_name,
+                source_data_path=prepared,
+                fragpipe_workflow_path=workflow,
+                fasta_path=fasta,
+                fasta_selection_mode="inferred",
+                fasta_download_url="https://example.test/human.fasta",
+                raw_data_type="mzml",
+                thread_num=2,
+                manifest_path=output_dir / "fragpipe" / "fragpipe-files.fp-manifest",
+                expected_pin_path=output_dir / "fragpipe" / "exp" / f"{Path(task.file_name).stem}_edited.pin",
+                output_paths={"fp_msdt": output_dir / "msdt" / f"{Path(task.file_name).stem}_fp_msdt.parquet"},
+                rawspectrum_output_path=output_dir / "rawspectrum" / f"{Path(task.file_name).stem}_rawspectrum.parquet",
+                needs_review=False,
+                blocking_issues=[],
+            )
+            result = SimpleNamespace(
+                resolution=SimpleNamespace(
+                    primary_project=SimpleNamespace(
+                        repository="massive",
+                        project_accession="MSVTEST",
+                        matched_file=task.file_name,
+                        match_type="exact",
+                        match_score=100,
+                    ),
+                    needs_review=False,
+                    resolution_confidence=1.0,
+                ),
+                context=SimpleNamespace(repository="massive", metadata={}, project_files=[]),
+                attributes=SimpleNamespace(
+                    acquisition_mode=SimpleNamespace(**attr("DDA")),
+                    species=SimpleNamespace(**attr("Homo sapiens")),
+                    instrument_name=SimpleNamespace(**attr("Orbitrap")),
+                    enzyme=SimpleNamespace(**attr("Trypsin")),
+                    labeling_strategy=SimpleNamespace(**attr("label-free")),
+                    fixed_mods=SimpleNamespace(**attr(["Carbamidomethyl C"])),
+                    variable_mods=SimpleNamespace(**attr(["Oxidation M"])),
+                    search_parameter_hints=SimpleNamespace(**attr({"recommended_workflow_name": "Default.workflow"})),
+                ),
+                asset=SimpleNamespace(
+                    repository="massive",
+                    original_file_name=task.file_name,
+                    matched_project_file=task.file_name,
+                    resolved_asset_type="raw",
+                    download_url="ftp://massive/sample.raw",
+                    download_urls=["ftp://massive/sample.raw"],
+                    transfer_method="ftp",
+                    expected_size_bytes=123,
+                    requires_conversion=True,
+                ),
+                plan=plan,
+            )
+            (output_dir / "project_resolution.json").write_text(
+                json.dumps({"primary_project": {"project_accession": "MSVTEST", "matched_file": task.file_name, "match_type": "exact", "match_score": 100}}),
+                encoding="utf-8",
+            )
+            (output_dir / "metadata.json").write_text(json.dumps({"metadata": {}}), encoding="utf-8")
+            (output_dir / "attributes.json").write_text(json.dumps({"species": attr("Homo sapiens")}), encoding="utf-8")
+            (output_dir / "decision_trace.json").write_text(json.dumps({"source_file_name": task.file_name}), encoding="utf-8")
+            (output_dir / "asset_resolution.json").write_text(json.dumps({"original_file_name": task.file_name}), encoding="utf-8")
+            (output_dir / "converter_config.json").write_text(json.dumps({"input": str(prepared)}), encoding="utf-8")
+            bundle = SimpleNamespace(plan=plan, converter_config_path=output_dir / "converter_config.json", materialized_workflow_path=workflow, materialized_fasta_path=fasta, task_root=output_dir)
+            return bundle, result, prepared
+
+    class FakeDockerRunner:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self, bundle):
+            plan = bundle.plan
+            plan.rawspectrum_output_path.parent.mkdir(parents=True, exist_ok=True)
+            plan.rawspectrum_output_path.write_text("rawspectrum", encoding="utf-8")
+            plan.expected_pin_path.parent.mkdir(parents=True, exist_ok=True)
+            plan.expected_pin_path.write_text("pin", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="generate msdt fail", stderr="")
+
+    monkeypatch.setattr("agent.orchestrator.pipeline.AgentService", FakeService)
+    monkeypatch.setattr("agent.msdt_converter.docker_runner.DockerMSDTConverterRunner", FakeDockerRunner)
+
+    batch_id = "full_batch_failure"
+    item_dir = tmp_path / "_batches" / batch_id / "items" / "001_sample"
+    batch = {
+        "batch_id": batch_id,
+        "status": "running",
+        "created_at": web_app._now_iso(),
+        "updated_at": web_app._now_iso(),
+        "repository": "massive",
+        "run_mode": "full",
+        "resource_policy": "balanced",
+        "output_dir": str(tmp_path / "_batches" / batch_id),
+        "excel_path": str(tmp_path / "_batches" / batch_id / "benchmark_results.xlsx"),
+        "items": [{"index": 1, "input": "sample.raw", "status": "queued", "output_dir": str(item_dir)}],
+        "llm_config": {"api_key": "sk-test", "base_url": "https://api.example.com", "model": "m1", "timeout": "120"},
+    }
+    with web_app._batches_lock:
+        web_app._batches[batch_id] = batch
+    try:
+        result = web_app._run_parameter_batch_item(batch_id, 0)
+
+        assert result["status"] == "failed"
+        recovery = json.loads((item_dir / "recovery_audit.json").read_text(encoding="utf-8"))
+        assert recovery["failure"]["category"] == "missing_msdt_output"
+        assert recovery["task"]["run_mode"] == "full"
+        assert recovery["recovery"]["decision"] == "manual_required"
     finally:
         with web_app._batches_lock:
             web_app._batches.pop(batch_id, None)
@@ -1777,6 +2084,13 @@ def test_parameter_only_mode_stops_after_planning_without_full_execution(monkeyp
         assert zip_path.exists()
         assert (output_dir / "parameter_audit.json").exists()
         assert (output_dir / "msdt_input_manifest.json").exists()
+        assert (output_dir / "agent_observation.json").exists()
+        assert (output_dir / "agent_plan.json").exists()
+        assert (output_dir / "agent_decision_trace.json").exists()
+        manifest = json.loads((output_dir / "msdt_input_manifest.json").read_text(encoding="utf-8"))
+        assert "agent_observation.json" in manifest["audit_files"]
+        assert "agent_plan.json" in manifest["audit_files"]
+        assert "agent_decision_trace.json" in manifest["audit_files"]
         with zipfile.ZipFile(zip_path) as archive:
             names = set(archive.namelist())
             converter_config = json.loads(archive.read("converter_config.json").decode("utf-8"))
@@ -1784,6 +2098,9 @@ def test_parameter_only_mode_stops_after_planning_without_full_execution(monkeyp
         assert "decision_trace.json" in names
         assert "parameter_audit.json" in names
         assert "msdt_input_manifest.json" in names
+        assert "agent_observation.json" in names
+        assert "agent_plan.json" in names
+        assert "agent_decision_trace.json" in names
         assert "workflows/Default.workflow" in names
         assert "assets/prepared/sample.mzML" not in names
         assert "assets/downloads/sample.raw" not in names
@@ -1942,10 +2259,152 @@ def test_prepare_mode_generates_input_package_without_running_docker(monkeypatch
         assert (output_dir / "converter_config.json").exists()
         assert (output_dir / "parameter_audit.json").exists()
         assert (output_dir / "msdt_input_manifest.json").exists()
+        assert (output_dir / "agent_observation.json").exists()
+        assert (output_dir / "agent_plan.json").exists()
+        assert (output_dir / "agent_decision_trace.json").exists()
         state = json.loads((output_dir / "task_state.json").read_text(encoding="utf-8"))
         assert state["stage"] == "packaging"
         detail = asyncio.run(get_task(task_id))
         assert detail["can_download"] is True
+        zip_path = output_dir / ".download_cache" / "results-compressed.zip"
+        with zipfile.ZipFile(zip_path) as archive:
+            names = set(archive.namelist())
+        assert "agent_observation.json" in names
+        assert "agent_plan.json" in names
+        assert "agent_decision_trace.json" in names
+    finally:
+        _tasks.pop(task_id, None)
+
+
+def test_full_mode_failure_writes_recovery_audit(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr(web_app, "_start_ready_queued_tasks", lambda: [])
+    monkeypatch.delenv("AGENT_DISABLE_FULL_WORKFLOW", raising=False)
+    monkeypatch.setenv("AGENT_WEB_FULL_WORKFLOW_ENABLED", "true")
+
+    output_dir = tmp_path / "full-failed-sample"
+    prepared_path = output_dir / "assets" / "prepared" / "sample.mzML"
+    fasta_path = output_dir / "fasta" / "uniprot_human.fasta"
+    workflow_path = output_dir / "workflows" / "Default.workflow"
+    plan = SimpleNamespace(
+        task_id="full-failed-sample",
+        source_file_name="sample.raw",
+        source_data_path=prepared_path,
+        fragpipe_workflow_path=workflow_path,
+        manifest_path=output_dir / "fragpipe" / "fragpipe-files.fp-manifest",
+        fasta_path=fasta_path,
+        fasta_selection_mode="inferred",
+        fasta_download_url="https://example.test/human.fasta",
+        raw_data_type="mzml",
+        converter_config_path=output_dir / "converter_config.json",
+        rawspectrum_output_path=output_dir / "rawspectrum" / "sample_rawspectrum.parquet",
+        expected_pin_path=output_dir / "fragpipe" / "exp" / "sample_edited.pin",
+        output_paths={"fp_msdt": output_dir / "msdt" / "sample_fp_msdt.parquet"},
+        thread_num=2,
+        needs_review=False,
+        blocking_issues=[],
+    )
+    result = SimpleNamespace(
+        resolution=SimpleNamespace(
+            primary_project=SimpleNamespace(project_accession="PXDTEST", matched_file="sample.raw"),
+            resolution_confidence=1.0,
+            needs_review=False,
+        ),
+        context=SimpleNamespace(repository="pride", metadata={}, project_files=[]),
+        attributes=SimpleNamespace(
+            acquisition_mode=_value("DDA"),
+            species=_value("Homo sapiens"),
+            instrument_name=_value("Orbitrap Fusion"),
+            enzyme=_value("Trypsin"),
+            fixed_mods=_value(["C[57.02]"]),
+            variable_mods=_value(["M[15.99]"]),
+            labeling_strategy=_value("label-free"),
+            search_parameter_hints=_value({"recommended_workflow_name": "Default.workflow"}),
+        ),
+        plan=plan,
+        asset=SimpleNamespace(original_file_name="sample.raw", matched_project_file="sample.raw", resolved_asset_type="raw"),
+    )
+
+    class FakeService:
+        def __init__(self, **_kwargs):
+            pass
+
+        def plan_dda_run_from_repository(self, **_kwargs):
+            return result
+
+        def _can_retry_with_mzml_instrument(self, _plan):
+            return False
+
+        def prepare_asset(self, _asset):
+            _write_minimal_dda_mzml(prepared_path)
+            return prepared_path
+
+        def validate_prepared_data_for_plan(self, result_arg, _prepared_path):
+            return result_arg
+
+        def write_task_bundle(self, output_dir_arg, *_args, **_kwargs):
+            Path(output_dir_arg).mkdir(parents=True, exist_ok=True)
+
+    def fake_materialize_dda_task_bundle(**kwargs):
+        output = Path(kwargs["output_dir"])
+        workflow_path.parent.mkdir(parents=True, exist_ok=True)
+        workflow_path.write_text("msfragger.search_enzyme_name_1=stricttrypsin\n", encoding="utf-8")
+        fasta_path.parent.mkdir(parents=True, exist_ok=True)
+        fasta_path.write_text(">P1\nPEPTIDE\n", encoding="utf-8")
+        plan.converter_config_path.write_text(json.dumps({"config": "full"}), encoding="utf-8")
+        return SimpleNamespace(
+            plan=plan,
+            converter_config_path=plan.converter_config_path,
+            materialized_workflow_path=workflow_path,
+            materialized_fasta_path=fasta_path,
+            task_root=output,
+        )
+
+    class FakeDockerRunner:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self, bundle):
+            bundle.plan.rawspectrum_output_path.parent.mkdir(parents=True, exist_ok=True)
+            bundle.plan.rawspectrum_output_path.write_text("rawspectrum", encoding="utf-8")
+            bundle.plan.expected_pin_path.parent.mkdir(parents=True, exist_ok=True)
+            bundle.plan.expected_pin_path.write_text("pin", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="generate msdt fail", stderr="")
+
+    monkeypatch.setattr("agent.orchestrator.pipeline.AgentService", FakeService)
+    monkeypatch.setattr("agent.execution.bundle.materialize_dda_task_bundle", fake_materialize_dda_task_bundle)
+    monkeypatch.setattr("agent.msdt_converter.docker_runner.DockerMSDTConverterRunner", FakeDockerRunner)
+
+    task_id = "full-failure"
+    _tasks[task_id] = {
+        "task_id": task_id,
+        "input_value": "sample.raw",
+        "project_key": "sample",
+        "submitter": "Alice",
+        "output_dir": str(output_dir),
+        "status": "running",
+        "created_at": "2026-05-09T00:00:00+00:00",
+        "started_at": "2026-05-09T00:00:00+00:00",
+        "logs": deque(maxlen=100),
+        "step": 0,
+        "total_steps": 5,
+        "blocking_issues": [],
+        "prefer_project_fasta": False,
+        "run_mode": "full",
+        "ui_language": "en",
+        "resource_policy": "balanced",
+        "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1", "timeout": "1200"},
+    }
+
+    try:
+        web_app._run_pipeline(task_id)
+
+        assert _tasks[task_id]["status"] == "failed"
+        recovery = json.loads((output_dir / "recovery_audit.json").read_text(encoding="utf-8"))
+        assert recovery["schema_version"] == "recovery-audit/v1"
+        assert recovery["failure"]["category"] == "missing_msdt_output"
+        assert recovery["task"]["run_mode"] == "full"
+        assert any(item["kind"] == "missing_output" for item in recovery["failure"]["evidence"])
     finally:
         _tasks.pop(task_id, None)
 
@@ -1995,12 +2454,30 @@ def test_pipeline_failure_persists_structured_error_without_traceback(monkeypatc
         error = json.loads((output_dir / "error.json").read_text(encoding="utf-8"))
         assert error["category"] == "docker_permission"
         assert "traceback" not in error
+        recovery = json.loads((output_dir / "recovery_audit.json").read_text(encoding="utf-8"))
+        assert recovery["failure"]["category"] == "docker_permission"
+        assert recovery["failure"]["stage"] == "pipeline"
+        assert recovery["task"]["run_mode"] == "parameters"
         history_text = (output_dir / "task_history.json").read_text(encoding="utf-8")
         assert "Traceback" not in history_text
         detail = asyncio.run(get_task(task_id))
         assert detail["error_summary"]["category"] == "docker_permission"
     finally:
         _tasks.pop(task_id, None)
+
+
+def test_batch_item_error_writes_recovery_audit(tmp_path):
+    output_dir = tmp_path / "batch-error"
+
+    message = web_app._write_batch_item_error(output_dir, "sample.raw", TimeoutError("remote request timed out"))
+
+    assert message
+    recovery = json.loads((output_dir / "recovery_audit.json").read_text(encoding="utf-8"))
+    assert recovery["schema_version"] == "recovery-audit/v1"
+    assert recovery["failure"]["category"] == "timeout"
+    assert recovery["failure"]["stage"] == "planning"
+    assert recovery["task"]["run_mode"] == "batch"
+    assert recovery["recovery"]["allowed_action"] == "retry_download"
 
 
 def test_create_task_uses_unique_output_directory_for_repeated_input(monkeypatch, tmp_path):

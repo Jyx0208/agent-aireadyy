@@ -37,7 +37,7 @@ def _attributes() -> AttributeSet:
         fixed_mods=AttributeValue(value=["C[57.02]"], confidence=0.7, source="default", evidence_excerpt="mods", conflict_flag=False),
         variable_mods=AttributeValue(value=["M[15.99]"], confidence=0.7, source="default", evidence_excerpt="mods", conflict_flag=False),
         fractionation_hint=AttributeValue(value=None, confidence=0.0, source="none", evidence_excerpt="", conflict_flag=False),
-        search_parameter_hints=AttributeValue(value={"precursor_tol": "20ppm", "recommended_workflow_name": "Default.workflow"}, confidence=0.6, source="rule", evidence_excerpt="profile", conflict_flag=False),
+        search_parameter_hints=AttributeValue(value={"precursor_tol": "20ppm", "recommended_workflow_name": "Default.workflow"}, confidence=0.9, source="llm_confirmed", evidence_excerpt="LLM confirmed DDA profile", conflict_flag=False),
     )
 
 
@@ -214,6 +214,10 @@ def test_run_pride_dda_msdt_docker_marks_failed_when_msdt_output_missing(tmp_pat
             pass
 
         def run(self, bundle):
+            bundle.plan.rawspectrum_output_path.parent.mkdir(parents=True, exist_ok=True)
+            bundle.plan.rawspectrum_output_path.write_text("rawspectrum", encoding="utf-8")
+            bundle.plan.expected_pin_path.parent.mkdir(parents=True, exist_ok=True)
+            bundle.plan.expected_pin_path.write_text("pin", encoding="utf-8")
             return subprocess.CompletedProcess(args=["docker"], returncode=0, stdout="ok", stderr="")
 
     monkeypatch.setattr("agent.orchestrator.pipeline.DockerMSDTConverterRunner", FakeDockerRunner)
@@ -226,6 +230,11 @@ def test_run_pride_dda_msdt_docker_marks_failed_when_msdt_output_missing(tmp_pat
 
     assert manifest.status == "failed"
     assert any("Missing required output" in note and "MSDT parquet" in note for note in manifest.notes)
+    recovery_audit = json.loads((tmp_path / "task_out" / "recovery_audit.json").read_text(encoding="utf-8"))
+    assert recovery_audit["schema_version"] == "recovery-audit/v1"
+    assert recovery_audit["failure"]["category"] == "missing_msdt_output"
+    assert recovery_audit["recovery"]["decision"] == "manual_required"
+    assert any(item["kind"] == "missing_output" for item in recovery_audit["failure"]["evidence"])
 
 
 def test_docker_runner_uses_materialized_workflow_path_in_config(tmp_path: Path):

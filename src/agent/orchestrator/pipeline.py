@@ -10,9 +10,14 @@ from agent.audit.review import append_review_item, build_review_item, build_task
 from agent.assets.downloader import download_file_asset
 from agent.assets.preparer import AssetPreparationError, DockerPwizConverter, RawToMzMLConverter, prepare_file_asset
 from agent.assets.resolver import resolve_file_asset
+from agent.agent_core.audit import write_agent_audit_artifacts
+from agent.agent_core.decision_trace import build_agent_decision_trace
+from agent.agent_core.observation import build_agent_observation
+from agent.agent_core.plan import build_agent_plan_summary
+from agent.agent_core.recovery import build_recovery_audit, write_recovery_audit
 from agent.decision.dda import plan_dda_execution
 from agent.execution.bundle import materialize_dda_task_bundle
-from agent.execution.outputs import execution_failure_reasons
+from agent.execution.outputs import ExecutionFailureEvent, execution_failure_events, execution_failure_reasons
 from agent.inference.rules import infer_attributes, non_proteomics_evidence
 from agent.inference.mzml_metadata import dda_mzml_search_blocking_issue, infer_instrument_family_from_name, parse_mzml_instrument
 from agent.llm.reasoner import LLMReasoner, confirm_no_sdrf_parameters, confirm_sdrf_parameters
@@ -114,6 +119,44 @@ class AgentService:
     def _runtime_log_path(output_dir: str | Path) -> Path:
         return Path(output_dir) / "logs" / "runtime.log"
 
+    def _write_recovery_audit(
+        self,
+        output_dir: str | Path,
+        *,
+        task: InputTask,
+        stage: str,
+        run_mode: str,
+        events: list[ExecutionFailureEvent],
+        result: PridePlanResult | None = None,
+        plan: DdaExecutionPlan | None = None,
+        artifacts: dict[str, str | Path | None] | None = None,
+    ) -> Path | None:
+        output_dir = Path(output_dir)
+        repository = "unknown"
+        project_accession = None
+        if result is not None:
+            repository = getattr(result.context, "repository", repository)
+            if result.resolution.primary_project is not None:
+                project_accession = result.resolution.primary_project.project_accession
+        try:
+            audit = build_recovery_audit(
+                task_id=task.task_id,
+                input_file=task.file_name,
+                output_dir=output_dir,
+                run_mode=run_mode,
+                repository=repository,
+                project_accession=project_accession,
+                stage=stage,
+                events=events,
+                artifacts=artifacts,
+                current_threads=getattr(plan, "thread_num", None) if plan is not None else None,
+                detected_by="agent.orchestrator.pipeline",
+            )
+            return write_recovery_audit(output_dir, audit)
+        except Exception as exc:
+            self._report(f"Recovery audit writing failed; continuing with existing failure artifacts: {exc}")
+            return None
+
     @staticmethod
     def _prepared_data_blocking_issue(plan: DdaExecutionPlan, prepared_path: str | Path) -> str | None:
         if plan.raw_data_type not in {"mzml", "wiff2mzml"}:
@@ -140,6 +183,51 @@ class AgentService:
         )
         self._report(f"Prepared data validation blocked FragPipe execution: {issue}")
         return result.model_copy(update={"plan": plan})
+
+    @staticmethod
+    def _asset_blocking_issues(asset: FileAsset) -> list[str]:
+        issues: list[str] = []
+        asset_type = str(getattr(asset, "resolved_asset_type", "") or "").strip().lower()
+        confidence = float(getattr(asset, "asset_confidence", 0.0) or 0.0)
+        if asset_type in {"", "unknown"}:
+            issues.append(
+                "File asset resolution requires review: data file type is unknown; "
+                "the agent cannot safely download or convert the selected file."
+            )
+        if confidence < 0.75:
+            issues.append(f"File asset resolution confidence is too low: {confidence:.2f}.")
+        if not (
+            getattr(asset, "matched_project_file", None)
+            or getattr(asset, "logical_path", None)
+            or getattr(asset, "local_path", None)
+        ):
+            issues.append("File asset resolution requires review: no matched repository file or local path was found.")
+        return issues
+
+    @classmethod
+    def _plan_with_asset_gate(cls, plan: DdaExecutionPlan, asset: FileAsset) -> DdaExecutionPlan:
+        issues = cls._asset_blocking_issues(asset)
+        if not issues:
+            return plan
+        merged = [*plan.blocking_issues]
+        for issue in issues:
+            if issue not in merged:
+                merged.append(issue)
+        return plan.model_copy(update={"needs_review": True, "blocking_issues": merged})
+
+    @staticmethod
+    def _asset_preparation_failure_event(asset: FileAsset, exc: AssetPreparationError) -> ExecutionFailureEvent:
+        category = "conversion_failure" if bool(getattr(asset, "requires_conversion", False)) else "download_failure"
+        marker_parts = [type(exc).__name__]
+        if getattr(exc, "local_path", None) is not None:
+            marker_parts.append(str(exc.local_path))
+        return ExecutionFailureEvent(
+            category=category,
+            reason=str(exc),
+            evidence_kind="exception",
+            path=getattr(exc, "local_path", None),
+            marker=" | ".join(marker_parts),
+        )
 
     @staticmethod
     def _write_run_log(output_dir: str | Path, stdout: str, stderr: str = "") -> Path:
@@ -366,6 +454,7 @@ class AgentService:
             reviewed_fasta_name=reviewed_fasta_name,
             prefer_project_fasta=prefer_project_fasta,
         )
+        plan = self._plan_with_asset_gate(plan, result.asset)
         return result.model_copy(update={"attributes": attributes, "plan": plan})
 
     def replan_with_mzml_instrument(
@@ -417,6 +506,7 @@ class AgentService:
             prefer_project_fasta=prefer_project_fasta,
             accept_search_parameter_review=accept_search_parameter_review,
         )
+        plan = self._plan_with_asset_gate(plan, result.asset)
         return result.model_copy(update={"attributes": attributes, "plan": plan})
 
     def resolve_asset(self, task: InputTask, context: ProjectContext, output_dir: str | Path) -> FileAsset:
@@ -504,6 +594,7 @@ class AgentService:
             reviewed_fasta_name=reviewed_fasta_name,
             prefer_project_fasta=prefer_project_fasta,
         )
+        plan = self._plan_with_asset_gate(plan, asset)
         self._report(f"[5/5] DDA 执行计划已生成。workflow={plan.fragpipe_workflow_path.name}")
         self._report_plan_summary(plan)
         return PridePlanResult(
@@ -558,6 +649,7 @@ class AgentService:
             reviewed_fasta_name=reviewed_fasta_name,
             prefer_project_fasta=prefer_project_fasta,
         )
+        plan = self._plan_with_asset_gate(plan, asset)
         self._report(f"[5/5] DDA 执行计划已生成。workflow={plan.fragpipe_workflow_path.name}")
         self._report_plan_summary(plan)
         return PridePlanResult(
@@ -585,6 +677,18 @@ class AgentService:
         write_json(output_dir / "attributes.json", attributes)
         write_json(output_dir / "decision_trace.json", plan)
         write_json(output_dir / "converter_config.json", build_converter_config(plan))
+        try:
+            observation = build_agent_observation(
+                getattr(context, "file_name", plan.source_file_name),
+                resolution,
+                context,
+                asset=asset,
+            )
+            decisions = build_agent_decision_trace(resolution, attributes, asset=asset, plan=plan)
+            agent_plan = build_agent_plan_summary(plan, attributes, decisions=decisions)
+            write_agent_audit_artifacts(output_dir, observation, agent_plan, decisions)
+        except Exception as exc:
+            self._report(f"Agent audit artifact writing failed; continuing without Phase 1 audit files: {exc}")
         status = "needs_review" if plan.needs_review else "resolved"
         state = build_task_state_snapshot(
             task_id=plan.task_id,
@@ -708,6 +812,12 @@ class AgentService:
             docker_result.stdout,
             docker_result.stderr,
         )
+        failure_events = execution_failure_events(
+            bundle.plan,
+            docker_result.returncode,
+            docker_result.stdout,
+            docker_result.stderr,
+        )
         if failure_reasons:
             notes = [docker_result.stdout, *failure_reasons]
             manifest = RunManifest(
@@ -740,6 +850,22 @@ class AgentService:
                 reasons=failure_reasons,
             )
             append_review_item(Path(output_dir) / "review_queue.json", review_item)
+            self._write_recovery_audit(
+                output_dir,
+                task=task,
+                stage="execution",
+                run_mode="full",
+                events=failure_events,
+                result=result,
+                plan=bundle.plan,
+                artifacts={
+                    "task_state_json": Path(output_dir) / "task_state.json",
+                    "review_queue_json": Path(output_dir) / "review_queue.json",
+                    "run_manifest_json": Path(output_dir) / "run_manifest.json",
+                    "run_log": run_log_path,
+                    "runtime_log": runtime_log_path if runtime_log_path.exists() else None,
+                },
+            )
             return manifest
         initial_manifest = RunManifest(
             task_id=task.task_id,
@@ -810,7 +936,42 @@ class AgentService:
             message = f"当前计划需要人工复核，暂不下载或准备数据文件。原因：{result.plan.blocking_issues}"
             self._report(message)
             raise ReviewRequiredError(message)
-        prepared_path = self.prepare_asset(result.asset)
+        try:
+            prepared_path = self.prepare_asset(result.asset)
+        except AssetPreparationError as exc:
+            reason = f"Asset preparation failed before MSDT input packaging: {exc}"
+            review_plan = result.plan.model_copy(
+                update={
+                    "needs_review": True,
+                    "blocking_issues": [*result.plan.blocking_issues, reason],
+                }
+            )
+            review_result = result.model_copy(update={"plan": review_plan})
+            self.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, review_plan, asset=result.asset)
+            append_review_item(
+                output_dir / "review_queue.json",
+                build_review_item(
+                    task_id=task.task_id,
+                    source_file=task.file_name,
+                    project_accession=result.resolution.primary_project.project_accession if result.resolution.primary_project else None,
+                    stage="asset_preparation",
+                    reasons=[reason],
+                ),
+            )
+            self._write_recovery_audit(
+                output_dir,
+                task=task,
+                stage="asset_preparation",
+                run_mode="prepare",
+                events=[self._asset_preparation_failure_event(result.asset, exc)],
+                result=review_result,
+                plan=review_plan,
+                artifacts={
+                    "task_state_json": output_dir / "task_state.json",
+                    "review_queue_json": output_dir / "review_queue.json",
+                },
+            )
+            raise
         result = self.validate_prepared_data_for_plan(result, prepared_path)
         if result.plan.needs_review:
             self.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
@@ -887,6 +1048,7 @@ class AgentService:
                     reviewed_fasta_name=active_reviewed_fasta_name,
                     prefer_project_fasta=prefer_project_fasta,
                 )
+                reviewed_plan = self._plan_with_asset_gate(reviewed_plan, result.asset)
                 result = result.model_copy(update={"plan": reviewed_plan})
         if result.plan.needs_review and self._search_review_issues(result.plan):
             if confirm_search_parameters is not None and confirm_search_parameters(result):
@@ -897,7 +1059,47 @@ class AgentService:
         prepared_path: Path | None = None
         if result.plan.needs_review and self._can_retry_with_mzml_instrument(result.plan):
             self._report("检测到项目级多个仪器；先准备/转换 mzML，并尝试从 mzML 解析文件级仪器。")
-            prepared_path = self.prepare_asset(result.asset)
+            try:
+                prepared_path = self.prepare_asset(result.asset)
+            except AssetPreparationError as exc:
+                output_dir = Path(output_dir)
+                reason = f"Asset preparation failed during mzML instrument probe: {exc}"
+                review_plan = result.plan.model_copy(
+                    update={"needs_review": True, "blocking_issues": [*result.plan.blocking_issues, reason]}
+                )
+                review_result = result.model_copy(update={"plan": review_plan})
+                self.write_task_bundle(
+                    output_dir,
+                    result.resolution,
+                    result.context,
+                    result.attributes,
+                    review_plan,
+                    asset=result.asset,
+                )
+                append_review_item(
+                    output_dir / "review_queue.json",
+                    build_review_item(
+                        task_id=task.task_id,
+                        source_file=task.file_name,
+                        project_accession=result.resolution.primary_project.project_accession if result.resolution.primary_project else None,
+                        stage="asset_preparation",
+                        reasons=[reason],
+                    ),
+                )
+                self._write_recovery_audit(
+                    output_dir,
+                    task=task,
+                    stage="asset_preparation",
+                    run_mode="prepare",
+                    events=[self._asset_preparation_failure_event(result.asset, exc)],
+                    result=review_result,
+                    plan=review_plan,
+                    artifacts={
+                        "task_state_json": output_dir / "task_state.json",
+                        "review_queue_json": output_dir / "review_queue.json",
+                    },
+                )
+                raise
             result = self.replan_with_mzml_instrument(
                 result,
                 prepared_path,
@@ -932,12 +1134,14 @@ class AgentService:
                 f"已下载的文件保留在：{exc.local_path}。详细信息：{exc}"
             )
             self._report(reason)
+            review_plan = result.plan.model_copy(update={"needs_review": True, "blocking_issues": result.plan.blocking_issues + [reason]})
+            review_result = result.model_copy(update={"plan": review_plan})
             self.write_task_bundle(
                 output_dir,
                 result.resolution,
                 result.context,
                 result.attributes,
-                result.plan.model_copy(update={"needs_review": True, "blocking_issues": result.plan.blocking_issues + [reason]}),
+                review_plan,
                 asset=result.asset,
             )
             append_review_item(
@@ -949,6 +1153,19 @@ class AgentService:
                     stage="asset_preparation",
                     reasons=[reason],
                 ),
+            )
+            self._write_recovery_audit(
+                output_dir,
+                task=task,
+                stage="asset_preparation",
+                run_mode="prepare",
+                events=[self._asset_preparation_failure_event(result.asset, exc)],
+                result=review_result,
+                plan=review_plan,
+                artifacts={
+                    "task_state_json": output_dir / "task_state.json",
+                    "review_queue_json": output_dir / "review_queue.json",
+                },
             )
             raise
         result = self.validate_prepared_data_for_plan(result, prepared_path)

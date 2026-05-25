@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent.execution.outputs import execution_failure_reasons, missing_required_execution_outputs
+from agent.execution.outputs import execution_failure_events, execution_failure_reasons, missing_required_execution_outputs
 from agent.models import DdaExecutionPlan
 
 
@@ -53,3 +53,22 @@ def test_execution_failure_reasons_flags_internal_converter_failure_with_zero_ex
 
     assert any("insufficient memory" in reason.lower() for reason in reasons)
     assert any("internal process exited non-zero" in reason.lower() for reason in reasons)
+
+
+def test_execution_failure_events_categorize_missing_pin_msdt_and_memory_marker(tmp_path: Path):
+    plan = _mzml_plan(tmp_path)
+    plan.rawspectrum_output_path.parent.mkdir(parents=True, exist_ok=True)
+    plan.rawspectrum_output_path.write_text("rawspectrum", encoding="utf-8")
+
+    events = execution_failure_events(
+        plan,
+        returncode=0,
+        stdout="Insufficient memory!\nProcess returned non-zero exit code\nmiss mzml_fp_pin_path\n",
+    )
+
+    categories = [event.category for event in events]
+    assert "missing_pin" in categories
+    assert "missing_msdt_output" in categories
+    assert "insufficient_memory" in categories
+    assert any(event.evidence_kind == "missing_output" and event.path == plan.expected_pin_path for event in events)
+    assert any(event.evidence_kind == "log_marker" and event.marker == "Insufficient memory!" for event in events)

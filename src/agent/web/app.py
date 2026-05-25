@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
+from types import SimpleNamespace
 from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -838,6 +839,83 @@ def _write_task_runtime_log(task_id: str, output_dir: Path) -> Path:
     return log_path
 
 
+def _result_with_plan(result: Any, plan: Any | None) -> Any:
+    if plan is None or getattr(result, "plan", None) is plan:
+        return result
+    model_copy = getattr(result, "model_copy", None)
+    if callable(model_copy):
+        return model_copy(update={"plan": plan})
+    values = dict(vars(result)) if hasattr(result, "__dict__") else {}
+    if not values:
+        values = {
+            "resolution": getattr(result, "resolution", None),
+            "context": getattr(result, "context", None),
+            "asset": getattr(result, "asset", None),
+            "attributes": getattr(result, "attributes", None),
+        }
+    values["plan"] = plan
+    return SimpleNamespace(**values)
+
+
+def _write_agent_audit_package(
+    output_dir: Path,
+    result: Any,
+    *,
+    plan: Any | None = None,
+    report: Callable[[str], None] | None = None,
+) -> None:
+    try:
+        from agent.agent_core.audit import write_agent_audit_for_result
+
+        write_agent_audit_for_result(output_dir, _result_with_plan(result, plan))
+    except Exception as exc:
+        if report is not None:
+            try:
+                report(f"Failed to write agent audit files: {exc}")
+            except Exception:
+                pass
+
+
+def _write_recovery_audit_package(
+    output_dir: Path,
+    task_obj: Any,
+    *,
+    stage: str,
+    run_mode: str,
+    events: list[Any],
+    result: Any | None = None,
+    plan: Any | None = None,
+    artifacts: dict[str, str | Path | None] | None = None,
+    report: Callable[[str], None] | None = None,
+) -> None:
+    try:
+        from agent.agent_core.recovery import build_recovery_audit, write_recovery_audit
+
+        resolution = getattr(result, "resolution", None)
+        primary = getattr(resolution, "primary_project", None)
+        context = getattr(result, "context", None)
+        audit = build_recovery_audit(
+            task_id=str(getattr(task_obj, "task_id", "")),
+            input_file=str(getattr(task_obj, "file_name", "")),
+            output_dir=output_dir,
+            run_mode=run_mode,
+            repository=str(getattr(context, "repository", "unknown")),
+            project_accession=getattr(primary, "project_accession", None),
+            stage=stage,
+            events=events,
+            artifacts=artifacts,
+            current_threads=getattr(plan, "thread_num", None) if plan is not None else None,
+            detected_by="agent.web.app",
+        )
+        write_recovery_audit(output_dir, audit)
+    except Exception as exc:
+        if report is not None:
+            try:
+                report(f"Failed to write recovery audit file: {exc}")
+            except Exception:
+                pass
+
+
 def _write_parameter_audit_files(output_dir: Path, batch_id: str, index: int, input_value: str, result: Any) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     resolution = getattr(result, "resolution", None)
@@ -956,6 +1034,19 @@ def _write_parameter_audit_files(output_dir: Path, batch_id: str, index: int, in
     }
     audit = _plain(audit)
     _json_write(output_dir / "parameter_audit.json", audit)
+    audit_files = [
+        "project_resolution.json",
+        "metadata.json",
+        "asset_resolution.json",
+        "attributes.json",
+        "decision_trace.json",
+        "agent_observation.json",
+        "agent_plan.json",
+        "agent_decision_trace.json",
+        "parameter_audit.json",
+        "task_state.json",
+        "logs/runtime.log",
+    ]
     manifest = {
         "package_type": "parameter_only_msdt_input_preview",
         "generated_at": _now_iso(),
@@ -975,16 +1066,7 @@ def _write_parameter_audit_files(output_dir: Path, batch_id: str, index: int, in
             "fasta_download_url": audit.get("fasta", {}).get("download_url", ""),
             "fragpipe_manifest_expected": audit.get("files", {}).get("fragpipe_manifest", ""),
         },
-        "audit_files": [
-            "project_resolution.json",
-            "metadata.json",
-            "asset_resolution.json",
-            "attributes.json",
-            "decision_trace.json",
-            "parameter_audit.json",
-            "task_state.json",
-            "logs/runtime.log",
-        ],
+        "audit_files": [path for path in audit_files if (output_dir / path).exists()],
     }
     _json_write(output_dir / "msdt_input_manifest.json", _plain(manifest))
     return audit
@@ -2501,6 +2583,7 @@ def _update_batch_item(batch_id: str, index: int, **fields: Any) -> None:
 def _write_batch_item_error(output_dir: Path, input_value: str, exc: BaseException) -> str:
     from agent.audit.review import build_task_state_snapshot, write_task_state
     from agent.errors import build_error_record, write_error_record
+    from agent.execution.outputs import ExecutionFailureEvent
     from agent.input.normalizer import normalize_input
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2526,6 +2609,25 @@ def _write_batch_item_error(output_dir: Path, input_value: str, exc: BaseExcepti
             notes=[public_message],
         ),
     )
+    if not (output_dir / "recovery_audit.json").exists():
+        _write_recovery_audit_package(
+            output_dir,
+            SimpleNamespace(task_id=task_id, file_name=source_file),
+            stage="planning",
+            run_mode="batch",
+            events=[
+                ExecutionFailureEvent(
+                    category=str(error.get("category") or "unknown"),
+                    reason=str(error.get("technical_message") or public_message),
+                    evidence_kind="exception",
+                    marker=str(error.get("exception_type") or type(exc).__name__),
+                )
+            ],
+            artifacts={
+                "error_json": output_dir / "error.json",
+                "task_state_json": output_dir / "task_state.json",
+            },
+        )
     return public_message
 
 
@@ -2617,13 +2719,14 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
                 repository=repository,
                 prefer_project_fasta=prefer_project_fasta,
             )
+            _write_agent_audit_package(output_dir, result, plan=bundle.plan, report=reporter)
             _write_parameter_audit_files(output_dir, batch_id, index, input_value, result)
             project_error = _primary_project_error(result)
             if project_error:
                 raise RuntimeError(project_error)
             if run_mode == _RUN_MODE_FULL:
                 from agent.audit.review import build_task_state_snapshot, write_task_state
-                from agent.execution.outputs import execution_failure_reasons
+                from agent.execution.outputs import execution_failure_events, execution_failure_reasons
                 from agent.msdt_converter.docker_runner import DockerMSDTConverterRunner
 
                 _append_batch_event(batch_id, "info", f"{input_value} running MSDT-Converter Docker.", item_index=index)
@@ -2636,6 +2739,26 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
                     docker_result.stderr,
                 )
                 if failure_reasons:
+                    failure_events = execution_failure_events(
+                        bundle.plan,
+                        docker_result.returncode,
+                        docker_result.stdout,
+                        docker_result.stderr,
+                    )
+                    _write_recovery_audit_package(
+                        output_dir,
+                        task,
+                        stage="execution",
+                        run_mode=_RUN_MODE_FULL,
+                        events=failure_events,
+                        result=result,
+                        plan=bundle.plan,
+                        artifacts={
+                            "task_state_json": output_dir / "task_state.json",
+                            "runtime_log": output_dir / "logs" / "runtime.log",
+                        },
+                        report=reporter,
+                    )
                     raise RuntimeError("; ".join(failure_reasons))
                 project_accession = result.resolution.primary_project.project_accession if result.resolution.primary_project else None
                 write_task_state(
@@ -2713,6 +2836,7 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
             finally:
                 _cleanup_batch_instrument_probe_files(output_dir, result, prepared_path)
         service.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
+        _write_agent_audit_package(output_dir, result, report=reporter)
         _write_parameter_audit_files(output_dir, batch_id, index, input_value, result)
         project_error = _primary_project_error(result)
         if project_error:
@@ -3339,6 +3463,7 @@ def _run_pipeline(task_id: str):
             _step(task_id, 5, "[5/5] 参数推断完成")
             _log(task_id, "info", f"Parameter-only mode completed: {repository_label} project resolution, file attribute inference, workflow/FASTA/search-parameter planning, and audit package generation are complete.")
             service.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
+            _write_agent_audit_package(output_dir, result, report=lambda message: _log(task_id, "debug", message))
             try:
                 from agent.audit.review import build_task_state_snapshot, write_task_state
 
@@ -3402,6 +3527,7 @@ def _run_pipeline(task_id: str):
                 report=reporter,
             )
         service.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, bundle.plan, asset=result.asset)
+        _write_agent_audit_package(output_dir, result, plan=bundle.plan, report=lambda message: _log(task_id, "debug", message))
         if prepare_only:
             _step(task_id, 4, "[4/5] Package MSDT-Converter input")
             from agent.msdt_converter.docker_runner import DockerMSDTConverterRunner
@@ -3448,8 +3574,14 @@ def _run_pipeline(task_id: str):
 
         # ── 步骤 5 ──
         _step(task_id, 5, "[5/5] 处理结果")
-        from agent.execution.outputs import execution_failure_reasons
+        from agent.execution.outputs import execution_failure_events, execution_failure_reasons
         failure_reasons = execution_failure_reasons(
+            bundle.plan,
+            docker_result.returncode,
+            docker_result.stdout,
+            docker_result.stderr,
+        )
+        failure_events = execution_failure_events(
             bundle.plan,
             docker_result.returncode,
             docker_result.stdout,
@@ -3526,17 +3658,54 @@ def _run_pipeline(task_id: str):
                         reasons=failure_reasons,
                     ),
                 )
+                _write_recovery_audit_package(
+                    output_dir,
+                    task_obj,
+                    stage="execution",
+                    run_mode=_RUN_MODE_FULL,
+                    events=failure_events,
+                    result=result,
+                    plan=bundle.plan,
+                    artifacts={
+                        "task_state_json": output_dir / "task_state.json",
+                        "review_queue_json": output_dir / "review_queue.json",
+                        "runtime_log": output_dir / "logs" / "runtime.log",
+                    },
+                    report=lambda message: _log(task_id, "debug", message),
+                )
             except Exception as audit_exc:
                 _log(task_id, "debug", f"Failed to write execution failure audit files: {audit_exc}")
             _set_task_terminal_status(task_id, "failed")
 
     except Exception as exc:
         from agent.errors import build_error_record, public_error_summary, write_error_record
+        from agent.execution.outputs import ExecutionFailureEvent
 
         error_record = build_error_record(exc, stage="pipeline", input_file=input_value)
         write_error_record(output_dir / "error.json", error_record)
         summary = public_error_summary(error_record)
         task["error_summary"] = summary
+        recovery_task = locals().get("task_obj") or SimpleNamespace(task_id=task_id, file_name=Path(input_value).name)
+        recovery_result = locals().get("result")
+        recovery_plan = getattr(locals().get("bundle"), "plan", None) or getattr(recovery_result, "plan", None)
+        _write_recovery_audit_package(
+            output_dir,
+            recovery_task,
+            stage="pipeline",
+            run_mode=_clean_run_mode(task.get("run_mode")),
+            events=[
+                ExecutionFailureEvent(
+                    category=str(error_record.get("category") or "unknown"),
+                    reason=str(error_record.get("technical_message") or summary.get("public_message") or exc),
+                    evidence_kind="exception",
+                    marker=str(error_record.get("exception_type") or type(exc).__name__),
+                )
+            ],
+            result=recovery_result,
+            plan=recovery_plan,
+            artifacts={"error_json": output_dir / "error.json"},
+            report=lambda message: _log(task_id, "debug", message),
+        )
         task["blocking_issues"] = [summary.get("public_message") or "任务运行失败。"]
         _log(task_id, "error", f"运行出错：{summary.get('public_message')}（{summary.get('category')}）")
         if "traceback" in error_record:

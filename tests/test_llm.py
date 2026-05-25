@@ -8,6 +8,7 @@ from agent.inference.rules import infer_attributes
 from agent.llm.reasoner import (
     OpenAICompatibleReasoner,
     _metadata_context_text,
+    _no_sdrf_attribute_prompt,
     confirm_no_sdrf_parameters,
     confirm_sdrf_parameters,
     default_llm_reasoner,
@@ -359,6 +360,87 @@ def test_llm_confirmation_keeps_workflow_parameter_overrides_in_hints():
     assert hints["recommended_workflow_name"] == "Default.workflow"
     assert hints["workflow_parameter_overrides"]["msfragger.search_enzyme_name_2"] == "Arg-C"
     assert hints["workflow_parameter_overrides"]["msfragger.search_enzyme_cut_2"] == "R"
+
+
+def test_no_sdrf_llm_semantic_enzyme_inference_completes_dual_digest_workflow_overrides():
+    context = ProjectContext(
+        project_accession="PXD000012",
+        file_name="semantic_digest.raw",
+        metadata={
+            "projectDescription": MetadataValue(
+                value=(
+                    "Proteins were first digested with a lysine-specific endoproteinase "
+                    "and then with trypsin before LC-MS/MS analysis."
+                ),
+                source="pride.projectDescription",
+                source_level="project",
+                completeness=0.8,
+            )
+        },
+        sdrf_rows=[],
+    )
+    base = infer_attributes(context)
+    assert base.enzyme.value == "Trypsin"
+
+    class SemanticDigestReasoner:
+        def confirm_search_parameters(self, context, attributes):
+            return {
+                "enzyme": AttributeValue(
+                    value="Trypsin/Lys-C",
+                    confidence=0.94,
+                    source="llm_confirmed",
+                    evidence_excerpt="Lysine-specific endoproteinase followed by trypsin implies Trypsin/Lys-C.",
+                    conflict_flag=False,
+                ),
+                "search_parameter_hints": AttributeValue(
+                    value={
+                        "recommended_workflow_name": "Default.workflow",
+                        "missed_cleavages": 3,
+                        "workflow_parameter_overrides": {},
+                    },
+                    confidence=0.9,
+                    source="llm_confirmed",
+                    evidence_excerpt="Dual digestion requires explicit FragPipe enzyme slots.",
+                    conflict_flag=False,
+                ),
+            }
+
+    confirmed = confirm_no_sdrf_parameters(context, base, llm_reasoner=SemanticDigestReasoner())
+
+    assert confirmed.enzyme.value == "Trypsin/Lys-C"
+    assert confirmed.enzyme.source == "llm_confirmed"
+    overrides = confirmed.search_parameter_hints.value["workflow_parameter_overrides"]
+    assert overrides["msfragger.search_enzyme_name_1"] == "stricttrypsin"
+    assert overrides["msfragger.search_enzyme_cut_1"] == "KR"
+    assert overrides["msfragger.search_enzyme_sense_1"] == "C"
+    assert overrides["msfragger.search_enzyme_name_2"] == "lysc"
+    assert overrides["msfragger.search_enzyme_cut_2"] == "K"
+    assert overrides["msfragger.search_enzyme_sense_2"] == "C"
+    assert overrides["msfragger.num_enzyme_termini"] == 2
+
+
+def test_no_sdrf_prompt_requests_biological_semantic_enzyme_inference():
+    context = ProjectContext(
+        project_accession="PXD000013",
+        file_name="semantic_digest.raw",
+        metadata={
+            "projectDescription": MetadataValue(
+                value="Digestion used a lysine-specific endoproteinase followed by trypsin.",
+                source="pride.projectDescription",
+                source_level="project",
+                completeness=0.8,
+            )
+        },
+        sdrf_rows=[],
+    )
+    attributes = infer_attributes(context)
+
+    prompt = _no_sdrf_attribute_prompt(context, attributes)
+
+    assert "semantic enzyme inference" in prompt.lower()
+    assert "lysine-specific endoproteinase" in prompt
+    assert "Trypsin/Lys-C" in prompt
+    assert "workflow_parameter_overrides" in prompt
 
 
 def test_no_sdrf_llm_context_includes_parameter_and_fasta_files():

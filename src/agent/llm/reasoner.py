@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 import httpx
 
+from agent.inference.enzyme_semantics import complete_enzyme_workflow_overrides
 from agent.models import AttributeSet, AttributeValue, ProjectContext
 
 
@@ -202,6 +203,12 @@ def _no_sdrf_attribute_prompt(context: ProjectContext, attributes: AttributeSet)
         "msfragger.search_enzyme_name_1/2, msfragger.search_enzyme_cut_1/2, msfragger.search_enzyme_sense_1/2, msfragger.num_enzyme_termini。\n"
         "多酶切时必须显式微调 workflow 酶切参数。例如 Trypsin + Arg-C：slot 1 保持 stricttrypsin/KR/C，slot 2 设置 Arg-C/R/C，"
         "msfragger.num_enzyme_termini=2；有依据时可将 missed cleavages 调到 3-4，并收紧 digest mass/length 范围。\n\n"
+        "Semantic enzyme inference: do not rely only on literal enzyme tokens. Interpret protocol language "
+        "using proteomics domain knowledge. For example, if the protocol says a lysine-specific endoproteinase, "
+        "lysine-directed endoprotease, or digestion at lysine residues was used together with trypsin, infer "
+        "enzyme.value='Trypsin/Lys-C' with high confidence only when the evidence supports both enzymes. For "
+        "Trypsin/Lys-C, workflow_parameter_overrides must set slot 1 to stricttrypsin/KR/C, slot 2 to Lys-C/K/C, "
+        "and msfragger.num_enzyme_termini=2.\n\n"
         "## DDA/DIA 判断（最关键）\n\n"
         "你必须根据以下信息判断数据采集模式（acquisition_mode）是 DDA 还是 DIA：\n\n"
         "### 判断依据\n"
@@ -298,6 +305,12 @@ def _sdrf_attribute_prompt(context: ProjectContext, attributes: AttributeSet) ->
         "msfragger.search_enzyme_name_1/2, msfragger.search_enzyme_cut_1/2, msfragger.search_enzyme_sense_1/2, msfragger.num_enzyme_termini。\n"
         "多酶切时必须显式微调 workflow 酶切参数。例如 Trypsin + Arg-C：slot 1 保持 stricttrypsin/KR/C，slot 2 设置 Arg-C/R/C，"
         "msfragger.num_enzyme_termini=2；有依据时可将 missed cleavages 调到 3-4，并收紧 digest mass/length 范围。\n\n"
+        "Semantic enzyme inference: do not rely only on literal enzyme tokens. Interpret protocol language "
+        "using proteomics domain knowledge. For example, if the protocol says a lysine-specific endoproteinase, "
+        "lysine-directed endoprotease, or digestion at lysine residues was used together with trypsin, infer "
+        "enzyme.value='Trypsin/Lys-C' with high confidence only when the evidence supports both enzymes. For "
+        "Trypsin/Lys-C, workflow_parameter_overrides must set slot 1 to stricttrypsin/KR/C, slot 2 to Lys-C/K/C, "
+        "and msfragger.num_enzyme_termini=2.\n\n"
         "## DDA/DIA 判断（最关键）\n\n"
         "你必须根据 SDRF 行中的信息判断数据采集模式（acquisition_mode）是 DDA 还是 DIA：\n\n"
         "### 判断依据\n"
@@ -600,6 +613,7 @@ def confirm_no_sdrf_parameters(
         and result.instrument_name.source.startswith("llm_confirmed")
     ):
         result = result.model_copy(update={"instrument_family": _derive_instrument_family(result.instrument_name.value)})
+    result = complete_enzyme_workflow_overrides(result)
 
     if report is not None:
         report("\u5927\u6a21\u578b\u786e\u8ba4\u7ed3\u679c\u5df2\u5408\u5e76\u5230\u5c5e\u6027\u63a8\u65ad\u4e2d\u3002")
@@ -689,6 +703,7 @@ def confirm_sdrf_parameters(
         and result.instrument_name.source.startswith("llm_confirmed")
     ):
         result = result.model_copy(update={"instrument_family": _derive_instrument_family(result.instrument_name.value)})
+    result = complete_enzyme_workflow_overrides(result)
 
     if report is not None:
         report("\u5927\u6a21\u578b SDRF \u6c47\u603b\u7ed3\u679c\u5df2\u5408\u5e76\u5230\u5c5e\u6027\u63a8\u65ad\u4e2d\u3002")

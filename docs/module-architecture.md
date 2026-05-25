@@ -22,8 +22,10 @@ input file / accession
   -> metadata normalization
   -> attribute inference and LLM confirmation
   -> workflow / FASTA / search-parameter planning
+  -> evidence-gated Agent decision trace
   -> optional file download and conversion
   -> optional MSDT-Converter execution
+  -> recovery audit on bounded failures
   -> output packaging and history persistence
 ```
 
@@ -59,12 +61,14 @@ Responsibilities:
 - `src/agent/orchestrator/pipeline.py`
 - `src/agent/decision/`
 - `src/agent/llm/`
+- `src/agent/agent_core/`
 
 Responsibilities:
 
 - infer acquisition mode, digestion, modifications, species, and instrument
 - choose workflow and FASTA
 - identify review cases and blocking issues
+- record Agent observation, plan, decision trace, and execution gates
 - support manual overrides when the operator confirms them
 
 ### 4. Execution layer
@@ -91,6 +95,7 @@ Responsibilities:
 - persist task history
 - persist batch manifests
 - persist error summaries and review queues
+- persist `recovery_audit.json` for failed full/batch/execution paths
 - rebuild the Project History panel after refresh or restart
 
 ## Run Modes
@@ -138,6 +143,10 @@ Responsibilities:
 - `msdt_input_manifest.json`
 - `parameter_audit.json`
 - `decision_trace.json`
+- `agent_observation.json`
+- `agent_plan.json`
+- `agent_decision_trace.json`
+- `recovery_audit.json`
 - `attributes.json`
 - `project_resolution.json`
 - `benchmark_results.xlsx`
@@ -152,3 +161,5 @@ Responsibilities:
 - batch and single-file parity
 - clear run modes
 - downloadable artifacts for verification
+
+For the detailed autonomy levels, evidence gates, recovery allowlist, and manual-review boundaries, see [Agent MVP audit and recovery contract](agent_mvp.md).

@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from agent.inference.enzyme_semantics import fragpipe_enzyme_overrides
 from agent.models import AttributeSet
 
 
@@ -244,57 +245,8 @@ def _sync_enzyme_dropdown_overrides(overrides: dict[str, str]) -> None:
             overrides[dropdown_key] = dropdown
 
 
-def _detected_known_enzymes(normalized: str, enzyme_text: str) -> set[str]:
-    detected: set[str] = set()
-    if "aspn" in normalized:
-        detected.add("aspn")
-    if "argc" in normalized:
-        detected.add("argc")
-    if "lysc" in normalized:
-        detected.add("lysc")
-    if "trypsin" in enzyme_text:
-        detected.add("trypsin")
-    return detected
-
-
 def _enzyme_overrides(attributes: AttributeSet) -> dict[str, Any]:
-    enzyme = str(attributes.enzyme.value or "").lower()
-    normalized = re.sub(r"[^a-z0-9]+", "", enzyme)
-    if len(_detected_known_enzymes(normalized, enzyme)) > 1:
-        return {}
-    if "aspn" in normalized:
-        return {
-            "msfragger.search_enzyme_name_1": "aspn",
-            "msfragger.search_enzyme_cut_1": "D",
-            "msfragger.search_enzyme_nocut_1": "",
-            "msfragger.search_enzyme_sense_1": "N",
-            "msfragger.misc.fragger.enzyme-dropdown-1": "aspn",
-        }
-    if "argc" in normalized:
-        return {
-            "msfragger.search_enzyme_name_1": "argc",
-            "msfragger.search_enzyme_cut_1": "R",
-            "msfragger.search_enzyme_nocut_1": "P",
-            "msfragger.search_enzyme_sense_1": "C",
-            "msfragger.misc.fragger.enzyme-dropdown-1": "argc",
-        }
-    if "lysc" in normalized:
-        return {
-            "msfragger.search_enzyme_name_1": "lysc",
-            "msfragger.search_enzyme_cut_1": "K",
-            "msfragger.search_enzyme_nocut_1": "",
-            "msfragger.search_enzyme_sense_1": "C",
-            "msfragger.misc.fragger.enzyme-dropdown-1": "lysc",
-        }
-    if "trypsin" in enzyme:
-        return {
-            "msfragger.search_enzyme_name_1": "stricttrypsin",
-            "msfragger.search_enzyme_cut_1": "KR",
-            "msfragger.search_enzyme_nocut_1": "",
-            "msfragger.search_enzyme_sense_1": "C",
-            "msfragger.misc.fragger.enzyme-dropdown-1": "stricttrypsin",
-        }
-    return {}
+    return fragpipe_enzyme_overrides(attributes.enzyme.value)
 
 
 def _as_list(value: Any) -> list[str]:

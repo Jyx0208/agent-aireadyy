@@ -6,6 +6,7 @@ from agent.models import (
     AttributeSet,
     AttributeValue,
     MetadataValue,
+    ProjectCandidate,
     ProjectContext,
     ProjectResolution,
 )
@@ -110,8 +111,8 @@ def _dda_attributes() -> AttributeSet:
         search_parameter_hints=AttributeValue(
             value={"precursor_tol": "20ppm", "recommended_workflow_name": "Default.workflow"},
             confidence=0.6,
-            source="rule",
-            evidence_excerpt="Orbitrap default profile",
+            source="llm_confirmed",
+            evidence_excerpt="LLM confirmed Orbitrap DDA profile",
             conflict_flag=False,
         ),
     )
@@ -122,13 +123,31 @@ def _reviewed_fasta(tmp_path: Path) -> Path:
     path.write_text(">sp|P1|REVIEWED_TEST\nMPEPTIDEK\n", encoding="utf-8")
     return path
 
+
+def _resolved_resolution() -> ProjectResolution:
+    return ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession="PXD_TEST",
+            matched_file="sample.raw",
+            match_type="exact",
+            match_score=100,
+            evidence=["test exact match"],
+            metadata_consistency=1.0,
+        ),
+        alternative_projects=[],
+        resolution_reason="test exact match",
+        resolution_confidence=1.0,
+        needs_review=False,
+    )
+
+
 def test_plan_dda_execution_generates_converter_compatible_paths(tmp_path: Path):
     attributes = _dda_attributes()
     plan = plan_dda_execution(
         task_id="task-001",
         source_file_name="sample.raw",
         source_data_path="/data/sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=attributes,
         output_dir=tmp_path,
     )
@@ -144,6 +163,70 @@ def test_plan_dda_execution_generates_converter_compatible_paths(tmp_path: Path)
     assert plan.output_paths["fp_msdt"].suffix == ".parquet"
 
 
+def test_plan_dda_execution_requires_review_for_ambiguous_project_resolution(tmp_path: Path):
+    resolution = ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession="PXD_A",
+            matched_file="sample.raw",
+            match_type="exact",
+            match_score=100,
+            metadata_consistency=0.5,
+        ),
+        resolution_reason="Exact file name tie across repositories.",
+        resolution_confidence=1.0,
+        needs_review=True,
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-project-review",
+        source_file_name="sample.raw",
+        source_data_path="/data/sample.mzML",
+        project_resolution=resolution,
+        attributes=_dda_attributes(),
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is True
+    assert any("项目解析" in issue or "project resolution" in issue.lower() for issue in plan.blocking_issues)
+
+
+def test_plan_dda_execution_requires_review_when_no_primary_project_is_resolved(tmp_path: Path):
+    plan = plan_dda_execution(
+        task_id="task-no-project",
+        source_file_name="sample.raw",
+        source_data_path="/data/sample.mzML",
+        project_resolution=ProjectResolution.empty(),
+        attributes=_dda_attributes(),
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is True
+    assert any("项目解析" in issue or "project resolution" in issue.lower() for issue in plan.blocking_issues)
+
+
+def test_plan_dda_execution_requires_review_for_rule_only_workflow_hint(tmp_path: Path):
+    attributes = _dda_attributes()
+    attributes.search_parameter_hints = AttributeValue(
+        value={"recommended_workflow_name": "Default.workflow"},
+        confidence=0.6,
+        source="rule",
+        evidence_excerpt="Default workflow rule only.",
+        conflict_flag=False,
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-rule-workflow",
+        source_file_name="sample.raw",
+        source_data_path="/data/sample.mzML",
+        project_resolution=_resolved_resolution(),
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.needs_review is True
+    assert any("workflow" in issue.lower() and "证据" in issue for issue in plan.blocking_issues)
+
+
 def test_plan_dda_execution_uses_search_threads_from_environment(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("AGENT_SEARCH_THREADS", "2")
 
@@ -151,7 +234,7 @@ def test_plan_dda_execution_uses_search_threads_from_environment(tmp_path: Path,
         task_id="task-threads",
         source_file_name="sample.raw",
         source_data_path="/data/sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=_dda_attributes(),
         output_dir=tmp_path,
     )
@@ -173,7 +256,7 @@ def test_plan_dda_execution_maps_mouse_species_alias_to_mouse_fasta(tmp_path: Pa
         task_id="task-mouse",
         source_file_name="sample.raw",
         source_data_path="/data/sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=attributes,
         output_dir=tmp_path,
     )
@@ -198,7 +281,7 @@ def test_plan_dda_execution_maps_rat_species_to_uniprot_download_target(tmp_path
         task_id="task-rat",
         source_file_name="sample.raw",
         source_data_path="/data/sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=attributes,
         output_dir=tmp_path,
     )
@@ -224,7 +307,7 @@ def test_plan_dda_execution_uses_combined_fasta_for_known_multi_species_mixture(
         task_id="task-mixture",
         source_file_name="sample.raw",
         source_data_path="/data/sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=attributes,
         output_dir=tmp_path,
     )
@@ -245,7 +328,7 @@ def test_plan_dda_execution_uses_wiff2mzml_mode_for_converted_sciex_input(tmp_pa
         task_id="task-wiff",
         source_file_name="sample.wiff",
         source_data_path=tmp_path / "sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=attributes,
         output_dir=tmp_path,
         reviewed_fasta_path=_reviewed_fasta(tmp_path),
@@ -261,7 +344,7 @@ def test_plan_dda_execution_allows_mgf_direct_msdt_conversion(tmp_path: Path):
         task_id="task-mgf",
         source_file_name="sample.mgf",
         source_data_path=tmp_path / "sample.mgf",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=attributes,
         output_dir=tmp_path,
     )
@@ -277,7 +360,7 @@ def test_plan_dda_execution_requires_review_for_mzid_result_file(tmp_path: Path)
         task_id="task-mzid",
         source_file_name="sample.mzid",
         source_data_path=tmp_path / "sample.mzid",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=attributes,
         output_dir=tmp_path,
     )
@@ -301,7 +384,7 @@ def test_plan_dda_execution_rejects_dia_for_strict_msdt(tmp_path: Path):
         task_id="task-002",
         source_file_name="sample.raw",
         source_data_path="/data/sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=attributes,
         output_dir=tmp_path,
     )
@@ -327,7 +410,7 @@ def test_plan_dda_execution_rejects_swath_as_dia(tmp_path: Path):
         task_id="task-swath",
         source_file_name="swath_sample.raw",
         source_data_path="/data/swath_sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=attributes,
         output_dir=tmp_path,
     )
@@ -378,7 +461,7 @@ def test_plan_dda_execution_accepts_dda_pasef_as_dda(tmp_path: Path):
         task_id="task-dda-pasef",
         source_file_name="tims_21nov0901_Slot1-6_1_313.mzML",
         source_data_path=tmp_path / "tims_21nov0901_Slot1-6_1_313.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=attributes,
         output_dir=tmp_path,
         reviewed_fasta_path=_reviewed_fasta(tmp_path),
@@ -415,7 +498,7 @@ def test_plan_dda_execution_defaults_to_uniprot_species_fasta_over_project_fasta
         task_id="task-project-fasta",
         source_file_name="sample.raw",
         source_data_path="/data/sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
@@ -453,7 +536,7 @@ def test_plan_dda_execution_requires_review_when_multiple_project_fastas_exist(t
         task_id="task-multi-project-fasta",
         source_file_name="sample.raw",
         source_data_path="/data/sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
@@ -509,7 +592,7 @@ def test_plan_dda_execution_prefers_uniprot_species_fasta_over_non_uniprot_llm_u
         task_id="task-protocol-fasta",
         source_file_name="01753_H12_P018443_S00_N01_R1.raw",
         source_data_path=tmp_path / "01753_H12_P018443_S00_N01_R1.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
@@ -554,7 +637,7 @@ def test_plan_dda_execution_can_prefer_project_fasta_when_user_selects_it(tmp_pa
         task_id="task-project-fasta",
         source_file_name="sample.raw",
         source_data_path=tmp_path / "sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
@@ -602,7 +685,7 @@ def test_plan_dda_execution_requires_review_for_no_sdrf_unsupported_species_defa
         task_id="task-no-sdrf-no-fasta",
         source_file_name="ASP-N_F4-R1.raw",
         source_data_path=tmp_path / "ASP-N_F4-R1.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
@@ -639,7 +722,7 @@ def test_plan_dda_execution_rejects_uniprot_directory_fasta_hint_for_environment
         task_id="task-environmental-fasta",
         source_file_name="RN5_neg.mzML",
         source_data_path=tmp_path / "RN5_neg.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=ProjectContext(
             repository="massive",
             project_accession="MSV000101857",
@@ -734,7 +817,7 @@ def test_plan_dda_execution_blocks_massive_metabolomics_without_proteomics_noise
         task_id="task-metabolomics",
         source_file_name="pos_inf_non_8629_male_65_192_B_H9.raw",
         source_data_path=tmp_path / "pos_inf_non_8629_male_65_192_B_H9.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
@@ -761,7 +844,7 @@ def test_plan_dda_execution_uses_existing_llm_recommended_workflow(tmp_path: Pat
         task_id="task-llm-workflow",
         source_file_name="sample.raw",
         source_data_path=tmp_path / "sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=attributes,
         output_dir=tmp_path,
     )
@@ -783,7 +866,7 @@ def test_plan_dda_execution_ignores_unknown_llm_recommended_workflow(tmp_path: P
         task_id="task-unknown-llm-workflow",
         source_file_name="sample.raw",
         source_data_path=tmp_path / "sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=attributes,
         output_dir=tmp_path,
     )
@@ -811,7 +894,7 @@ def test_plan_dda_execution_requires_review_for_top_down_project(tmp_path: Path)
         task_id="task-topdown",
         source_file_name="sample.raw",
         source_data_path=tmp_path / "sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
@@ -867,7 +950,7 @@ def test_plan_dda_execution_requires_review_for_multi_metadata_without_sdrf(tmp_
         task_id="task-multi-metadata",
         source_file_name="sample.raw",
         source_data_path=tmp_path / "sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
@@ -935,7 +1018,7 @@ def test_plan_dda_execution_trusts_high_confidence_llm_species_for_multi_species
         task_id="task-rat-multi-species",
         source_file_name=source_name,
         source_data_path=tmp_path / "20191002_EXP1_Evo1_AMV_TMT11prot_Rat_SetC_21min_46fracs_36.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
@@ -1008,7 +1091,7 @@ def test_plan_dda_execution_uses_species_uniprot_url_for_rat_taxonomy_hint_witho
         task_id="task-rat-taxonomy-url",
         source_file_name=source_name,
         source_data_path=tmp_path / "20191002_EXP1_Evo1_AMV_TMT11prot_Rat_SetC_21min_46fracs_36.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
@@ -1062,7 +1145,7 @@ def test_plan_dda_execution_resolves_pxd016662_rat_file_species_conflict_from_fi
         task_id="task-pxd016662-rat-tmt",
         source_file_name=source_name,
         source_data_path=tmp_path / "20191002_EXP1_Evo1_AMV_TMT11prot_Rat_SetC_21min_46fracs_36.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
@@ -1113,7 +1196,7 @@ def test_plan_dda_execution_corrects_pxd016662_non_rat_file_to_human_fasta(tmp_p
         task_id="task-pxd016662-human-phospho",
         source_file_name="20190914_EXP1_Evo1_AMV_LFQPhos_200ug_30ul-TiIMACHP_200ul_RT_01.raw",
         source_data_path=tmp_path / "20190914_EXP1_Evo1_AMV_LFQPhos_200ug_30ul-TiIMACHP_200ul_RT_01.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
@@ -1181,7 +1264,7 @@ def test_plan_dda_execution_uses_combined_reviewed_uniprot_for_resolved_multi_sp
         task_id="task-human-rat-combined",
         source_file_name="20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.raw",
         source_data_path=tmp_path / "20190524_EXP1_Evo2_DBJ_LFQprot_SDS_500ng_15000_21min_CV40_01.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
@@ -1224,7 +1307,7 @@ def test_plan_dda_execution_uses_all_llm_uniprot_proteome_ids_for_hye_mixture(tm
         task_id="task-hye-fasta",
         source_file_name="LFQ_Orbitrap_GP_QC_400_500.raw",
         source_data_path=tmp_path / "LFQ_Orbitrap_GP_QC_400_500.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=attributes,
         output_dir=tmp_path,
     )
@@ -1262,7 +1345,7 @@ def test_plan_dda_execution_prefers_species_fasta_over_conflicting_llm_uniprot_i
         task_id="task-rice-conflicting-fasta",
         source_file_name="Ubi-MSP1ox-F1-R1.raw",
         source_data_path=tmp_path / "Ubi-MSP1ox-F1-R1.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=attributes,
         output_dir=tmp_path,
     )
@@ -1319,7 +1402,7 @@ def test_plan_dda_execution_allows_multi_metadata_when_file_level_values_are_res
         task_id="task-multi-metadata-resolved",
         source_file_name="sample.raw",
         source_data_path=tmp_path / "sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
@@ -1382,7 +1465,7 @@ def test_plan_dda_execution_allows_multi_instrument_same_family_when_search_tole
         task_id="task-hela-arg-c-try",
         source_file_name="HeLa_ArgC-Try_CID_1.raw",
         source_data_path=tmp_path / "HeLa_ArgC-Try_CID_1.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         project_context=context,
         attributes=attributes,
         output_dir=tmp_path,
@@ -1398,7 +1481,7 @@ def test_plan_dda_execution_names_query_url_reviewed_fasta_with_fasta_suffix(tmp
         task_id="task-reviewed-url",
         source_file_name="sample.raw",
         source_data_path=tmp_path / "sample.mzML",
-        project_resolution=ProjectResolution.empty(),
+        project_resolution=_resolved_resolution(),
         attributes=attributes,
         output_dir=tmp_path,
         reviewed_fasta_url="https://rest.uniprot.org/uniprotkb/stream?compressed=false&format=fasta&query=%28proteome%3AUP000002311%29",
@@ -1408,3 +1491,4 @@ def test_plan_dda_execution_names_query_url_reviewed_fasta_with_fasta_suffix(tmp
     assert plan.fasta_path.name == "reviewed_reference.fasta"
     assert plan.fasta_selection_mode == "reviewed"
     assert plan.needs_review is False
+
