@@ -71,6 +71,8 @@ def build_agent_observation(
 ) -> AgentObservation:
     primary = _field(resolution, "primary_project")
     primary_summary = _candidate_summary(primary)
+    if primary_summary is not None:
+        primary_summary["resolution_confidence"] = _field(resolution, "resolution_confidence")
     alternatives = list(_field(resolution, "alternative_projects", []) or [])
     candidates = [
         *([primary_summary] if primary_summary is not None else []),

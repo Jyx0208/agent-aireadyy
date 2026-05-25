@@ -161,6 +161,9 @@ def test_build_agent_observation_summarizes_project_metadata_and_asset():
 
     assert observation.input_file == "Yeast_R3.raw"
     assert observation.selected_project["project_accession"] == "IPX0000753001"
+    assert observation.selected_project["resolution_confidence"] == 1.0
+    assert observation.selected_project["match_score"] == 100
+    assert observation.selected_project["metadata_consistency"] == 0.95
     assert observation.repository_candidates[1]["project_accession"] == "PXD071918"
     assert observation.metadata_evidence["species"]["value"] == ["Saccharomyces cerevisiae"]
     assert observation.asset_evidence["resolved_asset_type"] == "raw"

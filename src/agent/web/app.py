@@ -3259,6 +3259,11 @@ def _step(task_id: str, step: int, label: str):
     _emit(task_id, "step", message=label, step=step)
 
 
+def _notify_agent_audit_ready(task_id: str) -> None:
+    """Notify the frontend that agent audit files are available for real-time visualization."""
+    _emit(task_id, "agent_audit_ready")
+
+
 # ── Web Reporter ──────────────────────────────────────────────────
 class WebReporter:
     def __init__(self, task_id: str):
@@ -3429,6 +3434,9 @@ def _run_pipeline(task_id: str):
             if result.plan.fasta_download_url:
                 _log(task_id, "info", f"FASTA 下载源：{result.plan.fasta_download_url}")
 
+        _write_agent_audit_package(output_dir, result, report=lambda message: _log(task_id, "debug", message))
+        _notify_agent_audit_ready(task_id)
+
         prepared_path = None
         if not parameter_only and result.plan.needs_review and service._can_retry_with_mzml_instrument(result.plan):
             _log(task_id, "info", "检测到项目级多个仪器，先下载/转换 mzML，并从 mzML 读取文件级仪器信息。")
@@ -3448,12 +3456,16 @@ def _run_pipeline(task_id: str):
             )
             _set_review_summary(task_id, result)
             _log(task_id, "info", f"仪器复核后计划状态：{'需要人工复核' if result.plan.needs_review else '可继续运行'}")
+            _write_agent_audit_package(output_dir, result, report=lambda message: _log(task_id, "debug", message))
+            _notify_agent_audit_ready(task_id)
 
         if result.plan.needs_review:
             task["blocking_issues"] = result.plan.blocking_issues
             for issue in result.plan.blocking_issues:
                 _log(task_id, "error", f"[阻断] {issue}")
             service.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
+            _write_agent_audit_package(output_dir, result, report=lambda message: _log(task_id, "debug", message))
+            _notify_agent_audit_ready(task_id)
             _set_task_terminal_status(task_id, "blocked")
             return
 
@@ -3505,7 +3517,7 @@ def _run_pipeline(task_id: str):
         if result.plan.needs_review:
             task["blocking_issues"] = result.plan.blocking_issues
             for issue in result.plan.blocking_issues:
-                _log(task_id, "error", f"[闃绘柇] {issue}")
+                _log(task_id, "error", f"[阻断] {issue}")
             service.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
             _set_review_summary(task_id, result)
             _set_task_terminal_status(task_id, "blocked")
@@ -3851,6 +3863,91 @@ async def download_results(task_id: str):
         filename=f"{stem}_{suffix}.zip",
         media_type="application/zip",
     )
+
+
+def _resolve_task_output_dir(task_id: str) -> Path | None:
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+    if task is not None:
+        output_dir_raw = task.get("output_dir")
+        if output_dir_raw:
+            return Path(output_dir_raw)
+    history = _find_history_record(task_id)
+    if history is not None:
+        output_dir_name = str(history.get("output_dir") or "")
+        if output_dir_name:
+            return _runs_dir / output_dir_name
+    candidate = _runs_dir / safe_output_stem(task_id)
+    if candidate.exists() and candidate.is_dir():
+        return candidate
+    return None
+
+
+_AGENT_AUDIT_FILES = {
+    "observation": "agent_observation.json",
+    "plan": "agent_plan.json",
+    "decision_trace": "agent_decision_trace.json",
+    "recovery": "recovery_audit.json",
+}
+
+
+def _read_agent_audit_file(output_dir: Path, filename: str) -> tuple[dict[str, Any] | None, str | None]:
+    path = output_dir / filename
+    if not path.exists() or not path.is_file():
+        return None, "missing"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, "invalid"
+    return (data, None) if isinstance(data, dict) else (None, "invalid")
+
+
+@app.get("/api/tasks/{task_id}/agent-audit")
+async def get_agent_audit(task_id: str):
+    output_dir = _resolve_task_output_dir(task_id)
+    if output_dir is None or not output_dir.exists():
+        return {
+            "error": "Task output directory not found.",
+            "available": False,
+            "available_files": [],
+            "missing_files": list(_AGENT_AUDIT_FILES.values()),
+            "invalid_files": [],
+        }
+
+    payloads: dict[str, dict[str, Any] | None] = {}
+    available_files: list[str] = []
+    missing_files: list[str] = []
+    invalid_files: list[str] = []
+    for key, filename in _AGENT_AUDIT_FILES.items():
+        data, state = _read_agent_audit_file(output_dir, filename)
+        payloads[key] = data
+        if state == "missing":
+            missing_files.append(filename)
+        elif state == "invalid":
+            invalid_files.append(filename)
+        else:
+            available_files.append(filename)
+
+    if not any(payloads.values()):
+        return {
+            "error": "No agent audit files found.",
+            "available": False,
+            "available_files": available_files,
+            "missing_files": missing_files,
+            "invalid_files": invalid_files,
+        }
+
+    return {
+        "available": True,
+        "output_dir": str(output_dir),
+        "available_files": available_files,
+        "missing_files": missing_files,
+        "invalid_files": invalid_files,
+        "observation": payloads["observation"],
+        "plan": payloads["plan"],
+        "decision_trace": payloads["decision_trace"],
+        "recovery": payloads["recovery"],
+    }
 
 
 if __name__ == "__main__":

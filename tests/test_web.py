@@ -91,6 +91,76 @@ def test_english_log_localizes_missing_fasta_review_issue():
         _tasks.pop(task_id, None)
 
 
+def test_web_pipeline_does_not_emit_mojibake_blocking_marker():
+    source = Path("src/agent/web/app.py").read_text(encoding="utf-8")
+
+    assert "[闃" not in source
+    assert 'f"[阻断] {issue}"' in source
+
+
+def test_get_agent_audit_returns_active_task_audit_files(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    task_id = "audit-active"
+    output_dir = tmp_path / "active-run"
+    output_dir.mkdir()
+    (output_dir / "agent_observation.json").write_text(
+        json.dumps({"selected_project": {"project_accession": "PXD000001"}}),
+        encoding="utf-8",
+    )
+    (output_dir / "agent_plan.json").write_text(json.dumps({"execution_gate": "allowed"}), encoding="utf-8")
+    _tasks[task_id] = {"task_id": task_id, "output_dir": str(output_dir), "logs": deque(maxlen=10)}
+    try:
+        payload = asyncio.run(web_app.get_agent_audit(task_id))
+    finally:
+        _tasks.pop(task_id, None)
+
+    assert payload["available"] is True
+    assert payload["observation"]["selected_project"]["project_accession"] == "PXD000001"
+    assert payload["plan"]["execution_gate"] == "allowed"
+    assert payload["available_files"] == ["agent_observation.json", "agent_plan.json"]
+    assert "agent_decision_trace.json" in payload["missing_files"]
+
+
+def test_get_agent_audit_reads_history_record_and_ignores_bad_json(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    run_dir = tmp_path / "history-run"
+    run_dir.mkdir()
+    (run_dir / "task_history.json").write_text(
+        json.dumps({"task_id": "audit-history", "output_dir": "history-run", "status": "completed"}),
+        encoding="utf-8",
+    )
+    (run_dir / "agent_observation.json").write_text("{bad json", encoding="utf-8")
+    (run_dir / "agent_decision_trace.json").write_text(json.dumps({"decisions": []}), encoding="utf-8")
+
+    payload = asyncio.run(web_app.get_agent_audit("audit-history"))
+
+    assert payload["available"] is True
+    assert payload["observation"] is None
+    assert payload["decision_trace"] == {"decisions": []}
+    assert payload["available_files"] == ["agent_decision_trace.json"]
+    assert "agent_observation.json" in payload["invalid_files"]
+
+
+def test_get_agent_audit_reports_missing_audit_files(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    output_dir = tmp_path / "empty-run"
+    output_dir.mkdir()
+    _tasks["audit-empty"] = {"task_id": "audit-empty", "output_dir": str(output_dir), "logs": deque(maxlen=10)}
+    try:
+        payload = asyncio.run(web_app.get_agent_audit("audit-empty"))
+    finally:
+        _tasks.pop("audit-empty", None)
+
+    assert payload["available"] is False
+    assert payload["available_files"] == []
+    assert set(payload["missing_files"]) == {
+        "agent_observation.json",
+        "agent_plan.json",
+        "agent_decision_trace.json",
+        "recovery_audit.json",
+    }
+
+
 def test_download_progress_is_throttled_but_completion_is_logged(monkeypatch):
     task_id = "progress-upsert-test"
     _tasks[task_id] = {"logs": deque(maxlen=10)}
