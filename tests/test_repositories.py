@@ -208,6 +208,33 @@ def test_agent_auto_repository_queries_all_adapters_and_selects_highest_confiden
     assert "highest resolution confidence" in resolution.resolution_reason
 
 
+def test_auto_repository_marks_equal_confidence_cross_repository_matches_for_review():
+    class Adapter:
+        def __init__(self, name: str, resolution: ProjectResolution):
+            self.name = name
+            self._resolution = resolution
+
+        def can_handle_accession(self, value: str) -> bool:
+            return False
+
+        def resolve_project(self, raw_input: str) -> ProjectResolution:
+            return self._resolution
+
+    registry = RepositoryRegistry(
+        adapters=[
+            Adapter("pride", _repository_resolution("pride", "PXD_TIE", 1.0)),
+            Adapter("iprox", _repository_resolution("iprox", "IPX_TIE", 1.0)),
+        ]
+    )
+
+    resolution = registry.resolve_project("auto", "shared.raw")
+
+    assert resolution.primary_project is not None
+    assert resolution.needs_review is True
+    assert len(resolution.alternative_projects) == 1
+    assert "same confidence" in resolution.resolution_reason
+
+
 def test_iprox_xlsx_index_streams_project_rows(tmp_path: Path):
     from agent.repositories.iprox_adapter import IproxXlsxIndex
 

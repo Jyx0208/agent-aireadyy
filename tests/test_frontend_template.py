@@ -181,10 +181,10 @@ def test_frontend_template_uses_unclipped_semicircle_gauges():
 def test_frontend_template_uses_light_operational_app_shell():
     html = _html()
 
-    assert "--bg:#f6f8fb" in html
+    assert "--bg:#f1f5f9" in html
     assert "--surface:#ffffff" in html
-    assert "--primary:#4f46e5" in html
-    assert "--success:#059669" in html
+    assert "--primary:#6366f1" in html
+    assert "--success:#10b981" in html
     assert 'class="container app-shell"' in html
     assert 'class="surface workbench-card"' in html
     assert 'class="surface history-card operations-rail"' in html
@@ -229,6 +229,44 @@ def test_frontend_template_has_responsive_accessible_progress_and_panels():
     assert 'class="section-heading"' in html
     assert "@media(max-width:1100px)" in html
     assert "@media(max-width:720px)" in html
+
+
+def test_frontend_template_keeps_agent_reasoning_panel_stable_and_unclipped():
+    html = _html()
+
+    assert ".run-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(380px,420px)" in html
+    assert ".run-main{min-width:0}" in html
+    assert ".side-panels{display:flex;flex-direction:column;gap:14px;position:sticky;top:24px;align-self:start;min-width:0;height:calc(100vh - 48px);max-height:calc(100vh - 48px);min-height:0;overflow:visible" in html
+    assert ".review-panel{flex:0 1 280px;min-height:0;max-height:min(280px,34vh);overflow-y:auto" in html
+    assert ".agent-reasoning-panel{flex:1 1 360px;min-height:280px;min-width:0;display:flex;flex-direction:column" in html
+    assert ".agent-reasoning-body{display:none;flex:1 1 auto;min-height:0;padding:14px 16px;overflow:auto" in html
+    assert "@keyframes slideDown{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}" in html
+    assert "@media(max-width:1180px)" in html
+    assert ".side-panels{position:static;height:auto;max-height:none;overflow:visible}" in html
+
+
+def test_frontend_template_maps_agent_gate_labels_to_user_copy():
+    html = _html()
+
+    assert "const GATE_LABEL_KEYS={auto_accept:'agentGateAllowed',evidence_gated_accept:'agentGateAllowed',review_required:'agentGateReview',blocked:'agentGateBlocked',allowed:'agentGateAllowed'}" in html
+    assert "const labelKey=GATE_LABEL_KEYS[gate]" in html
+    assert "gate.replace(/_/g,'')" not in html
+    assert "_formatGate(plan.execution_gate)" in html
+
+
+def test_frontend_template_separates_project_match_and_metadata_confidence():
+    html = _html()
+
+    assert "agentResolutionConfidence:'Resolution confidence'" in html
+    assert "agentFileMatchScore:'File match score'" in html
+    assert "agentMetadataConsistency:'Metadata consistency'" in html
+    assert "agentResolutionConfidence:'解析置信度'" in html
+    assert "agentFileMatchScore:'文件匹配分数'" in html
+    assert "agentMetadataConsistency:'元数据一致性'" in html
+    assert "obs.selected_project.resolution_confidence" in html
+    assert "obs.selected_project.match_score" in html
+    assert "obs.selected_project.metadata_consistency" in html
+    assert "agentMatchConfidence" not in html
 
 
 def test_frontend_template_has_useful_history_empty_state_and_batch_actions():

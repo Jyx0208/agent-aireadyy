@@ -373,6 +373,44 @@ def _llm_confirmed_workflow_name(attributes: AttributeSet, workspace_root: Path)
     return None
 
 
+def _project_resolution_blocking_issues(project_resolution: ProjectResolution) -> list[str]:
+    primary = project_resolution.primary_project
+    issues: list[str] = []
+    if primary is None:
+        reason = project_resolution.resolution_reason or "No primary project resolved."
+        issues.append(f"项目解析需要人工复核：{reason}")
+        return issues
+    if project_resolution.needs_review:
+        reason = project_resolution.resolution_reason or "repository/file match requires review"
+        issues.append(f"项目解析需要人工复核：{reason}")
+    elif project_resolution.resolution_confidence < 0.85:
+        issues.append(f"项目解析置信度过低：{project_resolution.resolution_confidence:.2f}")
+    return issues
+
+
+def _workflow_source_blocking_issues(attributes: AttributeSet, workflow_name: str) -> list[str]:
+    if not workflow_name:
+        return []
+    hints = _hint_mapping(attributes)
+    source = str(attributes.search_parameter_hints.source or "").strip().lower()
+    confidence = float(attributes.search_parameter_hints.confidence or 0.0)
+    trusted_prefixes = ("llm_confirmed", "user_review", "sdrf")
+    if any(source.startswith(prefix) for prefix in trusted_prefixes):
+        return []
+    supporting_keys = {
+        key
+        for key, value in hints.items()
+        if key not in {"recommended_workflow_name", "workflow_name"} and value not in (None, "", [], {})
+    }
+    if supporting_keys:
+        return []
+    return [
+        "workflow 推荐证据不足：当前 workflow 仅来自低可信规则或默认值，"
+        f"source={attributes.search_parameter_hints.source}, confidence={confidence:.2f}。"
+        "需要 LLM/结构化元数据确认或人工复核。"
+    ]
+
+
 def _blocking_issues(attributes: AttributeSet, workflow_name: str, raw_data_type: str) -> list[str]:
     issues: list[str] = []
     if raw_data_type == "mgf":
@@ -624,7 +662,9 @@ def plan_dda_execution(
         workflow_name = ""  # 设置为空，后续会因为 blocking_issues 而被阻止
     else:
         blocking_issues = _blocking_issues(decision_attributes, workflow_name, raw_data_type)
+        blocking_issues.extend(_workflow_source_blocking_issues(decision_attributes, workflow_name))
     if not unsupported_assay:
+        blocking_issues.extend(_project_resolution_blocking_issues(project_resolution))
         blocking_issues.extend(fasta_issues)
         blocking_issues.extend(context_issues)
         blocking_issues.extend(

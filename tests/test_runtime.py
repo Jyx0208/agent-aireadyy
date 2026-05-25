@@ -42,6 +42,23 @@ def _reviewed_fasta(tmp_path: Path) -> Path:
     return path
 
 
+def _resolved_resolution() -> ProjectResolution:
+    return ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession="PXD123456",
+            matched_file="WT_5_Lys-c.raw",
+            match_type="exact",
+            match_score=100,
+            evidence=["test exact match"],
+            metadata_consistency=1.0,
+        ),
+        alternative_projects=[],
+        resolution_reason="test exact match",
+        resolution_confidence=1.0,
+        needs_review=False,
+    )
+
+
 def test_detect_toolchain_reports_missing_java_and_docker_server(monkeypatch):
     monkeypatch.setattr(
         "agent.runtime.toolchain.shutil.which",
@@ -387,6 +404,62 @@ def test_materialize_dda_task_bundle_keeps_multi_enzyme_dropdowns_consistent(tmp
     assert "msfragger.misc.fragger.enzyme-dropdown-2=argc" in workflow_text
     assert "msfragger.search_enzyme_name_2=Arg-C" in workflow_text
     assert "msfragger.search_enzyme_cut_2=R" in workflow_text
+
+
+def test_materialize_dda_task_bundle_derives_trypsin_lysc_dual_digest_overrides(tmp_path: Path):
+    task = normalize_input("semantic_digest.raw")
+    resolution = ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession="PXD123456",
+            matched_file=task.file_name,
+            match_type="exact",
+            match_score=100,
+            evidence=["exact"],
+            metadata_consistency=1.0,
+        ),
+        alternative_projects=[],
+        resolution_reason="exact match",
+        resolution_confidence=1.0,
+        needs_review=False,
+    )
+    context = ProjectContext(project_accession="PXD123456", file_name=task.file_name)
+    attributes = _attributes()
+    attributes.enzyme = AttributeValue(
+        value="Trypsin/Lys-C",
+        confidence=0.95,
+        source="llm_confirmed",
+        evidence_excerpt="Lysine-specific endoproteinase followed by trypsin.",
+        conflict_flag=False,
+    )
+    attributes.search_parameter_hints = AttributeValue(
+        value={"recommended_workflow_name": "Default.workflow", "missed_cleavages": 3},
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="Semantic dual digest inference.",
+        conflict_flag=False,
+    )
+
+    bundle = materialize_dda_task_bundle(
+        task=task,
+        project_resolution=resolution,
+        project_context=context,
+        attributes=attributes,
+        source_data_path=tmp_path / "semantic_digest.mzML",
+        output_dir=tmp_path / "task_out",
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
+    )
+
+    workflow_text = bundle.materialized_workflow_path.read_text(encoding="utf-8")
+    assert "msfragger.misc.fragger.enzyme-dropdown-1=stricttrypsin" in workflow_text
+    assert "msfragger.search_enzyme_name_1=stricttrypsin" in workflow_text
+    assert "msfragger.search_enzyme_cut_1=KR" in workflow_text
+    assert "msfragger.search_enzyme_sense_1=C" in workflow_text
+    assert "msfragger.misc.fragger.enzyme-dropdown-2=lysc" in workflow_text
+    assert "msfragger.search_enzyme_name_2=lysc" in workflow_text
+    assert "msfragger.search_enzyme_cut_2=K" in workflow_text
+    assert "msfragger.search_enzyme_sense_2=C" in workflow_text
+    assert "msfragger.num_enzyme_termini=2" in workflow_text
+    assert "msfragger.allowed_missed_cleavage_1=3" in workflow_text
 
 
 def test_workflow_parameter_overrides_ignore_unknown_msfragger_keys(tmp_path: Path):
@@ -750,7 +823,7 @@ def test_materialize_dda_task_bundle_rejects_downloaded_non_fasta_content(tmp_pa
     try:
         materialize_dda_task_bundle(
             task=task,
-            project_resolution=ProjectResolution.empty(),
+            project_resolution=_resolved_resolution(),
             project_context=context,
             attributes=attributes,
             source_data_path=tmp_path / "WT_5_Lys-c.mzML",

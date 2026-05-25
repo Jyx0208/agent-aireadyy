@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.assets.preparer import AssetPreparationError
 from agent.input.normalizer import normalize_input
 from agent.models import (
     AttributeSet,
@@ -87,6 +88,23 @@ def _reviewed_fasta(tmp_path: Path) -> Path:
     return path
 
 
+def _resolved_resolution(project_accession: str = "PXD_TEST", matched_file: str = "sample.raw") -> ProjectResolution:
+    return ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession=project_accession,
+            matched_file=matched_file,
+            match_type="exact",
+            match_score=100,
+            evidence=["test exact match"],
+            metadata_consistency=1.0,
+        ),
+        alternative_projects=[],
+        resolution_reason="test exact match",
+        resolution_confidence=1.0,
+        needs_review=False,
+    )
+
+
 def _write_minimal_dda_mzml(path: Path, instrument: str = "Q Exactive HF") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -135,7 +153,7 @@ def test_validate_prepared_data_blocks_ms1_only_mzml_before_fragpipe(tmp_path: P
         encoding="utf-8",
     )
     attributes = _attributes()
-    resolution = ProjectResolution.empty()
+    resolution = _resolved_resolution()
     context = ProjectContext(project_accession="PXD000001", file_name="sample.raw")
     plan = plan_dda_execution(
         task_id="task-ms1-only",
@@ -289,6 +307,15 @@ def test_prepare_pride_msdt_docker_input_uses_only_file_name(tmp_path: Path, mon
     assert config["generate_rawspectrum"]["data_path"].startswith("/workspace/")
     assert config["generate_fragpipe_search_result"]["workflow_path"].startswith("/workspace/workflows/")
     assert (tmp_path / "task_out" / "sage" / "sage_config.json").exists()
+    assert (tmp_path / "task_out" / "agent_observation.json").exists()
+    assert (tmp_path / "task_out" / "agent_plan.json").exists()
+    assert (tmp_path / "task_out" / "agent_decision_trace.json").exists()
+    observation = json.loads((tmp_path / "task_out" / "agent_observation.json").read_text(encoding="utf-8"))
+    agent_plan = json.loads((tmp_path / "task_out" / "agent_plan.json").read_text(encoding="utf-8"))
+    decision_trace = json.loads((tmp_path / "task_out" / "agent_decision_trace.json").read_text(encoding="utf-8"))
+    assert observation["selected_project"]["project_accession"] == "PXD123456"
+    assert agent_plan["selected_workflow"]["name"] == "Default.workflow"
+    assert any(decision["decision_type"] == "enzyme_inference" for decision in decision_trace["decisions"])
 
 
 def test_prepare_pride_msdt_docker_input_continues_after_search_parameter_confirmation(tmp_path: Path, monkeypatch):
@@ -353,7 +380,7 @@ def test_prepare_pride_msdt_docker_input_continues_after_search_parameter_confir
 def test_prepare_pride_msdt_docker_input_auto_downloads_species_fasta(tmp_path: Path, monkeypatch):
     service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
     task = normalize_input("mouse.raw")
-    resolution = ProjectResolution.empty()
+    resolution = _resolved_resolution(project_accession="PXD_MOUSE", matched_file="mouse.raw")
     context = ProjectContext(project_accession="PXD_MOUSE", file_name="mouse.raw", metadata={}, project_files=[])
 
     monkeypatch.setattr(service, "resolve_project", lambda _: resolution)
@@ -409,7 +436,7 @@ def test_prepare_pride_msdt_docker_input_confirms_llm_proteome_id_fasta(tmp_path
 
     def fake_resolve_project(_):
         resolve_calls.append(True)
-        return ProjectResolution.empty()
+        return _resolved_resolution(project_accession="PXD_MOUSE", matched_file="mouse.raw")
 
     monkeypatch.setattr(service, "resolve_project", fake_resolve_project)
     monkeypatch.setattr(service, "build_context", lambda *args, **kwargs: context)
@@ -610,3 +637,105 @@ def test_prepare_pride_msdt_docker_input_stops_before_download_when_plan_needs_r
 
     assert (tmp_path / "task_out" / "review_queue.json").exists()
     assert not (tmp_path / "task_out" / "assets" / "downloads" / "WT_5_Lys-c.raw").exists()
+
+
+def test_prepare_pride_msdt_docker_input_stops_before_download_when_asset_is_unresolved(tmp_path: Path, monkeypatch):
+    service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
+    task = normalize_input("WT_5_Lys-c.raw")
+    resolution = ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession="PXD_ASSET",
+            matched_file="WT_5_Lys-c.raw",
+            match_type="exact",
+            match_score=100,
+            evidence=["exact match"],
+            metadata_consistency=1.0,
+        ),
+        alternative_projects=[],
+        resolution_reason="exact match",
+        resolution_confidence=1.0,
+        needs_review=False,
+    )
+    context = ProjectContext(
+        project_accession="PXD_ASSET",
+        file_name="WT_5_Lys-c.raw",
+        metadata={},
+        project_files=[],
+    )
+
+    monkeypatch.setattr(service, "resolve_project", lambda _: resolution)
+    monkeypatch.setattr(service, "build_context", lambda *args, **kwargs: context)
+    monkeypatch.setattr(service, "infer_attributes", lambda *_: _attributes())
+    monkeypatch.setattr(
+        service,
+        "resolve_asset",
+        lambda *args, **kwargs: FileAsset(
+            original_file_name="WT_5_Lys-c.raw",
+            resolved_asset_type="unknown",
+            matched_project_file=None,
+            asset_confidence=0.2,
+            match_type="unresolved",
+        ),
+    )
+    monkeypatch.setattr(service, "prepare_asset", lambda *_: (_ for _ in ()).throw(AssertionError("should not download")))
+
+    with pytest.raises(ReviewRequiredError):
+        service.prepare_pride_msdt_docker_input(task=task, output_dir=tmp_path / "task_out")
+
+    review_queue = json.loads((tmp_path / "task_out" / "review_queue.json").read_text(encoding="utf-8"))
+    reasons = " ".join(review_queue[0]["reasons"])
+    assert "文件资产" in reasons or "asset" in reasons.lower()
+    assert not (tmp_path / "task_out" / "assets" / "downloads").exists()
+
+
+def test_prepare_pride_msdt_docker_input_writes_recovery_audit_when_asset_preparation_fails(tmp_path: Path, monkeypatch):
+    service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
+    task = normalize_input("WT_5_Lys-c.raw")
+    resolution = ProjectResolution(
+        primary_project=ProjectCandidate(
+            project_accession="PXD_CONVERT",
+            matched_file="WT_5_Lys-c.raw",
+            match_type="exact",
+            match_score=100,
+            evidence=["exact match"],
+            metadata_consistency=1.0,
+        ),
+        alternative_projects=[],
+        resolution_reason="exact match",
+        resolution_confidence=1.0,
+        needs_review=False,
+    )
+    context = ProjectContext(project_accession="PXD_CONVERT", file_name="WT_5_Lys-c.raw", metadata={}, project_files=[])
+    asset = FileAsset(
+        original_file_name="WT_5_Lys-c.raw",
+        resolved_asset_type="raw",
+        matched_project_file="WT_5_Lys-c.raw",
+        download_url="https://ftp.pride.ebi.ac.uk/pride/data/archive/WT_5_Lys-c.raw",
+        local_path=tmp_path / "task_out" / "assets" / "downloads" / "WT_5_Lys-c.raw",
+        prepared_path=tmp_path / "task_out" / "assets" / "prepared" / "WT_5_Lys-c.mzML",
+        requires_conversion=True,
+        asset_confidence=1.0,
+        match_type="exact",
+    )
+
+    monkeypatch.setattr(service, "resolve_project", lambda _: resolution)
+    monkeypatch.setattr(service, "build_context", lambda *args, **kwargs: context)
+    monkeypatch.setattr(service, "infer_attributes", lambda *_: _attributes())
+    monkeypatch.setattr(service, "resolve_asset", lambda *args, **kwargs: asset)
+    monkeypatch.setattr(
+        service,
+        "prepare_asset",
+        lambda *_: (_ for _ in ()).throw(
+            AssetPreparationError("ProteoWizard conversion failed", local_path=asset.local_path)
+        ),
+    )
+
+    with pytest.raises(AssetPreparationError):
+        service.prepare_pride_msdt_docker_input(task=task, output_dir=tmp_path / "task_out")
+
+    recovery = json.loads((tmp_path / "task_out" / "recovery_audit.json").read_text(encoding="utf-8"))
+    assert recovery["schema_version"] == "recovery-audit/v1"
+    assert recovery["failure"]["stage"] == "asset_preparation"
+    assert recovery["failure"]["category"] == "conversion_failure"
+    assert recovery["recovery"]["decision"] == "retry_scheduled"
+    assert recovery["recovery"]["allowed_action"] == "retry_conversion_with_fallback"
