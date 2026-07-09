@@ -1,0 +1,7 @@
+metric	value	split
+sequence_accuracy	0.66	overall
+peptide_recall	0.61	overall
+amino_acid_precision	0.87	train
+sequence_accuracy	0.49	heldout_project
+sequence_accuracy	0.42	phosphotyrosine
+sequence_accuracy	0.51	high_charge

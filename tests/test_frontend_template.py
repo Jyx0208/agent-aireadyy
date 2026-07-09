@@ -13,12 +13,17 @@ def _html() -> str:
 def test_frontend_template_exposes_accessible_landmarks_and_live_regions():
     html = _html()
 
+    assert "<title>Task-aware AI-ready Data Agent</title>" in html
+    assert "<h1>Task-aware AI-ready Data Agent</h1>" in html
+    assert "Task-aware AI-ready Data Agent v0.3.1" in html
+    assert "<title>PRIDE AI-ready Agent</title>" not in html
     assert 'class="skip-link"' in html
     assert 'href="#mainContent"' in html
     assert '<main class="container app-shell" id="mainContent"' in html
     assert 'aria-live="polite"' in html
     assert 'aria-describedby="runModeHelp"' in html
     assert 'role="status"' in html
+    assert "/api/history?fast=1" in html
 
 
 def test_frontend_template_labels_primary_form_controls():
@@ -118,10 +123,281 @@ def test_frontend_template_uses_workflow_tabs_and_status_cards():
     assert 'role="tablist"' in html
     assert 'data-workflow-tab="single"' in html
     assert 'data-workflow-tab="batch"' in html
+    assert 'data-workflow-tab="discovery"' in html
     assert 'id="singleTaskPanel"' in html
     assert 'id="batchTaskPanel"' in html
+    assert 'id="discoveryTaskPanel"' in html
     assert 'class="status-cards system-summary"' in html
     assert "setWorkflowTab(" in html
+
+
+def test_frontend_template_exposes_discovery_workflow():
+    html = _html()
+
+    assert 'id="discoveryStartBtn"' in html
+    assert 'id="discoveryCancelBtn"' in html
+    assert 'id="discoveryLogBox"' in html
+    assert 'for="discoverySpecies"' in html
+    assert 'for="discoveryMaxProjects"' in html
+    assert 'id="discoveryUseMemory"' in html
+    assert 'id="discoveryTaskType"' in html
+    assert 'id="discoveryAgentic" checked' in html
+    assert 'id="discoveryAgenticRounds"' in html
+    assert 'id="discoveryPrompt"' in html
+    assert 'id="discoveryResults"' in html
+    assert "startDiscovery()" in html
+    assert "pollDiscoveryJob()" in html
+    assert "cancelDiscoveryJob()" in html
+    assert "renderDiscoveryJobLogs" in html
+    assert "safeRenderDiscoveryJobLogs" in html
+    assert "discoverySubmitting" in html
+    assert "正在提交 Discovery 请求" in html
+    assert "safeRenderDiscoveryJobLogs([{ts:new Date().toISOString(),level:'info',message:t('discoverySubmitting')}])" in html
+    assert "llm_config:collectConfig()" in html
+    assert "downloadDiscoveryFile" in html
+    assert "/api/discovery/jobs" in html
+    assert "/api/discovery" in html
+    assert "dataset_manifest_csv" in html
+    assert "dataset_manifest_usable_csv" in html
+    assert "batch_inputs_valid" in html
+    assert "batch_inputs_usable" in html
+    assert "quality_report" in html
+    assert "dataset_manifest_task_ready_csv" in html
+    assert "batch_inputs_task_ready" in html
+    assert "task_ai_readiness_matrix_csv" in html
+    assert "data_value_ranking_csv" in html
+    assert "data_value_report_md" in html
+    assert "downloadUsableManifestCsv" in html
+    assert "downloadValidBatchInputs" in html
+    assert "downloadQualityReport" in html
+    assert "discoveryTrust" in html
+    assert "discoveryUsable" in html
+    assert "discoveryValidity" in html
+    assert "discoveryTaskReady" in html
+    assert "discoveryAgenticSummary" in html
+    assert "validity_status" in html
+    assert "validity_reasons" in html
+    assert "task_readiness_status" in html
+    assert "label_source_status" in html
+    assert "spectra_requirement_status" in html
+    assert "metadata_requirement_status" in html
+    assert "ai_ready_target_schema" in html
+    assert "fragmentation_methods" in html
+    assert "diversity_tags" in html
+    assert 'id="discoveryReviewBtn"' in html
+    assert "saveDiscoveryReviews()" in html
+    assert "collectDiscoveryReviews()" in html
+    assert "/review" in html
+    assert 'data-discovery-review="decision"' in html
+    assert "DISCOVERY_VALIDITY_GROUPS=['valid','weak_keep','needs_review','exclude']" in html
+    assert "discovery-file-group" in html
+    assert "discoveryValidityBucket(file)" in html
+    assert "discoveryGroup_valid" in html
+    assert "discoveryGroup_weak_keep" in html
+    assert "discoveryGroup_needs_review" in html
+    assert "discoveryGroup_exclude" in html
+    assert "discoverySetSelect('aiReadyTaskType',discoveryTaskType)" in html
+    assert "batchRunMode&&fullWorkflowEnabled" in html
+    assert "batchRunMode.value='full'" in html
+    assert "task_ai_readiness_score" in html
+    assert "data_value_score" in html
+
+
+def test_frontend_template_exposes_immunopeptidomics_discovery_fields():
+    html = _html()
+
+    assert 'value="general"' in html
+    assert "General data search" in html
+    assert "Discovery target" in html
+    assert 'value="immunopeptidomics"' in html
+    assert "[hidden]{display:none!important}" in html
+    assert "Immunopeptidomics / HLA ligandome" in html
+    assert 'id="discoveryPtmRow"' in html
+    assert 'id="discoveryPtm" multiple size="6"' in html
+    assert "Hold Ctrl/Command to select multiple PTM types." in html
+    assert "ptm_types:discoverySelectedPtmTypes()" in html
+    assert "function discoverySetMultiSelect" in html
+    assert "function discoverySelectedPtmTypes" in html
+    assert "function discoveryAddPtmSelection" in html
+    assert 'id="discoveryGoal" onchange="toggleDiscoveryGoalControls()"' in html
+    assert "function toggleDiscoveryGoalControls()" in html
+    assert "function discoverySelectedPtmType()" in html
+    assert "ptm_type:discoverySelectedPtmType()" in html
+    assert "toggleDiscoveryGoalControls();" in html
+    assert "hla ligandome" in html.lower()
+    assert "immunopeptide_scope" in html
+    assert "hla_class" in html
+    assert "hla_alleles" in html
+    assert "immunopeptide_enrichment_methods" in html
+
+
+def test_frontend_template_has_clean_chinese_i18n_override():
+    html = _html()
+
+    assert "const CLEAN_ZH_I18N" in html
+    assert "蛋白质组 AI 数据工作台" in html
+    assert "数据发现" in html
+    assert "AI-ready 构建" in html
+    assert "运行 Discovery" in html
+    assert "发送到 Batch" in html
+    assert "Discovery 期间使用 LLM 规划查询" in html
+    assert "Object.assign(I18N.zh,CLEAN_ZH_I18N)" in html
+
+
+def test_frontend_template_simplifies_ai_ready_build_into_three_stage_flow():
+    html = _html()
+
+    assert 'class="ai-ready-flow"' in html
+    assert "1. Input source" in html
+    assert "2. Task and build" in html
+    assert "3. Results and next step" in html
+    assert "1. 输入来源" in html
+    assert "2. 任务与构建" in html
+    assert "3. 结果与下一步" in html
+    assert 'name="aiReadySource" value="agent_run" checked' in html
+    assert 'name="aiReadySource" value="local_search"' in html
+    assert 'name="aiReadySource" value="existing_build"' in html
+    assert 'data-ai-ready-source-panel="agent_run"' in html
+    assert 'data-ai-ready-source-panel="local_search" hidden' in html
+    assert 'data-ai-ready-source-panel="existing_build" hidden' in html
+    assert "function toggleAiReadySource()" in html
+    assert "toggleAiReadySource();" in html
+    assert "Manual TSV/MGF paths" in html
+    assert "Advanced build tools" in html
+    assert "Advanced reports and repository checks" in html
+    assert "手动 TSV/MGF 路径" in html
+    assert "高级构建工具" in html
+    assert "高级报告与 repository 检查" in html
+
+
+def test_frontend_template_connects_full_batch_to_ai_ready_build():
+    html = _html()
+
+    assert "function eligibleBatchAgentRunDirs(batch)" in html
+    assert "if(mode!=='full')return []" in html
+    assert "function batchItemHasAiReadyUsableRun(item)" in html
+    assert "function workflowOutcomeText(outcome)" in html
+    assert "function aiReadyOutcomeText(outcome)" in html
+    assert "Partial outputs usable" in html
+    assert "Completed from partial outputs" in html
+    assert "workflowOutcome==='failed_with_usable_partial_outputs'" in html
+    assert "item&&item.usable_partial_outputs" in html
+    assert "buildAiReadyFromBatch()" in html
+    assert "completed or usable partial batch run(s)" in html
+    assert "batchAiReadyAvailable" in html
+    assert "batchAiReadyRecipeNext" in html
+    assert "data.output_dir&&!data.dataset_recipe" in html
+    assert "aiReadyRecipeBatchDir" in html
+    assert "function showBatchNeedsApiKey()" in html
+    assert "batchNeedsApiKeyAfterHandoff" in html
+    assert "use Build AI-ready" in html or "AI-ready 构建" in html
+
+
+def test_frontend_template_guides_discovery_to_batch_to_build_loop():
+    html = _html()
+
+    assert 'id="discoveryNextStep"' in html
+    assert "function renderDiscoveryNextStep()" in html
+    assert "discoveryNextStepBatch" in html
+    assert "discoveryBatchReadyNext" in html
+    assert "Send selected to Batch" in html
+    assert "Review / evidence" in html
+    assert "discovery-row-details" in html
+    assert "QC / Review" in html
+
+
+def test_frontend_template_allows_open_species_general_discovery():
+    html = _html()
+
+    assert 'placeholder="optional; e.g. human, mouse"' in html
+    assert "Species preference" in html
+    assert "优先填写物种，保留其他" in html
+    assert "Please provide positive project/file limits." in html
+    assert "请确保项目和文件数量限制为正数。" in html
+    assert "if(payload.max_projects<1||payload.max_files<1)" in html
+    assert "!payload.species.length" not in html
+
+
+def test_frontend_template_exposes_repository_smoke_and_agent_harness():
+    html = _html()
+
+    assert 'id="aiReadyRepositorySmokeRepository"' in html
+    assert 'id="aiReadyRepositorySmokeInput"' in html
+    assert 'id="aiReadyIproxIndexProjects"' in html
+    assert 'id="aiReadyIproxIndexYears"' in html
+    assert 'id="aiReadyIproxIndexDir"' in html
+    assert 'id="aiReadyIproxIndexBtn"' in html
+    assert 'id="aiReadyHarnessCaseFile"' in html
+    assert 'id="aiReadyRepositorySmokeBtn"' in html
+    assert 'id="aiReadyHarnessBtn"' in html
+    assert "refreshIproxIndex()" in html
+    assert "runRepositorySmoke()" in html
+    assert "runAgentHarness()" in html
+    assert "/api/ai-ready/refresh-iprox-index" in html
+    assert "/api/ai-ready/repository-smoke" in html
+    assert "/api/ai-ready/agent-harness" in html
+    assert "iprox_index_dir:iproxIndexDir" in html
+    assert "tests/fixtures/agent_harness_cases.json" in html
+
+
+def test_frontend_template_exposes_recipe_split_and_gap_generation():
+    html = _html()
+
+    assert 'id="aiReadyRecipeBatchDir"' in html
+    assert 'id="aiReadyRecipeDiscoveryManifest"' in html
+    assert 'id="aiReadyRecipeRepositoryAudit"' in html
+    assert 'id="aiReadyRecipeSplitStrategy"' in html
+    assert 'value="project_disjoint"' in html
+    assert 'value="lab_disjoint"' in html
+    assert 'value="protein_disjoint"' in html
+    assert "repository_audit:repositoryAudit" in html
+    assert "split_strategy:splitStrategy" in html
+    assert 'id="aiReadyRecipeBtn"' in html
+    assert "makeDatasetRecipe()" in html
+    assert "/api/ai-ready/make-dataset-recipe" in html
+    assert 'id="aiReadyModelLoopRecipeDir"' in html
+    assert 'id="aiReadyModelLoopAdapter"' in html
+    assert 'value="xuanjinovo_template"' in html
+    assert 'value="massnet_eval"' in html
+    assert 'value="casanovo_eval"' in html
+    assert 'id="aiReadyModelLoopMetricsFile"' in html
+    assert "JSON / CSV / TSV / log" in html
+    assert "xuanjinovo_eval_metrics.tsv" in html
+    assert 'id="aiReadyModelLoopAdapterCommand"' in html
+    assert "adapter:adapterCommand?'external_command':adapter" in html
+    assert 'id="aiReadyRepositoryPlan"' in html
+    assert "function renderModelRepositoryPlan(data,stat)" in html
+    assert "model_informed_repository_plan" in html
+    assert "Model-informed repository plan" in html
+    assert "planned_repositories" in html
+    assert 'id="aiReadyDiscoveryRequests"' in html
+    assert "function renderModelDiscoveryRequests(data)" in html
+    assert "function applyModelDiscoveryRequest(index)" in html
+    assert "function applyModelDiscoveryRequestFallback(request,message)" in html
+    assert "/api/ai-ready/model-informed-discovery-payload" in html
+    assert "applyDiscoveryGoalFields(payload)" in html
+    assert "currentModelDiscoveryRequests" in html
+    assert "Next discovery requests" in html
+    assert "setWorkflowTab('discovery')" in html
+    assert "discoverySetSelect('discoveryRepository'" in html
+    assert "model_informed_discovery_requests" in html
+    assert 'id="aiReadyModelLoopBtn"' in html
+    assert 'id="aiReadyDataScientistModelLoopDir"' in html
+    assert 'id="aiReadyRepositorySmokeDirs"' in html
+    assert 'id="aiReadyDataScientistReportBtn"' in html
+    assert 'id="aiReadyGuidanceAlignmentBtn"' in html
+    assert 'id="aiReadyDataScientistLoopBtn"' in html
+    assert "runDatasetModelLoop()" in html
+    assert "makeDataScientistAgentReport()" in html
+    assert "makeGuidanceAlignmentReport()" in html
+    assert "runDataScientistAgentLoop()" in html
+    assert "repository_smoke_dirs:repositorySmokeDirs" in html
+    assert "/api/ai-ready/model-loop" in html
+    assert "/api/ai-ready/data-scientist-report" in html
+    assert "/api/ai-ready/guidance-alignment" in html
+    assert "/api/ai-ready/data-scientist-loop" in html
+    assert "coverage gap" in html.lower()
+    assert "evidence graph" in html.lower()
 
 
 def test_frontend_template_exposes_device_performance_metrics():
@@ -187,7 +463,9 @@ def test_frontend_template_uses_light_operational_app_shell():
     assert "--success:#10b981" in html
     assert 'class="container app-shell"' in html
     assert 'class="surface workbench-card"' in html
-    assert 'class="surface history-card operations-rail"' in html
+    assert 'class="right-rail operations-rail"' in html
+    assert 'class="surface api-config-card"' in html
+    assert 'class="surface history-card"' in html
     assert "system-summary" in html
 
 

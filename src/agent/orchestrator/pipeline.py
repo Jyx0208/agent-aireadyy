@@ -8,7 +8,7 @@ from typing import Any, Callable
 from agent.ai_ready.exporter import export_ai_ready_bundle
 from agent.audit.review import append_review_item, build_review_item, build_task_state_snapshot, write_task_state
 from agent.assets.downloader import download_file_asset
-from agent.assets.preparer import AssetPreparationError, DockerPwizConverter, RawToMzMLConverter, prepare_file_asset
+from agent.assets.preparer import AssetPreparationError, DockerPwizConverter, RawToMzMLConverter, prepare_file_asset, prepare_local_file_asset
 from agent.assets.resolver import resolve_file_asset
 from agent.agent_core.audit import write_agent_audit_artifacts
 from agent.agent_core.decision_trace import build_agent_decision_trace
@@ -21,8 +21,8 @@ from agent.execution.outputs import ExecutionFailureEvent, execution_failure_eve
 from agent.inference.rules import infer_attributes, non_proteomics_evidence
 from agent.inference.mzml_metadata import dda_mzml_search_blocking_issue, infer_instrument_family_from_name, parse_mzml_instrument
 from agent.llm.reasoner import LLMReasoner, confirm_no_sdrf_parameters, confirm_sdrf_parameters
-from agent.metadata.context import build_project_context
-from agent.models import AttributeValue, DdaExecutionPlan, FileAsset, InputTask, PridePlanResult, ProjectContext, ProjectResolution, RunManifest
+from agent.metadata.context import build_project_context, build_project_context_for_known_file
+from agent.models import AttributeSet, AttributeValue, DdaExecutionPlan, FileAsset, InputTask, PridePlanResult, ProjectCandidate, ProjectContext, ProjectResolution, RunManifest
 from agent.msdt_converter.config import build_converter_config
 from agent.msdt_converter.docker_runner import DockerMSDTConverterRunner
 from agent.msdt_converter.runner import MSDTConverterRunner
@@ -34,6 +34,56 @@ from agent.utils import write_json
 
 class ReviewRequiredError(RuntimeError):
     pass
+
+
+def _local_source_asset_type(path: Path) -> str:
+    lower = path.name.lower()
+    if lower.endswith((".mzml", ".mzml.gz")):
+        return "mzml"
+    if lower.endswith((".mzxml", ".mzxml.gz")):
+        return "mzxml"
+    if lower.endswith((".d", ".d.zip", ".d.tar.gz", ".d.tgz")):
+        return "tims"
+    if lower.endswith((".mgf", ".mgf.gz")):
+        return "mgf"
+    if lower.endswith((".mzid", ".mzid.gz")):
+        return "mzid"
+    if lower.endswith((".raw", ".raw.zip")):
+        return "raw"
+    return "unknown"
+
+
+def _local_source_requires_conversion(asset_type: str) -> bool:
+    return asset_type in {"raw", "mzxml"}
+
+
+def _trim_known_suffix(name: str, suffixes: tuple[str, ...]) -> str:
+    lower = name.lower()
+    for suffix in suffixes:
+        if lower.endswith(suffix):
+            return name[: -len(suffix)]
+    return Path(name).stem
+
+
+def _local_source_prepared_path(source_path: Path, output_dir: str | Path, asset_type: str) -> Path:
+    lower = source_path.name.lower()
+    output_dir = Path(output_dir)
+    if asset_type == "raw":
+        stem = _trim_known_suffix(source_path.name, (".raw.zip", ".raw"))
+        return output_dir / "assets" / "prepared" / f"{stem}.mzML"
+    if asset_type == "mzxml":
+        stem = _trim_known_suffix(source_path.name, (".mzxml.gz", ".mzxml"))
+        return output_dir / "assets" / "prepared" / f"{stem}.mzML"
+    if lower.endswith(".mzml.gz"):
+        stem = _trim_known_suffix(source_path.name, (".mzml.gz",))
+        return output_dir / "assets" / "prepared" / f"{stem}.mzML"
+    if lower.endswith(".mgf.gz"):
+        stem = _trim_known_suffix(source_path.name, (".mgf.gz",))
+        return output_dir / "assets" / "prepared" / f"{stem}.mgf"
+    if lower.endswith(".mzid.gz"):
+        stem = _trim_known_suffix(source_path.name, (".mzid.gz",))
+        return output_dir / "assets" / "prepared" / f"{stem}.mzid"
+    return source_path
 
 
 class AgentService:
@@ -457,6 +507,57 @@ class AgentService:
         plan = self._plan_with_asset_gate(plan, result.asset)
         return result.model_copy(update={"attributes": attributes, "plan": plan})
 
+    def apply_workflow_override_to_result(
+        self,
+        result: PridePlanResult,
+        workflow_name: str | None,
+        task: InputTask,
+        output_dir: str | Path,
+        prefer_project_fasta: bool = False,
+        reviewed_fasta_path: str | Path | None = None,
+        reviewed_fasta_url: str | None = None,
+        reviewed_fasta_name: str | None = None,
+        accept_search_parameter_review: bool = False,
+    ) -> PridePlanResult:
+        workflow_name = str(workflow_name or "").strip()
+        if not workflow_name:
+            return result
+        current_hints = result.attributes.search_parameter_hints.value
+        hints = dict(current_hints) if isinstance(current_hints, dict) else {}
+        hints["recommended_workflow_name"] = workflow_name
+        attributes = result.attributes.model_copy(
+            update={
+                "search_parameter_hints": AttributeValue(
+                    value=hints,
+                    confidence=1.0,
+                    source="user_review",
+                    evidence_excerpt=f"User-selected workflow override: {workflow_name}",
+                    conflict_flag=False,
+                )
+            }
+        )
+        source_data_path = (
+            result.asset.prepared_path
+            or result.asset.local_path
+            or Path(output_dir) / "assets" / "prepared" / f"{task.stem}.mzML"
+        )
+        plan = plan_dda_execution(
+            task_id=task.task_id,
+            source_file_name=task.file_name,
+            source_data_path=source_data_path,
+            project_resolution=result.resolution,
+            attributes=attributes,
+            output_dir=output_dir,
+            project_context=result.context,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+            reviewed_fasta_name=reviewed_fasta_name,
+            prefer_project_fasta=prefer_project_fasta,
+            accept_search_parameter_review=accept_search_parameter_review,
+        )
+        plan = self._plan_with_asset_gate(plan, result.asset)
+        return result.model_copy(update={"attributes": attributes, "plan": plan})
+
     def replan_with_mzml_instrument(
         self,
         result: PridePlanResult,
@@ -522,6 +623,101 @@ class AgentService:
         fallback = DockerPwizConverter(report=self.reporter)
         adapter = self.repositories.get(asset.repository)
         return prepare_file_asset(adapter, asset, primary, fallback_converter=fallback, report=self.reporter)
+
+    def prepare_local_asset(self, asset: FileAsset, converter: RawToMzMLConverter | None = None) -> Path:
+        primary = converter or RawToMzMLConverter(report=self.reporter)
+        fallback = DockerPwizConverter(report=self.reporter)
+        return prepare_local_file_asset(asset, primary, fallback_converter=fallback, report=self.reporter)
+
+    @staticmethod
+    def _known_local_project_file_record(
+        file_name: str,
+        *,
+        file_size_bytes: int | None = None,
+        download_url: str | None = None,
+    ) -> dict[str, Any]:
+        category = "SEARCH" if file_name.lower().endswith((".tsv", ".pin")) else "RAW"
+        return {
+            "fileName": file_name,
+            "fileSizeBytes": file_size_bytes,
+            "publicFileLocations": [{"value": download_url}] if download_url else [],
+            "fileCategory": {"value": category},
+        }
+
+    def _load_known_project_context_from_dir(
+        self,
+        context_dir: str | Path,
+        *,
+        project_accession: str,
+        file_name: str,
+        file_size_bytes: int | None,
+    ) -> ProjectContext:
+        context_path = Path(context_dir) / "metadata.json"
+        if not context_path.exists():
+            raise FileNotFoundError(f"--context-dir must contain metadata.json: {context_path}")
+        context = ProjectContext.model_validate_json(context_path.read_text(encoding="utf-8"))
+        existing_accession = context.project_accession or context.px_accession
+        if existing_accession and existing_accession != project_accession:
+            raise ValueError(
+                f"--context-dir project accession mismatch: {existing_accession} != {project_accession}"
+            )
+        project_files = [
+            self._known_local_project_file_record(file_name, file_size_bytes=file_size_bytes),
+            *[
+                record
+                for record in context.project_files
+                if str(record.get("fileName") or "") != file_name
+            ],
+        ]
+        evidence_documents = [
+            *context.evidence_documents,
+            {
+                "source": "local.context_dir",
+                "text": f"Reusing project context from {Path(context_dir)} for local source file {file_name}.",
+            },
+        ]
+        return context.model_copy(
+            update={
+                "repository": "pride",
+                "project_accession": project_accession,
+                "px_accession": project_accession,
+                "file_name": file_name,
+                "project_files": project_files,
+                "evidence_documents": evidence_documents,
+            }
+        )
+
+    def _load_known_project_attributes_from_dir(self, context_dir: str | Path) -> AttributeSet | None:
+        attributes_path = Path(context_dir) / "attributes.json"
+        if not attributes_path.exists():
+            return None
+        self._report(f"Reusing attributes from context dir: {attributes_path}")
+        return AttributeSet.model_validate_json(attributes_path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _known_local_file_asset(
+        task: InputTask,
+        source_path: Path,
+        *,
+        output_dir: str | Path,
+        project_accession: str,
+        matched_file: str,
+    ) -> FileAsset:
+        asset_type = _local_source_asset_type(source_path)
+        prepared_path = _local_source_prepared_path(source_path, output_dir, asset_type)
+        return FileAsset(
+            repository="pride",
+            original_file_name=task.file_name,
+            resolved_asset_type=asset_type,  # type: ignore[arg-type]
+            project_accession=project_accession,
+            matched_project_file=matched_file,
+            local_path=source_path,
+            prepared_path=prepared_path,
+            expected_size_bytes=source_path.stat().st_size,
+            requires_conversion=_local_source_requires_conversion(asset_type),
+            asset_confidence=1.0 if asset_type != "unknown" else 0.2,
+            match_type="known_project_local_source",
+        )
 
     def plan_dda_run(
         self,
@@ -604,6 +800,418 @@ class AgentService:
             attributes=attributes,
             plan=plan,
         )
+
+    def plan_dda_run_from_known_project(
+        self,
+        task: InputTask,
+        project_accession: str,
+        output_dir: str | Path,
+        repository: str = "pride",
+        matched_file: str | None = None,
+        reviewed_fasta_path: str | Path | None = None,
+        reviewed_fasta_url: str | None = None,
+        reviewed_fasta_name: str | None = None,
+        prefer_project_fasta: bool = False,
+    ) -> PridePlanResult:
+        repository_name = repository if repository != "auto" else "pride"
+        candidate = ProjectCandidate(
+            repository=repository_name,
+            project_accession=project_accession,
+            matched_file=matched_file or task.file_name,
+            match_type="exact",
+            match_score=100,
+            evidence=["project_accession supplied by discovery handoff"],
+            metadata_consistency=1.0,
+        )
+        resolution = ProjectResolution(
+            primary_project=candidate,
+            alternative_projects=[],
+            resolution_reason=f"Selected {repository_name}:{project_accession} from structured discovery handoff.",
+            resolution_confidence=1.0,
+            needs_review=False,
+        )
+        self._report(f"Using discovery handoff project: {project_accession} ({repository_name})")
+        self._report_resolution_summary(resolution)
+        context = self.build_context_from_repository(resolution, task.file_name, repository=repository_name)
+        self._report(f"[2/5] Project context prepared from discovery handoff; SDRF rows={len(context.sdrf_rows)}")
+        self._report_metadata_summary(context)
+        asset = self.resolve_asset(task, context, output_dir)
+        self._report(
+            f"[3/5] Resolved data asset from known project: {asset.matched_project_file or 'unknown'} "
+            f"(type={asset.resolved_asset_type}, conversion_required={asset.requires_conversion})"
+        )
+        self._report_asset_summary(asset)
+        attributes = self.infer_attributes(context)
+        self._report(f"[4/5] File attributes inferred. acquisition={attributes.acquisition_mode.value}")
+        self._report_attribute_summary(attributes)
+        source_data_path = asset.prepared_path or asset.local_path or Path(output_dir) / "assets" / "prepared" / f"{task.stem}.mzML"
+        plan = plan_dda_execution(
+            task_id=task.task_id,
+            source_file_name=task.file_name,
+            source_data_path=source_data_path,
+            project_resolution=resolution,
+            attributes=attributes,
+            output_dir=output_dir,
+            project_context=context,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+            reviewed_fasta_name=reviewed_fasta_name,
+            prefer_project_fasta=prefer_project_fasta,
+        )
+        plan = self._plan_with_asset_gate(plan, asset)
+        self._report(f"[5/5] DDA execution plan generated. workflow={plan.fragpipe_workflow_path.name}")
+        self._report_plan_summary(plan)
+        return PridePlanResult(
+            resolution=resolution,
+            context=context,
+            asset=asset,
+            attributes=attributes,
+            plan=plan,
+        )
+
+    def plan_dda_run_from_known_project_local_source(
+        self,
+        task: InputTask,
+        source_data_path: str | Path,
+        project_accession: str,
+        output_dir: str | Path,
+        repository: str = "pride",
+        matched_file: str | None = None,
+        reviewed_fasta_path: str | Path | None = None,
+        reviewed_fasta_url: str | None = None,
+        reviewed_fasta_name: str | None = None,
+        prefer_project_fasta: bool = False,
+        context_dir: str | Path | None = None,
+    ) -> PridePlanResult:
+        source_path = Path(source_data_path)
+        if not source_path.exists():
+            raise FileNotFoundError(f"Local source file does not exist: {source_path}")
+        if source_path.is_file() and source_path.stat().st_size == 0:
+            raise ValueError(f"Local source file is empty: {source_path}")
+        repository_name = repository if repository != "auto" else "pride"
+        if repository_name != "pride":
+            raise ValueError("Known-project local source mode currently supports PRIDE only.")
+        file_name = matched_file or task.file_name
+        candidate = ProjectCandidate(
+            repository="pride",
+            project_accession=project_accession,
+            matched_file=file_name,
+            match_type="known_project_local_source",
+            match_score=100,
+            evidence=[
+                "project_accession supplied by caller",
+                "source data path supplied as local cached file",
+                "PRIDE project file-list endpoint intentionally not queried",
+            ],
+            metadata_consistency=0.8,
+        )
+        resolution = ProjectResolution(
+            primary_project=candidate,
+            alternative_projects=[],
+            resolution_reason=f"Selected pride:{project_accession} with caller-provided local source file.",
+            resolution_confidence=1.0,
+            needs_review=False,
+        )
+        self._report(f"Using known project/local source: {project_accession} -> {source_path}")
+        self._report_resolution_summary(resolution)
+        if context_dir is not None:
+            context = self._load_known_project_context_from_dir(
+                context_dir,
+                project_accession=project_accession,
+                file_name=file_name,
+                file_size_bytes=source_path.stat().st_size,
+            )
+            self._report("[2/5] Project context reused from --context-dir; PRIDE API was not queried.")
+        else:
+            context = build_project_context_for_known_file(
+                self.pride_client,
+                project_accession,
+                file_name,
+                file_size_bytes=source_path.stat().st_size,
+            )
+            self._report("[2/5] Project context prepared without PRIDE file-list query.")
+        self._report_metadata_summary(context)
+        asset = self._known_local_file_asset(
+            task,
+            source_path,
+            output_dir=output_dir,
+            project_accession=project_accession,
+            matched_file=file_name,
+        )
+        self._report_asset_summary(asset)
+        attributes = self._load_known_project_attributes_from_dir(context_dir) if context_dir is not None else None
+        if attributes is None:
+            attributes = self.infer_attributes(context)
+        self._report(f"[4/5] File attributes inferred. acquisition={attributes.acquisition_mode.value}")
+        self._report_attribute_summary(attributes)
+        source_for_plan = asset.prepared_path or source_path
+        plan = plan_dda_execution(
+            task_id=task.task_id,
+            source_file_name=task.file_name,
+            source_data_path=source_for_plan,
+            project_resolution=resolution,
+            attributes=attributes,
+            output_dir=output_dir,
+            project_context=context,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+            reviewed_fasta_name=reviewed_fasta_name,
+            prefer_project_fasta=prefer_project_fasta,
+        )
+        plan = self._plan_with_asset_gate(plan, asset)
+        self._report(f"[5/5] DDA execution plan generated. workflow={plan.fragpipe_workflow_path.name}")
+        self._report_plan_summary(plan)
+        return PridePlanResult(
+            resolution=resolution,
+            context=context,
+            asset=asset,
+            attributes=attributes,
+            plan=plan,
+        )
+
+    def prepare_known_project_local_msdt_docker_input(
+        self,
+        task: InputTask,
+        source_data_path: str | Path,
+        project_accession: str,
+        output_dir: str | Path,
+        repository: str = "pride",
+        matched_file: str | None = None,
+        reviewed_fasta_path: str | Path | None = None,
+        reviewed_fasta_url: str | None = None,
+        reviewed_fasta_name: str | None = None,
+        prefer_project_fasta: bool = False,
+        context_dir: str | Path | None = None,
+        workflow_name: str | None = None,
+    ):
+        result = self.plan_dda_run_from_known_project_local_source(
+            task=task,
+            source_data_path=source_data_path,
+            project_accession=project_accession,
+            output_dir=output_dir,
+            repository=repository,
+            matched_file=matched_file,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+            reviewed_fasta_name=reviewed_fasta_name,
+            prefer_project_fasta=prefer_project_fasta,
+            context_dir=context_dir,
+        )
+        result = self.apply_workflow_override_to_result(
+            result,
+            workflow_name,
+            task=task,
+            output_dir=output_dir,
+            prefer_project_fasta=prefer_project_fasta,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+            reviewed_fasta_name=reviewed_fasta_name,
+        )
+        output_dir = Path(output_dir)
+        if result.plan.needs_review:
+            self.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
+            message = f"Known-project local source plan requires review: {result.plan.blocking_issues}"
+            self._report(message)
+            raise ReviewRequiredError(message)
+        try:
+            prepared_path = self.prepare_local_asset(result.asset)
+        except AssetPreparationError as exc:
+            reason = f"Local asset preparation failed before MSDT input packaging: {exc}"
+            review_plan = result.plan.model_copy(
+                update={
+                    "needs_review": True,
+                    "blocking_issues": [*result.plan.blocking_issues, reason],
+                }
+            )
+            review_result = result.model_copy(update={"plan": review_plan})
+            self.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, review_plan, asset=result.asset)
+            append_review_item(
+                output_dir / "review_queue.json",
+                build_review_item(
+                    task_id=task.task_id,
+                    source_file=task.file_name,
+                    project_accession=result.resolution.primary_project.project_accession if result.resolution.primary_project else None,
+                    stage="asset_preparation",
+                    reasons=[reason],
+                ),
+            )
+            self._write_recovery_audit(
+                output_dir,
+                task=task,
+                stage="asset_preparation",
+                run_mode="prepare",
+                events=[self._asset_preparation_failure_event(result.asset, exc)],
+                result=review_result,
+                plan=review_plan,
+                artifacts={
+                    "task_state_json": output_dir / "task_state.json",
+                    "review_queue_json": output_dir / "review_queue.json",
+                },
+            )
+            raise
+        result = self.validate_prepared_data_for_plan(result, prepared_path)
+        if result.plan.needs_review:
+            self.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
+            message = f"Prepared data validation requires review before FragPipe execution: {result.plan.blocking_issues}"
+            self._report(message)
+            raise ReviewRequiredError(message)
+        bundle = materialize_dda_task_bundle(
+            task=task,
+            project_resolution=result.resolution,
+            project_context=result.context,
+            attributes=result.attributes,
+            source_data_path=prepared_path,
+            output_dir=output_dir,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+            reviewed_fasta_name=reviewed_fasta_name,
+            prefer_project_fasta=prefer_project_fasta,
+            report=self.reporter,
+        )
+        self.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, bundle.plan, asset=result.asset)
+        docker_runner = DockerMSDTConverterRunner(image="guomics2017/msdt-converter:v1.3", report=self.reporter)
+        if hasattr(docker_runner, "write_container_config"):
+            docker_runner.write_container_config(bundle)
+        self._report(
+            "Known-project local MSDT-Converter input package is ready: "
+            f"workflow={bundle.materialized_workflow_path}; fasta={bundle.materialized_fasta_path}; "
+            f"converter_config={bundle.converter_config_path}"
+        )
+        return bundle, result, Path(prepared_path)
+
+    def run_known_project_local_dda_msdt_docker(
+        self,
+        task: InputTask,
+        source_data_path: str | Path,
+        project_accession: str,
+        output_dir: str | Path,
+        repository: str = "pride",
+        matched_file: str | None = None,
+        image: str = "guomics2017/msdt-converter:v1.3",
+        reviewed_fasta_path: str | Path | None = None,
+        reviewed_fasta_url: str | None = None,
+        context_dir: str | Path | None = None,
+        workflow_name: str | None = None,
+    ) -> RunManifest:
+        bundle, result, prepared_path = self.prepare_known_project_local_msdt_docker_input(
+            task=task,
+            source_data_path=source_data_path,
+            project_accession=project_accession,
+            output_dir=output_dir,
+            repository=repository,
+            matched_file=matched_file,
+            reviewed_fasta_path=reviewed_fasta_path,
+            reviewed_fasta_url=reviewed_fasta_url,
+            context_dir=context_dir,
+            workflow_name=workflow_name,
+        )
+        self._report("Known-project local input package is ready; starting MSDT-Converter Docker.")
+        runner = DockerMSDTConverterRunner(image=image, report=self.reporter)
+        docker_result = runner.run(bundle)
+        run_log_path = self._write_run_log(output_dir, docker_result.stdout, docker_result.stderr)
+        outputs = {key: str(value) for key, value in bundle.plan.output_paths.items()}
+        outputs["run_log"] = str(run_log_path)
+        runtime_log_path = self._runtime_log_path(output_dir)
+        if runtime_log_path.exists():
+            outputs["runtime_log"] = str(runtime_log_path)
+        failure_reasons = execution_failure_reasons(
+            bundle.plan,
+            docker_result.returncode,
+            docker_result.stdout,
+            docker_result.stderr,
+        )
+        failure_events = execution_failure_events(
+            bundle.plan,
+            docker_result.returncode,
+            docker_result.stdout,
+            docker_result.stderr,
+        )
+        if failure_reasons:
+            notes = [docker_result.stdout, *failure_reasons]
+            manifest = RunManifest(
+                task_id=task.task_id,
+                created_at=datetime.now(UTC),
+                status="failed",
+                project_accession=result.resolution.primary_project.project_accession if result.resolution.primary_project else None,
+                source_file=task.file_name,
+                source_data_path=str(prepared_path),
+                outputs=outputs,
+                notes=notes,
+            )
+            write_json(Path(output_dir) / "run_manifest.json", manifest)
+            write_task_state(
+                Path(output_dir) / "task_state.json",
+                build_task_state_snapshot(
+                    task_id=task.task_id,
+                    status="failed",
+                    stage="execution",
+                    source_file=task.file_name,
+                    project_accession=result.resolution.primary_project.project_accession if result.resolution.primary_project else None,
+                    notes=notes,
+                ),
+            )
+            append_review_item(
+                Path(output_dir) / "review_queue.json",
+                build_review_item(
+                    task_id=task.task_id,
+                    source_file=task.file_name,
+                    project_accession=result.resolution.primary_project.project_accession if result.resolution.primary_project else None,
+                    stage="execution",
+                    reasons=failure_reasons,
+                ),
+            )
+            self._write_recovery_audit(
+                output_dir,
+                task=task,
+                stage="execution",
+                run_mode="full",
+                events=failure_events,
+                result=result,
+                plan=bundle.plan,
+                artifacts={
+                    "task_state_json": Path(output_dir) / "task_state.json",
+                    "review_queue_json": Path(output_dir) / "review_queue.json",
+                    "run_manifest_json": Path(output_dir) / "run_manifest.json",
+                    "run_log": run_log_path,
+                    "runtime_log": runtime_log_path if runtime_log_path.exists() else None,
+                },
+            )
+            return manifest
+        msdt_output = bundle.plan.output_paths.get("fp_msdt")
+        initial_manifest = RunManifest(
+            task_id=task.task_id,
+            created_at=datetime.now(UTC),
+            status="completed",
+            project_accession=result.resolution.primary_project.project_accession if result.resolution.primary_project else None,
+            source_file=task.file_name,
+            source_data_path=str(prepared_path),
+            outputs=outputs,
+            notes=[docker_result.stdout],
+        )
+        ai_ready_path = self.export_ai_ready(
+            msdt_path=msdt_output,
+            output_dir=Path(output_dir) / "ai_ready",
+            project_accession=initial_manifest.project_accession or "",
+            source_file=task.file_name,
+            attribute_evidence=result.attributes.model_dump(mode="json"),
+            decision_trace=bundle.plan.model_dump(mode="json"),
+            run_manifest=initial_manifest.model_dump(mode="json"),
+        )
+        outputs["ai_ready"] = str(ai_ready_path)
+        manifest = initial_manifest.model_copy(update={"outputs": outputs})
+        write_json(Path(output_dir) / "run_manifest.json", manifest)
+        write_task_state(
+            Path(output_dir) / "task_state.json",
+            build_task_state_snapshot(
+                task_id=task.task_id,
+                status="completed",
+                stage="execution",
+                source_file=task.file_name,
+                project_accession=result.resolution.primary_project.project_accession if result.resolution.primary_project else None,
+                notes=[],
+            ),
+        )
+        return manifest
 
     def plan_dda_run_from_pride(
         self,

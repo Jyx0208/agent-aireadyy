@@ -1,21 +1,25 @@
 # System Architecture
 
-This document describes the production shape of PRIDE AI-ready Agent as it stands today.
+This document describes the current production shape of the Task-aware AI-ready Data Agent. PRIDE remains the most mature online path, but the system is now repository-aware and includes AI-ready dataset construction, recipe generation, recovery, and data-scientist-loop smoke capabilities.
 
 ## Goal
 
-The system turns a proteomics file name or accession into one of three outcomes:
+The system turns a proteomics data need, file name, accession, or existing run into one of several evidence-backed outcomes:
 
-1. parameter-only planning
-2. prepared MSDT-Converter input package
-3. full end-to-end execution
+1. dataset discovery and candidate manifest
+2. parameter-only planning
+3. prepared MSDT-Converter input package
+4. full or partial-output execution evidence
+5. AI-ready task table export
+6. dataset recipe, split, leakage, hard benchmark, curation, and model-loop smoke reports
 
 The implementation is designed to be auditable, repository-agnostic, and safe to run on a single workstation or a small server.
 
 ## High-Level Architecture
 
 ```text
-input file / accession
+natural-language goal / input file / accession / existing run
+  -> optional discovery and candidate scoring
   -> input normalization
   -> repository adapter resolution
   -> project/file matching
@@ -26,6 +30,8 @@ input file / accession
   -> optional file download and conversion
   -> optional MSDT-Converter execution
   -> recovery audit on bounded failures
+  -> optional AI-ready Build and dataset recipe
+  -> optional model-loop smoke and gap plan
   -> output packaging and history persistence
 ```
 
@@ -52,7 +58,7 @@ Responsibilities:
 
 Responsibilities:
 
-- resolve PRIDE and MassIVE through one adapter interface
+- resolve PRIDE, MassIVE, and iProX through one adapter interface
 - map external metadata into canonical project/file objects
 - hide API-specific differences from downstream planning
 
@@ -70,6 +76,7 @@ Responsibilities:
 - identify review cases and blocking issues
 - record Agent observation, plan, decision trace, and execution gates
 - support manual overrides when the operator confirms them
+- support task-aware discovery, readiness, and data-value decisions
 
 ### 4. Execution layer
 

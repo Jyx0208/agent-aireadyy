@@ -37,7 +37,7 @@ def test_build_converter_config_matches_expected_sections(tmp_path: Path):
     assert config["generate_fragpipe_search_result"]["need"] is True
     assert config["generate_msdt"]["mzml"]["need_mzml"] is True
     assert config["generate_msdt"]["mzml"]["need_fragpipe"] is True
-    assert config["generate_msdt"]["mzml"]["fp_pin_path"].endswith("_edited.pin")
+    assert config["generate_msdt"]["mzml"]["fp_pin_path"].endswith("sample_edited.pin")
 
     dumped = tmp_path / "converter_config.json"
     dumped.write_text(json.dumps(config, indent=2), encoding="utf-8")

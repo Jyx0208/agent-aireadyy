@@ -6,7 +6,7 @@ import re
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 from xml.sax.saxutils import escape
 
@@ -265,18 +265,25 @@ def _workflow(attributes: dict[str, Any], decision_trace: dict[str, Any]) -> str
     if workflow:
         return str(workflow)
     path = decision_trace.get("fragpipe_workflow_path")
-    return Path(str(path)).name if path else ""
+    return _path_name(path) if path else ""
 
 
 def _fasta(attributes: dict[str, Any], decision_trace: dict[str, Any]) -> str:
     path = decision_trace.get("fasta_path")
     if path:
-        return Path(str(path)).name
+        return _path_name(path)
     hints = _search_hints(attributes)
     fasta = hints.get("recommended_fasta_name")
     if fasta:
         return str(fasta)
     return ""
+
+
+def _path_name(path: Any) -> str:
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    return PureWindowsPath(text).name if "\\" in text else Path(text).name
 
 
 def _expected_msdt_path(decision_trace: dict[str, Any]) -> str:

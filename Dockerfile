@@ -1,11 +1,16 @@
 FROM python:3.13-slim
 
 WORKDIR /app
-ENV TZ=Asia/Shanghai
+ENV TZ=Asia/Shanghai \
+    PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    docker-cli \
     curl \
+    docker.io \
+    git \
+    openjdk-21-jre-headless \
     tzdata \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone \
@@ -17,10 +22,9 @@ COPY src/ src/
 COPY profiles/ profiles/
 COPY scripts/ scripts/
 
-RUN pip install --no-cache-dir -e ".[web]" fastapi "uvicorn[standard]" python-dotenv
+RUN pip install --no-cache-dir -e ".[dev,web]" fastapi "uvicorn[standard]" python-dotenv
 
-RUN mkdir -p /app/data && useradd -m agent
-USER agent
+RUN mkdir -p /app/data /app/runs /app/.agent_cache
 
 EXPOSE 8000
 

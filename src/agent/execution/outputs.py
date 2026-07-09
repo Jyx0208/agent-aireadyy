@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from glob import glob
 from pathlib import Path
 
 from agent.models import DdaExecutionPlan, JsonModel
@@ -26,9 +27,17 @@ def required_execution_outputs(plan: DdaExecutionPlan) -> list[tuple[str, Path]]
     return outputs
 
 
+def _fragpipe_pin_exists(plan: DdaExecutionPlan) -> bool:
+    if plan.expected_pin_path.exists() and plan.expected_pin_path.is_file():
+        return True
+    return any(Path(path).is_file() for path in glob(plan.expected_pin_glob))
+
+
 def missing_required_execution_outputs(plan: DdaExecutionPlan) -> list[str]:
     missing: list[str] = []
     for label, path in required_execution_outputs(plan):
+        if label == "FragPipe PIN" and _fragpipe_pin_exists(plan):
+            continue
         if not path.exists() or not path.is_file():
             missing.append(f"{label}: {path}")
     if plan.output_paths.get("fp_msdt") is None:
@@ -87,6 +96,8 @@ def execution_failure_events(
         )
 
     for label, path in required_execution_outputs(plan):
+        if label == "FragPipe PIN" and _fragpipe_pin_exists(plan):
+            continue
         if not path.exists() or not path.is_file():
             if label == "FragPipe PIN":
                 category = "missing_pin"

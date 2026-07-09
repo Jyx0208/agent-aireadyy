@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
+import re
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 
 
-def docker_host_mount_path(path: Path) -> Path:
+def docker_host_mount_path(path: Path) -> PurePath:
     """Translate an in-container path to the host path seen by Docker daemon."""
     resolved = path.resolve()
     mappings = (
@@ -21,5 +22,16 @@ def docker_host_mount_path(path: Path) -> Path:
             relative = resolved.relative_to(container_root)
         except ValueError:
             continue
-        return Path(host_root_raw).expanduser().resolve() / relative
+        return _join_host_path(host_root_raw, relative)
     return resolved
+
+
+def _join_host_path(host_root_raw: str, relative: Path) -> PurePath:
+    """Join a Docker-daemon host root without corrupting Windows paths inside Linux containers."""
+    host_root = host_root_raw.strip()
+    relative_parts = relative.parts
+    if re.match(r"^[A-Za-z]:[\\/]", host_root):
+        return PureWindowsPath(host_root, *relative_parts)
+    if host_root.startswith("/"):
+        return PurePosixPath(host_root, *relative_parts)
+    return Path(host_root).expanduser().resolve().joinpath(*relative_parts)

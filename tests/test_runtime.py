@@ -500,6 +500,48 @@ def test_workflow_parameter_overrides_ignore_unknown_msfragger_keys(tmp_path: Pa
     assert "msfragger.search_enzyme_cut_2=R" in workflow_text
 
 
+def test_workflow_parameter_overrides_strip_units_from_numeric_fragpipe_fields(tmp_path: Path):
+    source = tmp_path / "Default.workflow"
+    source.write_text(
+        "\n".join(
+            [
+                "msfragger.fragment_mass_tolerance=20",
+                "msfragger.fragment_mass_units=1",
+                "msfragger.precursor_true_tolerance=20",
+                "msfragger.precursor_true_units=1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "out.workflow"
+    attributes = _attributes()
+    attributes.search_parameter_hints = AttributeValue(
+        value={
+            "workflow_parameter_overrides": {
+                "msfragger.fragment_mass_tolerance": "0.02Da",
+                "msfragger.fragment_mass_units": "Da",
+                "msfragger.precursor_true_tolerance": "10ppm",
+                "msfragger.precursor_true_units": "ppm",
+            }
+        },
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="LLM proposed tolerance values with units.",
+        conflict_flag=False,
+    )
+
+    materialize_workflow_with_attributes(source, destination, attributes)
+
+    workflow_text = destination.read_text(encoding="utf-8")
+    assert "msfragger.fragment_mass_tolerance=0.02" in workflow_text
+    assert "msfragger.fragment_mass_units=0" in workflow_text
+    assert "msfragger.precursor_true_tolerance=10" in workflow_text
+    assert "msfragger.precursor_true_units=1" in workflow_text
+    assert "0.02Da" not in workflow_text
+    assert "10ppm" not in workflow_text
+
+
 def test_search_hint_missed_cleavages_accepts_common_range_text(tmp_path: Path):
     source = tmp_path / "Default.workflow"
     source.write_text("msfragger.allowed_missed_cleavage_1=2\n", encoding="utf-8")
