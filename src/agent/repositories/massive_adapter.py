@@ -180,6 +180,20 @@ class MassiveClient:
             return payload
         return {"records": payload}
 
+    def search_datasets(self, query_text: str, page_size: int = 30) -> list[dict[str, Any]]:
+        query = quote(f'{{"title_input":"{query_text}"}}')
+        response = self._client.get(f"{self.base_url}/QueryDatasets?pageSize={int(page_size)}&offset=0&query={query}")
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict):
+            rows = payload.get("row_data") or payload.get("data") or payload.get("datasets") or payload.get("records")
+            if isinstance(rows, list):
+                return [row if isinstance(row, dict) else {"value": row} for row in rows]
+            return [payload]
+        if isinstance(payload, list):
+            return [row if isinstance(row, dict) else {"value": row} for row in payload]
+        return []
+
     def list_dataset_files_from_csv(self, accession: str, csv_url: str | None = None) -> list[dict[str, Any]]:
         # MassIVE does not expose a single stable file-list API in its public docs.
         # This hook supports deployments that point at a precomputed MassIVE file index CSV.
@@ -383,6 +397,33 @@ class MassiveAdapter:
                 }
         return self.map_project(raw, accession)
 
+    def search_projects(self, query: str, limit: int = 30) -> list[CanonicalProject]:
+        projects: list[CanonicalProject] = []
+        seen: set[str] = set()
+        accession = _extract_massive_accession(query)
+        if accession:
+            project = self.get_project(accession)
+            if project.primary_accession:
+                return [project]
+        if not hasattr(self.client, "search_datasets"):
+            return []
+        try:
+            rows = self.client.search_datasets(query, page_size=limit)
+        except Exception:
+            return []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            project = self.map_project(raw)
+            key = project.primary_accession
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            projects.append(project)
+            if len(projects) >= limit:
+                break
+        return projects
+
     def list_project_files(self, project: CanonicalProject) -> list[CanonicalFile]:
         raw_files = self._raw_file_records(project.raw_metadata)
         if not raw_files and hasattr(self.client, "list_dataset_files_from_csv"):
@@ -510,6 +551,7 @@ class MassiveAdapter:
             raw.get("proteomeXchangeAccession"),
             raw.get("ProteomeXchange ID"),
             raw.get("pxd"),
+            raw.get("px"),
             fallback_accession if fallback_accession.upper().startswith("PXD") else None,
         )
         primary = native_accession or px_accession or fallback_accession
@@ -517,12 +559,16 @@ class MassiveAdapter:
         if not description:
             description = _first_text(raw.get("summary"))
         processing = _first_text(raw.get("data_processing_protocol"), raw.get("methods"), raw.get("protocol"))
-        instruments = _dedupe_text(_cv_values(raw.get("instruments"), prefer_name_without_value=True)) or _plain_text_values(raw.get("instrument"), raw.get("instruments"))
+        instruments = _dedupe_text(_cv_values(raw.get("instruments"), prefer_name_without_value=True)) or _plain_text_values(
+            raw.get("instrument_resolved"),
+            raw.get("instrument"),
+            raw.get("instruments"),
+        )
         organisms = (
             _dedupe_text(_cv_values(raw.get("species"), name_contains="scientific name"))
             or _dedupe_text(_cv_values(raw.get("species"), name_contains="common name"))
             or _dedupe_text(_cv_values(raw.get("organism")))
-            or _plain_text_values(raw.get("species"), raw.get("organism"))
+            or _plain_text_values(raw.get("species_resolved"), raw.get("species"), raw.get("organism"))
         )
         keywords = _dedupe_text(_cv_values(raw.get("keywords"))) or _list_text(raw.get("keywords"))
         return CanonicalProject(

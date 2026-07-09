@@ -1,11 +1,16 @@
 services:
   web:
-    build: .
+    build:
+      context: .
+    image: pride-agent-all-in-one-local:latest
     container_name: pride-agent-web
+    working_dir: /app
     ports:
       - "8000:8000"
     environment:
       - TZ=${TZ:-Asia/Shanghai}
+      - AGENT_LLM_API_KEY=${AGENT_LLM_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - AGENT_LLM_BASE_URL=${AGENT_LLM_BASE_URL:-https://api.deepseek.com}
       - AGENT_LLM_MODEL=${AGENT_LLM_MODEL:-deepseek-v4-flash}
       - AGENT_LLM_TIMEOUT=${AGENT_LLM_TIMEOUT:-1200}
@@ -14,18 +19,21 @@ services:
       - AGENT_FRAGPIPE_RAM_GB=${AGENT_FRAGPIPE_RAM_GB:-0}
       - AGENT_RESULT_RETENTION_SECONDS=${AGENT_RESULT_RETENTION_SECONDS:-1800}
       - AGENT_MAX_RESULT_PROJECTS=${AGENT_MAX_RESULT_PROJECTS:-4}
+      - AGENT_PROTECTED_RESULT_DIRS=${AGENT_PROTECTED_RESULT_DIRS:-baseline_validation,real_smoke,multi_mini_validation,local_validation,ai_ready_builds}
       - AGENT_WEB_FULL_WORKFLOW_ENABLED=${AGENT_WEB_FULL_WORKFLOW_ENABLED:-0}
       - AGENT_PRIDE_CACHE_DIR=${AGENT_PRIDE_CACHE_DIR:-/app/.agent_cache/pride}
       - AGENT_IPROX_INDEX_XLSX=${AGENT_IPROX_INDEX_XLSX:-/app/data/iprox.xlsx}
       - AGENT_ZIP_COMPRESS_LEVEL=${AGENT_ZIP_COMPRESS_LEVEL:-6}
+      - AGENT_CONTAINER_APP_DIR=/app
+      - AGENT_DOCKER_VOLUMES_FROM=${AGENT_DOCKER_VOLUMES_FROM:-}
+      - AGENT_HOST_APP_DIR=${AGENT_HOST_APP_DIR:-/opt/pride-agent}
       - AGENT_CONTAINER_RUNS_DIR=/app/runs
       - AGENT_HOST_RUNS_DIR=${AGENT_HOST_RUNS_DIR:-/opt/pride-agent/runs}
-    group_add:
-      - "${DOCKER_GID:-0}"
+      - AGENT_MSDT_DOCKER_TIMEOUT_SECONDS=${AGENT_MSDT_DOCKER_TIMEOUT_SECONDS:-7200}
+      - AGENT_MSDT_DOCKER_IDLE_TIMEOUT_SECONDS=${AGENT_MSDT_DOCKER_IDLE_TIMEOUT_SECONDS:-900}
+      - AGENT_MSDT_ABORT_ON_LOW_PSM=${AGENT_MSDT_ABORT_ON_LOW_PSM:-1}
     volumes:
+      - .:/app
       - /var/run/docker.sock:/var/run/docker.sock
-      - /usr/bin/docker:/usr/bin/docker:ro
-      - ./runs:/app/runs
-      - ./.agent_cache:/app/.agent_cache
-      - ${AGENT_IPROX_HOST_XLSX:-./iProx数据(1).xlsx}:/app/data/iprox.xlsx:ro
+      - ./data:/app/data
     restart: unless-stopped

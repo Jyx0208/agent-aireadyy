@@ -161,3 +161,107 @@ def build_project_context(
         ],
         raw_project_metadata=project,
     )
+
+
+def build_project_context_for_known_file(
+    client: PrideClient,
+    project_accession: str,
+    file_name: str,
+    *,
+    file_size_bytes: int | None = None,
+    download_url: str | None = None,
+) -> ProjectContext:
+    """Build a PRIDE context for an already-local file without listing all files.
+
+    This is intentionally narrow: it still uses project-level metadata, but it
+    avoids the expensive/fragile PRIDE file-list endpoint for cached local files
+    supplied by discovery handoff or manual HPC sync.
+    """
+    project = client.get_project(project_accession)
+    project_files = [
+        {
+            "fileName": file_name,
+            "fileSizeBytes": file_size_bytes,
+            "publicFileLocations": [{"value": download_url}] if download_url else [],
+            "fileCategory": {"value": "SEARCH"} if file_name.lower().endswith((".tsv", ".pin")) else {"value": "RAW"},
+        }
+    ]
+    metadata = {
+        "title": MetadataValue(
+            value=project.get("title"),
+            source="pride.title",
+            source_level="project",
+            completeness=1.0 if project.get("title") else 0.0,
+        ),
+        "projectDescription": MetadataValue(
+            value=project.get("projectDescription"),
+            source="pride.projectDescription",
+            source_level="project",
+            completeness=1.0 if project.get("projectDescription") else 0.0,
+        ),
+        "sampleProcessingProtocol": MetadataValue(
+            value=project.get("sampleProcessingProtocol"),
+            source="pride.sampleProcessingProtocol",
+            source_level="project",
+            completeness=1.0 if project.get("sampleProcessingProtocol") else 0.0,
+        ),
+        "dataProcessingProtocol": MetadataValue(
+            value=project.get("dataProcessingProtocol"),
+            source="pride.dataProcessingProtocol",
+            source_level="project",
+            completeness=1.0 if project.get("dataProcessingProtocol") else 0.0,
+        ),
+        "organisms": MetadataValue(
+            value=_entry_names(project.get("organisms", [])),
+            source="pride.organisms",
+            source_level="project",
+            completeness=1.0 if project.get("organisms") else 0.0,
+        ),
+        "instruments": MetadataValue(
+            value=_entry_names(project.get("instruments", [])),
+            source="pride.instruments",
+            source_level="project",
+            completeness=1.0 if project.get("instruments") else 0.0,
+        ),
+        "experimentTypes": MetadataValue(
+            value=_entry_names(project.get("experimentTypes", [])),
+            source="pride.experimentTypes",
+            source_level="project",
+            completeness=1.0 if project.get("experimentTypes") else 0.0,
+        ),
+        "keywords": MetadataValue(
+            value=project.get("keywords", []),
+            source="pride.keywords",
+            source_level="project",
+            completeness=1.0 if project.get("keywords") else 0.0,
+        ),
+    }
+
+    return ProjectContext(
+        repository="pride",
+        project_accession=project_accession,
+        px_accession=project_accession,
+        file_name=file_name,
+        metadata=metadata,
+        sdrf_rows=[],
+        project_files=project_files,
+        evidence_documents=[
+            {
+                "source": "pride.project",
+                "text": " ".join(
+                    str(value or "")
+                    for value in (
+                        project.get("title"),
+                        project.get("projectDescription"),
+                        project.get("sampleProcessingProtocol"),
+                        project.get("dataProcessingProtocol"),
+                    )
+                ),
+            },
+            {
+                "source": "local.known_file",
+                "text": f"Using local cached source file {file_name}; PRIDE project file list was not queried.",
+            },
+        ],
+        raw_project_metadata=project,
+    )

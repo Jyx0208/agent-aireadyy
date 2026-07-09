@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Callable
@@ -21,7 +22,17 @@ class DockerMSDTConverterRunner:
         self.report = report
 
     @staticmethod
-    def _container_path(bundle: MaterializedTaskBundle, path: Path) -> str:
+    def _path_posix(path: Path) -> str:
+        return path.resolve().as_posix()
+
+    @staticmethod
+    def _volumes_from_container() -> str | None:
+        raw = os.getenv("AGENT_DOCKER_VOLUMES_FROM", "").strip()
+        return raw or None
+
+    def _container_path(self, bundle: MaterializedTaskBundle, path: Path) -> str:
+        if self._volumes_from_container():
+            return self._path_posix(path)
         try:
             resolved_path = path.resolve()
             resolved_root = bundle.task_root.resolve()
@@ -50,6 +61,34 @@ class DockerMSDTConverterRunner:
         if ram_gb <= 0:
             return None
         return f"-Xmx{ram_gb}G"
+
+    @staticmethod
+    def _float_env(name: str) -> float | None:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def _bool_env(name: str, default: bool = True) -> bool:
+        raw = os.getenv(name, "").strip().casefold()
+        if not raw:
+            return default
+        return raw not in {"0", "false", "no", "off"}
+
+    @staticmethod
+    def _cidfile_path(bundle: MaterializedTaskBundle) -> Path:
+        return bundle.task_root / ".msdt_converter.cid"
+
+    @staticmethod
+    def _task_label(bundle: MaterializedTaskBundle) -> str:
+        plan = getattr(bundle, "plan", None)
+        raw = getattr(plan, "task_id", None) or Path(bundle.task_root).name
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(raw))[:120] or "unknown"
 
     def write_container_config(self, bundle: MaterializedTaskBundle) -> Path:
         is_mgf = bundle.plan.raw_data_type == "mgf"
@@ -133,17 +172,17 @@ class DockerMSDTConverterRunner:
         return bundle.converter_config_path
 
     def build_command(self, bundle: MaterializedTaskBundle) -> list[str]:
-        task_root = docker_host_mount_path(bundle.task_root)
         container_config_path = self._container_path(bundle, bundle.converter_config_path)
-        command = [
-            "docker",
-            "run",
-            "--rm",
-            "-v",
-            f"{task_root}:/workspace",
-            "-e",
-            f"TZ={os.getenv('AGENT_MSDT_DOCKER_TZ') or os.getenv('TZ') or 'Asia/Shanghai'}",
-        ]
+        command = ["docker", "run", "--rm"]
+        command.extend(["--cidfile", str(self._cidfile_path(bundle))])
+        command.extend(["--label", f"agent.pride.task={self._task_label(bundle)}"])
+        volumes_from = self._volumes_from_container()
+        if volumes_from:
+            command.extend(["--volumes-from", volumes_from])
+        else:
+            task_root = docker_host_mount_path(bundle.task_root)
+            command.extend(["-v", f"{task_root}:/workspace"])
+        command.extend(["-e", f"TZ={os.getenv('AGENT_MSDT_DOCKER_TZ') or os.getenv('TZ') or 'Asia/Shanghai'}"])
         java_options = self._fragpipe_java_options()
         if java_options:
             command.extend(["-e", f"_JAVA_OPTIONS={java_options}"])
@@ -160,6 +199,60 @@ class DockerMSDTConverterRunner:
 
     def run(self, bundle: MaterializedTaskBundle) -> subprocess.CompletedProcess[str]:
         self.write_container_config(bundle)
+        self._remove_stale_cidfile(bundle)
         command = self.build_command(bundle)
         emit(self.report, f"正在启动 MSDT-Converter Docker 镜像：{self.image}")
-        return run_command_streaming(command, report=self.report)
+        return run_command_streaming(
+            command,
+            report=self.report,
+            timeout_seconds=self._float_env("AGENT_MSDT_DOCKER_TIMEOUT_SECONDS"),
+            idle_timeout_seconds=self._float_env("AGENT_MSDT_DOCKER_IDLE_TIMEOUT_SECONDS"),
+            abort_predicate=self._abort_reason_from_output,
+            on_abort=lambda reason: self._stop_child_container(bundle, reason),
+        )
+
+    def _abort_reason_from_output(self, line: str, _lines: list[str]) -> str | None:
+        abort_mode = self._low_psm_abort_mode()
+        if abort_mode == "off":
+            return None
+        if re.search(r"\bRT regression using 0 PSMs\b", line, flags=re.IGNORECASE):
+            if abort_mode == "strict":
+                return "low_psm_msbooster"
+            if self._has_zero_search_psm_evidence(_lines):
+                return "zero_psm_msbooster"
+            return "low_psm_msbooster"
+        return None
+
+    @staticmethod
+    def _low_psm_abort_mode() -> str:
+        raw = os.getenv("AGENT_MSDT_ABORT_ON_LOW_PSM", "").strip().casefold()
+        if raw in {"0", "false", "no", "off", "disabled"}:
+            return "off"
+        if raw in {"strict", "immediate"}:
+            return "strict"
+        return "evidence"
+
+    @staticmethod
+    def _has_zero_search_psm_evidence(lines: list[str]) -> bool:
+        for text in lines:
+            if re.search(r"\b0\s+unique peptides from\s+0\s+PSMs\b", text, flags=re.IGNORECASE):
+                return True
+        return False
+
+    def _remove_stale_cidfile(self, bundle: MaterializedTaskBundle) -> None:
+        cidfile = self._cidfile_path(bundle)
+        if cidfile.exists():
+            try:
+                cidfile.unlink()
+            except OSError:
+                pass
+
+    def _stop_child_container(self, bundle: MaterializedTaskBundle, reason: str) -> None:
+        cidfile = self._cidfile_path(bundle)
+        if not cidfile.exists():
+            return
+        container_id = cidfile.read_text(encoding="utf-8", errors="ignore").strip()
+        if not container_id:
+            return
+        emit(self.report, f"agent_watchdog_stopping_msdt_container:{reason}:{container_id[:12]}")
+        subprocess.run(["docker", "stop", container_id], capture_output=True, text=True, timeout=20, check=False)

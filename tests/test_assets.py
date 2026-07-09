@@ -3,7 +3,7 @@ import zipfile
 from pathlib import Path
 
 from agent.assets.downloader import download_file_asset
-from agent.assets.preparer import prepare_file_asset
+from agent.assets.preparer import prepare_file_asset, prepare_local_file_asset
 from agent.assets.resolver import resolve_file_asset
 from agent.input.normalizer import normalize_input
 from agent.models import FileAsset, ProjectContext
@@ -15,6 +15,38 @@ def _project_context(file_name: str, project_files: list[dict]) -> ProjectContex
         file_name=file_name,
         project_files=project_files,
     )
+
+
+def test_prepare_local_file_asset_converts_raw_without_download_url(tmp_path: Path):
+    events: list[tuple[str, str]] = []
+    raw_path = tmp_path / "sample.RAW"
+    raw_path.write_bytes(b"raw-bytes")
+    prepared_path = tmp_path / "prepared" / "sample.mzML"
+
+    class FakeConverter:
+        def convert_to_mzml(self, source: Path, target: Path) -> Path:
+            events.append(("convert", source.name))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("<mzML />", encoding="utf-8")
+            return target
+
+    asset = FileAsset(
+        original_file_name="sample.RAW",
+        resolved_asset_type="raw",
+        project_accession="PXD123456",
+        matched_project_file="sample.RAW",
+        local_path=raw_path,
+        prepared_path=prepared_path,
+        requires_conversion=True,
+        asset_confidence=1.0,
+        match_type="known_project_local_source",
+    )
+
+    prepared = prepare_local_file_asset(asset, FakeConverter())
+
+    assert prepared == prepared_path
+    assert prepared_path.read_text(encoding="utf-8") == "<mzML />"
+    assert events == [("convert", "sample.RAW")]
 
 
 def test_resolve_file_asset_prefers_matching_mzml_over_raw(tmp_path: Path):

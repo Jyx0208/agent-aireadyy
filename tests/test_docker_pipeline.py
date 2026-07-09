@@ -155,6 +155,152 @@ def test_run_pride_dda_msdt_docker_executes_runner(tmp_path: Path, monkeypatch):
     assert Path(manifest.outputs["run_log"]).read_text(encoding="utf-8") == "ok"
 
 
+def test_prepare_known_project_local_raw_converts_before_materializing(tmp_path: Path, monkeypatch):
+    service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
+    task = normalize_input("sample.RAW")
+    raw_path = tmp_path / "cache" / "sample.RAW"
+    raw_path.parent.mkdir(parents=True)
+    raw_path.write_bytes(b"raw-bytes")
+    output_dir = tmp_path / "known_raw"
+    context = ProjectContext(
+        project_accession="PXD123456",
+        file_name="sample.RAW",
+        metadata={
+            "projectDescription": MetadataValue(
+                value="Human DDA Orbitrap phosphoproteomics",
+                source="pride.projectDescription",
+                source_level="project",
+                completeness=1.0,
+            )
+        },
+        project_files=[],
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        "agent.orchestrator.pipeline.build_project_context_for_known_file",
+        lambda *args, **kwargs: context,
+    )
+    monkeypatch.setattr(service, "infer_attributes", lambda *_: _attributes())
+
+    def fake_prepare_local_asset(asset):
+        captured["asset"] = asset
+        _write_minimal_dda_mzml(asset.prepared_path)
+        return asset.prepared_path
+
+    monkeypatch.setattr(service, "prepare_local_asset", fake_prepare_local_asset)
+
+    bundle, result, prepared_path = service.prepare_known_project_local_msdt_docker_input(
+        task=task,
+        source_data_path=raw_path,
+        project_accession="PXD123456",
+        output_dir=output_dir,
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
+    )
+
+    expected_prepared = output_dir / "assets" / "prepared" / "sample.mzML"
+    assert prepared_path == expected_prepared
+    assert result.asset.resolved_asset_type == "raw"
+    assert result.asset.requires_conversion is True
+    assert captured["asset"].download_url is None
+    assert bundle.plan.raw_data_type == "mzml"
+    assert bundle.plan.source_data_path == expected_prepared
+    asset_resolution = json.loads((output_dir / "asset_resolution.json").read_text(encoding="utf-8"))
+    assert asset_resolution["resolved_asset_type"] == "raw"
+    assert asset_resolution["prepared_path"].endswith("sample.mzML")
+
+
+def test_prepare_known_project_local_source_can_reuse_context_dir_without_pride(tmp_path: Path, monkeypatch):
+    service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
+    task = normalize_input("sample.mzML")
+    source_path = tmp_path / "cache" / "sample.mzML"
+    _write_minimal_dda_mzml(source_path)
+    output_dir = tmp_path / "known_mzml"
+    context_dir = tmp_path / "context"
+    context_dir.mkdir()
+    context = ProjectContext(
+        project_accession="PXDCTX",
+        file_name="previous_sample.mzML",
+        metadata={
+            "projectDescription": MetadataValue(
+                value="Human DDA Orbitrap proteomics",
+                source="pride.projectDescription",
+                source_level="project",
+                completeness=1.0,
+            )
+        },
+        project_files=[],
+    )
+    (context_dir / "metadata.json").write_text(context.model_dump_json(), encoding="utf-8")
+    (context_dir / "attributes.json").write_text(_attributes().model_dump_json(), encoding="utf-8")
+
+    monkeypatch.setattr(
+        "agent.orchestrator.pipeline.build_project_context_for_known_file",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("PRIDE context should not be queried")),
+    )
+
+    bundle, _, prepared_path = service.prepare_known_project_local_msdt_docker_input(
+        task=task,
+        source_data_path=source_path,
+        project_accession="PXDCTX",
+        output_dir=output_dir,
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
+        context_dir=context_dir,
+    )
+
+    assert prepared_path == source_path
+    assert bundle.plan.raw_data_type == "mzml"
+    written_context = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert written_context["file_name"] == "sample.mzML"
+    assert written_context["project_files"][0]["fileName"] == "sample.mzML"
+
+
+def test_prepare_known_project_local_source_accepts_reviewed_workflow_override(tmp_path: Path, monkeypatch):
+    service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
+    task = normalize_input("sample.mzML")
+    source_path = tmp_path / "cache" / "sample.mzML"
+    _write_minimal_dda_mzml(source_path)
+    output_dir = tmp_path / "known_mzml_workflow_override"
+    context_dir = tmp_path / "context"
+    context_dir.mkdir()
+    context = ProjectContext(
+        project_accession="PXDCTX",
+        file_name="sample.mzML",
+        metadata={
+            "projectDescription": MetadataValue(
+                value="Human DDA Orbitrap proteomics",
+                source="pride.projectDescription",
+                source_level="project",
+                completeness=1.0,
+            )
+        },
+        project_files=[],
+    )
+    (context_dir / "metadata.json").write_text(context.model_dump_json(), encoding="utf-8")
+    (context_dir / "attributes.json").write_text(_attributes().model_dump_json(), encoding="utf-8")
+
+    monkeypatch.setattr(
+        "agent.orchestrator.pipeline.build_project_context_for_known_file",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("PRIDE context should not be queried")),
+    )
+
+    bundle, result, _ = service.prepare_known_project_local_msdt_docker_input(
+        task=task,
+        source_data_path=source_path,
+        project_accession="PXDCTX",
+        output_dir=output_dir,
+        reviewed_fasta_path=_reviewed_fasta(tmp_path),
+        context_dir=context_dir,
+        workflow_name="TMT10.workflow",
+    )
+
+    assert result.attributes.search_parameter_hints.value["recommended_workflow_name"] == "TMT10.workflow"
+    assert bundle.plan.fragpipe_workflow_path.name == "TMT10.workflow"
+    assert bundle.materialized_workflow_path.name == "TMT10.workflow"
+    converter_config = json.loads(bundle.converter_config_path.read_text(encoding="utf-8"))
+    assert converter_config["generate_fragpipe_search_result"]["workflow_path"].endswith("TMT10.workflow")
+
+
 def test_run_pride_dda_msdt_docker_marks_failed_when_msdt_output_missing(tmp_path: Path, monkeypatch):
     service = AgentService(pride_client=None, llm_reasoner=_DummyReasoner())
     task = normalize_input("WT_5_Lys-c.raw")

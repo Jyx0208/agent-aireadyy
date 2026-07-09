@@ -367,10 +367,48 @@ def _llm_confirmed_workflow_name(attributes: AttributeSet, workspace_root: Path)
     if not workflow_name:
         return None
     safe_name = _safe_file_name(workflow_name)
-    workflow_path = workspace_root / "profiles" / "fragpipe" / safe_name
+    workflows_dir = workspace_root / "profiles" / "fragpipe"
+    workflow_path = workflows_dir / safe_name
     if workflow_path.exists() and workflow_path.is_file():
         return safe_name
+    alias_name = _workflow_alias_name(safe_name, workflows_dir)
+    if alias_name:
+        return alias_name
     return None
+
+
+def _workflow_alias_name(workflow_name: str, workflows_dir: Path) -> str | None:
+    """Map narrow LLM workflow aliases to shipped FragPipe templates.
+
+    Some public metadata names lower-plex TMT experiments as TMT6/TMT11 while
+    the packaged FragPipe profiles use the compatible TMT10 templates. Keep this
+    intentionally small so arbitrary missing workflows still go to review.
+    """
+    aliases = {
+        "TMT6.workflow": "TMT10.workflow",
+        "TMT6-phospho.workflow": "TMT10-phospho.workflow",
+        "TMT6-MS3.workflow": "TMT10-MS3.workflow",
+        "TMT6-MS3-phospho.workflow": "TMT10-MS3-phospho.workflow",
+        "TMT11.workflow": "TMT10.workflow",
+        "TMT11-phospho.workflow": "TMT10-phospho.workflow",
+        "TMT11-MS3.workflow": "TMT10-MS3.workflow",
+        "TMT11-MS3-phospho.workflow": "TMT10-MS3-phospho.workflow",
+    }
+    alias_name = aliases.get(workflow_name)
+    if not alias_name:
+        return None
+    alias_path = workflows_dir / alias_name
+    if alias_path.exists() and alias_path.is_file():
+        return alias_name
+    return None
+
+
+def _workflow_runs_msbooster(workflow_path: Path) -> bool:
+    try:
+        text = workflow_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return bool(re.search(r"(?m)^msbooster\.run-msbooster\s*=\s*true\s*$", text, re.IGNORECASE))
 
 
 def _project_resolution_blocking_issues(project_resolution: ProjectResolution) -> list[str]:
@@ -687,7 +725,10 @@ def plan_dda_execution(
 
     rawspectrum_output_path = rawspectrum_dir / f"{source_data_path.stem}_rawspectrum.parquet"
     manifest_path = fragpipe_dir / "fragpipe-files.fp-manifest"
-    expected_pin_path = fragpipe_dir / "exp" / f"{source_data_path.stem}_edited.pin"
+    workflow_path = workspace_root / "profiles" / "fragpipe" / workflow_name
+    expected_pin_name = f"{source_data_path.stem}_edited.pin" if _workflow_runs_msbooster(workflow_path) else f"{source_data_path.stem}.pin"
+    expected_pin_path = fragpipe_dir / "exp" / expected_pin_name
+    expected_pin_glob = str(fragpipe_dir / "exp" / f"{source_data_path.stem}*.pin")
     converter_config_path = output_dir / "converter_config.json"
     if raw_data_type == "mgf":
         msdt_output_name = f"{source_data_path.stem}_mgf_msdt.parquet"
@@ -707,13 +748,13 @@ def plan_dda_execution(
         fasta_path=fasta_path,
         fasta_selection_mode=fasta_mode,  # type: ignore[arg-type]
         fasta_download_url=project_fasta_url,
-        fragpipe_workflow_path=workspace_root / "profiles" / "fragpipe" / workflow_name,
+        fragpipe_workflow_path=workflow_path,
         manifest_path=manifest_path,
         converter_config_path=converter_config_path,
         rawspectrum_output_path=rawspectrum_output_path,
         fragpipe_workdir=fragpipe_dir,
         expected_pin_path=expected_pin_path,
-        expected_pin_glob=str(expected_pin_path),
+        expected_pin_glob=expected_pin_glob,
         output_paths=output_paths,
         thread_num=_search_thread_num(),
         needs_review=bool(blocking_issues),

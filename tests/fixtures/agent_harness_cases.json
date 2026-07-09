@@ -1,0 +1,114 @@
+{
+  "cases": [
+    {
+      "id": "pride_human_rt_prediction",
+      "goal": "Find human DDA data for RT prediction",
+      "repository": "pride",
+      "expected_task_type": "rt_prediction",
+      "expected_species": ["human"],
+      "expected_repository": "pride",
+      "expected_next_action_category": "discovery_plan",
+      "expected_hard_constraints": {
+        "acquisition_mode": "dda"
+      }
+    },
+    {
+      "id": "pride_fragment_intensity_diversity",
+      "goal": "Find diverse human DDA data for fragment intensity prediction across instruments",
+      "repository": "pride",
+      "expected_task_type": "fragment_intensity_prediction",
+      "expected_species": ["human"],
+      "expected_repository": "pride",
+      "expected_next_action_category": "discovery_plan"
+    },
+    {
+      "id": "partial_output_recovery",
+      "goal": "Use partial outputs when full failed but usable partial outputs exist",
+      "repository": "pride",
+      "expected_repository": "pride",
+      "expected_next_action_category": "recovery_plan",
+      "expected_blocker_recovery_class": "usable_partial_outputs"
+    },
+    {
+      "id": "massive_known_accession_smoke",
+      "goal": "Smoke test MassIVE known accession parameters",
+      "repository": "massive",
+      "input_value": "MSV000068064/datasets/68064/srm_74_3.raw",
+      "expected_repository": "massive",
+      "expected_next_action_category": "repository_smoke"
+    },
+    {
+      "id": "massive_natural_language_discovery",
+      "goal": "Find MassIVE human DDA phosphoproteomics data for RT prediction",
+      "repository": "massive",
+      "expected_task_type": "rt_prediction",
+      "expected_species": ["human"],
+      "expected_repository": "massive",
+      "expected_next_action_category": "discovery_plan"
+    },
+    {
+      "id": "iprox_known_accession_smoke",
+      "goal": "Smoke test iProX known accession parameters",
+      "repository": "iprox",
+      "input_value": "IPX0015463001/OsGF14f interacting proteins.raw",
+      "expected_repository": "iprox",
+      "expected_next_action_category": "repository_smoke"
+    },
+    {
+      "id": "iprox_natural_language_discovery",
+      "goal": "Find iProX human DDA phosphoproteomics data for de novo",
+      "repository": "iprox",
+      "expected_task_type": "denovo",
+      "expected_species": ["human"],
+      "expected_repository": "iprox",
+      "expected_next_action_category": "discovery_plan"
+    },
+    {
+      "id": "iprox_missing_index_blocker",
+      "goal": "iProX discovery cannot continue because iProX index is missing",
+      "repository": "iprox",
+      "expected_repository": "iprox",
+      "expected_next_action_category": "stop_with_blocker",
+      "expected_blocker_recovery_class": "iprox_index_missing"
+    },
+    {
+      "id": "auto_repository_merge_discovery",
+      "goal": "Search all repositories PRIDE MassIVE iProX for diverse human DDA RT prediction data",
+      "repository": "auto",
+      "allowed_repositories": ["pride", "massive", "iprox"],
+      "expected_task_type": "rt_prediction",
+      "expected_species": ["human"],
+      "expected_repository": "auto",
+      "expected_next_action_category": "discovery_plan"
+    },
+    {
+      "id": "iprox_index_recovery_plan",
+      "goal": "Refresh iProX index to recover the iProX index missing repository blocker",
+      "repository": "iprox",
+      "expected_repository": "iprox",
+      "expected_next_action_category": "repository_blocker_recovery_plan",
+      "expected_blocker_recovery_class": "iprox_index_missing"
+    },
+    {
+      "id": "model_failure_gap_expansion",
+      "goal": "Use baseline model failure modes to plan model-informed dataset expansion",
+      "repository": "pride",
+      "expected_repository": "pride",
+      "expected_next_action_category": "model_informed_expansion_plan"
+    },
+    {
+      "id": "model_adapter_contract_plan",
+      "goal": "Validate external model adapter contract and metric schema before model-loop smoke",
+      "repository": "pride",
+      "expected_repository": "pride",
+      "expected_next_action_category": "model_adapter_contract_plan"
+    },
+    {
+      "id": "counterfactual_benchmark_plan",
+      "goal": "Build a counterfactual benchmark for selected positives, hard positives, and blocked negatives",
+      "repository": "pride",
+      "expected_repository": "pride",
+      "expected_next_action_category": "counterfactual_benchmark_plan"
+    }
+  ]
+}

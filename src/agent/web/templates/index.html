@@ -3,12 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PRIDE AI-ready Agent</title>
+<title>Task-aware AI-ready Data Agent</title>
 <style>
 :root{--bg:#f1f5f9;--surface:#ffffff;--panel:#f8fafc;--panel2:#eef2f7;--line:#e2e8f0;--line-strong:#cbd5e1;--text:#0f172a;--muted:#475569;--soft:#94a3b8;--primary:#6366f1;--primary-soft:#eef2ff;--primary-glow:rgba(99,102,241,.12);--accent:#6366f1;--accent2:#0ea5e9;--success:#10b981;--green:#10b981;--red:#ef4444;--amber:#f59e0b;--danger-soft:#fef2f2;--warning-soft:#fffbeb;--shadow-sm:0 1px 2px rgba(15,23,42,.04);--shadow:0 4px 16px rgba(15,23,42,.06),0 1px 3px rgba(15,23,42,.04);--shadow-lg:0 12px 32px rgba(15,23,42,.08),0 2px 6px rgba(15,23,42,.04);--radius:10px;--radius-sm:6px;--radius-lg:14px}
 *{box-sizing:border-box;margin:0;padding:0}
 body{min-height:100vh;background:var(--bg);color:var(--text);font-family:"Plus Jakarta Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;line-height:1.55;-webkit-font-smoothing:antialiased}
 button,input,select{font:inherit}
+[hidden]{display:none!important}
 button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
 .skip-link{position:absolute;left:12px;top:8px;z-index:20;transform:translateY(-140%);background:var(--primary);color:#fff;border-radius:var(--radius-sm);padding:8px 12px;font-weight:700;text-decoration:none}
 .skip-link:focus{transform:translateY(0)}
@@ -53,6 +54,7 @@ h1{font-size:1.4rem;letter-spacing:-.01em;font-weight:800}
 .form-row{display:grid;grid-template-columns:104px minmax(0,1fr);gap:10px;align-items:center;margin-bottom:10px}
 .form-row label{text-align:right;color:var(--muted);font-size:.78rem;font-weight:600}
 .form-row input,.form-row select{width:100%;padding:10px 12px;background:var(--bg);border:1.5px solid var(--line);border-radius:var(--radius-sm);color:var(--text);transition:.15s border-color}
+.form-help{grid-column:2;font-size:.72rem;color:var(--muted);line-height:1.35;margin-top:-5px}
 .form-row input.error,.main-input input[aria-invalid="true"]{border-color:var(--red);box-shadow:0 0 0 3px rgba(239,68,68,.1)}
 .mode-row{display:grid;grid-template-columns:104px minmax(0,1fr);gap:10px;align-items:start;margin:12px 0 10px}
 .mode-label{text-align:right;color:var(--muted);font-size:.78rem;font-weight:600;padding-top:8px}
@@ -84,6 +86,7 @@ h1{font-size:1.4rem;letter-spacing:-.01em;font-weight:800}
 .batch-item-name{overflow-wrap:anywhere}
 .batch-item-status{color:var(--muted);white-space:nowrap}
 .batch-item-error{grid-column:1/-1;color:var(--red);font-size:.72rem;overflow-wrap:anywhere}
+.batch-item-error.partial{color:#0f766e}
 .batch-log-panel{margin-top:10px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--panel);padding:12px}
 .batch-log-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
 .batch-log-title{font-size:.78rem;font-weight:750}
@@ -94,6 +97,101 @@ h1{font-size:1.4rem;letter-spacing:-.01em;font-weight:800}
 .batch-event-level{color:#93c5fd;text-transform:uppercase;font-weight:750}
 .batch-event.error .batch-event-level,.batch-event.error .batch-event-message{color:#fca5a5}
 .batch-event-message{overflow-wrap:anywhere}
+.discovery-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px}
+.discovery-results{display:grid;gap:12px;margin-top:12px}
+.discovery-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.discovery-stat{padding:10px 12px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--panel)}
+.discovery-stat.completed{border-color:rgba(16,185,129,.45)}
+.discovery-stat.partial{border-color:rgba(20,184,166,.5);background:rgba(20,184,166,.06)}
+.discovery-stat.blocked{border-color:rgba(245,158,11,.48)}
+.discovery-stat-label{font-size:.68rem;color:var(--muted);font-weight:750;text-transform:uppercase;letter-spacing:.04em}
+.discovery-stat-value{font-size:1.15rem;font-weight:800;margin-top:2px}
+.discovery-actions{display:flex;gap:8px;flex-wrap:wrap}
+.discovery-selection-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 12px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--panel)}
+.discovery-selection-meta{font-size:.74rem;color:var(--muted);font-weight:650}
+.discovery-select-cell{white-space:nowrap;text-align:center}
+.discovery-pagination{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 0}
+.discovery-pagination-meta{font-size:.74rem;color:var(--muted);font-weight:650}
+.discovery-table-wrap{border:1px solid var(--line);border-radius:var(--radius-sm);overflow:auto;background:var(--surface)}
+.discovery-table{width:100%;min-width:1180px;border-collapse:collapse;font-size:.74rem}
+.discovery-table th,.discovery-table td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+.discovery-table th{background:var(--panel);font-size:.66rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);font-weight:800}
+.discovery-table tr:last-child td{border-bottom:0}
+.discovery-file-table{min-width:1620px;table-layout:fixed}
+.discovery-file-table th,.discovery-file-table td{padding:7px 9px}
+.discovery-file-table tbody tr{height:auto}
+.discovery-task-cell,.discovery-frag-cell,.discovery-reasons-cell,.discovery-evidence-cell{max-height:4.8rem;overflow:auto;padding-right:3px}
+.discovery-evidence{max-width:320px;color:var(--muted);overflow-wrap:anywhere}
+.discovery-file-table .discovery-evidence{max-width:none}
+.discovery-review-select{min-width:116px}
+.discovery-file-table .discovery-review-cell{display:grid;grid-template-columns:1fr 1fr;gap:6px;min-width:0;margin-top:6px}
+.discovery-file-table .discovery-review-select{min-width:0;width:100%}
+.discovery-note{min-width:150px}
+.discovery-file-table .discovery-note{grid-column:1/-1;min-width:0;width:100%}
+.discovery-row-details summary{cursor:pointer;color:var(--primary);font-weight:750;font-size:.7rem}
+.discovery-row-details[open] summary{margin-bottom:6px}
+.discovery-row-details .discovery-evidence-cell{font-size:.68rem;color:var(--muted);border-top:1px dashed var(--line);margin-top:8px;padding-top:6px}
+.ai-ready-flow{display:grid;gap:14px}
+.ai-ready-stage{border-top:1px solid var(--line);padding-top:12px}
+.ai-ready-stage:first-of-type{border-top:0;padding-top:0}
+.ai-ready-stage-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}
+.ai-ready-stage-title{font-size:.86rem;font-weight:800;color:var(--text)}
+.ai-ready-stage-desc{font-size:.74rem;color:var(--muted);margin-top:2px}
+.ai-ready-source-options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:10px}
+.ai-ready-source-option{display:flex;align-items:flex-start;gap:8px;padding:10px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--panel);font-size:.76rem;color:var(--muted)}
+.ai-ready-source-option input{margin-top:3px;accent-color:var(--primary)}
+.ai-ready-source-option strong{display:block;color:var(--text);font-size:.78rem;margin-bottom:2px}
+.ai-ready-fields{display:grid;gap:8px}
+.ai-ready-advanced{border:1px dashed var(--line-strong);border-radius:var(--radius-sm);padding:10px;background:var(--panel);margin-top:4px}
+.ai-ready-advanced summary{cursor:pointer;color:var(--primary);font-weight:800;font-size:.78rem}
+.ai-ready-advanced[open] summary{margin-bottom:10px}
+.ai-ready-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.discovery-next-step{padding:10px 12px;border:1px solid rgba(99,102,241,.25);border-radius:var(--radius-sm);background:var(--primary-soft);color:var(--text);font-size:.76rem;line-height:1.5}
+.discovery-next-step strong{display:block;margin-bottom:2px;font-size:.78rem}
+.discovery-status{font-size:.76rem;color:var(--muted)}
+.discovery-status.ok{color:var(--green)}
+.discovery-status.error{color:var(--red)}
+.discovery-goal-box{display:grid;gap:8px;margin:12px 0 14px;padding:14px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--panel)}
+.discovery-goal-box label{font-size:.76rem;font-weight:750;color:var(--muted)}
+.discovery-goal-input{width:100%;min-height:78px;resize:vertical;padding:11px 12px;background:var(--surface);border:1.5px solid var(--line);border-radius:var(--radius-sm);color:var(--text);font-size:.82rem}
+.discovery-goal-input:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-glow)}
+.discovery-goal-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.discovery-helper{font-size:.72rem;color:var(--muted)}
+.discovery-helper.ok{color:var(--green)}
+.discovery-helper.error{color:var(--red)}
+.download-menu{position:relative;display:inline-block}
+.download-menu summary{list-style:none}
+.download-menu summary::-webkit-details-marker{display:none}
+.download-menu[open] summary{border-color:var(--primary);color:var(--primary);background:var(--primary-soft)}
+.download-menu-body{position:absolute;z-index:10;top:calc(100% + 6px);left:0;min-width:230px;display:grid;gap:6px;padding:8px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--surface);box-shadow:var(--shadow-lg)}
+.download-menu-body .btn{justify-content:flex-start;width:100%}
+.discovery-review-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 12px;border:1px dashed var(--line-strong);border-radius:var(--radius-sm);background:var(--panel)}
+.discovery-log-panel{margin-top:10px}
+.discovery-log-box{height:180px}
+.discovery-file-groups{display:grid;gap:14px}
+.discovery-file-group{border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--surface);overflow:hidden}
+.discovery-file-group[data-validity="valid"]{border-color:rgba(16,185,129,.45)}
+.discovery-file-group[data-validity="weak_keep"]{border-color:rgba(99,102,241,.35)}
+.discovery-file-group[data-validity="needs_review"]{border-color:rgba(245,158,11,.45)}
+.discovery-file-group[data-validity="exclude"]{border-color:rgba(239,68,68,.35)}
+.discovery-file-group-head{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;padding:12px 14px;background:var(--panel);border-bottom:1px solid var(--line)}
+.discovery-file-group-title{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:.86rem;font-weight:800;color:var(--text)}
+.discovery-file-group-desc{margin-top:3px;font-size:.72rem;color:var(--muted)}
+.discovery-file-group-meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end;font-size:.72rem;color:var(--muted)}
+.discovery-file-group-body{overflow-x:auto}
+.discovery-validity-dot{width:9px;height:9px;border-radius:999px;background:var(--soft);display:inline-block}
+.discovery-validity-dot.valid{background:var(--green)}
+.discovery-validity-dot.weak_keep{background:var(--primary)}
+.discovery-validity-dot.needs_review{background:var(--amber)}
+.discovery-validity-dot.exclude{background:var(--red)}
+.discovery-pagination-inline{display:flex;gap:8px;align-items:center;justify-content:flex-end;padding:9px 12px;border-top:1px solid var(--line);background:var(--surface)}
+.discovery-file-main{display:grid;gap:3px;min-width:230px}
+.discovery-file-name{font-weight:650;color:var(--text);overflow-wrap:anywhere}
+.discovery-file-sub{font-size:.68rem;color:var(--muted);overflow-wrap:anywhere}
+.discovery-metric-pair{display:grid;gap:3px;font-size:.72rem;white-space:nowrap}
+.discovery-metric-pair strong{font-size:.8rem;color:var(--text)}
+.discovery-compact-list{font-size:.72rem;color:var(--text);max-width:220px;overflow-wrap:anywhere}
+.discovery-compact-muted{font-size:.68rem;color:var(--muted);margin-top:3px}
 .config-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px;padding-top:14px;border-top:1px solid var(--line)}
 .config-toggle{background:transparent;border:0;color:var(--primary);cursor:pointer;font-size:.82rem;font-weight:700;transition:.15s color;padding:0}
 .config-toggle:hover{color:#4338ca}
@@ -108,8 +206,14 @@ h1{font-size:1.4rem;letter-spacing:-.01em;font-weight:800}
 .warn.show{display:block}
 .public-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}
 .public-meta{font-size:.74rem;color:var(--muted)}
-.history-card{max-height:560px;display:flex;flex-direction:column;min-height:0}
+      .history-card{max-height:560px;display:flex;flex-direction:column;min-height:0}
 .operations-rail{position:sticky;top:24px}
+.right-rail{display:grid;gap:18px;align-self:start}
+.api-config-card{display:grid;gap:10px}
+.api-config-card .config-head{margin-top:0;padding-top:0;border-top:0}
+.api-config-card .config-actions{margin-left:0}
+.api-config-card .form-row{grid-template-columns:92px minmax(0,1fr)}
+.api-config-card .form-row label{text-align:right}
 .history-card .result-list{max-height:430px;overflow-y:auto;padding-right:4px}
 .result-list{display:flex;flex-direction:column;gap:8px}
 .empty{font-size:.78rem;color:var(--muted);text-align:center;padding:20px}
@@ -285,7 +389,7 @@ h1{font-size:1.4rem;letter-spacing:-.01em;font-weight:800}
 .gauge-card.high .metric-value{color:#b91c1c}
 @media(prefers-reduced-motion:reduce){.gauge-needle{transition:none}}
 /* Workflow tabs */
-.workflow-tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px}
+.workflow-tabs{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px}
 .workflow-tab{display:grid;gap:4px;text-align:left;border:1.5px solid var(--line);border-radius:var(--radius-sm);background:var(--panel);color:var(--text);padding:12px 14px;cursor:pointer;min-height:76px;transition:.15s all}
 .workflow-tab strong{font-size:.84rem;font-weight:750}
 .workflow-tab span{font-size:.7rem;color:var(--muted)}
@@ -299,11 +403,12 @@ h1{font-size:1.4rem;letter-spacing:-.01em;font-weight:800}
 .status-pill::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--soft);flex-shrink:0}
 .status-pill.running::before{background:var(--primary);box-shadow:0 0 6px var(--primary-glow)}
 .status-pill.completed::before{background:var(--green)}
+.status-pill.partial::before{background:#14b8a6;box-shadow:0 0 6px rgba(20,184,166,.28)}
 .status-pill.failed::before{background:var(--red)}
 .status-pill.queued::before,.status-pill.needs_review::before,.status-pill.blocked::before{background:var(--amber)}
 footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border-top:1px solid var(--line)}
 @media(max-width:1180px){.run-grid{grid-template-columns:1fr}.side-panels{position:static;height:auto;max-height:none;overflow:visible}.review-panel{max-height:300px}.agent-reasoning-panel{min-height:300px}.agent-reasoning-body.open{max-height:520px}}
-@media(max-width:1100px){.grid{grid-template-columns:1fr}.operations-rail,.review-panel{position:static}.status-cards{grid-template-columns:1fr 1fr}.workflow-tabs{grid-template-columns:1fr}.history-card{max-height:60vh}.history-card .result-list{max-height:calc(60vh - 90px)}header{align-items:flex-start;flex-direction:column}.header-actions{justify-content:flex-start}.main-input{flex-direction:column}.steps{grid-template-columns:1fr 1fr}.form-row,.mode-row{grid-template-columns:1fr}.form-row label,.mode-label{text-align:left}.config-actions,.option-row,.examples{margin-left:0}.batch-toolbar{align-items:stretch}.batch-toolbar label,.batch-toolbar .btn{width:100%;justify-content:center}.batch-toolbar input{flex:1}}
+@media(max-width:1100px){.grid{grid-template-columns:1fr}.operations-rail,.review-panel{position:static}.status-cards{grid-template-columns:1fr 1fr}.workflow-tabs{grid-template-columns:1fr}.history-card{max-height:60vh}.history-card .result-list{max-height:calc(60vh - 90px)}header{align-items:flex-start;flex-direction:column}.header-actions{justify-content:flex-start}.main-input{flex-direction:column}.steps{grid-template-columns:1fr 1fr}.form-row,.mode-row{grid-template-columns:1fr}.form-row label,.mode-label{text-align:left}.config-actions,.option-row,.examples{margin-left:0}.batch-toolbar{align-items:stretch}.batch-toolbar label,.batch-toolbar .btn{width:100%;justify-content:center}.batch-toolbar input{flex:1}.ai-ready-source-options{grid-template-columns:1fr}.ai-ready-stage-head{display:grid}}
 @media(max-width:720px){.container{padding:14px}.surface{padding:14px}.status-cards{grid-template-columns:1fr}.pane-title{display:grid}.workflow-tab{min-height:58px}.server-status{white-space:normal}.log-box{height:380px}}
 </style>
 </head>
@@ -312,9 +417,9 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
 <main class="container app-shell" id="mainContent" tabindex="-1">
   <header>
     <div class="brand-stack">
-      <div class="product-kicker" data-i18n="productKicker">Proteomics workflow workbench</div>
-      <h1>PRIDE AI-ready Agent</h1>
-      <div class="subtitle" data-i18n="subtitle">Resolve PRIDE files, infer search parameters, and run or preview the MSDT-Converter workflow.</div>
+      <div class="product-kicker" data-i18n="productKicker">Proteomics AI data workbench</div>
+      <h1>Task-aware AI-ready Data Agent</h1>
+      <div class="subtitle" data-i18n="subtitle">Discover task-fit proteomics data, run or reuse search workflows, and build validated AI-ready training datasets.</div>
     </div>
     <div class="header-actions">
       <div class="language-switch" role="group" aria-label="Language">
@@ -345,6 +450,10 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
       </div>
       <div class="form-alert" id="formAlert" role="alert" aria-live="assertive" aria-atomic="true" hidden></div>
       <div class="workflow-tabs" role="tablist" aria-label="Workflow type">
+        <button class="workflow-tab" id="discoveryTaskTab" type="button" role="tab" aria-selected="false" aria-controls="discoveryTaskPanel" data-workflow-tab="discovery" onclick="setWorkflowTab('discovery')">
+          <strong data-i18n="discoveryTabTitle">Dataset discovery</strong>
+          <span data-i18n="discoveryTabDesc">Find candidate files for model-building datasets.</span>
+        </button>
         <button class="workflow-tab" id="singleTaskTab" type="button" role="tab" aria-selected="true" aria-controls="singleTaskPanel" data-workflow-tab="single" onclick="setWorkflowTab('single')">
           <strong data-i18n="singleTabTitle">Single file</strong>
           <span data-i18n="singleTabDesc">Run one PRIDE file through planning or the full workflow.</span>
@@ -352,6 +461,10 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
         <button class="workflow-tab" id="batchTaskTab" type="button" role="tab" aria-selected="false" aria-controls="batchTaskPanel" data-workflow-tab="batch" onclick="setWorkflowTab('batch')">
           <strong data-i18n="batchTabTitle">Batch Excel</strong>
           <span data-i18n="batchTabDesc">Plan many files and export a benchmark spreadsheet.</span>
+        </button>
+        <button class="workflow-tab" id="aiReadyTaskTab" type="button" role="tab" aria-selected="false" aria-controls="aiReadyTaskPanel" data-workflow-tab="ai_ready" onclick="setWorkflowTab('ai_ready')">
+          <strong data-i18n="aiReadyTabTitle">AI-ready Build</strong>
+          <span data-i18n="aiReadyTabDesc">Convert completed runs or search outputs into task tables.</span>
         </button>
       </div>
       <div class="task-pane" id="singleTaskPanel" role="tabpanel" aria-labelledby="singleTaskTab">
@@ -462,6 +575,7 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
           <button class="btn btn-primary btn-small" id="batchStartBtn" type="button" onclick="startBatch()" data-i18n="startBatch">Run batch Excel</button>
           <button class="btn btn-secondary btn-small" id="batchDownloadBtn" type="button" onclick="downloadBatchExcel()" disabled data-i18n="downloadExcel">Download Excel</button>
           <button class="btn btn-secondary btn-small" id="batchAuditBtn" type="button" onclick="downloadBatchAudit()" disabled data-i18n="downloadAudit">Download audit ZIP</button>
+          <button class="btn btn-green btn-small" id="batchAiReadyBtn" type="button" onclick="buildAiReadyFromBatch()" disabled data-i18n="buildAiReadyFromBatch">Build AI-ready</button>
         </div>
         <div class="batch-status" id="batchStatus" role="status" aria-live="polite"></div>
         <div class="batch-items" id="batchItems" aria-live="polite"></div>
@@ -473,31 +587,439 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
           <div class="batch-log-box" id="batchLogBox" role="log" aria-live="polite"></div>
         </div>
       </div>
-      <div class="config-head">
-        <button class="config-toggle" id="configToggle" aria-controls="configBody" aria-expanded="false" onclick="toggleConfig()"><span data-i18n="apiConfig">API Configuration</span> <span id="configStatus"></span></button>
-        <span class="inline-status" id="apiCheckStatus" role="status" aria-live="polite"></span>
-      </div>
-      <div class="config-body" id="configBody">
-        <div class="form-row"><label for="cfgApiKey">API Key *</label><input type="password" id="cfgApiKey" aria-required="true" aria-invalid="false" autocomplete="off" data-i18n-placeholder="apiKeyPlaceholder" placeholder="Your API key for this task"></div>
-        <div class="form-row"><label for="cfgBaseUrl">Base URL</label><input type="text" id="cfgBaseUrl" inputmode="url" placeholder="https://api.deepseek.com"></div>
-        <div class="form-row"><label for="cfgModel" data-i18n="model">Model</label><input type="text" id="cfgModel" placeholder="deepseek-v4-flash"></div>
-        <div class="form-row"><label for="cfgTimeout" data-i18n="timeout">Timeout</label><input type="number" id="cfgTimeout" min="1" placeholder="1200"></div>
-        <div class="config-actions">
-          <button class="btn btn-secondary btn-small" id="checkApiBtn" onclick="checkLLMConfig()" data-i18n="checkApi">Check API Key</button>
-          <span class="inline-status" id="resultRetention"></span>
+      <div class="discovery-panel task-pane" id="discoveryTaskPanel" role="tabpanel" aria-labelledby="discoveryTaskTab" hidden>
+        <div class="pane-title">
+          <div>
+            <h3 data-i18n="discoveryTitle">Dataset Discovery</h3>
+            <p class="batch-help" data-i18n="discoveryHelp">Search repository metadata for candidate projects/files and export quality-scored manifests. No RAW download or workflow execution.</p>
+          </div>
+          <span class="status-pill queued" data-i18n="workflowReady">Ready</span>
+        </div>
+        <div class="form-row">
+          <label for="discoverySource" data-i18n="discoverySource">Discovery source</label>
+          <select id="discoverySource" onchange="toggleDiscoverySourceControls()">
+            <option value="remote" data-i18n="discoverySourceRemote">Remote repository discovery</option>
+            <option value="local" data-i18n="discoverySourceLocal">Local raw/mzML directory</option>
+          </select>
+        </div>
+        <div class="form-row" id="discoveryLocalDirRow" hidden>
+          <label for="discoveryLocalDir" data-i18n="discoveryLocalDir">Local data directory</label>
+          <input type="text" id="discoveryLocalDir" placeholder="C:\path\to\raw_or_mzML_files">
+        </div>
+        <div class="mode-help" id="discoverySourceHelp" data-i18n="discoverySourceHelp">Remote searches supported repository metadata. Local scans only acquisition or peaklist files and keeps search-result tables in AI-ready Build.</div>
+        <div class="discovery-goal-box">
+          <label for="discoveryPrompt" data-i18n="discoveryGoalPrompt">Discovery request</label>
+          <textarea class="discovery-goal-input" id="discoveryPrompt" autocomplete="off" data-i18n-placeholder="discoveryGoalPlaceholder" placeholder="Find small DDA proteomics datasets for HLA ligandome, drug treatment, or another future modeling use case. Prioritize diversity."></textarea>
+          <div class="discovery-goal-actions">
+            <button class="btn btn-secondary btn-small" id="discoveryParseBtn" type="button" onclick="parseDiscoveryGoal()" data-i18n="parseDiscoveryGoal">Parse goal</button>
+            <span class="discovery-helper" id="discoveryParseStatus" data-i18n="discoveryParseHelp">Natural language fills the fields below; the fields are the final constraints.</span>
+          </div>
+        </div>
+        <div class="form-row">
+          <label for="discoveryRepository" data-i18n="repository">Repository</label>
+          <select id="discoveryRepository">
+            <option value="pride">PRIDE</option>
+            <option value="massive">MassIVE</option>
+            <option value="iprox">iProX</option>
+            <option value="auto" data-i18n="repositoryAuto">Auto</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label for="discoveryGoal" data-i18n="discoveryGoal">Discovery target</label>
+          <select id="discoveryGoal" onchange="toggleDiscoveryGoalControls()">
+            <option value="general" data-i18n="discoveryGoalGeneral">General data search</option>
+            <option value="ptm" data-i18n="discoveryGoalPtm">PTM-enriched data</option>
+            <option value="immunopeptidomics" data-i18n="discoveryGoalImmunopeptidomics">Immunopeptidomics / HLA ligandome</option>
+          </select>
+        </div>
+        <div class="form-row" id="discoveryPtmRow">
+          <label for="discoveryPtm" data-i18n="discoveryPtm">PTM type</label>
+          <select id="discoveryPtm" multiple size="6">
+            <option value="phospho">phospho</option>
+            <option value="acetyl">acetyl</option>
+            <option value="ubiquitin">ubiquitin/GlyGly</option>
+            <option value="glyco">glyco</option>
+            <option value="methyl">methyl</option>
+            <option value="unknown_ptm">unknown / any</option>
+          </select>
+          <div class="form-help" data-i18n="discoveryPtmHelp">Hold Ctrl/Command to select multiple PTM types.</div>
+        </div>
+        <div class="form-row">
+          <label for="discoveryLabeling" data-i18n="discoveryLabeling">Labeling</label>
+          <select id="discoveryLabeling">
+            <option value="label_free">label-free</option>
+            <option value="TMT">TMT</option>
+            <option value="iTRAQ">iTRAQ</option>
+            <option value="unknown">unknown / any</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label for="discoverySpecies" data-i18n="discoverySpecies">Species preference</label>
+          <input type="text" id="discoverySpecies" value="" autocomplete="off" placeholder="optional; e.g. human, mouse">
+        </div>
+        <div class="form-row">
+          <label for="discoverySpeciesPolicy" data-i18n="discoverySpeciesPolicy">Species policy</label>
+          <select id="discoverySpeciesPolicy">
+            <option value="open" data-i18n="discoverySpeciesPolicyOpen">Prefer listed, keep others</option>
+            <option value="include_only" data-i18n="discoverySpeciesPolicyIncludeOnly">Include only listed species</option>
+            <option value="exclude" data-i18n="discoverySpeciesPolicyExclude">Exclude listed species</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label for="discoveryAcquisition" data-i18n="discoveryAcquisition">Acquisition</label>
+          <select id="discoveryAcquisition">
+            <option value="dda">DDA</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label for="discoveryTaskType" data-i18n="discoveryTaskType">Task readiness</label>
+          <select id="discoveryTaskType">
+            <option value="">Not set</option>
+            <option value="rt_prediction">RT prediction</option>
+            <option value="fragment_intensity_prediction">Fragment intensity prediction</option>
+            <option value="psm_scoring">PSM scoring</option>
+            <option value="denovo">De novo</option>
+            <option value="ptm_denovo">PTM de novo</option>
+            <option value="chimeric_interpretation">Chimeric interpretation</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label for="discoveryMaxProjects" data-i18n="discoveryMaxProjects">Max projects</label>
+          <input type="number" id="discoveryMaxProjects" min="1" max="100" value="5">
+        </div>
+        <div class="form-row">
+          <label for="discoveryMaxFiles" data-i18n="discoveryMaxFiles">Max files</label>
+          <input type="number" id="discoveryMaxFiles" min="1" max="2000" value="50">
+        </div>
+        <div class="form-row">
+          <label for="discoveryFilesPerProject" data-i18n="discoveryFilesPerProject">Files/project</label>
+          <input type="number" id="discoveryFilesPerProject" min="1" max="100" value="20">
+        </div>
+        <div class="form-row">
+          <label for="discoveryDiversityStrategy" data-i18n="discoveryDiversityStrategy">Diversity</label>
+          <select id="discoveryDiversityStrategy">
+            <option value="balanced">Balanced</option>
+            <option value="high">High</option>
+            <option value="off">Off</option>
+          </select>
+        </div>
+        <label class="option-row">
+          <input type="checkbox" id="discoveryUseMemory" checked>
+          <span data-i18n="discoveryUseMemory">Use review memory as a trust prior.</span>
+        </label>
+        <label class="option-row">
+          <input type="checkbox" id="discoverySaveMemory" checked>
+          <span data-i18n="discoverySaveMemory">Save this discovery run to local memory.</span>
+        </label>
+        <label class="option-row">
+          <input type="checkbox" id="discoveryAgentic" checked>
+          <span data-i18n="discoveryAgentic">Use LLM query planning during discovery.</span>
+        </label>
+        <div class="mode-help" style="margin-left:114px" data-i18n="discoveryAgenticHelp">When enabled, the LLM plans repository search queries and can run one follow-up round. The top Parse goal button already uses LLM to fill the fields.</div>
+        <div class="form-row">
+          <label for="discoveryAgenticRounds" data-i18n="discoveryAgenticRounds">Agentic rounds</label>
+          <select id="discoveryAgenticRounds">
+            <option value="1">1</option>
+            <option value="2">2</option>
+          </select>
+        </div>
+        <div class="discovery-toolbar">
+          <button class="btn btn-primary btn-small" id="discoveryStartBtn" type="button" onclick="startDiscovery()" data-i18n="startDiscovery">Run discovery</button>
+          <button class="btn btn-secondary btn-small" id="discoveryCancelBtn" type="button" onclick="cancelDiscoveryJob()" disabled data-i18n="cancelDiscovery">Cancel</button>
+          <span class="discovery-status" id="discoveryStatus" role="status" aria-live="polite"></span>
+        </div>
+        <div class="batch-log-panel discovery-log-panel">
+          <div class="batch-log-head">
+            <span class="batch-log-title" data-i18n="discoveryLogTitle">Discovery log</span>
+            <span class="batch-log-meta" id="discoveryLogMeta" data-i18n="discoveryLogEmpty">No discovery events yet.</span>
+          </div>
+          <div class="batch-log-box discovery-log-box" id="discoveryLogBox" role="log" aria-live="polite"></div>
+        </div>
+        <div class="discovery-results" id="discoveryResults" hidden>
+          <div class="discovery-summary" id="discoverySummary"></div>
+          <div class="discovery-next-step" id="discoveryNextStep" role="status" aria-live="polite" hidden></div>
+          <div class="discovery-actions">
+            <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('dataset_manifest_csv')" data-i18n="downloadManifestCsv">Download manifest CSV</button>
+            <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('batch_inputs')" data-i18n="downloadBatchInputs">Download batch inputs</button>
+            <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('quality_report')" data-i18n="downloadQualityReport">Download quality report</button>
+            <details class="download-menu">
+              <summary class="btn btn-secondary btn-small" data-i18n="moreDownloads">More downloads</summary>
+              <div class="download-menu-body">
+                <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('dataset_manifest_json')" data-i18n="downloadManifestJson">Full JSON</button>
+                <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('dataset_manifest_usable_csv')" data-i18n="downloadUsableManifestCsv">Usable CSV</button>
+                <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('dataset_manifest_valid_csv')" data-i18n="downloadValidManifestCsv">Valid CSV</button>
+                <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('dataset_manifest_task_ready_csv')" data-i18n="downloadTaskReadyManifestCsv">Task-ready CSV</button>
+                <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('task_ai_readiness_matrix_csv')">AI-readiness matrix</button>
+                <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('data_value_ranking_csv')">Data-value ranking</button>
+                <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('data_value_report_md')">Data-value report</button>
+                <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('batch_inputs_valid')" data-i18n="downloadValidBatchInputs">Valid inputs</button>
+                <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('batch_inputs_usable')" data-i18n="downloadUsableBatchInputs">Usable inputs</button>
+                <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('batch_inputs_task_ready')" data-i18n="downloadTaskReadyBatchInputs">Task-ready inputs</button>
+              </div>
+            </details>
+          </div>
+          <div class="discovery-selection-toolbar" id="discoverySelectionToolbar">
+            <span class="discovery-selection-meta" id="discoverySelectionMeta" data-i18n="discoverySelectionEmpty">No files selected.</span>
+            <button class="btn btn-secondary btn-small" type="button" onclick="setDiscoverySelection('usable')" data-i18n="selectUsableDiscovery">Select usable</button>
+            <button class="btn btn-secondary btn-small" type="button" onclick="setDiscoverySelection('all')" data-i18n="selectAllDiscovery">Select all</button>
+            <button class="btn btn-secondary btn-small" type="button" onclick="setDiscoverySelection('none')" data-i18n="clearDiscoverySelection">Clear</button>
+            <button class="btn btn-green btn-small" type="button" onclick="sendDiscoverySelectionToBatch()" data-i18n="sendDiscoveryToBatch">Send selected to Batch</button>
+          </div>
+          <div class="discovery-table-wrap" id="discoveryProjectTable"></div>
+          <div class="discovery-table-wrap" id="discoveryFileTable"></div>
+          <div class="discovery-pagination" id="discoveryFilePagination" hidden></div>
+          <div class="discovery-review-actions">
+            <button class="btn btn-green btn-small" id="discoveryReviewBtn" type="button" onclick="saveDiscoveryReviews()" data-i18n="saveDiscoveryReviews">Save optional labels</button>
+            <span class="discovery-helper" data-i18n="discoveryReviewHelp">Use only when manually reviewing rows.</span>
+          </div>
         </div>
       </div>
-      <div class="warn show" id="warnBanner" data-i18n="apiWarning">The API key is checked when a task starts and is not written to public history.</div>
+      <div class="discovery-panel task-pane" id="aiReadyTaskPanel" role="tabpanel" aria-labelledby="aiReadyTaskTab" hidden>
+        <div class="pane-title">
+          <div>
+            <h3 data-i18n="aiReadyBuildTitle">AI-ready Build</h3>
+            <p class="batch-help" data-i18n="aiReadyBuildHelp">Profile local TSV/MGF inputs and validate AI-ready build reports. Local paths only; no upload or workflow execution.</p>
+          </div>
+        </div>
+        <div class="ai-ready-flow">
+          <div class="ai-ready-stage">
+            <div class="ai-ready-stage-head">
+              <div>
+                <div class="ai-ready-stage-title" data-i18n="aiReadyStageSource">1. Input source</div>
+                <div class="ai-ready-stage-desc" data-i18n="aiReadyStageSourceHelp">Choose where the build should start.</div>
+              </div>
+            </div>
+            <div class="ai-ready-source-options" role="radiogroup" aria-label="AI-ready input source">
+              <label class="ai-ready-source-option">
+                <input type="radio" name="aiReadySource" value="agent_run" checked onchange="toggleAiReadySource()">
+                <span><strong data-i18n="aiReadySourceBatch">From Batch run</strong><span data-i18n="aiReadySourceBatchHelp">Use completed or usable partial agent runs.</span></span>
+              </label>
+              <label class="ai-ready-source-option">
+                <input type="radio" name="aiReadySource" value="local_search" onchange="toggleAiReadySource()">
+                <span><strong data-i18n="aiReadySourceLocal">From local search result</strong><span data-i18n="aiReadySourceLocalHelp">Use TSV/MGF files or a search output directory.</span></span>
+              </label>
+              <label class="ai-ready-source-option">
+                <input type="radio" name="aiReadySource" value="existing_build" onchange="toggleAiReadySource()">
+                <span><strong data-i18n="aiReadySourceExisting">From existing AI-ready output</strong><span data-i18n="aiReadySourceExistingHelp">Validate or continue from a previous build.</span></span>
+              </label>
+            </div>
+            <div class="ai-ready-fields" data-ai-ready-source-panel="agent_run">
+              <div class="form-row">
+                <label for="aiReadyAgentRunDir" data-i18n="aiReadyAgentRunDir">Original agent run directory</label>
+                <input type="text" id="aiReadyAgentRunDir" placeholder="C:\path\to\runs\original_agent_run">
+              </div>
+            </div>
+            <div class="ai-ready-fields" data-ai-ready-source-panel="local_search" hidden>
+              <div class="form-row">
+                <label for="aiReadySearchDir" data-i18n="aiReadySearchDir">Search output directory</label>
+                <input type="text" id="aiReadySearchDir" placeholder="C:\path\to\fragpipe_or_sage_output">
+              </div>
+              <details class="ai-ready-advanced">
+                <summary data-i18n="aiReadyAdvancedManualPaths">Manual TSV/MGF paths</summary>
+                <div class="form-row">
+                  <label for="aiReadySearchResults" data-i18n="aiReadySearchResults">Search result TSV paths</label>
+                  <textarea id="aiReadySearchResults" rows="2" placeholder="C:\path\to\psm.tsv"></textarea>
+                </div>
+                <div class="form-row">
+                  <label for="aiReadyPeaklists" data-i18n="aiReadyPeaklists">MGF peaklist paths</label>
+                  <textarea id="aiReadyPeaklists" rows="2" placeholder="C:\path\to\spectra.mgf"></textarea>
+                </div>
+              </details>
+            </div>
+            <div class="ai-ready-fields" data-ai-ready-source-panel="existing_build" hidden>
+              <div class="form-row">
+                <label for="aiReadyBuildDir" data-i18n="aiReadyBuildDir">Existing build dir</label>
+                <input type="text" id="aiReadyBuildDir" placeholder="runs/discovery/... or runs/ai_ready_builds/...">
+              </div>
+            </div>
+          </div>
+
+          <div class="ai-ready-stage">
+            <div class="ai-ready-stage-head">
+              <div>
+                <div class="ai-ready-stage-title" data-i18n="aiReadyStageBuild">2. Task and build</div>
+                <div class="ai-ready-stage-desc" data-i18n="aiReadyStageBuildHelp">Pick the downstream task, then run the smallest useful build check.</div>
+              </div>
+            </div>
+            <div class="form-row">
+              <label for="aiReadyTaskType" data-i18n="aiReadyTaskType">Task type</label>
+              <select id="aiReadyTaskType">
+                <option value="rt_prediction">RT prediction</option>
+                <option value="fragment_intensity_prediction">Fragment intensity prediction</option>
+                <option value="psm_scoring">PSM scoring</option>
+                <option value="denovo">De novo</option>
+                <option value="ptm_denovo">PTM de novo</option>
+                <option value="chimeric_interpretation">Chimeric interpretation</option>
+              </select>
+            </div>
+            <div class="ai-ready-actions">
+              <button class="btn btn-green btn-small" id="aiReadyAgentRunBuildBtn" type="button" onclick="buildAiReadyFromAgentRun()" data-i18n="buildFromAgentRun">Build from agent run</button>
+              <button class="btn btn-primary btn-small" id="aiReadyMiniE2EBtn" type="button" onclick="validateMiniE2E()" data-i18n="validateMiniE2E">Validate mini E2E</button>
+              <button class="btn btn-secondary btn-small" id="aiReadyProfileBtn" type="button" onclick="profileAiReadyInputs()" data-i18n="profileAiReadyInputs">Profile inputs</button>
+              <button class="btn btn-primary btn-small" id="aiReadyValidateBtn" type="button" onclick="validateAiReadyBuild()" data-i18n="validateAiReadyBuild">Validate build</button>
+              <span class="discovery-status" id="aiReadyStatus" role="status" aria-live="polite"></span>
+            </div>
+            <details class="ai-ready-advanced">
+              <summary data-i18n="aiReadyAdvancedBuildTools">Advanced build tools</summary>
+              <div class="ai-ready-actions">
+                <button class="btn btn-secondary btn-small" id="aiReadyLocateBtn" type="button" onclick="locateAiReadyInputs()" data-i18n="locateAiReadyInputs">Locate inputs</button>
+                <button class="btn btn-secondary btn-small" id="aiReadyAgentRunLocateBtn" type="button" onclick="locateAgentRunInputs()" data-i18n="locateAgentRunInputs">Locate agent run</button>
+                <button class="btn btn-green btn-small" id="aiReadySmokeBtn" type="button" onclick="runAiReadyRealSmoke()" data-i18n="runAiReadyRealSmoke">Run real smoke</button>
+              </div>
+            </details>
+          </div>
+
+          <div class="ai-ready-stage">
+            <div class="ai-ready-stage-head">
+              <div>
+                <div class="ai-ready-stage-title" data-i18n="aiReadyStageNext">3. Results and next step</div>
+                <div class="ai-ready-stage-desc" data-i18n="aiReadyStageNextHelp">Generate recipe/split, run smoke evaluation, or review blockers.</div>
+              </div>
+            </div>
+            <div class="form-row">
+              <label for="aiReadyRecipeBatchDir" data-i18n="aiReadyRecipeBatchDir">Batch/benchmark dir</label>
+              <input type="text" id="aiReadyRecipeBatchDir" placeholder="runs/ai_ready_builds/mini_e2e_batch_...">
+            </div>
+            <div class="form-row">
+              <label for="aiReadyRecipeSplitStrategy" data-i18n="aiReadyRecipeSplitStrategy">Split strategy</label>
+              <select id="aiReadyRecipeSplitStrategy">
+                <option value="auto">Auto</option>
+                <option value="project_disjoint">Project-disjoint</option>
+                <option value="file_disjoint">File-disjoint</option>
+                <option value="sample_disjoint">Sample-disjoint</option>
+                <option value="lab_disjoint">Lab-disjoint</option>
+                <option value="instrument_disjoint">Instrument-disjoint</option>
+                <option value="organism_disjoint">Organism-disjoint</option>
+                <option value="peptide_disjoint">Peptide-disjoint</option>
+                <option value="protein_disjoint">Protein-disjoint</option>
+                <option value="modification_disjoint">Modification-disjoint</option>
+                <option value="acquisition_disjoint">Acquisition-disjoint</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label for="aiReadyModelLoopRecipeDir" data-i18n="aiReadyModelLoopRecipeDir">Model-loop recipe dir</label>
+              <input type="text" id="aiReadyModelLoopRecipeDir" placeholder="runs/ai_ready_builds/dataset_recipe_...">
+            </div>
+            <div class="ai-ready-actions">
+              <button class="btn btn-primary btn-small" id="aiReadyRecipeBtn" type="button" onclick="makeDatasetRecipe()" data-i18n="makeDatasetRecipe">Make recipe/split</button>
+              <button class="btn btn-primary btn-small" id="aiReadyModelLoopBtn" type="button" onclick="runDatasetModelLoop()" data-i18n="runDatasetModelLoop">Run model-loop smoke</button>
+              <button class="btn btn-green btn-small" id="aiReadyDataScientistLoopBtn" type="button" onclick="runDataScientistAgentLoop()" data-i18n="runDataScientistAgentLoop">Run data scientist loop</button>
+            </div>
+            <details class="ai-ready-advanced">
+              <summary data-i18n="aiReadyAdvancedReportsAndDebug">Advanced reports and repository checks</summary>
+              <div class="form-row">
+                <label for="aiReadyRecipeDiscoveryManifest" data-i18n="aiReadyRecipeDiscoveryManifest">Discovery manifest</label>
+                <input type="text" id="aiReadyRecipeDiscoveryManifest" placeholder="optional dataset_manifest.csv/json">
+              </div>
+              <div class="form-row">
+                <label for="aiReadyRecipeRepositoryAudit" data-i18n="aiReadyRecipeRepositoryAudit">Repository audit</label>
+                <input type="text" id="aiReadyRecipeRepositoryAudit" placeholder="optional repository_audit.json/csv/md">
+              </div>
+              <div class="form-row">
+                <label for="aiReadyModelLoopAdapter" data-i18n="aiReadyModelLoopAdapter">Metric adapter</label>
+                <select id="aiReadyModelLoopAdapter">
+                  <option value="dry_run">Dry-run smoke</option>
+                  <option value="xuanjinovo_template">XuanjiNovo eval</option>
+                  <option value="massnet_eval">MassNet eval</option>
+                  <option value="casanovo_eval">Casanovo eval</option>
+                  <option value="external_command">External command</option>
+                </select>
+              </div>
+              <div class="form-row">
+                <label for="aiReadyModelLoopMetricsFile" data-i18n="aiReadyModelLoopMetricsFile">Model metrics file</label>
+                <input type="text" id="aiReadyModelLoopMetricsFile" placeholder="optional JSON / CSV / TSV / log, e.g. tests/fixtures/xuanjinovo_eval_metrics.tsv">
+                <div class="form-help" data-i18n="aiReadyModelLoopMetricsHelp">Reads model eval outputs and normalizes metrics such as sequence_accuracy, peptide_recall, cosine_similarity, heldout_project, phosphotyrosine, and high_charge.</div>
+              </div>
+              <div class="form-row">
+                <label for="aiReadyModelLoopAdapterCommand" data-i18n="aiReadyModelLoopAdapterCommand">Adapter command</label>
+                <input type="text" id="aiReadyModelLoopAdapterCommand" placeholder="optional; must write external_model_metrics.json when used">
+                <div class="form-help" data-i18n="aiReadyModelLoopAdapterCommandHelp">Leave empty when using a metrics file. Use only for a real external training/eval command.</div>
+              </div>
+              <div class="form-row">
+                <label for="aiReadyDataScientistModelLoopDir" data-i18n="aiReadyDataScientistModelLoopDir">Data scientist model-loop dir</label>
+                <input type="text" id="aiReadyDataScientistModelLoopDir" placeholder="optional model-loop output dir">
+              </div>
+              <div class="form-row">
+                <label for="aiReadyRepositorySmokeRepository" data-i18n="repositorySmokeRepository">Repository smoke</label>
+                <select id="aiReadyRepositorySmokeRepository">
+                  <option value="massive">MassIVE</option>
+                  <option value="iprox">iProX</option>
+                  <option value="pride">PRIDE</option>
+                  <option value="auto">Auto</option>
+                </select>
+              </div>
+              <div class="form-row">
+                <label for="aiReadyRepositorySmokeInput" data-i18n="repositorySmokeInput">Smoke accession/file</label>
+                <input type="text" id="aiReadyRepositorySmokeInput" placeholder="MSV000068064/datasets/68064/srm_74_3.raw">
+              </div>
+              <div class="form-row">
+                <label for="aiReadyIproxIndexProjects" data-i18n="aiReadyIproxIndexProjects">iProX index projects</label>
+                <input type="text" id="aiReadyIproxIndexProjects" placeholder="optional, e.g. IPX0015463000">
+              </div>
+              <div class="form-row">
+                <label for="aiReadyIproxIndexYears" data-i18n="aiReadyIproxIndexYears">iProX index years</label>
+                <input type="text" id="aiReadyIproxIndexYears" placeholder="optional, e.g. 2020,2024">
+              </div>
+              <div class="form-row">
+                <label for="aiReadyIproxIndexDir" data-i18n="aiReadyIproxIndexDir">iProX index dir</label>
+                <input type="text" id="aiReadyIproxIndexDir" placeholder="optional; filled after refresh or data/iprox_index">
+                <div class="form-help" data-i18n="aiReadyIproxIndexDirHelp">Repository smoke uses this JSONL cache for iProX resolution.</div>
+              </div>
+              <div class="form-row">
+                <label for="aiReadyRepositorySmokeDirs" data-i18n="aiReadyRepositorySmokeDirs">Repository smoke dirs</label>
+                <textarea id="aiReadyRepositorySmokeDirs" rows="3" placeholder="optional; one repository-smoke output dir per line"></textarea>
+                <div class="form-help" data-i18n="aiReadyRepositorySmokeDirsHelp">Used by the data scientist loop to include MassIVE/iProX smoke evidence in guidance alignment.</div>
+              </div>
+              <div class="form-row">
+                <label for="aiReadyHarnessCaseFile" data-i18n="agentHarnessCaseFile">Harness case file</label>
+                <input type="text" id="aiReadyHarnessCaseFile" value="tests/fixtures/agent_harness_cases.json">
+              </div>
+              <div class="ai-ready-actions">
+                <button class="btn btn-secondary btn-small" id="aiReadyIproxIndexBtn" type="button" onclick="refreshIproxIndex()" data-i18n="refreshIproxIndex">Refresh iProX index</button>
+                <button class="btn btn-secondary btn-small" id="aiReadyRepositorySmokeBtn" type="button" onclick="runRepositorySmoke()" data-i18n="runRepositorySmoke">Repository smoke</button>
+                <button class="btn btn-secondary btn-small" id="aiReadyHarnessBtn" type="button" onclick="runAgentHarness()" data-i18n="runAgentHarness">Run harness</button>
+                <button class="btn btn-primary btn-small" id="aiReadyDataScientistReportBtn" type="button" onclick="makeDataScientistAgentReport()" data-i18n="makeDataScientistAgentReport">Make data scientist report</button>
+                <button class="btn btn-primary btn-small" id="aiReadyGuidanceAlignmentBtn" type="button" onclick="makeGuidanceAlignmentReport()" data-i18n="makeGuidanceAlignmentReport">Guidance alignment</button>
+              </div>
+            </details>
+          </div>
+        </div>
+        <div class="discovery-results" id="aiReadyResults" hidden>
+          <div class="discovery-summary" id="aiReadyTaskCards"></div>
+          <div class="discovery-summary" id="aiReadyRepositoryPlan"></div>
+          <div class="discovery-table-wrap" id="aiReadyDiscoveryRequests"></div>
+          <div class="discovery-actions" id="aiReadyDownloads"></div>
+        </div>
+      </div>
     </section>
 
-    <section class="surface history-card operations-rail">
-      <div class="public-head">
-        <h2 data-i18n="projectHistory">Project History</h2>
-        <button class="btn btn-secondary btn-small" onclick="loadResults()" data-i18n="refresh">Refresh</button>
-      </div>
-      <div class="public-meta" id="publicResultsMeta" role="status" aria-live="polite" data-i18n="historyReading">Reading queue and result history...</div>
-      <div class="result-list" id="publicResults"><div class="empty" data-i18n="historyReading">Reading queue and result history...</div></div>
-    </section>
+    <div class="right-rail operations-rail">
+      <section class="surface api-config-card" aria-label="API Configuration">
+        <div class="config-head">
+          <button class="config-toggle" id="configToggle" aria-controls="configBody" aria-expanded="false" onclick="toggleConfig()"><span data-i18n="apiConfig">API Configuration</span> <span id="configStatus"></span></button>
+          <span class="inline-status" id="apiCheckStatus" role="status" aria-live="polite"></span>
+        </div>
+        <div class="config-body" id="configBody">
+          <div class="form-row"><label for="cfgApiKey">API Key *</label><input type="password" id="cfgApiKey" aria-required="true" aria-invalid="false" autocomplete="off" data-i18n-placeholder="apiKeyPlaceholder" placeholder="Your API key for this task"></div>
+          <div class="form-row"><label for="cfgBaseUrl">Base URL</label><input type="text" id="cfgBaseUrl" inputmode="url" placeholder="https://api.deepseek.com"></div>
+          <div class="form-row"><label for="cfgModel" data-i18n="model">Model</label><input type="text" id="cfgModel" placeholder="deepseek-v4-flash"></div>
+          <div class="form-row"><label for="cfgTimeout" data-i18n="timeout">Timeout</label><input type="number" id="cfgTimeout" min="1" placeholder="1200"></div>
+          <div class="config-actions">
+            <button class="btn btn-secondary btn-small" id="checkApiBtn" onclick="checkLLMConfig()" data-i18n="checkApi">Check API Key</button>
+            <span class="inline-status" id="resultRetention"></span>
+          </div>
+        </div>
+        <div class="warn show" id="warnBanner" data-i18n="apiWarning">The API key is checked when a task starts and is not written to public history.</div>
+      </section>
+      <section class="surface history-card">
+        <div class="public-head">
+          <h2 data-i18n="projectHistory">Project History</h2>
+          <button class="btn btn-secondary btn-small" onclick="loadResults()" data-i18n="refresh">Refresh</button>
+        </div>
+        <div class="public-meta" id="publicResultsMeta" role="status" aria-live="polite" data-i18n="historyReading">Reading queue and result history...</div>
+        <div class="result-list" id="publicResults"><div class="empty" data-i18n="historyReading">Reading queue and result history...</div></div>
+      </section>
+    </div>
   </div>
 
   <section class="surface run-card monitor-card" id="runCard" aria-label="Task monitor">
@@ -552,7 +1074,7 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
     </div>
   </section>
 
-  <footer>PRIDE AI-ready Agent v0.3.1</footer>
+  <footer>Task-aware AI-ready Data Agent v0.3.1</footer>
 </main>
 
 <script>
@@ -561,15 +1083,25 @@ let currentLanguage='en';
 let currentRunMode='prepare';
 let fullWorkflowEnabled=false;
 let lastReviewSummary=null;
-let currentBatchId=null,batchPollTimer=null;
+let currentBatchId=null,batchPollTimer=null,currentBatchRecord=null;
 let currentWorkflowTab='single';
+let currentDiscoveryId=null;
+let currentDiscoveryRecord=null;
+let currentDiscoveryJobId=null,discoveryPollTimer=null;
+let currentBatchInputRecords=[];
+let currentModelDiscoveryRequests=[];
+let currentDiscoveryFilePage=1;
+let discoveryValidityPages={valid:1,weak_keep:1,needs_review:1,exclude:1};
+const DISCOVERY_FILE_PAGE_SIZE=20;
+const DISCOVERY_VALIDITY_GROUPS=['valid','weak_keep','needs_review','exclude'];
+const discoverySelectedFileKeys=new Set();
 const HEALTH_REFRESH_MS=2000;
 let healthPollActive=false;
 
 const I18N={
   en:{
-    productKicker:'Proteomics workflow workbench',
-    subtitle:'Resolve PRIDE files, infer search parameters, and run or preview the MSDT-Converter workflow.',
+    productKicker:'Proteomics AI data workbench',
+    subtitle:'Discover task-fit proteomics data, run or reuse search workflows, and build validated AI-ready training datasets.',
     serverReading:'Reading server status...',
     taskEyebrow:'Workflow control',
     createTask:'Create Task',
@@ -577,6 +1109,10 @@ const I18N={
     singleTabDesc:'Plan one PRIDE file or run it end to end.',
     batchTabTitle:'Batch Excel',
     batchTabDesc:'Parameter planning for many files with a complete spreadsheet report.',
+    discoveryTabTitle:'Dataset discovery',
+    discoveryTabDesc:'Find repository or local files for model-building datasets.',
+    aiReadyTabTitle:'AI-ready Build',
+    aiReadyTabDesc:'Convert completed runs or search outputs into task tables.',
     singleSetupTitle:'Single task setup',
     singleSetupHelp:'Use Parameter planning for quick metadata checks; use Full workflow when Docker and storage are ready.',
     workflowReady:'Ready',
@@ -615,6 +1151,13 @@ const I18N={
     startBatch:'Run batch Excel',
     downloadExcel:'Download Excel',
     downloadAudit:'Download audit ZIP',
+    buildAiReadyFromBatch:'Build AI-ready',
+    batchAiReadyNoRuns:'No completed or usable partial batch run directories are available yet.',
+    batchAiReadyRunning:(n)=>`Running AI-ready mini E2E for ${n} completed or usable partial batch run(s)...`,
+    batchAiReadyDone:(n)=>`AI-ready mini E2E finished for ${n} completed or usable partial batch run(s).`,
+    batchAiReadyAvailable:(n)=>`${n} completed or usable partial run(s) can be sent to AI-ready Build.`,
+    batchAiReadyRecipeNext:'Next: review AI-ready task cards, then make recipe/split from the prefilled output directory.',
+    batchNeedsApiKeyAfterHandoff:'Discovery handoff is ready. Enter an API key in API Configuration, then run Batch parameters/full.',
     batchLogTitle:'Batch log',
     batchLogEmpty:'No batch events yet.',
     batchAuditReady:'Audit package is ready.',
@@ -625,6 +1168,187 @@ const I18N={
     batchDownloadReady:'Excel report is ready.',
     batchCreateFailed:e=>`Batch request failed: ${e}`,
     batchReadFailed:e=>`Failed to read batch: ${e}`,
+    discoveryTitle:'Dataset Discovery',
+    discoveryHelp:'Search repository metadata for candidate projects/files and export quality-scored manifests. No RAW download or workflow execution.',
+    discoverySource:'Discovery source',
+    discoverySourceRemote:'Remote repository discovery',
+    discoverySourceLocal:'Local raw/mzML directory',
+    discoveryLocalDir:'Local data directory',
+    discoverySourceHelp:'Remote searches supported repository metadata. Local scans only acquisition or peaklist files and keeps search-result tables in AI-ready Build.',
+    discoveryLocalDirRequired:'Please provide a local raw/mzML directory.',
+    discoveryGoalPrompt:'Discovery request',
+    discoveryGoalPlaceholder:'Find small DDA proteomics datasets for HLA ligandome, drug treatment, or another future modeling use case. Prioritize diversity.',
+    parseDiscoveryGoal:'Parse request',
+    discoveryParsingGoal:'Parsing with LLM...',
+    discoveryParseHelp:'Natural language fills the fields below; the fields are the final constraints.',
+    discoveryParseEmpty:'Enter a discovery request first.',
+    discoveryParseDone:'Parsed request into fields. Review the constraints, then run discovery.',
+    discoveryParseLlmDone:'LLM parsed the request into fields. Review the constraints, then run discovery.',
+    discoveryParseFallback:e=>`LLM parse failed; used local fallback: ${e}`,
+    discoveryGoal:'Discovery target',
+    discoveryGoalGeneral:'General data search',
+    discoveryGoalPtm:'PTM-enriched data',
+    discoveryGoalImmunopeptidomics:'Immunopeptidomics / HLA ligandome',
+    discoveryPtm:'PTM type',
+    discoveryPtmHelp:'Hold Ctrl/Command to select multiple PTM types.',
+    discoveryLabeling:'Labeling',
+    discoverySpecies:'Species preference',
+    discoverySpeciesPolicy:'Species policy',
+    discoverySpeciesPolicyOpen:'Prefer listed, keep others',
+    discoverySpeciesPolicyIncludeOnly:'Include only listed species',
+    discoverySpeciesPolicyExclude:'Exclude listed species',
+    discoveryAcquisition:'Acquisition',
+    discoveryTaskType:'Task readiness',
+    discoveryMaxProjects:'Max projects',
+    discoveryMaxFiles:'Max files',
+    discoveryFilesPerProject:'Files/project',
+    discoveryDiversityStrategy:'Diversity',
+    discoveryUseMemory:'Use review memory as a trust prior.',
+    discoverySaveMemory:'Save this discovery run to local memory.',
+    discoveryAgentic:'Use LLM query planning during discovery.',
+    discoveryAgenticHelp:'When enabled, the LLM plans repository search queries and can run one follow-up round. The top Parse goal button already uses LLM to fill the fields.',
+    discoveryAgenticRounds:'Agentic rounds',
+    startDiscovery:'Run discovery',
+    cancelDiscovery:'Cancel',
+    discoveryRunning:'Searching PRIDE...',
+    discoveryQueued:'Discovery queued...',
+    discoverySubmitting:'Submitting discovery request to the server...',
+    discoveryCancelling:'Cancelling discovery...',
+    discoveryCancelled:'Discovery cancelled.',
+    discoveryLogTitle:'Discovery log',
+    discoveryLogEmpty:'No discovery events yet.',
+    discoveryLogCount:n=>`${n} event(s)`,
+    discoveryLogRenderFailed:'Discovery log display failed; polling continues.',
+    discoveryDone:(projects,files)=>`Discovery completed: ${projects} projects, ${files} files.`,
+    discoveryFailed:e=>`Discovery failed: ${e}`,
+    discoveryRequired:'Please provide positive project/file limits.',
+    downloadManifestCsv:'Download manifest CSV',
+    downloadUsableManifestCsv:'Download usable CSV',
+    downloadValidManifestCsv:'Download valid CSV',
+    downloadManifestJson:'Download JSON',
+    downloadBatchInputs:'Download batch inputs',
+    downloadValidBatchInputs:'Download valid inputs',
+    downloadUsableBatchInputs:'Download usable inputs',
+    downloadTaskReadyManifestCsv:'Download task-ready CSV',
+    downloadTaskReadyBatchInputs:'Download task-ready inputs',
+    downloadQualityReport:'Download quality report',
+    moreDownloads:'More downloads',
+    discoverySelectionEmpty:'No files selected.',
+    discoverySelectionCount:(selected,total)=>`${selected}/${total} selected for Batch handoff.`,
+    discoveryNextStepTitle:'Next step',
+    discoveryNextStepNone:'No usable files are selected yet. Select valid or weak_keep files, then send them to Batch.',
+    discoveryNextStepBatch:(selected,total)=>`${selected}/${total} files are selected. Send selected to Batch, review run mode, then start parameters/full.`,
+    discoveryGroupSelected:(selected,total)=>`${selected}/${total} selected`,
+    discoveryGroup_valid:'Valid',
+    discoveryGroup_weak_keep:'Weak keep',
+    discoveryGroup_needs_review:'Needs review',
+    discoveryGroup_exclude:'Excluded',
+    discoveryGroupDesc_valid:'Strongest candidates. Selected by default for Batch handoff.',
+    discoveryGroupDesc_weak_keep:'Usable candidates with minor missing evidence. Selected by default.',
+    discoveryGroupDesc_needs_review:'Important evidence is missing or ambiguous. Inspect before selecting.',
+    discoveryGroupDesc_exclude:'Known mismatch or unsupported file role. Not selected by default.',
+    selectUsableDiscovery:'Select usable',
+    selectAllDiscovery:'Select all',
+    clearDiscoverySelection:'Clear',
+    sendDiscoveryToBatch:'Send selected to Batch',
+    discoveryBatchReady:(n)=>`${n} discovery files were copied to Batch with project context. Review run mode, then start the batch.`,
+    discoveryBatchReadyNext:'After Batch completes, use Build AI-ready to convert completed or usable partial runs into task training tables.',
+    discoveryBatchNone:'Select at least one discovery file first.',
+    discoveryPage:(page,total,start,end,count)=>`Page ${page}/${total} · rows ${start}-${end} of ${count}`,
+    prevPage:'Previous',
+    nextPage:'Next',
+    saveDiscoveryReviews:'Save optional labels',
+    discoveryReviewHelp:'Use only when manually reviewing rows.',
+    discoveryReviewSaving:'Saving optional labels...',
+    discoveryReviewSaved:n=>`Saved ${n} optional labels.`,
+    discoveryReviewEmpty:'No optional labels selected.',
+    discoveryReviewFailed:e=>`Optional label save failed: ${e}`,
+    discoveryProjects:'Projects',
+    discoveryFiles:'Files',
+    discoveryUsable:'Usable',
+    discoveryNeedsReview:'Needs review',
+    discoveryMemory:'Memory',
+    discoveryScore:'Score',
+    discoveryTrust:'Trust',
+    discoveryValidity:'Validity',
+    discoveryRole:'Role',
+    discoveryEvidenceLevel:'Evidence level',
+    discoverySdrf:'SDRF',
+    discoveryInstrument:'Instrument',
+    discoveryFragmentation:'Fragmentation',
+    discoveryLcGradient:'LC gradient',
+    discoveryDiversity:'Diversity',
+    discoveryTaskReady:'Task readiness',
+    discoveryAgenticSummary:'Agentic',
+    discoveryEvidence:'Evidence',
+    discoveryNoResults:'No candidate files returned.',
+    aiReadyBuildTitle:'AI-ready Build',
+    aiReadyBuildHelp:'Build task tables from Batch runs, local search outputs, or existing AI-ready results. Advanced debug inputs stay collapsed.',
+    aiReadyStageSource:'1. Input source',
+    aiReadyStageSourceHelp:'Choose where the build should start.',
+    aiReadySourceBatch:'From Batch run',
+    aiReadySourceBatchHelp:'Use completed or usable partial agent runs.',
+    aiReadySourceLocal:'From local search result',
+    aiReadySourceLocalHelp:'Use TSV/MGF files or a search output directory.',
+    aiReadySourceExisting:'From existing AI-ready output',
+    aiReadySourceExistingHelp:'Validate or continue from a previous build.',
+    aiReadyStageBuild:'2. Task and build',
+    aiReadyStageBuildHelp:'Pick the downstream task, then run the smallest useful build check.',
+    aiReadyStageNext:'3. Results and next step',
+    aiReadyStageNextHelp:'Generate recipe/split, run smoke evaluation, or review blockers.',
+    aiReadyAdvancedManualPaths:'Manual TSV/MGF paths',
+    aiReadyAdvancedBuildTools:'Advanced build tools',
+    aiReadyAdvancedReportsAndDebug:'Advanced reports and repository checks',
+    aiReadySearchDir:'Search output directory',
+    aiReadyAgentRunDir:'Original agent run directory',
+    aiReadySearchResults:'Search result TSV paths',
+    aiReadyPeaklists:'MGF peaklist paths',
+    aiReadyTaskType:'Task type',
+    aiReadyBuildDir:'Existing build dir',
+    aiReadyRecipeBatchDir:'Batch/benchmark dir',
+    aiReadyRecipeDiscoveryManifest:'Discovery manifest',
+    aiReadyRecipeRepositoryAudit:'Repository audit',
+    aiReadyRecipeSplitStrategy:'Split strategy',
+    aiReadyModelLoopRecipeDir:'Model-loop recipe dir',
+    aiReadyModelLoopAdapter:'Metric adapter',
+    aiReadyModelLoopMetricsFile:'Model metrics file',
+    aiReadyModelLoopMetricsHelp:'Reads JSON/CSV/TSV/log model eval outputs and normalizes XuanjiNovo, MassNet, or Casanovo-style metrics.',
+    aiReadyModelLoopAdapterCommand:'Adapter command',
+    aiReadyModelLoopAdapterCommandHelp:'Leave empty when using a metrics file. Use only for a real external training/eval command.',
+    aiReadyDataScientistModelLoopDir:'Data scientist model-loop dir',
+    makeDatasetRecipe:'Make recipe/split',
+    runDatasetModelLoop:'Run model-loop smoke',
+    makeDataScientistAgentReport:'Make data scientist report',
+    makeGuidanceAlignmentReport:'Guidance alignment',
+    runDataScientistAgentLoop:'Run data scientist loop',
+    repositorySmokeRepository:'Repository smoke',
+    repositorySmokeInput:'Smoke accession/file',
+    aiReadyIproxIndexProjects:'iProX index projects',
+    aiReadyIproxIndexYears:'iProX index years',
+    aiReadyIproxIndexDir:'iProX index dir',
+    aiReadyIproxIndexDirHelp:'Repository smoke uses this JSONL cache for iProX resolution.',
+    aiReadyRepositorySmokeDirs:'Repository smoke dirs',
+    aiReadyRepositorySmokeDirsHelp:'Used by the data scientist loop to include MassIVE/iProX smoke evidence in guidance alignment.',
+    refreshIproxIndex:'Refresh iProX index',
+    agentHarnessCaseFile:'Harness case file',
+    locateAiReadyInputs:'Locate inputs',
+    locateAgentRunInputs:'Locate agent run',
+    buildFromAgentRun:'Build from agent run',
+    validateMiniE2E:'Validate mini E2E',
+    profileAiReadyInputs:'Profile inputs',
+    runAiReadyRealSmoke:'Run real smoke',
+    runRepositorySmoke:'Repository smoke',
+    runAgentHarness:'Run harness',
+    validateAiReadyBuild:'Validate build',
+    aiReadyLocating:'Locating inputs...',
+    aiReadyProfiling:'Profiling inputs...',
+    aiReadySmoking:'Running real smoke...',
+    aiReadyValidating:'Validating build...',
+    aiReadyDone:'AI-ready check completed.',
+    aiReadyFailed:e=>`AI-ready check failed: ${e}`,
+    aiReadyNeedsSearchResult:'Please provide at least one search result path.',
+    aiReadyNeedsSearchDir:'Please provide a search output directory.',
+    aiReadyNeedsAgentRunDir:'Please provide an original agent run directory.',
     apiConfig:'API Configuration',
     apiKeyPlaceholder:'Your API key for this task',
     model:'Model',
@@ -882,6 +1606,58 @@ const I18N={
 };
 
 Object.assign(I18N.zh,{
+  discoveryGoalPrompt:'建模目标',
+  discoveryGoalPlaceholder:'寻找用于 RT 预测的人源磷酸化 DDA 小数据集，优先覆盖不同仪器和 LC 梯度。',
+  parseDiscoveryGoal:'解析目标',
+  discoveryParsingGoal:'正在用 LLM 解析...',
+  discoveryParseHelp:'自然语言会填充下方条件；最终执行以下方条件为准。',
+  discoveryParseEmpty:'请先输入建模目标。',
+  discoveryParseDone:'已解析到下方条件；请检查后再运行 discovery。',
+  discoveryParseLlmDone:'LLM 已解析到下方条件；请检查后再运行 discovery。',
+  discoveryParseFallback:e=>`LLM 解析失败，已使用本地兜底：${e}`,
+  discoveryDiversityStrategy:'多样性策略',
+  downloadManifestCsv:'下载 manifest CSV',
+  downloadUsableManifestCsv:'下载 usable CSV',
+  downloadValidManifestCsv:'下载 valid CSV',
+  downloadManifestJson:'下载 JSON',
+  downloadBatchInputs:'下载 batch inputs',
+  downloadValidBatchInputs:'下载 valid inputs',
+  downloadUsableBatchInputs:'下载 usable inputs',
+  downloadTaskReadyManifestCsv:'下载 task-ready CSV',
+  downloadTaskReadyBatchInputs:'下载 task-ready inputs',
+  downloadQualityReport:'下载质量报告',
+  moreDownloads:'更多下载',
+  discoverySelectionEmpty:'未选择文件。',
+  discoverySelectionCount:(selected,total)=>`${selected}/${total} 个文件将发送到 Batch。`,
+  discoveryGroupSelected:(selected,total)=>`已选 ${selected}/${total}`,
+  discoveryGroup_valid:'Valid 高可信',
+  discoveryGroup_weak_keep:'Weak keep 可用',
+  discoveryGroup_needs_review:'Needs review 待复核',
+  discoveryGroup_exclude:'Exclude 排除',
+  discoveryGroupDesc_valid:'证据最完整，默认勾选并可直接进入 Batch。',
+  discoveryGroupDesc_weak_keep:'有轻微信息缺失但仍可用，默认勾选。',
+  discoveryGroupDesc_needs_review:'关键证据缺失或不确定，需要人工看过再勾选。',
+  discoveryGroupDesc_exclude:'存在明确冲突或不支持，不默认勾选。',
+  selectUsableDiscovery:'选择可用项',
+  selectAllDiscovery:'全选',
+  clearDiscoverySelection:'清空',
+  sendDiscoveryToBatch:'发送到 Batch',
+  discoveryBatchReady:n=>`已将 ${n} 个 discovery 文件连同 project context 填入 Batch。请检查运行模式后再启动。`,
+  discoveryBatchNone:'请先选择至少一个 discovery 文件。',
+  cancelDiscovery:'取消',
+  discoveryQueued:'Discovery 已排队...',
+  discoveryCancelling:'正在取消 Discovery...',
+  discoveryCancelled:'Discovery 已取消。',
+  discoveryLogTitle:'Discovery 日志',
+  discoveryLogEmpty:'暂无 discovery 事件。',
+  discoveryLogCount:n=>`${n} 条事件`,
+  discoveryAgentic:'Discovery 时使用 LLM 规划查询。',
+  discoveryAgenticHelp:'开启后，LLM 会规划所选数据库的搜索 query，并可执行一轮 follow-up。顶部“解析目标”已经会用 LLM 填充字段。',
+  discoveryPage:(page,total,start,end,count)=>`第 ${page}/${total} 页 · ${start}-${end} / ${count} 行`,
+  prevPage:'上一页',
+  nextPage:'下一页',
+  saveDiscoveryReviews:'保存人工标签',
+  discoveryReviewHelp:'仅在人工复核表格行时使用。',
   repository:'数据库',
   repositoryAuto:'自动',
   repositoryHelp:'自动模式会尽量识别 PXD/MSV/IPX。已知来源时请直接选择对应数据库。',
@@ -890,6 +1666,387 @@ Object.assign(I18N.zh,{
   reviewedFastaHelp:'环境样本或非模式物种无法自动选择参考 FASTA 时，在这里提供真实 FASTA。',
   repositoryLabel:{auto:'自动',pride:'PRIDE',massive:'MassIVE',iprox:'iProX'}
 });
+
+Object.assign(I18N.zh,{
+  aiReadyRecipeBatchDir:'Batch/benchmark 目录',
+  aiReadyRecipeDiscoveryManifest:'Discovery manifest',
+  aiReadyRecipeRepositoryAudit:'Repository audit',
+  aiReadyRecipeSplitStrategy:'Split strategy',
+  aiReadyModelLoopRecipeDir:'Model-loop recipe dir',
+  aiReadyModelLoopAdapter:'Metric adapter',
+  aiReadyModelLoopMetricsFile:'Model metrics file',
+  aiReadyModelLoopMetricsHelp:'Reads JSON/CSV/TSV/log model eval outputs and normalizes XuanjiNovo, MassNet, or Casanovo-style metrics.',
+  aiReadyModelLoopAdapterCommand:'Adapter command',
+  aiReadyModelLoopAdapterCommandHelp:'Leave empty when using a metrics file. Use only for a real external training/eval command.',
+  makeDatasetRecipe:'生成 recipe/split',
+  runDatasetModelLoop:'运行 model-loop smoke',
+  makeGuidanceAlignmentReport:'指导对齐审计',
+  runDataScientistAgentLoop:'运行数据科学闭环',
+  aiReadyRepositorySmokeDirs:'Repository smoke 目录',
+  aiReadyRepositorySmokeDirsHelp:'供数据科学闭环纳入 MassIVE/iProX smoke 证据和指导对齐。'
+});
+
+const CLEAN_ZH_I18N={
+  productKicker:'蛋白质组 AI 数据工作台',
+  subtitle:'按建模任务发现可用数据，复用或运行搜库流程，并生成可验证的 AI-ready 训练集。',
+  serverReading:'正在读取服务状态...',
+  taskEyebrow:'流程控制',
+  createTask:'创建任务',
+  singleTabTitle:'单文件',
+  singleTabDesc:'规划单个文件，或在确认资源后执行完整流程。',
+  batchTabTitle:'批量任务',
+  batchTabDesc:'批量规划多个文件，生成参数审计和结果报告。',
+  discoveryTabTitle:'数据发现',
+  discoveryTabDesc:'为建模任务寻找远端或本地候选数据。',
+  aiReadyTabTitle:'AI-ready 构建',
+  aiReadyTabDesc:'把搜库结果或已有 run 转成任务训练表。',
+  singleSetupTitle:'单文件任务设置',
+  singleSetupHelp:'快速检查用“仅参数”；Docker、磁盘和样本都确认后再用完整流程。',
+  workflowReady:'就绪',
+  inputPlaceholder:'示例：P17_severe_NoPOTS.raw',
+  start:'开始',
+  creating:'创建中...',
+  queuedBtn:'排队中...',
+  runningBtn:'运行中...',
+  submitter:'提交人 *',
+  submitterPlaceholder:'姓名或课题组成员',
+  repository:'数据库',
+  repositoryAuto:'自动',
+  repositoryHelp:'自动模式会尽量识别 PXD/MSV/IPX；已知来源时建议直接指定数据库。',
+  reviewedFasta:'确认过的 FASTA URL / 本地路径',
+  reviewedFastaPlaceholder:'可选：https://.../reference.fasta 或 C:\\path\\reference.fasta',
+  reviewedFastaHelp:'环境样本或非模式物种无法自动选择参考 FASTA 时，在这里提供可信 FASTA。',
+  runMode:'运行模式',
+  modeFull:'完整流程',
+  modePrepare:'准备输入包',
+  modeParameters:'仅参数',
+  modeFullHelp:'下载或转换数据，生成输入包，运行 Docker，并打包结果。',
+  modePrepareHelp:'下载或转换数据，并生成 MSDT-Converter 输入包；不运行 Docker。',
+  modeParametersHelp:'解析项目并推断 workflow、FASTA、酶切、修饰、物种和仪器；不下载 RAW，不运行 Docker。',
+  preferFasta:'如果项目提供 FASTA，则优先使用项目 FASTA；否则使用按物种推断的 UniProt FASTA。',
+  examples:'示例',
+  batchTitle:'批量 Excel 报告',
+  batchHelp:'每行粘贴一个文件名。可选择参数审计、输入包准备或完整执行，并导出 benchmark Excel。',
+  batchRunModeHelp:'选择批量任务只推断参数、准备 MSDT 输入包，或端到端运行 Docker。',
+  resourcePolicy:'资源策略',
+  policyBalanced:'均衡',
+  policyConservative:'保守',
+  policyFast:'快速',
+  batchSubmitter:'批量提交人 *',
+  batchJobs:'并行任务数',
+  startBatch:'运行批量任务',
+  downloadExcel:'下载 Excel',
+  downloadAudit:'下载审计 ZIP',
+  buildAiReadyFromBatch:'构建 AI-ready',
+  batchAiReadyNoRuns:'还没有 completed 或可复用 partial 的 batch run 目录。',
+  batchAiReadyRunning:n=>`正在为 ${n} 个 completed/usable partial run 执行 AI-ready mini E2E...`,
+  batchAiReadyDone:n=>`AI-ready mini E2E 已完成：${n} 个 run。`,
+  batchAiReadyAvailable:n=>`${n} 个 completed/usable partial run 可进入 AI-ready 构建。`,
+  batchAiReadyRecipeNext:'下一步：检查 AI-ready 任务卡片，然后用已预填的输出目录生成 recipe/split。',
+  batchNeedsApiKeyAfterHandoff:'Discovery handoff 已就绪。请先在 API Configuration 填写 API Key，再运行 Batch parameters/full。',
+  batchLogTitle:'批量日志',
+  batchLogEmpty:'暂无批量事件。',
+  batchAuditReady:'审计包已生成。',
+  auditReady:'审计已保存',
+  batchRequired:'请至少粘贴一个文件名。',
+  batchCreating:'正在创建批量任务并检查 API Key...',
+  batchStatus:(status,done,total,failed,review)=>`批量 ${status}：${done}/${total} 已规划，${failed} 失败，${review} 需要复核。`,
+  batchDownloadReady:'Excel 报告已可下载。',
+  batchCreateFailed:e=>`批量请求失败：${e}`,
+  batchReadFailed:e=>`读取批量任务失败：${e}`,
+  discoveryTitle:'数据发现',
+  discoveryHelp:'检索数据库元数据或扫描本地文件，输出带质量评分的 manifest；不会下载 RAW 或自动跑 workflow。',
+  discoverySource:'发现来源',
+  discoverySourceRemote:'远端数据库发现',
+  discoverySourceLocal:'本地 raw/mzML 目录',
+  discoveryLocalDir:'本地数据目录',
+  discoverySourceHelp:'远端模式检索数据库元数据；本地模式只扫描采集/谱图文件，psm.tsv、peptide.tsv、pin、MGF 等搜库结果请放到 AI-ready 构建模块。',
+  discoveryLocalDirRequired:'请填写本地 raw/mzML 目录。',
+  discoveryGoalPrompt:'发现需求',
+  discoveryGoalPlaceholder:'例如：寻找小型 DDA 蛋白质组数据，用于 HLA 免疫肽、药物处理或其他未来建模任务，并优先覆盖多样性。',
+  parseDiscoveryGoal:'解析需求',
+  discoveryParsingGoal:'正在用 LLM 解析...',
+  discoveryParseHelp:'自然语言会更新下方字段；真正执行时以下方字段为准。',
+  discoveryParseEmpty:'请先输入发现需求。',
+  discoveryParseDone:'已解析到下方字段。请检查约束后再运行 Discovery。',
+  discoveryParseLlmDone:'LLM 已解析到下方字段。请检查约束后再运行 Discovery。',
+  discoveryParseFallback:e=>`LLM 解析失败，已使用本地兜底：${e}`,
+  discoveryGoal:'发现目标',
+  discoveryGoalGeneral:'通用数据发现',
+  discoveryGoalPtm:'PTM 富集数据',
+  discoveryGoalImmunopeptidomics:'免疫肽 / HLA 配体组',
+  discoveryPtm:'PTM 类型',
+  discoveryPtmHelp:'按住 Ctrl/Command 可多选 PTM 类型。',
+  discoveryLabeling:'标记方式',
+  discoverySpecies:'物种偏好',
+  discoverySpeciesPolicy:'物种策略',
+  discoverySpeciesPolicyOpen:'优先填写物种，保留其他',
+  discoverySpeciesPolicyIncludeOnly:'只保留填写物种',
+  discoverySpeciesPolicyExclude:'排除填写物种',
+  discoveryAcquisition:'采集方式',
+  discoveryTaskType:'任务适配',
+  discoveryMaxProjects:'项目上限',
+  discoveryMaxFiles:'文件上限',
+  discoveryFilesPerProject:'每项目文件数',
+  discoveryDiversityStrategy:'多样性策略',
+  discoveryUseMemory:'使用人工复核记忆作为可信度先验。',
+  discoverySaveMemory:'把本次发现结果保存到本地记忆。',
+  discoveryAgentic:'Discovery 期间使用 LLM 规划查询。',
+  discoveryAgenticHelp:'开启后，LLM 会根据目标规划数据库查询，并可执行一轮 follow-up；上方“解析目标”只负责填字段。',
+  discoveryAgenticRounds:'Agentic 轮数',
+  startDiscovery:'运行 Discovery',
+  cancelDiscovery:'取消',
+  discoveryRunning:'正在检索...',
+  discoveryQueued:'Discovery 已排队...',
+  discoverySubmitting:'正在提交 Discovery 请求...',
+  discoveryCancelling:'正在取消 Discovery...',
+  discoveryCancelled:'Discovery 已取消。',
+  discoveryLogTitle:'Discovery 日志',
+  discoveryLogEmpty:'暂无 Discovery 事件。',
+  discoveryLogCount:n=>`${n} 条事件`,
+  discoveryLogRenderFailed:'Discovery 日志显示失败，轮询会继续。',
+  discoveryDone:(projects,files)=>`Discovery 完成：${projects} 个项目，${files} 个文件。`,
+  discoveryFailed:e=>`Discovery 失败：${e}`,
+  discoveryRequired:'请确保项目和文件数量限制为正数。',
+  downloadManifestCsv:'下载 manifest CSV',
+  downloadUsableManifestCsv:'下载 usable CSV',
+  downloadValidManifestCsv:'下载 valid CSV',
+  downloadManifestJson:'下载 JSON',
+  downloadBatchInputs:'下载 batch inputs',
+  downloadValidBatchInputs:'下载 valid inputs',
+  downloadUsableBatchInputs:'下载 usable inputs',
+  downloadTaskReadyManifestCsv:'下载 task-ready CSV',
+  downloadTaskReadyBatchInputs:'下载 task-ready inputs',
+  downloadQualityReport:'下载质量报告',
+  moreDownloads:'更多下载',
+  discoverySelectionEmpty:'尚未选择文件。',
+  discoverySelectionCount:(selected,total)=>`${selected}/${total} 个文件将发送到 Batch。`,
+  discoveryNextStepTitle:'下一步',
+  discoveryNextStepNone:'当前还没有可发送的文件。请先选择 valid 或 weak_keep 文件，再发送到 Batch。',
+  discoveryNextStepBatch:(selected,total)=>`已选择 ${selected}/${total} 个文件。下一步发送到 Batch，检查运行模式后启动 parameters/full。`,
+  discoveryGroupSelected:(selected,total)=>`已选 ${selected}/${total}`,
+  discoveryGroup_valid:'Valid 高可信',
+  discoveryGroup_weak_keep:'Weak keep 可用',
+  discoveryGroup_needs_review:'Needs review 待复核',
+  discoveryGroup_exclude:'Excluded 已排除',
+  discoveryGroupDesc_valid:'证据最完整，默认勾选，可直接进入 Batch。',
+  discoveryGroupDesc_weak_keep:'有轻微证据缺口但仍可用，默认勾选。',
+  discoveryGroupDesc_needs_review:'关键证据缺失或有歧义，建议人工检查后再选。',
+  discoveryGroupDesc_exclude:'存在明确冲突或不支持的文件角色，默认不选。',
+  selectUsableDiscovery:'选择可用项',
+  selectAllDiscovery:'全选',
+  clearDiscoverySelection:'清空',
+  sendDiscoveryToBatch:'发送到 Batch',
+  discoveryBatchReady:n=>`已将 ${n} 个 Discovery 文件连同 project context 填入 Batch。请检查运行模式后再启动。`,
+  discoveryBatchReadyNext:'Batch 完成后，使用“构建 AI-ready”把 completed 或 usable partial run 转成任务训练表。',
+  discoveryBatchNone:'请先选择至少一个 Discovery 文件。',
+  discoveryPage:(page,total,start,end,count)=>`第 ${page}/${total} 页 · ${start}-${end} / ${count} 行`,
+  prevPage:'上一页',
+  nextPage:'下一页',
+  saveDiscoveryReviews:'保存人工标签',
+  discoveryReviewHelp:'仅在人工复核表格行时使用。',
+  discoveryReviewSaving:'正在保存人工标签...',
+  discoveryReviewSaved:n=>`已保存 ${n} 条人工标签。`,
+  discoveryReviewEmpty:'没有选择人工标签。',
+  discoveryReviewFailed:e=>`保存人工标签失败：${e}`,
+  discoveryProjects:'项目',
+  discoveryFiles:'文件',
+  discoveryUsable:'可用',
+  discoveryNeedsReview:'待复核',
+  discoveryMemory:'记忆',
+  discoveryScore:'评分',
+  discoveryTrust:'可信度',
+  discoveryValidity:'有效性',
+  discoveryRole:'角色',
+  discoveryEvidenceLevel:'证据级别',
+  discoverySdrf:'SDRF',
+  discoveryInstrument:'仪器',
+  discoveryFragmentation:'碎裂方式',
+  discoveryLcGradient:'LC 梯度',
+  discoveryDiversity:'多样性',
+  discoveryTaskReady:'任务适配',
+  discoveryAgenticSummary:'Agentic',
+  discoveryEvidence:'证据',
+  discoveryNoResults:'没有返回候选文件。',
+  aiReadyBuildTitle:'AI-ready 构建',
+  aiReadyBuildHelp:'从 Batch run、本地搜库结果或已有 AI-ready 输出构建任务训练表；调试入口默认折叠。',
+  aiReadyStageSource:'1. 输入来源',
+  aiReadyStageSourceHelp:'选择本次构建从哪里开始。',
+  aiReadySourceBatch:'来自 Batch run',
+  aiReadySourceBatchHelp:'使用 completed 或 usable partial 的 agent run。',
+  aiReadySourceLocal:'来自本地搜库结果',
+  aiReadySourceLocalHelp:'使用 TSV/MGF 文件或搜库结果目录。',
+  aiReadySourceExisting:'来自已有 AI-ready 输出',
+  aiReadySourceExistingHelp:'验证或继续使用已有 build。',
+  aiReadyStageBuild:'2. 任务与构建',
+  aiReadyStageBuildHelp:'选择下游任务，然后运行最小必要构建检查。',
+  aiReadyStageNext:'3. 结果与下一步',
+  aiReadyStageNextHelp:'生成 recipe/split、运行 smoke 评估，或复查 blocker。',
+  aiReadyAdvancedManualPaths:'手动 TSV/MGF 路径',
+  aiReadyAdvancedBuildTools:'高级构建工具',
+  aiReadyAdvancedReportsAndDebug:'高级报告与 repository 检查',
+  aiReadySearchDir:'搜库结果目录',
+  aiReadyAgentRunDir:'原 agent run 目录',
+  aiReadySearchResults:'搜库结果 TSV 路径',
+  aiReadyPeaklists:'MGF peaklist 路径',
+  aiReadyTaskType:'任务类型',
+  aiReadyBuildDir:'已有 build 目录',
+  aiReadyRecipeBatchDir:'Batch/benchmark 目录',
+  aiReadyRecipeDiscoveryManifest:'Discovery manifest',
+  aiReadyRecipeRepositoryAudit:'Repository audit',
+  aiReadyRecipeSplitStrategy:'Split 策略',
+  aiReadyModelLoopRecipeDir:'Model-loop recipe 目录',
+  aiReadyModelLoopAdapter:'指标适配器',
+  aiReadyModelLoopMetricsFile:'模型指标文件',
+  aiReadyModelLoopMetricsHelp:'读取 JSON/CSV/TSV/log 模型评估结果，并规范化 XuanjiNovo、MassNet 或 Casanovo 风格指标。',
+  aiReadyModelLoopAdapterCommand:'适配器命令',
+  aiReadyModelLoopAdapterCommandHelp:'使用指标文件时留空；只有真实外部训练/评估命令才需要填写。',
+  aiReadyDataScientistModelLoopDir:'Data scientist model-loop 目录',
+  makeDatasetRecipe:'生成 recipe/split',
+  runDatasetModelLoop:'运行 model-loop smoke',
+  makeDataScientistAgentReport:'生成数据科学报告',
+  makeGuidanceAlignmentReport:'指导对齐审计',
+  runDataScientistAgentLoop:'运行数据科学闭环',
+  repositorySmokeRepository:'Repository smoke',
+  repositorySmokeInput:'Smoke accession/file',
+  aiReadyIproxIndexProjects:'iProX index 项目',
+  aiReadyIproxIndexYears:'iProX index 年份',
+  aiReadyIproxIndexDir:'iProX index 目录',
+  aiReadyIproxIndexDirHelp:'Repository smoke 会使用这个 JSONL cache 来解析 iProX。',
+  aiReadyRepositorySmokeDirs:'Repository smoke 目录',
+  aiReadyRepositorySmokeDirsHelp:'供 data scientist loop 纳入 MassIVE/iProX smoke 证据和指导对齐。',
+  refreshIproxIndex:'刷新 iProX index',
+  agentHarnessCaseFile:'Harness case 文件',
+  locateAiReadyInputs:'定位输入',
+  locateAgentRunInputs:'定位 agent run',
+  buildFromAgentRun:'从 agent run 构建',
+  validateMiniE2E:'验证 mini E2E',
+  profileAiReadyInputs:'分析输入',
+  runAiReadyRealSmoke:'运行真实 smoke',
+  runRepositorySmoke:'Repository smoke',
+  runAgentHarness:'运行 harness',
+  validateAiReadyBuild:'验证 build',
+  aiReadyLocating:'正在定位输入...',
+  aiReadyProfiling:'正在分析输入...',
+  aiReadySmoking:'正在运行 smoke...',
+  aiReadyValidating:'正在验证 build...',
+  aiReadyDone:'AI-ready 检查完成。',
+  aiReadyFailed:e=>`AI-ready 检查失败：${e}`,
+  aiReadyNeedsSearchResult:'请至少提供一个搜库结果路径。',
+  aiReadyNeedsSearchDir:'请提供搜库结果目录。',
+  aiReadyNeedsAgentRunDir:'请提供原 agent run 目录。',
+  apiConfig:'API 配置',
+  apiKeyPlaceholder:'本次任务使用的 API Key',
+  model:'模型',
+  timeout:'超时',
+  checkApi:'检查 API Key',
+  apiWarning:'API Key 只在任务启动时检查，不会写入公开历史。',
+  projectHistory:'项目历史',
+  refresh:'刷新',
+  historyReading:'正在读取队列和结果历史...',
+  historyEmpty:'暂无运行中任务或保留结果。',
+  historyEmptyTitle:'还没有项目历史',
+  historyEmptyBody:'可以先启动单文件任务，或运行批量规划。状态、提交人、时间、下载和失败复核入口都会显示在这里。',
+  historyEmptySingleAction:'单文件',
+  historyEmptyBatchAction:'批量任务',
+  waiting:'等待中',
+  all:'全部',
+  resultFiles:'结果文件',
+  downloadZip:'下载 ZIP',
+  needsReview:'需要复核',
+  reviewTitle:'搜库参数',
+  reviewEmpty:'任务运行后会显示 workflow、FASTA、搜库参数、修饰和需要复核的问题。',
+  updated:'更新时间',
+  automatic:'自动推断',
+  manualReview:'需要人工复核',
+  issues:'问题',
+  chooseContinue:'选择后继续',
+  continueWithChoices:'使用选择继续',
+  chooseReview:'请选择复核参数。',
+  apiRequired:'请先填写 API Key。',
+  submitterRequired:'请填写提交人。',
+  inputRequired:'请输入文件名或 accession。',
+  checking:'检查中...',
+  apiOk:'API Key 可用。',
+  apiFailed:'API Key 检查失败。',
+  checkRequestFailed:'API 检查请求失败。',
+  logCount:n=>`${n} 条日志`,
+  serverStatus:(running,queued,max)=>`运行 ${running}/${max}，排队 ${queued}`,
+  retention:(retention,maxProjects)=>`结果约 ${retention} 分钟后清理；最多保留 ${maxProjects} 个可下载项目。`,
+  systemCpu:'CPU',
+  systemMemory:'内存',
+  systemDisk:'磁盘',
+  systemCores:cores=>`${cores} 核`,
+  systemHost:'宿主机',
+  systemContainer:'容器',
+  historyMeta:(total,active,failed,downloadable,size,minutes)=>`历史 ${total} 条 · 运行中 ${active} · 失败 ${failed} · 可下载 ${downloadable} · 占用 ${size} · 文件约 ${minutes} 分钟后清理；API Key 不共享。`,
+  unknown:'未知',
+  notProvided:'未提供',
+  active:'运行中',
+  status:{queued:'排队中',running:'运行中',completed:'已完成',failed:'失败',blocked:'需要复核',pending:'等待中'},
+  statusBar:{pending:'等待中',queued:'排队中',running:'运行中',completed:'已完成',failed:'失败',blocked:'需要复核'},
+  action:{watch:'查看',inspect:'检查',download:'下载',view:'打开'},
+  batchAction:{watch:'跟踪批量',download:'下载 Excel',view:'打开批量'},
+  mode:{full:'完整流程',prepare:'准备输入包',parameters:'仅参数'},
+  repositoryLabel:{auto:'自动',pride:'PRIDE',massive:'MassIVE',iprox:'iProX'},
+  timeSource:{started_at:'开始',created_at:'创建',finished_at:'完成',updated_at:'更新',history_time:'记录'},
+  duration:'耗时',
+  queue:(pos,len,running,max)=>`任务已进入队列，当前位置 ${pos}/${len}。服务器正在运行 ${running}/${max} 个任务，空位释放后会自动启动。`,
+  createdTask:id=>`任务已创建：${id}`,
+  creatingTask:'正在检查 API Key 并创建任务...',
+  createFailed:e=>`创建任务请求失败：${e}`,
+  readFailed:e=>`读取任务失败：${e}`,
+  websocketError:'WebSocket 连接错误。',
+  reviewSubmitted:'已提交复核选择，任务重新进入队列。',
+  reviewSubmitFailed:e=>`提交复核失败：${e}`,
+  noIssues:'没有保存阻断原因。',
+  generatedNoZip:'参数包已生成，包含 converter_config、workflow、审计 JSON、decision_trace 和日志；不包含 RAW/mzML/FASTA 大文件。',
+  generatedWaitingZip:'结果目录已生成；ZIP 正在打包或当前没有可下载文件。',
+  zipReady:'ZIP 已打包完成，可以下载。',
+  noDownload:'没有可下载文件。',
+  preparingDownload:'正在准备下载...',
+  downloadStarted:'下载已开始。',
+  downloadFailed:e=>`下载失败：${e}`,
+  filesCleaned:'下载文件已清理',
+  fileCount:n=>`${n} 个文件`,
+  stepFull:['1 解析','2 下载','3 输入包','4 Docker','5 结果'],
+  stepPrepare:['1 解析','2 下载','3 输入包','4 打包','5 完成'],
+  stepParams:['1 解析','2 推断','3 计划','4 复核','5 完成'],
+  agentReasoning:'Agent 推理过程',
+  agentAuditFailed:'当前任务没有 Agent 审计数据。',
+  agentWaiting:'等待 Agent 推理数据...',
+  agentDataUnderstanding:'数据理解',
+  agentWorkflowSelection:'Workflow 选择',
+  agentRecoveryAttempts:'恢复尝试',
+  agentQualityChecks:'AI-ready 质量检查',
+  agentProjectSelected:'已选项目',
+  agentFileMatched:'匹配文件',
+  agentAssetType:'资产类型',
+  agentResolutionConfidence:'解析置信度',
+  agentFileMatchScore:'文件匹配分数',
+  agentMetadataConsistency:'元数据一致性',
+  agentMetadataEvidence:'元数据证据',
+  agentNoMetadata:'没有记录元数据证据。',
+  agentSelectedDatabase:'已选数据库',
+  agentSelectedWorkflow:'已选 workflow',
+  agentSearchParameters:'搜库参数',
+  agentResourcePolicy:'资源策略',
+  agentExecutionGate:'执行门控',
+  agentBlockingIssues:'阻断原因',
+  agentNoBlockingIssues:'没有阻断原因。',
+  agentRecoveryCategory:'失败类别',
+  agentRecoveryStage:'失败阶段',
+  agentRecoveryDecision:'恢复决策',
+  agentRecoveryNext:'下一步',
+  agentNoRecovery:'没有恢复尝试记录。',
+  agentDecisionCount:n=>`${n} 条决策`,
+  agentSource:'来源',
+  agentConfidence:'置信度',
+  agentGateAllowed:'允许',
+  agentGateBlocked:'阻断',
+  agentGateReview:'需要复核'
+};
+Object.assign(I18N.zh,CLEAN_ZH_I18N);
 
 function t(key){return I18N[currentLanguage][key]??I18N.en[key]??key}
 function tf(key,...args){const v=t(key);return typeof v==='function'?v(...args):v}
@@ -914,6 +2071,45 @@ function batchActionText(a){return t('batchAction')[a]||t('batchAction').view}
 function modeText(m){return t('mode')[m]||I18N.en.mode[m]||t('mode').full}
 function repositoryLabel(value){const labels=t('repositoryLabel')||I18N.en.repositoryLabel;return labels[value]||labels.pride}
 function statusText(s){return t('statusBar')[s]||s||t('unknown')}
+function workflowOutcomeText(outcome){
+  const value=String(outcome||'').toLowerCase();
+  if(currentLanguage==='zh'){
+    if(value==='failed_with_usable_partial_outputs')return 'partial 结果可用';
+    if(value==='completed_from_usable_partial_outputs')return '由 partial 结果完成';
+    if(value==='partial_outputs_low_confidence')return 'partial 结果需复核';
+    if(value==='failed_no_training_labels')return '无训练标签';
+    if(value==='blocked_by_review_gate')return '被复核门控阻断';
+  }
+  if(value==='failed_with_usable_partial_outputs')return 'Partial outputs usable';
+  if(value==='completed_from_usable_partial_outputs')return 'Completed from partial outputs';
+  if(value==='partial_outputs_low_confidence')return 'Partial outputs need review';
+  if(value==='failed_no_training_labels')return 'No training labels';
+  if(value==='blocked_by_review_gate')return 'Blocked by review gate';
+  return value||'';
+}
+function aiReadyOutcomeText(outcome){
+  const value=String(outcome||'').toLowerCase();
+  if(currentLanguage==='zh'){
+    if(value==='completed_from_usable_partial_outputs')return '由 partial 结果完成';
+    if(value==='completed')return '已完成';
+    if(value==='blocked')return '已阻断';
+  }
+  if(value==='completed_from_usable_partial_outputs')return 'Completed from partial outputs';
+  if(value==='completed')return 'Completed';
+  if(value==='blocked')return 'Blocked';
+  return value||'';
+}
+function itemStatusClass(item){
+  const outcome=String(item&&item.workflow_outcome?item.workflow_outcome:'').toLowerCase();
+  if(item&&item.usable_partial_outputs)return 'partial';
+  if(outcome==='failed_with_usable_partial_outputs'||outcome==='completed_from_usable_partial_outputs')return 'partial';
+  return String(item&&item.status?item.status:'queued').toLowerCase();
+}
+function itemStatusLabel(item){
+  const outcomeLabel=workflowOutcomeText(item&&item.workflow_outcome);
+  if(outcomeLabel&&(item&&item.usable_partial_outputs||String(item&&item.workflow_outcome||'').includes('partial')))return outcomeLabel;
+  return statusText(item&&item.status?item.status:'queued');
+}
 
 const UI={
   emptyState(message){return '<div class="empty" role="status">'+esc(message)+'</div>'},
@@ -946,7 +2142,9 @@ const UI={
   batchItem(item){
     const error=item.error?'<div class="batch-item-error">'+esc(item.error)+'</div>':'';
     const audit=item.audit_path?'<span class="review-meta">'+esc(t('auditReady'))+'</span>':'';
-    return '<div class="batch-item"><span class="batch-item-name">'+esc(item.input||'')+audit+'</span><span class="batch-item-status">'+this.statusPill(item.status||'queued',item.status||'queued')+'</span>'+error+'</div>';
+    const recovery=[workflowOutcomeText(item.workflow_outcome),item.recovery_primary_issue||'',item.recovery_recommended_next_step||''].filter(Boolean).join(' | ');
+    const recoveryHtml=recovery?'<div class="batch-item-error partial">'+esc(recovery)+'</div>':'';
+    return '<div class="batch-item"><span class="batch-item-name">'+esc(item.input||'')+audit+'</span><span class="batch-item-status">'+this.statusPill(itemStatusClass(item),itemStatusLabel(item))+'</span>'+error+recoveryHtml+'</div>';
   },
   batchEvent(event){
     const level=String(event.level||'info').toLowerCase();
@@ -1066,7 +2264,7 @@ function setRunMode(mode,persist=true){
 }
 
 function setWorkflowTab(tab,persist=true){
-  currentWorkflowTab=(tab==='batch')?'batch':'single';
+  currentWorkflowTab=(tab==='batch'||tab==='discovery'||tab==='ai_ready')?tab:'single';
   if(persist)localStorage.setItem('workflowTab',currentWorkflowTab);
   document.querySelectorAll('[data-workflow-tab]').forEach(btn=>{
     const active=btn.dataset.workflowTab===currentWorkflowTab;
@@ -1075,6 +2273,8 @@ function setWorkflowTab(tab,persist=true){
   });
   document.getElementById('singleTaskPanel').hidden=currentWorkflowTab!=='single';
   document.getElementById('batchTaskPanel').hidden=currentWorkflowTab!=='batch';
+  document.getElementById('discoveryTaskPanel').hidden=currentWorkflowTab!=='discovery';
+  document.getElementById('aiReadyTaskPanel').hidden=currentWorkflowTab!=='ai_ready';
 }
 
 async function loadConfig(){
@@ -1131,10 +2331,10 @@ function updateServerStatus(d){
   renderSystemMetrics(d.system_metrics);
 }
 
-async function loadResults(){
+async function loadResults(refresh=false){
   const box=document.getElementById('publicResults');
   try{
-    const r=await fetch('/api/history');
+    const r=await fetch(refresh?'/api/history?fast=0&refresh=1':'/api/history?fast=1');
     const d=await r.json();
     const summary=d.summary||{};
     document.getElementById('publicResultsMeta').textContent=tf('historyMeta',summary.total||0,summary.active||0,summary.failed||0,summary.downloadable||0,formatSize(summary.storage_bytes||0),retentionMinutes(d));
@@ -1209,15 +2409,49 @@ function renderBatchEvents(batch){
   box.scrollTop=box.scrollHeight;
 }
 
+function batchItemHasAiReadyUsableRun(item){
+  const status=String(item&&item.status?item.status:'').toLowerCase();
+  if(status==='completed')return true;
+  const workflowOutcome=String(item&&item.workflow_outcome?item.workflow_outcome:'').toLowerCase();
+  return Boolean(item&&item.usable_partial_outputs)
+    || workflowOutcome==='failed_with_usable_partial_outputs'
+    || workflowOutcome==='completed_from_usable_partial_outputs';
+}
+
+function eligibleBatchAgentRunDirs(batch){
+  const mode=String(batch&&batch.run_mode?batch.run_mode:'').toLowerCase();
+  if(mode!=='full')return [];
+  const dirs=[];
+  (batch&&Array.isArray(batch.items)?batch.items:[]).forEach(item=>{
+    const dir=item&&item.output_dir?String(item.output_dir):'';
+    if(item&&batchItemHasAiReadyUsableRun(item)&&dir&&!dirs.includes(dir))dirs.push(dir);
+  });
+  return dirs;
+}
+
+function showBatchNeedsApiKey(){
+  const message=t('batchNeedsApiKeyAfterHandoff');
+  const status=document.getElementById('batchStatus');
+  if(status){
+    status.textContent=message;
+    status.className='batch-status error';
+  }
+  renderBatchEvents({events:[{ts:now(),level:'warning',message}],items:[]});
+}
+
 function updateBatchView(batch){
   if(!batch||batch.error){
     const status=document.getElementById('batchStatus');
     status.textContent=batch&&batch.error?batch.error:'';
     status.className='batch-status error';
+    currentBatchRecord=batch||null;
+    const aiReadyBtn=document.getElementById('batchAiReadyBtn');
+    if(aiReadyBtn)aiReadyBtn.disabled=true;
     renderBatchEvents(batch||{});
     return;
   }
   currentBatchId=batch.batch_id||currentBatchId;
+  currentBatchRecord=batch;
   const done=(batch.completed_items||0)+(batch.failed_items||0)+(batch.needs_review_items||0);
   const total=batch.item_count||0;
   const failed=batch.failed_items||0;
@@ -1231,8 +2465,12 @@ function updateBatchView(batch){
   downloadBtn.disabled=!batch.can_download;
   const auditBtn=document.getElementById('batchAuditBtn');
   auditBtn.disabled=!batch.can_download_audit;
+  const aiReadyBtn=document.getElementById('batchAiReadyBtn');
+  const aiReadyRuns=eligibleBatchAgentRunDirs(batch);
+  if(aiReadyBtn)aiReadyBtn.disabled=aiReadyRuns.length===0;
   if(batch.can_download)status.textContent+=' '+t('batchDownloadReady');
   if(batch.can_download_audit)status.textContent+=' '+t('batchAuditReady');
+  if(aiReadyRuns.length)status.textContent+=' '+tf('batchAiReadyAvailable',aiReadyRuns.length);
   if(batch.status==='completed'||batch.status==='failed'){
     clearInterval(batchPollTimer);
     setButtonBusy(document.getElementById('batchStartBtn'),false,t('startBatch'));
@@ -1256,12 +2494,18 @@ async function startBatch(){
   const inputs=collectBatchInputs();
   if(inputs.length===0){input.classList.add('error');input.setAttribute('aria-invalid','true');input.focus();showFormAlert(t('batchRequired'));return}
   if(!validateBatchSubmitter()){showFormAlert(t('submitterRequired'));return}
-  if(!validateConfig()){showFormAlert(t('apiRequired'));return}
+  if(!validateConfig()){
+    showFormAlert(t('apiRequired'));
+    if(currentBatchInputRecords&&currentBatchInputRecords.length)showBatchNeedsApiKey();
+    return;
+  }
   clearFormAlert();
   const btn=document.getElementById('batchStartBtn'),status=document.getElementById('batchStatus');
   setButtonBusy(btn,true,t('creating'));
   document.getElementById('batchDownloadBtn').disabled=true;
   document.getElementById('batchAuditBtn').disabled=true;
+  const batchAiReadyBtn=document.getElementById('batchAiReadyBtn');
+  if(batchAiReadyBtn)batchAiReadyBtn.disabled=true;
   status.textContent=t('batchCreating');
   status.className='batch-status';
   renderBatchItems(inputs.map((value,index)=>({input:value,status:index===0?'queued':'queued'})));
@@ -1275,6 +2519,7 @@ async function startBatch(){
     jobs:parseInt(document.getElementById('batchJobs').value||'3',10),
     fasta_preference:document.getElementById('preferProjectFasta').checked?'project':'llm',
     ui_language:currentLanguage,
+    input_records:currentBatchInputRecords,
     llm_config:collectConfig()
   };
   try{
@@ -1321,6 +2566,62 @@ function downloadBatchAuditById(id){
   window.location.href='/api/batches/'+encodeURIComponent(id)+'/audit.zip';
 }
 
+async function buildAiReadyFromBatch(){
+  const runs=eligibleBatchAgentRunDirs(currentBatchRecord);
+  const batchStatus=document.getElementById('batchStatus');
+  if(!runs.length){
+    batchStatus.textContent=t('batchAiReadyNoRuns');
+    batchStatus.className='batch-status error';
+    return;
+  }
+  const btn=document.getElementById('batchAiReadyBtn');
+  const aiStatus=document.getElementById('aiReadyStatus');
+  document.getElementById('aiReadyAgentRunDir').value=runs[0];
+  setWorkflowTab('ai_ready');
+  const aiReadyPanel=document.getElementById('aiReadyAgentRunDir');
+  if(aiReadyPanel)aiReadyPanel.scrollIntoView({block:'center',behavior:'smooth'});
+  setButtonBusy(btn,true,t('aiReadyValidating'));
+  aiStatus.textContent=tf('batchAiReadyRunning',runs.length);
+  aiStatus.className='discovery-status';
+  batchStatus.textContent=tf('batchAiReadyRunning',runs.length);
+  batchStatus.className='batch-status';
+  try{
+    const payload={
+      task_types:[document.getElementById('aiReadyTaskType').value],
+      peaklists:aiReadyLines('aiReadyPeaklists')
+    };
+    let endpoint='/api/ai-ready/mini-e2e';
+    if(runs.length===1){
+      payload.agent_run_dir=runs[0];
+    }else{
+      payload.agent_run_dirs=runs;
+      endpoint='/api/ai-ready/mini-e2e-batch';
+    }
+    const resp=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      aiStatus.textContent=tf('aiReadyFailed',data.error);
+      aiStatus.className='discovery-status error';
+      batchStatus.textContent=tf('aiReadyFailed',data.error);
+      batchStatus.className='batch-status error';
+      return;
+    }
+    renderAiReady(data);
+    aiStatus.textContent=tf('batchAiReadyDone',runs.length)+' '+t('batchAiReadyRecipeNext');
+    aiStatus.className='discovery-status ok';
+    batchStatus.textContent=tf('batchAiReadyDone',runs.length)+' '+t('batchAiReadyRecipeNext');
+    batchStatus.className='batch-status ok';
+  }catch(e){
+    aiStatus.textContent=tf('aiReadyFailed',e);
+    aiStatus.className='discovery-status error';
+    batchStatus.textContent=tf('aiReadyFailed',e);
+    batchStatus.className='batch-status error';
+  }finally{
+    setButtonBusy(btn,false,t('buildAiReadyFromBatch'));
+    if(btn&&currentBatchRecord)btn.disabled=eligibleBatchAgentRunDirs(currentBatchRecord).length===0;
+  }
+}
+
 async function attachBatch(id){
   if(!id)return;
   setWorkflowTab('batch');
@@ -1328,6 +2629,1643 @@ async function attachBatch(id){
   clearInterval(batchPollTimer);
   await pollBatch(id);
   batchPollTimer=setInterval(()=>pollBatch(id),1500);
+}
+
+function discoveryInt(id,defaultValue){
+  const value=parseInt(document.getElementById(id).value||String(defaultValue),10);
+  return Number.isFinite(value)&&value>0?value:defaultValue;
+}
+
+function discoveryHasAny(text,terms){
+  return terms.some(term=>text.includes(term));
+}
+
+function discoverySetSelect(id,value){
+  const el=document.getElementById(id);
+  if(!el)return false;
+  const option=Array.from(el.options).find(item=>item.value===value);
+  if(!option)return false;
+  el.value=value;
+  if(id==='discoveryGoal')toggleDiscoveryGoalControls();
+  return true;
+}
+
+function discoverySetMultiSelect(id,values){
+  const el=document.getElementById(id);
+  if(!el)return false;
+  const wanted=new Set((Array.isArray(values)?values:[values]).map(v=>String(v||'')));
+  let matched=false;
+  Array.from(el.options).forEach(option=>{
+    option.selected=wanted.has(option.value);
+    if(option.selected)matched=true;
+  });
+  return matched;
+}
+
+function toggleDiscoverySourceControls(){
+  const source=document.getElementById('discoverySource')?.value||'remote';
+  const localRow=document.getElementById('discoveryLocalDirRow');
+  if(localRow)localRow.hidden=source!=='local';
+  const localInput=document.getElementById('discoveryLocalDir');
+  if(source!=='local'&&localInput){
+    localInput.classList.remove('error');
+    localInput.setAttribute('aria-invalid','false');
+  }
+}
+
+function discoverySelectedGoal(){
+  return document.getElementById('discoveryGoal')?.value||'general';
+}
+
+function discoverySelectedPtmTypes(){
+  if(discoverySelectedGoal()!=='ptm')return [];
+  const el=document.getElementById('discoveryPtm');
+  const values=el?Array.from(el.selectedOptions).map(option=>option.value).filter(Boolean):[];
+  return values.length?values:['phospho'];
+}
+
+function discoverySelectedPtmType(){
+  const values=discoverySelectedPtmTypes();
+  return values.length?values[0]:'unknown_ptm';
+}
+
+function discoveryAddPtmSelection(value){
+  discoverySetSelect('discoveryGoal','ptm');
+  const el=document.getElementById('discoveryPtm');
+  const current=el?Array.from(el.selectedOptions).map(option=>option.value).filter(Boolean):[];
+  const next=current.filter(item=>item!=='unknown_ptm');
+  if(value&&!next.includes(value))next.push(value);
+  discoverySetMultiSelect('discoveryPtm',next.length?next:[value||'phospho']);
+}
+
+function toggleDiscoveryGoalControls(){
+  const isPtm=discoverySelectedGoal()==='ptm';
+  const ptmRow=document.getElementById('discoveryPtmRow');
+  if(ptmRow)ptmRow.hidden=!isPtm;
+  if(!isPtm)discoverySetMultiSelect('discoveryPtm',['unknown_ptm']);
+}
+
+function collectDiscoveryIntentFields(){
+  return {
+    prompt:(document.getElementById('discoveryPrompt')?.value||'').trim(),
+    source:document.getElementById('discoverySource').value,
+    repository:document.getElementById('discoveryRepository').value,
+    goal:document.getElementById('discoveryGoal').value,
+    ptm_type:discoverySelectedPtmType(),
+    ptm_types:discoverySelectedPtmTypes(),
+    labeling_strategy:document.getElementById('discoveryLabeling').value,
+    species:document.getElementById('discoverySpecies').value.split(/[,;\n]+/).map(v=>v.trim()).filter(Boolean),
+    species_policy:document.getElementById('discoverySpeciesPolicy').value,
+    acquisition_mode:document.getElementById('discoveryAcquisition').value,
+    task_type:document.getElementById('discoveryTaskType').value,
+    max_projects:discoveryInt('discoveryMaxProjects',5),
+    max_files:discoveryInt('discoveryMaxFiles',50),
+    max_files_per_project:discoveryInt('discoveryFilesPerProject',20),
+    agentic_rounds:discoveryInt('discoveryAgenticRounds',1),
+    diversity_strategy:document.getElementById('discoveryDiversityStrategy').value,
+    agentic:document.getElementById('discoveryAgentic').checked
+  };
+}
+
+function applyDiscoveryGoalFields(fields){
+  const data=fields||{};
+  if(data.source){
+    discoverySetSelect('discoverySource',String(data.source));
+    toggleDiscoverySourceControls();
+  }
+  if(data.repository)discoverySetSelect('discoveryRepository',String(data.repository));
+  if(data.goal)discoverySetSelect('discoveryGoal',String(data.goal));
+  if(Array.isArray(data.ptm_types)&&data.ptm_types.length)discoverySetMultiSelect('discoveryPtm',data.ptm_types);
+  else if(data.ptm_type)discoverySetMultiSelect('discoveryPtm',[String(data.ptm_type)]);
+  if(data.labeling_strategy)discoverySetSelect('discoveryLabeling',String(data.labeling_strategy));
+  if(Array.isArray(data.species)&&data.species.length)document.getElementById('discoverySpecies').value=data.species.join(', ');
+  else if(typeof data.species==='string'&&data.species.trim())document.getElementById('discoverySpecies').value=data.species.trim();
+  if(data.species_policy)discoverySetSelect('discoverySpeciesPolicy',String(data.species_policy));
+  if(data.acquisition_mode)discoverySetSelect('discoveryAcquisition',String(data.acquisition_mode));
+  if(data.task_type!==undefined)discoverySetSelect('discoveryTaskType',String(data.task_type||''));
+  if(data.diversity_strategy)discoverySetSelect('discoveryDiversityStrategy',String(data.diversity_strategy));
+  if(data.max_projects!==undefined)document.getElementById('discoveryMaxProjects').value=String(Math.max(1,Math.min(100,parseInt(data.max_projects,10)||5)));
+  if(data.max_files!==undefined)document.getElementById('discoveryMaxFiles').value=String(Math.max(1,Math.min(2000,parseInt(data.max_files,10)||50)));
+  if(data.max_files_per_project!==undefined)document.getElementById('discoveryFilesPerProject').value=String(Math.max(1,Math.min(100,parseInt(data.max_files_per_project,10)||20)));
+  if(data.agentic_rounds!==undefined)discoverySetSelect('discoveryAgenticRounds',String(Math.max(1,Math.min(2,parseInt(data.agentic_rounds,10)||1))));
+  document.getElementById('discoveryAgentic').checked=data.agentic!==false;
+}
+
+function parseDiscoveryGoalFallback(showStatus=true,errorMessage=''){
+  const promptEl=document.getElementById('discoveryPrompt');
+  const status=document.getElementById('discoveryParseStatus');
+  const raw=(promptEl?.value||'').trim();
+  if(!raw){
+    if(status){
+      status.textContent=t('discoveryParseEmpty');
+      status.className='discovery-helper error';
+    }
+    return;
+  }
+  const text=raw.toLowerCase();
+  const species=[];
+  if(discoveryHasAny(text,['rat','rattus','rattus norvegicus']))species.push('rat');
+  if(discoveryHasAny(text,['rice','oryza','oryza sativa']))species.push('rice');
+  if(discoveryHasAny(text,['human','homo sapiens','人源','人类']))species.push('human');
+  if(discoveryHasAny(text,['mouse','murine','mus musculus','小鼠']))species.push('mouse');
+  if(discoveryHasAny(text,['yeast','saccharomyces','酵母']))species.push('yeast');
+  if(discoveryHasAny(text,['e coli','e. coli','ecoli','escherichia','大肠杆菌']))species.push('e coli');
+  if(species.length)document.getElementById('discoverySpecies').value=Array.from(new Set(species)).join(', ');
+  if(discoveryHasAny(text,['phospho','phosphorylation','phosphoproteomics','phosphopeptide']))discoveryAddPtmSelection('phospho');
+  if(discoveryHasAny(text,['acetyl','acetylation','acetylome']))discoveryAddPtmSelection('acetyl');
+  if(discoveryHasAny(text,['ubiquitin','ubiquitination','ubiquitylation','glygly','di-glycine','diglycine']))discoveryAddPtmSelection('ubiquitin');
+  if(discoveryHasAny(text,['glyco','glycosylation','glycoproteomics','glycopeptide','hexnac']))discoveryAddPtmSelection('glyco');
+  if(discoveryHasAny(text,['methyl','methylation','methylome']))discoveryAddPtmSelection('methyl');
+  if(discoveryHasAny(text,['tmt','tmt10','tmt16','tandem mass tag']))discoverySetSelect('discoveryLabeling','TMT');
+  else if(discoveryHasAny(text,['itraq','itraq4','itraq8']))discoverySetSelect('discoveryLabeling','iTRAQ');
+  else if(discoveryHasAny(text,['label-free','label free','lfq']))discoverySetSelect('discoveryLabeling','label_free');
+
+  if(discoveryHasAny(text,[
+    'immunopeptidomics','immunopeptidome','immunopeptide','immunopeptides',
+    'hla ligandome','mhc ligandome','hla peptidome','mhc peptidome',
+    'hla ligand','mhc ligand','eluted ligand','eluted ligands',
+    'hla-eluted peptide','hla eluted peptide','mhc-eluted peptide','mhc eluted peptide',
+    'neoantigen','neoantigens','tumor antigen','tumour antigen','cancer antigen',
+    'antigen presentation','antigen processing','hla-ip','mhc-ip',
+    'hla immunoprecipitation','mhc immunoprecipitation','immunoaffinity purification',
+    'pan-hla','w6/32','anti-hla','anti-mhc','hla class i','hla class ii',
+    'mhc class i','mhc class ii','hla-i','hla-ii','mhc-i','mhc-ii'
+  ])){
+    const explicitImmunoTarget=discoveryHasAny(text,[
+      'discovery target immunopeptidomics',
+      'target immunopeptidomics',
+      'use immunopeptidomics target',
+      'immunopeptidomics target',
+      'hla target'
+    ]);
+    discoverySetSelect('discoveryGoal',explicitImmunoTarget?'immunopeptidomics':'general');
+    discoverySetMultiSelect('discoveryPtm',['unknown_ptm']);
+  }
+
+  if(discoveryHasAny(text,['only ','include only','only include','only use','strict species','strictly species','只要','仅','只用'])){
+    discoverySetSelect('discoverySpeciesPolicy','include_only');
+  }else if(discoveryHasAny(text,['exclude species','without species','do not use species','exclude ','不要','排除'])){
+    discoverySetSelect('discoverySpeciesPolicy','exclude');
+  }else{
+    discoverySetSelect('discoverySpeciesPolicy','open');
+  }
+
+  if(discoveryHasAny(text,[
+    'phospho','phosphorylation','phosphoproteomics','phosphoproteome','phosphopeptide',
+    'phosphopeptide enrichment','enriched phosphopeptides','pser','pthr','ptyr',
+    'sty phosphorylation','kinase substrate','kinase signaling','phosphosite',
+    'phosphosite localization','ti-imac','fe-imac','ga-imac','ti4+-imac','moac',
+    'metal oxide affinity chromatography','polymac','titansphere','titanium dioxide',
+    'tio2','phosphotyrosine enrichment','anti-phosphotyrosine antibody enrichment'
+  ])){
+    discoverySetSelect('discoveryGoal','ptm');
+    discoveryAddPtmSelection('phospho');
+  }
+  if(discoveryHasAny(text,['dda','data dependent','data-dependent','shotgun']))discoverySetSelect('discoveryAcquisition','dda');
+
+  let taskType='';
+  if(discoveryHasAny(text,['chimeric','cofragment','co-fragment']))taskType='chimeric_interpretation';
+  else if(discoveryHasAny(text,['ptm de novo','ptm denovo','modified de novo']))taskType='ptm_denovo';
+  else if(discoveryHasAny(text,['de novo','denovo']))taskType=discoveryHasAny(text,['phospho','acetyl','glyco','methyl','ptm','ubiquitin'])?'ptm_denovo':'denovo';
+  else if(discoveryHasAny(text,['fragment intensity','ion intensity','intensity prediction']))taskType='fragment_intensity_prediction';
+  else if(discoveryHasAny(text,['psm scoring','psm score','rescoring','rescore']))taskType='psm_scoring';
+  else if(discoveryHasAny(text,['rt prediction','retention time','irt']))taskType='rt_prediction';
+  if(taskType)discoverySetSelect('discoveryTaskType',taskType);
+
+  if(discoveryHasAny(text,['no diversity','without diversity','disable diversity'])){
+    discoverySetSelect('discoveryDiversityStrategy','off');
+  }else if(discoveryHasAny(text,['diversity','diverse','instrument','lc gradient','gradient','fragmentation','cross species','multi species'])){
+    discoverySetSelect('discoveryDiversityStrategy','high');
+  }else{
+    discoverySetSelect('discoveryDiversityStrategy','balanced');
+  }
+
+  const projectMatch=text.match(/(?:max(?:imum)?\s*)?(\d{1,3})\s*(?:projects?|project)/);
+  if(projectMatch)document.getElementById('discoveryMaxProjects').value=String(Math.max(1,Math.min(100,parseInt(projectMatch[1],10))));
+  const fileMatch=text.match(/(?:max(?:imum)?\s*)?(\d{1,4})\s*(?:files?|file)/);
+  if(fileMatch)document.getElementById('discoveryMaxFiles').value=String(Math.max(1,Math.min(2000,parseInt(fileMatch[1],10))));
+  const roundMatch=text.match(/(?:agentic\s*)?rounds?\s*[:=]?\s*(1|2)|\b(1|2)\s*(?:agentic\s*)?rounds?\b/);
+  const roundValue=roundMatch?roundMatch.slice(1).find(Boolean):'';
+  if(roundValue)discoverySetSelect('discoveryAgenticRounds',roundValue);
+  else if(discoveryHasAny(text,['one round','single round','1-round','round 1']))discoverySetSelect('discoveryAgenticRounds','1');
+  else if(discoveryHasAny(text,['two rounds','second round','2-round','round 2']))discoverySetSelect('discoveryAgenticRounds','2');
+
+  document.getElementById('discoveryAgentic').checked=true;
+  if(showStatus&&status){
+    status.textContent=errorMessage?tf('discoveryParseFallback',errorMessage):t('discoveryParseDone');
+    status.className=errorMessage?'discovery-helper error':'discovery-helper ok';
+  }
+  return;
+}
+/* legacy fallback parser disabled after semantic-readiness v2.
+
+  if(discoveryHasAny(text,['phospho','phosphorylation','phosphoproteomics','磷酸化'])){
+    discoverySetSelect('discoveryGoal','ptm');
+    discoverySetSelect('discoveryPtm','phospho');
+  }
+  if(discoveryHasAny(text,['dda','data dependent','data-dependent','shotgun']))discoverySetSelect('discoveryAcquisition','dda');
+
+  let taskType='';
+  if(discoveryHasAny(text,['chimeric','cofragment','co-fragment','共碎裂','嵌合']))taskType='chimeric_interpretation';
+  else if(discoveryHasAny(text,['ptm de novo','ptm denovo','modified de novo','磷酸化 de novo','修饰 de novo']))taskType='ptm_denovo';
+  else if(discoveryHasAny(text,['de novo','denovo','从头测序']))taskType=discoveryHasAny(text,['phospho','acetyl','glyco','methyl','ptm','修饰','磷酸化'])?'ptm_denovo':'denovo';
+  else if(discoveryHasAny(text,['fragment intensity','ion intensity','intensity prediction','碎片强度','离子强度']))taskType='fragment_intensity_prediction';
+  else if(discoveryHasAny(text,['psm scoring','psm score','rescoring','rescore','打分']))taskType='psm_scoring';
+  else if(discoveryHasAny(text,['rt prediction','retention time','irt','保留时间']))taskType='rt_prediction';
+  if(taskType)discoverySetSelect('discoveryTaskType',taskType);
+
+  if(discoveryHasAny(text,['no diversity','without diversity','disable diversity','不要 diversity','不需要 diversity'])){
+    discoverySetSelect('discoveryDiversityStrategy','off');
+  }else if(discoveryHasAny(text,['diversity','diverse','instrument','lc gradient','gradient','fragmentation','多样性','仪器','梯度','碎裂'])){
+    discoverySetSelect('discoveryDiversityStrategy','high');
+  }else{
+    discoverySetSelect('discoveryDiversityStrategy','balanced');
+  }
+
+  const projectMatch=text.match(/(?:max(?:imum)?\s*)?(\d{1,3})\s*(?:projects?|project)/);
+  if(projectMatch)document.getElementById('discoveryMaxProjects').value=String(Math.max(1,Math.min(100,parseInt(projectMatch[1],10))));
+  const fileMatch=text.match(/(?:max(?:imum)?\s*)?(\d{1,4})\s*(?:files?|file)/);
+  if(fileMatch)document.getElementById('discoveryMaxFiles').value=String(Math.max(1,Math.min(2000,parseInt(fileMatch[1],10))));
+  const roundMatch=text.match(/(?:agentic\s*)?rounds?\s*[:=]?\s*(1|2)|\b(1|2)\s*(?:agentic\s*)?rounds?\b/);
+  const roundValue=roundMatch?roundMatch.slice(1).find(Boolean):'';
+  if(roundValue)discoverySetSelect('discoveryAgenticRounds',roundValue);
+  else if(discoveryHasAny(text,['one round','single round','1-round','round 1','一轮']))discoverySetSelect('discoveryAgenticRounds','1');
+  else if(discoveryHasAny(text,['two rounds','second round','2-round','round 2','两轮','二轮']))discoverySetSelect('discoveryAgenticRounds','2');
+
+  document.getElementById('discoveryAgentic').checked=true;
+  if(showStatus&&status){
+    status.textContent=errorMessage?tf('discoveryParseFallback',errorMessage):t('discoveryParseDone');
+    status.className=errorMessage?'discovery-helper error':'discovery-helper ok';
+  }
+}
+*/
+
+async function parseDiscoveryGoal(){
+  const promptEl=document.getElementById('discoveryPrompt');
+  const status=document.getElementById('discoveryParseStatus');
+  const btn=document.getElementById('discoveryParseBtn');
+  const raw=(promptEl?.value||'').trim();
+  if(!raw){
+    if(status){
+      status.textContent=t('discoveryParseEmpty');
+      status.className='discovery-helper error';
+    }
+    return;
+  }
+  setButtonBusy(btn,true,t('discoveryParsingGoal'));
+  if(status){
+    status.textContent=t('discoveryParsingGoal');
+    status.className='discovery-helper';
+  }
+  try{
+    const resp=await fetch('/api/discovery/parse-goal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:raw,current:collectDiscoveryIntentFields(),llm_config:collectConfig()})});
+    const data=await resp.json();
+    if(data.error)throw new Error(data.error);
+    applyDiscoveryGoalFields(data.fields||{});
+    const warnings=Array.isArray(data.warnings)&&data.warnings.length?' Warnings: '+data.warnings.slice(0,3).join('; '):'';
+    if(status){
+      status.textContent=t('discoveryParseLlmDone')+warnings;
+      status.className=warnings?'discovery-helper error':'discovery-helper ok';
+    }
+  }catch(e){
+    parseDiscoveryGoalFallback(false);
+    if(status){
+      status.textContent=tf('discoveryParseFallback',e.message||String(e));
+      status.className='discovery-helper error';
+    }
+  }finally{
+    setButtonBusy(btn,false,t('parseDiscoveryGoal'));
+  }
+}
+
+function buildDiscoveryPrompt(){
+  const raw=document.getElementById('discoveryPrompt').value.trim();
+  const diversity=document.getElementById('discoveryDiversityStrategy').value;
+  const notes=[];
+  if(diversity==='high'){
+    notes.push('Prioritize diversity across species, instrument family, fragmentation method, and LC gradient when selecting candidate files.');
+  }else if(diversity==='balanced'){
+    notes.push('Use balanced diversity as a tie-breaker when candidate scores are close.');
+  }else if(diversity==='off'){
+    notes.push('Do not add diversity as an extra preference; prioritize trust score and task readiness.');
+  }
+  return [raw,...notes].filter(Boolean).join('\n\n');
+}
+
+function collectDiscoveryPayload(){
+  const agentic=document.getElementById('discoveryAgentic').checked;
+  const diversityStrategy=document.getElementById('discoveryDiversityStrategy').value;
+  const source=document.getElementById('discoverySource').value;
+  return {
+    source,
+    local_dir:document.getElementById('discoveryLocalDir').value.trim(),
+    repository:document.getElementById('discoveryRepository').value,
+    goal:document.getElementById('discoveryGoal').value,
+    ptm_type:discoverySelectedPtmType(),
+    ptm_types:discoverySelectedPtmTypes(),
+    labeling_strategy:document.getElementById('discoveryLabeling').value,
+    species:document.getElementById('discoverySpecies').value.split(/[,;\n]+/).map(v=>v.trim()).filter(Boolean),
+    species_policy:document.getElementById('discoverySpeciesPolicy').value,
+    acquisition_mode:document.getElementById('discoveryAcquisition').value,
+    task_type:document.getElementById('discoveryTaskType').value,
+    max_projects:discoveryInt('discoveryMaxProjects',5),
+    max_files:discoveryInt('discoveryMaxFiles',50),
+    max_files_per_project:discoveryInt('discoveryFilesPerProject',20),
+    max_candidate_projects:Math.max(20,discoveryInt('discoveryMaxProjects',5)*5),
+    use_memory:document.getElementById('discoveryUseMemory').checked,
+    save_memory:document.getElementById('discoverySaveMemory').checked,
+    diversity_strategy:diversityStrategy,
+    agentic,
+    agentic_rounds:discoveryInt('discoveryAgenticRounds',1),
+    prompt:buildDiscoveryPrompt()
+  };
+}
+
+function discoveryListText(values){
+  const items=Array.isArray(values)?values.filter(Boolean):[];
+  return items.length?items.join('; '):'unknown';
+}
+
+function discoveryLcText(file){
+  if(file.lc_gradient_minutes!==null&&file.lc_gradient_minutes!==undefined&&file.lc_gradient_minutes!=='')return String(file.lc_gradient_minutes)+' min';
+  return file.lc_gradient||'unknown';
+}
+
+function discoveryTaskReadyText(file){
+  if(!file.task_readiness_status)return'';
+  const parts=[file.task_readiness_status];
+  if(file.task_ai_readiness_score!==null&&file.task_ai_readiness_score!==undefined)parts.push('AI-ready: '+_formatRatio(file.task_ai_readiness_score));
+  if(file.task_ai_readiness_band)parts.push('band: '+file.task_ai_readiness_band);
+  if(file.data_value_score!==null&&file.data_value_score!==undefined)parts.push('value: '+_formatRatio(file.data_value_score));
+  if(file.data_value_action)parts.push('action: '+file.data_value_action);
+  if(file.label_source_status)parts.push('labels: '+file.label_source_status);
+  if(file.spectra_requirement_status)parts.push('spectra: '+file.spectra_requirement_status);
+  if(file.metadata_requirement_status)parts.push('metadata: '+file.metadata_requirement_status);
+  if(file.ai_ready_target_schema)parts.push(file.ai_ready_target_schema);
+  if(Array.isArray(file.missing_task_requirements)&&file.missing_task_requirements.length){
+    parts.push('missing: '+file.missing_task_requirements.slice(0,3).join('; '));
+  }
+  return parts.join(' | ');
+}
+
+const DISCOVERY_DECISIONS=[
+  ['',''],
+  ['keep','keep'],
+  ['reject','reject'],
+  ['needs_review','needs_review']
+];
+const DISCOVERY_REASONS=[
+  'correct',
+  'wrong_ptm',
+  'wrong_acquisition',
+  'wrong_species',
+  'result_file',
+  'missing_url',
+  'duplicate',
+  'unclear',
+  'other'
+];
+
+function discoveryOptions(options,selected){
+  const current=selected||'';
+  return options.map(item=>{
+    const value=Array.isArray(item)?item[0]:item;
+    const label=Array.isArray(item)?item[1]:item;
+    return '<option value="'+esc(value)+'" '+(value===current?'selected':'')+'>'+esc(label||'--')+'</option>';
+  }).join('');
+}
+
+function discoveryReviewControls(file){
+  const decision=file.review_decision||'';
+  const reason=file.review_reason||(decision==='keep'?'correct':'unclear');
+  const note=file.review_note||'';
+  return '<select class="discovery-review-select" data-discovery-review="decision" aria-label="Optional label decision">'+discoveryOptions(DISCOVERY_DECISIONS,decision)+'</select>'
+    +'<select class="discovery-review-select" data-discovery-review="reason" aria-label="Optional label reason">'+discoveryOptions(DISCOVERY_REASONS,reason)+'</select>'
+    +'<input class="discovery-note" data-discovery-review="note" type="text" value="'+esc(note)+'" aria-label="Optional label note">';
+}
+
+function discoveryEvidenceText(evidence){
+  const items=Array.isArray(evidence)?evidence:[];
+  const parts=items.slice(0,4).map(item=>{
+    if(!item)return'';
+    if(typeof item==='string')return item;
+    const src=item.source||item.field||'evidence';
+    const text=item.text||'';
+    return src+(text?': '+text:'');
+  }).filter(Boolean);
+  return parts.join('; ');
+}
+
+function renderDiscoverySummary(data){
+  const summary=data.summary||{};
+  const diversity=summary.diversity||{};
+  const validity=summary.validity_status_counts||summary.validity?.validity_status_counts||{};
+  const unknown=summary.unknown_counts||diversity.unknown_counts||{};
+  const task=summary.task_readiness||{};
+  const agentic=summary.agentic||{};
+  const box=document.getElementById('discoverySummary');
+  const stat=(label,value)=>'<div class="discovery-stat"><div class="discovery-stat-label">'+esc(label)+'</div><div class="discovery-stat-value">'+esc(value)+'</div></div>';
+  const taskStatus=Object.entries(task.status_counts||{}).map(([k,v])=>k+': '+v).join('; ')||'off';
+  const agenticStatus=agentic.enabled?('rounds: '+(agentic.rounds||1)+', warnings: '+((agentic.warnings||[]).length||0)):'off';
+  box.innerHTML=[
+    stat(t('discoveryProjects'),String(data.project_count||summary.selected_projects||0)),
+    stat(t('discoveryFiles'),String(data.file_count||summary.selected_files||0)),
+    stat(t('discoveryUsable'),String(summary.usable_files||0)),
+    stat(t('discoveryNeedsReview'),String(summary.needs_review_files||0)),
+    stat(t('discoveryMemory'),(summary.memory_used?'prior ':'')+(summary.memory_saved?'saved':'off')),
+    stat(t('discoveryValidity'),Object.entries(validity).map(([k,v])=>k+': '+v).join(' · ')||'n/a'),
+    stat(t('discoveryInstrument'),String(unknown.instrument_family||0)+' unknown'),
+    stat(t('discoveryFragmentation'),String(unknown.fragmentation_method||0)+' unknown'),
+    stat(t('discoveryTaskReady'),taskStatus),
+    stat(t('discoveryAgenticSummary'),agenticStatus)
+  ].join('');
+}
+
+function renderDiscoveryNextStep(){
+  const box=document.getElementById('discoveryNextStep');
+  if(!box)return;
+  const files=(currentDiscoveryRecord&&Array.isArray(currentDiscoveryRecord.files))?currentDiscoveryRecord.files:[];
+  const selected=discoverySelectedFileKeys.size;
+  if(!files.length){
+    box.hidden=true;
+    box.innerHTML='';
+    return;
+  }
+  box.hidden=false;
+  const body=selected
+    ? tf('discoveryNextStepBatch',selected,files.length)
+    : t('discoveryNextStepNone');
+  box.innerHTML='<strong>'+esc(t('discoveryNextStepTitle'))+'</strong>'+esc(body);
+}
+
+function renderDiscoveryProjects(projects){
+  const box=document.getElementById('discoveryProjectTable');
+  const rows=(projects||[]).slice(0,50).map(project=>{
+    return '<tr><td>'+esc(project.project_accession||'')+'</td><td>'+esc(project.project_title||'')+'</td><td>'+esc(_formatScore(project.project_score))+'</td><td>'+esc(_formatRatio(project.trust_score||project.confidence))+'</td><td>'+esc(discoveryListText(project.instrument_families))+'</td><td>'+esc(discoveryListText(project.fragmentation_methods))+'</td><td>'+esc(project.selected_file_count||0)+'</td></tr>';
+  }).join('');
+  box.innerHTML='<table class="discovery-table"><thead><tr><th>Project</th><th>Title</th><th>'+esc(t('discoveryScore'))+'</th><th>'+esc(t('discoveryTrust'))+'</th><th>'+esc(t('discoveryInstrument'))+'</th><th>'+esc(t('discoveryFragmentation'))+'</th><th>Files</th></tr></thead><tbody>'+(rows||'<tr><td colspan="7">'+esc(t('discoveryNoResults'))+'</td></tr>')+'</tbody></table>';
+}
+
+function discoveryIsUsableForBatch(file){
+  const validity=String(file.validity_status||'').toLowerCase();
+  const role=String(file.file_role||'').toLowerCase();
+  const type=String(file.file_type||'').toLowerCase();
+  if(file.needs_review||validity==='excluded'||validity==='exclude'||validity==='not_candidate')return false;
+  if(role.includes('result')||role.includes('report'))return false;
+  if(['.tsv','.txt','.csv','.xlsx','.pdf','.mzid'].includes(type))return false;
+  return validity==='valid'||validity==='weak_keep'||file.task_readiness_status==='ready'||file.task_readiness_status==='weak_ready';
+}
+
+function discoveryFileKey(file,index){
+  return [file.project_accession||'',file.file_name||'',String(index)].join('::');
+}
+
+function syncDiscoverySelectionFromDom(){
+  document.querySelectorAll('[data-discovery-select]').forEach(input=>{
+    const key=input.dataset.fileKey||'';
+    if(!key)return;
+    if(input.checked)discoverySelectedFileKeys.add(key);
+    else discoverySelectedFileKeys.delete(key);
+  });
+}
+
+function seedDiscoverySelection(files){
+  discoverySelectedFileKeys.clear();
+  (files||[]).forEach((file,index)=>{
+    if(discoveryIsUsableForBatch(file))discoverySelectedFileKeys.add(discoveryFileKey(file,index));
+  });
+}
+
+function setDiscoverySelection(mode){
+  const files=(currentDiscoveryRecord&&Array.isArray(currentDiscoveryRecord.files))?currentDiscoveryRecord.files:[];
+  discoverySelectedFileKeys.clear();
+  files.forEach((file,index)=>{
+    const key=discoveryFileKey(file,index);
+    if(mode==='all')discoverySelectedFileKeys.add(key);
+    else if(mode==='usable'&&discoveryIsUsableForBatch(file))discoverySelectedFileKeys.add(key);
+  });
+  renderDiscoveryFiles(null,{keepPage:true});
+}
+
+function updateDiscoverySelectionMeta(){
+  syncDiscoverySelectionFromDom();
+  const files=(currentDiscoveryRecord&&Array.isArray(currentDiscoveryRecord.files))?currentDiscoveryRecord.files:[];
+  const selected=discoverySelectedFileKeys.size;
+  const meta=document.getElementById('discoverySelectionMeta');
+  if(meta)meta.textContent=files.length?tf('discoverySelectionCount',selected,files.length):t('discoverySelectionEmpty');
+  renderDiscoveryNextStep();
+}
+
+function discoveryBatchRecord(file){
+  return {
+    input:file.file_name||'',
+    repository:file.repository||'pride',
+    project_accession:file.project_accession||'',
+    project_title:file.project_title||'',
+    file_name:file.file_name||'',
+    download_url:file.download_url||'',
+    file_type:file.file_type||'',
+    file_role:file.file_role||'',
+    validity_status:file.validity_status||'',
+    task_type:document.getElementById('discoveryTaskType').value||'',
+    task_readiness_status:file.task_readiness_status||'',
+    task_ai_readiness_score:file.task_ai_readiness_score,
+    task_ai_readiness_band:file.task_ai_readiness_band||'',
+    data_value_score:file.data_value_score,
+    data_value_action:file.data_value_action||'',
+    evidence_level:file.evidence_level||'',
+    sdrf_match_status:file.sdrf_match_status||'',
+    instrument_families:Array.isArray(file.instrument_families)?file.instrument_families:[],
+    fragmentation_methods:Array.isArray(file.fragmentation_methods)?file.fragmentation_methods:[],
+    species_policy:file.species_policy||document.getElementById('discoverySpeciesPolicy').value||'open',
+    canonical_species:Array.isArray(file.canonical_species)?file.canonical_species:[],
+    organism_taxon_id:Array.isArray(file.organism_taxon_id)?file.organism_taxon_id:[],
+    ptm_type:file.ptm_type||discoverySelectedPtmType()||'',
+    ptm_subtype:file.ptm_subtype||'',
+    ptm_evidence_terms:Array.isArray(file.ptm_evidence_terms)?file.ptm_evidence_terms:[],
+    ptm_enrichment_methods:Array.isArray(file.ptm_enrichment_methods)?file.ptm_enrichment_methods:[],
+    semantic_metadata_confidence:file.semantic_metadata_confidence,
+    semantic_interpretation_trace:Array.isArray(file.semantic_interpretation_trace)?file.semantic_interpretation_trace:[],
+    immunopeptide_scope:file.immunopeptide_scope||'',
+    hla_class:Array.isArray(file.hla_class)?file.hla_class:[],
+    hla_alleles:Array.isArray(file.hla_alleles)?file.hla_alleles:[],
+    immunopeptide_evidence_terms:Array.isArray(file.immunopeptide_evidence_terms)?file.immunopeptide_evidence_terms:[],
+    immunopeptide_enrichment_methods:Array.isArray(file.immunopeptide_enrichment_methods)?file.immunopeptide_enrichment_methods:[],
+    immunopeptide_metadata_confidence:file.immunopeptide_metadata_confidence,
+    labeling_strategy:file.labeling_strategy||document.getElementById('discoveryLabeling').value||'',
+    lc_gradient_minutes:file.lc_gradient_minutes
+  };
+}
+
+function selectedDiscoveryBatchRecords(){
+  const files=(currentDiscoveryRecord&&Array.isArray(currentDiscoveryRecord.files))?currentDiscoveryRecord.files:[];
+  syncDiscoverySelectionFromDom();
+  return files.map((file,index)=>({file,index}))
+    .filter(item=>discoverySelectedFileKeys.has(discoveryFileKey(item.file,item.index)))
+    .map(item=>discoveryBatchRecord(item.file));
+}
+
+function sendDiscoverySelectionToBatch(){
+  const records=selectedDiscoveryBatchRecords();
+  const status=document.getElementById('discoveryStatus');
+  if(!records.length){
+    if(status){
+      status.textContent=t('discoveryBatchNone');
+      status.className='discovery-status error';
+    }
+    return;
+  }
+  currentBatchInputRecords=records;
+  document.getElementById('batchInput').value=records.map(item=>item.file_name).join('\n');
+  const source=currentDiscoveryRecord&&currentDiscoveryRecord.summary?currentDiscoveryRecord.summary.source:'';
+  const selectedRepos=[...new Set(records.map(item=>item.repository||'').filter(Boolean))];
+  document.getElementById('batchRepository').value=source==='local_dir'||selectedRepos.length!==1?'auto':selectedRepos[0];
+  const discoveryTaskType=document.getElementById('discoveryTaskType').value||'';
+  if(discoveryTaskType)discoverySetSelect('aiReadyTaskType',discoveryTaskType);
+  const batchRunMode=document.getElementById('batchRunMode');
+  if(batchRunMode&&fullWorkflowEnabled)batchRunMode.value='full';
+  if(!document.getElementById('batchSubmitter').value.trim()){
+    document.getElementById('batchSubmitter').value='discovery_handoff';
+  }
+  setWorkflowTab('batch');
+  const batchStatus=document.getElementById('batchStatus');
+  batchStatus.textContent=tf('discoveryBatchReady',records.length)+' '+t('discoveryBatchReadyNext');
+  batchStatus.className='batch-status ok';
+  renderBatchItems(records.map(item=>({input:item.file_name,status:'queued'})));
+  renderBatchEvents({events:[
+    {ts:now(),level:'info',message:tf('discoveryBatchReady',records.length)},
+    {ts:now(),level:'info',message:t('discoveryBatchReadyNext')}
+  ],items:[]});
+}
+
+function renderDiscoveryPagination(total){
+  const box=document.getElementById('discoveryFilePagination');
+  if(!box)return;
+  if(total<=DISCOVERY_FILE_PAGE_SIZE){
+    box.hidden=true;
+    box.innerHTML='';
+    return;
+  }
+  const totalPages=Math.max(1,Math.ceil(total/DISCOVERY_FILE_PAGE_SIZE));
+  currentDiscoveryFilePage=Math.max(1,Math.min(totalPages,currentDiscoveryFilePage));
+  const start=(currentDiscoveryFilePage-1)*DISCOVERY_FILE_PAGE_SIZE+1;
+  const end=Math.min(total,currentDiscoveryFilePage*DISCOVERY_FILE_PAGE_SIZE);
+  box.hidden=false;
+  box.innerHTML='<button class="btn btn-secondary btn-small" type="button" onclick="changeDiscoveryFilePage(-1)" '+(currentDiscoveryFilePage<=1?'disabled':'')+'>'+esc(t('prevPage'))+'</button>'
+    +'<span class="discovery-pagination-meta">'+esc(tf('discoveryPage',currentDiscoveryFilePage,totalPages,start,end,total))+'</span>'
+    +'<button class="btn btn-secondary btn-small" type="button" onclick="changeDiscoveryFilePage(1)" '+(currentDiscoveryFilePage>=totalPages?'disabled':'')+'>'+esc(t('nextPage'))+'</button>';
+}
+
+function changeDiscoveryFilePage(delta){
+  syncDiscoverySelectionFromDom();
+  const files=(currentDiscoveryRecord&&Array.isArray(currentDiscoveryRecord.files))?currentDiscoveryRecord.files:[];
+  const totalPages=Math.max(1,Math.ceil(files.length/DISCOVERY_FILE_PAGE_SIZE));
+  currentDiscoveryFilePage=Math.max(1,Math.min(totalPages,currentDiscoveryFilePage+delta));
+  renderDiscoveryFiles(null,{keepPage:true});
+}
+
+function discoveryValidityBucket(file){
+  const validity=String(file.validity_status||'needs_review').toLowerCase();
+  if(validity==='valid')return 'valid';
+  if(validity==='weak_keep')return 'weak_keep';
+  if(validity==='exclude'||validity==='excluded'||validity==='not_candidate')return 'exclude';
+  return 'needs_review';
+}
+
+function discoveryValidityTitle(group){
+  return t('discoveryGroup_'+group)||group;
+}
+
+function discoveryValidityDescription(group){
+  return t('discoveryGroupDesc_'+group)||'';
+}
+
+function discoveryFilesByValidity(files){
+  const grouped={valid:[],weak_keep:[],needs_review:[],exclude:[]};
+  (files||[]).forEach((file,index)=>{
+    const group=discoveryValidityBucket(file);
+    grouped[group].push({file,index});
+  });
+  return grouped;
+}
+
+function renderDiscoveryGroupPager(group,total){
+  if(total<=DISCOVERY_FILE_PAGE_SIZE)return '';
+  const totalPages=Math.max(1,Math.ceil(total/DISCOVERY_FILE_PAGE_SIZE));
+  const page=Math.max(1,Math.min(totalPages,discoveryValidityPages[group]||1));
+  discoveryValidityPages[group]=page;
+  const start=(page-1)*DISCOVERY_FILE_PAGE_SIZE+1;
+  const end=Math.min(total,page*DISCOVERY_FILE_PAGE_SIZE);
+  return '<div class="discovery-pagination-inline">'
+    +'<button class="btn btn-secondary btn-small" type="button" onclick="changeDiscoveryValidityPage(\''+esc(group)+'\',-1)" '+(page<=1?'disabled':'')+'>'+esc(t('prevPage'))+'</button>'
+    +'<span class="discovery-pagination-meta">'+esc(tf('discoveryPage',page,totalPages,start,end,total))+'</span>'
+    +'<button class="btn btn-secondary btn-small" type="button" onclick="changeDiscoveryValidityPage(\''+esc(group)+'\',1)" '+(page>=totalPages?'disabled':'')+'>'+esc(t('nextPage'))+'</button>'
+    +'</div>';
+}
+
+function changeDiscoveryValidityPage(group,delta){
+  syncDiscoverySelectionFromDom();
+  const files=(currentDiscoveryRecord&&Array.isArray(currentDiscoveryRecord.files))?currentDiscoveryRecord.files:[];
+  const grouped=discoveryFilesByValidity(files);
+  const total=(grouped[group]||[]).length;
+  const totalPages=Math.max(1,Math.ceil(total/DISCOVERY_FILE_PAGE_SIZE));
+  discoveryValidityPages[group]=Math.max(1,Math.min(totalPages,(discoveryValidityPages[group]||1)+delta));
+  renderDiscoveryFiles(null,{keepPage:true});
+}
+
+function discoverySelectionCountForItems(items){
+  return (items||[]).filter(item=>discoverySelectedFileKeys.has(discoveryFileKey(item.file,item.index))).length;
+}
+
+function renderDiscoveryFileRow(file,index){
+  const review=file.needs_review?UI.statusPill('needs_review','review'):UI.statusPill('completed','ok');
+  const taskReady=discoveryTaskReadyText(file);
+  const defaultSelected=discoveryIsUsableForBatch(file);
+  const key=discoveryFileKey(file,index);
+  const checked=discoverySelectedFileKeys.has(key);
+  const checkbox='<input type="checkbox" data-discovery-select data-file-index="'+esc(index)+'" data-file-key="'+esc(key)+'" data-default-selected="'+(defaultSelected?'true':'false')+'" '+(checked?'checked':'')+' onchange="updateDiscoverySelectionMeta()" aria-label="Select '+esc(file.file_name||'file')+'">';
+  const fileCell='<div class="discovery-file-main"><div class="discovery-file-name">'+esc(file.file_name||'')+'</div><div class="discovery-file-sub">'+esc(file.project_accession||'')+' · '+esc(file.file_type||'')+' · '+esc(formatSize(file.expected_size_bytes||0))+'</div></div>';
+  const roleCell='<div class="discovery-compact-list">'+esc(file.file_role||'unknown')+'</div><div class="discovery-compact-muted">'+esc(file.evidence_level||'unknown')+' · '+esc(file.sdrf_match_status||'not_checked')+'</div>';
+  const scoreCell='<div class="discovery-metric-pair"><span>'+esc(t('discoveryScore'))+' <strong>'+esc(_formatScore(file.file_score))+'</strong></span><span>'+esc(t('discoveryTrust'))+' <strong>'+esc(_formatRatio(file.trust_score||file.confidence))+'</strong></span><span>AI-ready <strong>'+esc(_formatRatio(file.task_ai_readiness_score))+'</strong></span><span>Value <strong>'+esc(_formatRatio(file.data_value_score))+'</strong></span></div>';
+  const fragCell='<div class="discovery-frag-cell"><div class="discovery-compact-list">'+esc(discoveryListText(file.fragmentation_methods))+'</div><div class="discovery-compact-muted">'+esc(discoveryLcText(file))+'</div></div>';
+  const semanticBits=[];
+  if(file.semantic_metadata_confidence!==null&&file.semantic_metadata_confidence!==undefined)semanticBits.push('semantic: '+_formatRatio(file.semantic_metadata_confidence));
+  if(file.species_policy)semanticBits.push('species policy: '+file.species_policy);
+  if(Array.isArray(file.ptm_enrichment_methods)&&file.ptm_enrichment_methods.length)semanticBits.push('method: '+file.ptm_enrichment_methods.slice(0,2).join('; '));
+  if(Array.isArray(file.ptm_evidence_terms)&&file.ptm_evidence_terms.length)semanticBits.push('PTM: '+file.ptm_evidence_terms.slice(0,3).join('; '));
+  if(file.immunopeptide_scope)semanticBits.push('domain: '+file.immunopeptide_scope);
+  if(Array.isArray(file.hla_class)&&file.hla_class.length)semanticBits.push('HLA class: '+file.hla_class.slice(0,2).join('; '));
+  if(Array.isArray(file.hla_alleles)&&file.hla_alleles.length)semanticBits.push('allele: '+file.hla_alleles.slice(0,2).join('; '));
+  if(Array.isArray(file.immunopeptide_enrichment_methods)&&file.immunopeptide_enrichment_methods.length)semanticBits.push('HLA/MHC method: '+file.immunopeptide_enrichment_methods.slice(0,2).join('; '));
+  const reasonCell='<div class="discovery-reasons-cell"><div class="discovery-compact-list">'+esc(discoveryListText(file.validity_reasons))+'</div><div class="discovery-compact-muted">'+esc(discoveryListText((file.diversity_tags||[]).slice(0,5)))+'</div><div class="discovery-compact-muted">'+esc(semanticBits.join(' | ')||'semantic: n/a')+'</div></div>';
+  const details='<details class="discovery-row-details"><summary>Review / evidence</summary><div class="discovery-review-cell">'+discoveryReviewControls(file)+'</div><div class="discovery-evidence-cell">'+esc(discoveryEvidenceText(file.evidence)||'No evidence text')+'</div></details>';
+  return '<tr data-project-accession="'+esc(file.project_accession||'')+'" data-file-name="'+esc(file.file_name||'')+'"><td class="discovery-select-cell">'+checkbox+'</td><td>'+fileCell+'</td><td>'+roleCell+'</td><td>'+scoreCell+'</td><td><div class="discovery-task-cell">'+esc(taskReady||'')+'</div></td><td>'+esc(discoveryListText(file.instrument_families))+'</td><td>'+fragCell+'</td><td>'+reasonCell+'</td><td>'+review+'<div class="discovery-compact-muted">'+details+'</div></td></tr>';
+}
+
+function renderDiscoveryFiles(files,options={}){
+  if(Array.isArray(files)){
+    if(currentDiscoveryRecord)currentDiscoveryRecord.files=files;
+    if(!options.keepSelection)seedDiscoverySelection(files);
+    if(!options.keepPage)discoveryValidityPages={valid:1,weak_keep:1,needs_review:1,exclude:1};
+  }
+  syncDiscoverySelectionFromDom();
+  const allFiles=(currentDiscoveryRecord&&Array.isArray(currentDiscoveryRecord.files))?currentDiscoveryRecord.files:[];
+  const box=document.getElementById('discoveryFileTable');
+  const legacyPager=document.getElementById('discoveryFilePagination');
+  if(legacyPager){legacyPager.hidden=true;legacyPager.innerHTML='';}
+  const grouped=discoveryFilesByValidity(allFiles);
+  const sections=DISCOVERY_VALIDITY_GROUPS.map(group=>{
+    const items=grouped[group]||[];
+    const total=items.length;
+    const totalPages=Math.max(1,Math.ceil(total/DISCOVERY_FILE_PAGE_SIZE));
+    discoveryValidityPages[group]=Math.max(1,Math.min(totalPages,discoveryValidityPages[group]||1));
+    const start=(discoveryValidityPages[group]-1)*DISCOVERY_FILE_PAGE_SIZE;
+    const visible=items.slice(start,start+DISCOVERY_FILE_PAGE_SIZE);
+    const selected=discoverySelectionCountForItems(items);
+    const rows=visible.map(item=>renderDiscoveryFileRow(item.file,item.index)).join('');
+    const colgroup='<colgroup><col style="width:54px"><col style="width:250px"><col style="width:145px"><col style="width:132px"><col style="width:230px"><col style="width:120px"><col style="width:210px"><col style="width:300px"><col style="width:180px"></colgroup>';
+    const table='<table class="discovery-table discovery-file-table">'+colgroup+'<thead><tr><th>Select</th><th>File / Project</th><th>'+esc(t('discoveryRole'))+' / '+esc(t('discoveryEvidenceLevel'))+'</th><th>'+esc(t('discoveryScore'))+' / '+esc(t('discoveryTrust'))+' / AI-ready / Value</th><th>'+esc(t('discoveryTaskReady'))+'</th><th>'+esc(t('discoveryInstrument'))+'</th><th>'+esc(t('discoveryFragmentation'))+' / '+esc(t('discoveryLcGradient'))+'</th><th>Reasons / '+esc(t('discoveryDiversity'))+'</th><th>QC / Review</th></tr></thead><tbody>'+(rows||'<tr><td colspan="9">'+esc(t('discoveryNoResults'))+'</td></tr>')+'</tbody></table>';
+    return '<section class="discovery-file-group" data-validity="'+esc(group)+'">'
+      +'<div class="discovery-file-group-head"><div><div class="discovery-file-group-title"><span class="discovery-validity-dot '+esc(group)+'"></span><span>'+esc(discoveryValidityTitle(group))+'</span><span class="status-pill queued">'+esc(String(total))+'</span></div><div class="discovery-file-group-desc">'+esc(discoveryValidityDescription(group))+'</div></div><div class="discovery-file-group-meta"><span>'+esc(tf('discoveryGroupSelected',selected,total))+'</span></div></div>'
+      +'<div class="discovery-file-group-body">'+table+'</div>'
+      +renderDiscoveryGroupPager(group,total)
+      +'</section>';
+  }).join('');
+  box.innerHTML='<div class="discovery-file-groups">'+(sections||'<div class="empty">'+esc(t('discoveryNoResults'))+'</div>')+'</div>';
+  updateDiscoverySelectionMeta();
+}
+
+function renderDiscovery(data){
+  currentDiscoveryId=data.discovery_id||null;
+  currentDiscoveryRecord=data||null;
+  renderDiscoverySummary(data);
+  renderDiscoveryProjects(data.projects||[]);
+  renderDiscoveryFiles(data.files||[]);
+  document.getElementById('discoveryResults').hidden=false;
+}
+
+function renderDiscoveryJobLogs(logs){
+  const box=document.getElementById('discoveryLogBox');
+  const meta=document.getElementById('discoveryLogMeta');
+  const items=Array.isArray(logs)?logs:[];
+  if(meta)meta.textContent=items.length?tf('discoveryLogCount',items.length):t('discoveryLogEmpty');
+  if(!box)return;
+  if(!items.length){
+    box.innerHTML='<div class="empty">'+esc(t('discoveryLogEmpty'))+'</div>';
+    return;
+  }
+  box.innerHTML=items.map(item=>{
+    const level=String(item.level||'info').toLowerCase();
+    const ts=String(item.ts||'').split('T').pop().slice(0,8)||now();
+    const badge=level==='warning'?'debug':level;
+    return '<div class="log-line"><span class="ts">'+esc(ts)+'</span><span class="badge '+esc(badge)+'">'+esc(level.toUpperCase())+'</span><span class="msg '+esc(level)+'">'+esc(item.message||'')+'</span></div>';
+  }).join('');
+  box.scrollTop=box.scrollHeight;
+}
+
+function safeRenderDiscoveryJobLogs(logs){
+  try{
+    renderDiscoveryJobLogs(logs);
+    return true;
+  }catch(e){
+    console.error('Discovery log render failed',e);
+    const meta=document.getElementById('discoveryLogMeta');
+    if(meta)meta.textContent=t('discoveryLogRenderFailed');
+    return false;
+  }
+}
+
+function discoveryJobIsTerminal(status){
+  return ['completed','failed','cancelled'].includes(String(status||'').toLowerCase());
+}
+
+async function pollDiscoveryJob(){
+  if(!currentDiscoveryJobId)return;
+  const status=document.getElementById('discoveryStatus');
+  const startBtn=document.getElementById('discoveryStartBtn');
+  const cancelBtn=document.getElementById('discoveryCancelBtn');
+  try{
+    const resp=await fetch('/api/discovery/jobs/'+encodeURIComponent(currentDiscoveryJobId));
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('discoveryFailed',data.error);
+      status.className='discovery-status error';
+      if(discoveryPollTimer){clearTimeout(discoveryPollTimer);discoveryPollTimer=null;}
+      setButtonBusy(startBtn,false,t('startDiscovery'));
+      cancelBtn.disabled=true;
+      currentDiscoveryJobId=null;
+      return;
+    }
+    safeRenderDiscoveryJobLogs(data.logs||[]);
+    const jobStatus=String(data.status||'');
+    if(jobStatus==='queued'){
+      status.textContent=t('discoveryQueued');
+      status.className='discovery-status';
+    }else if(jobStatus==='running'){
+      status.textContent=t('discoveryRunning');
+      status.className='discovery-status';
+    }else if(jobStatus==='cancelled'){
+      status.textContent=t('discoveryCancelled');
+      status.className='discovery-status error';
+    }else if(jobStatus==='failed'){
+      status.textContent=tf('discoveryFailed',data.error||'unknown');
+      status.className='discovery-status error';
+    }else if(jobStatus==='completed'){
+      if(data.record){
+        try{
+          renderDiscovery(data.record);
+        }catch(renderError){
+          console.error('Discovery result render failed',renderError);
+          status.textContent=tf('discoveryFailed',renderError);
+          status.className='discovery-status error';
+        }
+      }
+      const record=data.record||{};
+      if(status.className!=='discovery-status error'){
+        status.textContent=tf('discoveryDone',record.project_count||0,record.file_count||0);
+        status.className='discovery-status ok';
+      }
+    }
+    if(discoveryJobIsTerminal(jobStatus)){
+      if(discoveryPollTimer){clearTimeout(discoveryPollTimer);discoveryPollTimer=null;}
+      setButtonBusy(startBtn,false,t('startDiscovery'));
+      cancelBtn.disabled=true;
+      currentDiscoveryJobId=null;
+      return;
+    }
+    discoveryPollTimer=setTimeout(pollDiscoveryJob,1000);
+  }catch(e){
+    status.textContent=tf('discoveryFailed',e);
+    status.className='discovery-status error';
+    if(discoveryPollTimer){clearTimeout(discoveryPollTimer);discoveryPollTimer=null;}
+    setButtonBusy(startBtn,false,t('startDiscovery'));
+    cancelBtn.disabled=true;
+    currentDiscoveryJobId=null;
+  }
+}
+
+async function cancelDiscoveryJob(){
+  if(!currentDiscoveryJobId)return;
+  const status=document.getElementById('discoveryStatus');
+  const cancelBtn=document.getElementById('discoveryCancelBtn');
+  cancelBtn.disabled=true;
+  status.textContent=t('discoveryCancelling');
+  status.className='discovery-status';
+  try{
+    const resp=await fetch('/api/discovery/jobs/'+encodeURIComponent(currentDiscoveryJobId)+'/cancel',{method:'POST'});
+    const data=await resp.json();
+    safeRenderDiscoveryJobLogs(data.logs||[]);
+  }catch(e){
+    status.textContent=tf('discoveryFailed',e);
+    status.className='discovery-status error';
+  }
+}
+
+async function startDiscovery(){
+  const payload=collectDiscoveryPayload();
+  const speciesInput=document.getElementById('discoverySpecies');
+  const localDirInput=document.getElementById('discoveryLocalDir');
+  if(payload.max_projects<1||payload.max_files<1){
+    showFormAlert(t('discoveryRequired'));
+    return;
+  }
+  if(payload.source==='local'&&!payload.local_dir){
+    localDirInput.classList.add('error');
+    localDirInput.setAttribute('aria-invalid','true');
+    localDirInput.focus();
+    showFormAlert(t('discoveryLocalDirRequired'));
+    return;
+  }
+  clearFormAlert();
+  speciesInput.classList.remove('error');
+  localDirInput.classList.remove('error');
+  localDirInput.setAttribute('aria-invalid','false');
+  const btn=document.getElementById('discoveryStartBtn');
+  const cancelBtn=document.getElementById('discoveryCancelBtn');
+  const status=document.getElementById('discoveryStatus');
+  if(discoveryPollTimer){clearTimeout(discoveryPollTimer);discoveryPollTimer=null;}
+  currentDiscoveryJobId=null;
+  safeRenderDiscoveryJobLogs([{ts:new Date().toISOString(),level:'info',message:t('discoverySubmitting')}]);
+  setButtonBusy(btn,true,t('discoveryRunning'));
+  cancelBtn.disabled=true;
+  status.textContent=t('discoveryQueued');
+  status.className='discovery-status';
+  try{
+    const resp=await fetch('/api/discovery/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('discoveryFailed',data.error);
+      status.className='discovery-status error';
+      setButtonBusy(btn,false,t('startDiscovery'));
+      return;
+    }
+    currentDiscoveryJobId=data.job_id||null;
+    safeRenderDiscoveryJobLogs(data.logs||[]);
+    cancelBtn.disabled=false;
+    discoveryPollTimer=setTimeout(pollDiscoveryJob,500);
+  }catch(e){
+    status.textContent=tf('discoveryFailed',e);
+    status.className='discovery-status error';
+    setButtonBusy(btn,false,t('startDiscovery'));
+    cancelBtn.disabled=true;
+  }
+}
+
+function downloadDiscoveryFile(fileKey){
+  if(!currentDiscoveryId)return;
+  window.location.href='/api/discovery/'+encodeURIComponent(currentDiscoveryId)+'/download?file='+encodeURIComponent(fileKey);
+}
+
+function aiReadyLines(id){
+  const el=document.getElementById(id);
+  if(!el)return [];
+  return el.value.split(/\r?\n/).map(v=>v.trim()).filter(Boolean);
+}
+
+function toggleAiReadySource(){
+  const checked=document.querySelector('input[name="aiReadySource"]:checked');
+  const source=checked?checked.value:'agent_run';
+  document.querySelectorAll('[data-ai-ready-source-panel]').forEach(panel=>{
+    panel.hidden=panel.getAttribute('data-ai-ready-source-panel')!==source;
+  });
+}
+
+function modelDiscoveryRequestsFromRecord(data){
+  const payload=data&&data.model_informed_discovery_requests;
+  return payload&&Array.isArray(payload.requests)?payload.requests:[];
+}
+
+function renderModelDiscoveryRequests(data){
+  const box=document.getElementById('aiReadyDiscoveryRequests');
+  if(!box)return;
+  currentModelDiscoveryRequests=modelDiscoveryRequestsFromRecord(data);
+  if(!currentModelDiscoveryRequests.length){
+    box.innerHTML='';
+    return;
+  }
+  const rows=currentModelDiscoveryRequests.slice(0,8).map((request,index)=>{
+    const title=[request.request_id||('request_'+(index+1)),request.dimension,request.target].filter(Boolean).join(' | ');
+    const meta=[
+      'priority '+(request.priority||'medium'),
+      'repository '+(request.repository||'auto'),
+      request.requires_user_confirmation?'needs confirmation':'',
+      request.reason||''
+    ].filter(Boolean).join(' | ');
+    const query=request.query||'';
+    const button='<button class="btn btn-green btn-small" type="button" onclick="applyModelDiscoveryRequest('+index+')">Use request</button>';
+    return '<article class="result-row"><div><div class="result-title">'+esc(title)+'</div><div class="result-sub">'+esc(query)+'</div><div class="result-sub">'+esc(meta)+'</div></div><div class="result-actions">'+button+'</div></article>';
+  }).join('');
+  const more=currentModelDiscoveryRequests.length>8?'<div class="metric-meta">Showing 8 of '+esc(currentModelDiscoveryRequests.length)+' requests. Download the full JSON/CSV for all requests.</div>':'';
+  box.innerHTML='<div class="section-heading">Next discovery requests</div>'+rows+more;
+}
+
+function renderModelRepositoryPlan(data,stat){
+  const box=document.getElementById('aiReadyRepositoryPlan');
+  if(!box)return;
+  const plan=data&&data.model_informed_repository_plan;
+  const repos=plan&&Array.isArray(plan.planned_repositories)?plan.planned_repositories:[];
+  if(!plan||!repos.length){
+    box.innerHTML='';
+    return;
+  }
+  const requestCount=plan.request_count||0;
+  const payloadCount=plan.payload_count||0;
+  const queueCount=plan.queue_item_count||0;
+  const detail=[
+    requestCount?'requests '+requestCount:'',
+    payloadCount?'payloads '+payloadCount:'',
+    queueCount?'queue '+queueCount:''
+  ].filter(Boolean).join(' | ');
+  box.innerHTML=stat(
+    'Model-informed repository plan',
+    repos.join(', '),
+    [plan.repository_strategy||'',detail].filter(Boolean).join(' | '),
+    plan.repository_strategy==='multi_repository'?'completed':''
+  );
+}
+
+function applyModelDiscoveryRequestFallback(request,message){
+  const constraints=request.constraints||{};
+  const query=request.query||request.reason||'';
+  const payload={
+    source:'remote',
+    repository:request.repository||'auto',
+    task_type:request.task_type||'',
+    species_policy:constraints.species_policy||request.species_policy||'open',
+    ptm_type:constraints.modification_scope==='any_ptm'?'unknown_ptm':(constraints.modification_scope||request.ptm_type||'unknown_ptm'),
+    labeling_strategy:constraints.labeling_strategy||request.labeling_strategy||'label_free',
+    acquisition_mode:String(constraints.acquisition||constraints.acquisition_mode||'dda').toLowerCase(),
+    max_files:50,
+    agentic:true,
+    agentic_rounds:1,
+    diversity_strategy:'high'
+  };
+  if(Array.isArray(constraints.species)&&constraints.species.length)payload.species=constraints.species;
+  setWorkflowTab('discovery');
+  const prompt=document.getElementById('discoveryPrompt');
+  if(prompt)prompt.value=query;
+  applyDiscoveryGoalFields(payload);
+  const status=document.getElementById('discoveryStatus');
+  if(status){
+    status.textContent=message||'Loaded model-informed discovery request. Review constraints, then run discovery.';
+    status.className='discovery-status ok';
+  }
+}
+
+async function applyModelDiscoveryRequest(index){
+  const request=currentModelDiscoveryRequests[index];
+  if(!request)return;
+  const status=document.getElementById('discoveryStatus');
+  if(status){
+    status.textContent='Preparing model-informed discovery request...';
+    status.className='discovery-status';
+  }
+  try{
+    const resp=await fetch('/api/ai-ready/model-informed-discovery-payload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({request})});
+    const data=await resp.json();
+    if(data.error)throw new Error(data.error);
+    const payload=data.payload||{};
+    setWorkflowTab('discovery');
+    const prompt=document.getElementById('discoveryPrompt');
+    if(prompt)prompt.value=payload.prompt||request.query||request.reason||'';
+    applyDiscoveryGoalFields(payload);
+    if(status){
+      status.textContent='Loaded model-informed discovery payload. Review constraints, then run discovery.';
+      status.className='discovery-status ok';
+    }
+  }catch(error){
+    applyModelDiscoveryRequestFallback(request,'Loaded request locally; backend payload preview failed: '+(error&&error.message?error.message:error));
+  }
+  const discoveryPanel=document.getElementById('discoveryPrompt');
+  if(discoveryPanel)discoveryPanel.scrollIntoView({block:'center',behavior:'smooth'});
+}
+
+function renderAiReady(data){
+  const results=document.getElementById('aiReadyResults');
+  const cards=document.getElementById('aiReadyTaskCards');
+  const downloads=document.getElementById('aiReadyDownloads');
+  const taskCards=data.task_cards||[];
+  const recoveryCards=data.recovery_cards||[];
+  const stat=(label,value,detail,statusClass='')=>'<div class="discovery-stat '+esc(statusClass)+'"><div class="discovery-stat-label">'+esc(label)+'</div><div class="discovery-stat-value">'+esc(value)+'</div>'+(detail?'<div class="metric-meta">'+esc(detail)+'</div>':'')+'</div>';
+  const recoveryHtml=recoveryCards.map(card=>{
+    const partial=card.usable_partial_outputs?'Partial outputs usable':'';
+    const outcome=aiReadyOutcomeText(card.ai_ready_outcome)||workflowOutcomeText(card.workflow_outcome)||card.status||'unknown';
+    const details=[partial,card.primary_issue||'',card.recommended_next_step||''].filter(Boolean).join(' | ');
+    return stat(card.label||card.scope||'Recovery',outcome,details,card.usable_partial_outputs?'partial':'');
+  }).join('');
+  const taskHtml=taskCards.length?taskCards.map(card=>{
+    const status=String(card.status||'unknown');
+    const rows=(card.rows_out!==null&&card.rows_out!==undefined)?String(card.rows_out)+' rows':'';
+    const details=[card.target_schema||'',...(card.blockers||[]),...(card.warnings||[])].filter(Boolean).slice(0,5).join(' | ');
+    const cls=status==='completed'?'completed':(status==='blocked'?'blocked':'');
+    return stat(card.task_type||'task',[status,rows].filter(Boolean).join(' | '),details,cls);
+  }).join(''):'';
+  const overall=aiReadyOutcomeText(data.mini_e2e_summary&&data.mini_e2e_summary.ai_ready_outcome)||data.status||'available';
+  cards.innerHTML=(recoveryHtml||taskHtml)?recoveryHtml+taskHtml:stat('Status',overall);
+  renderModelRepositoryPlan(data,stat);
+  renderModelDiscoveryRequests(data);
+  const entries=Object.entries(data.downloads||{});
+  downloads.innerHTML=entries.length?entries.map(([key,url])=>'<button class="btn btn-secondary btn-small" type="button" onclick="window.location.href=\''+esc(url)+'\'">'+esc(key)+'</button>').join(''):'';
+  const recipeDir=document.getElementById('aiReadyRecipeBatchDir');
+  if(recipeDir&&data.output_dir&&!data.dataset_recipe)recipeDir.value=data.output_dir;
+  results.hidden=false;
+}
+
+async function profileAiReadyInputs(){
+  const searchResults=aiReadyLines('aiReadySearchResults');
+  const searchDir=document.getElementById('aiReadySearchDir').value.trim();
+  const status=document.getElementById('aiReadyStatus');
+  if(!searchResults.length&&!searchDir){
+    status.textContent=t('aiReadyNeedsSearchResult');
+    status.className='discovery-status error';
+    return;
+  }
+  const btn=document.getElementById('aiReadyProfileBtn');
+  setButtonBusy(btn,true,t('aiReadyProfiling'));
+  status.textContent=t('aiReadyProfiling');
+  status.className='discovery-status';
+  try{
+    const payload={
+      search_dir:searchDir,
+      search_results:searchResults,
+      peaklists:aiReadyLines('aiReadyPeaklists'),
+      task_types:[document.getElementById('aiReadyTaskType').value]
+    };
+    const resp=await fetch('/api/ai-ready/profile-inputs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('aiReadyFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    renderAiReady(data);
+    status.textContent=t('aiReadyDone');
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('aiReadyFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,t('profileAiReadyInputs'));
+  }
+}
+
+async function locateAiReadyInputs(){
+  const searchDir=document.getElementById('aiReadySearchDir').value.trim();
+  const status=document.getElementById('aiReadyStatus');
+  if(!searchDir){
+    status.textContent=t('aiReadyNeedsSearchDir');
+    status.className='discovery-status error';
+    return;
+  }
+  const btn=document.getElementById('aiReadyLocateBtn');
+  setButtonBusy(btn,true,t('aiReadyLocating'));
+  status.textContent=t('aiReadyLocating');
+  status.className='discovery-status';
+  try{
+    const payload={search_dir:searchDir,task_types:[document.getElementById('aiReadyTaskType').value]};
+    const resp=await fetch('/api/ai-ready/locate-inputs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('aiReadyFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    renderAiReady(data);
+    status.textContent=t('aiReadyDone');
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('aiReadyFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,t('locateAiReadyInputs'));
+  }
+}
+
+async function locateAgentRunInputs(){
+  const agentRunDir=document.getElementById('aiReadyAgentRunDir').value.trim();
+  const status=document.getElementById('aiReadyStatus');
+  if(!agentRunDir){
+    status.textContent=t('aiReadyNeedsAgentRunDir');
+    status.className='discovery-status error';
+    return;
+  }
+  const btn=document.getElementById('aiReadyAgentRunLocateBtn');
+  setButtonBusy(btn,true,t('aiReadyLocating'));
+  status.textContent=t('aiReadyLocating');
+  status.className='discovery-status';
+  try{
+    const payload={agent_run_dir:agentRunDir,task_types:[document.getElementById('aiReadyTaskType').value]};
+    const resp=await fetch('/api/ai-ready/locate-agent-run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('aiReadyFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    renderAiReady(data);
+    status.textContent=t('aiReadyDone');
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('aiReadyFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,t('locateAgentRunInputs'));
+  }
+}
+
+async function runAiReadyRealSmoke(){
+  const searchDir=document.getElementById('aiReadySearchDir').value.trim();
+  const status=document.getElementById('aiReadyStatus');
+  if(!searchDir){
+    status.textContent=t('aiReadyNeedsSearchDir');
+    status.className='discovery-status error';
+    return;
+  }
+  const btn=document.getElementById('aiReadySmokeBtn');
+  setButtonBusy(btn,true,t('aiReadySmoking'));
+  status.textContent=t('aiReadySmoking');
+  status.className='discovery-status';
+  try{
+    const payload={search_dir:searchDir,task_types:[document.getElementById('aiReadyTaskType').value]};
+    const resp=await fetch('/api/ai-ready/real-smoke',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('aiReadyFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    renderAiReady(data);
+    status.textContent=t('aiReadyDone');
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('aiReadyFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,t('runAiReadyRealSmoke'));
+  }
+}
+
+async function runRepositorySmoke(){
+  const inputValue=document.getElementById('aiReadyRepositorySmokeInput').value.trim();
+  const iproxIndexDir=document.getElementById('aiReadyIproxIndexDir').value.trim();
+  const status=document.getElementById('aiReadyStatus');
+  if(!inputValue){
+    status.textContent='Repository accession or file path is required.';
+    status.className='discovery-status error';
+    return;
+  }
+  const btn=document.getElementById('aiReadyRepositorySmokeBtn');
+  setButtonBusy(btn,true,'Smoking...');
+  status.textContent='Running repository smoke...';
+  status.className='discovery-status';
+  try{
+    const payload={
+      repository:document.getElementById('aiReadyRepositorySmokeRepository').value,
+      input_value:inputValue,
+      iprox_index_dir:iproxIndexDir,
+      mode:'parameters'
+    };
+    const resp=await fetch('/api/ai-ready/repository-smoke',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('aiReadyFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    renderAiReady(data);
+    status.textContent=t('aiReadyDone');
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('aiReadyFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,'Repository smoke');
+  }
+}
+
+async function refreshIproxIndex(){
+  const projects=document.getElementById('aiReadyIproxIndexProjects').value.trim();
+  const years=document.getElementById('aiReadyIproxIndexYears').value.trim();
+  const status=document.getElementById('aiReadyStatus');
+  if(!projects&&!years){
+    status.textContent='At least one iProX project accession or year is required.';
+    status.className='discovery-status error';
+    return;
+  }
+  const btn=document.getElementById('aiReadyIproxIndexBtn');
+  setButtonBusy(btn,true,'Refreshing...');
+  status.textContent='Refreshing public iProX JSONL index...';
+  status.className='discovery-status';
+  try{
+    const payload={projects:projects,years:years};
+    const resp=await fetch('/api/ai-ready/refresh-iprox-index',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('aiReadyFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    renderAiReady(data);
+    if(data.output_dir)document.getElementById('aiReadyIproxIndexDir').value=data.output_dir;
+    status.textContent='iProX index refreshed.';
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('aiReadyFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,t('refreshIproxIndex'));
+  }
+}
+
+async function runAgentHarness(){
+  const caseFile=document.getElementById('aiReadyHarnessCaseFile').value.trim()||'tests/fixtures/agent_harness_cases.json';
+  const status=document.getElementById('aiReadyStatus');
+  const btn=document.getElementById('aiReadyHarnessBtn');
+  setButtonBusy(btn,true,'Running...');
+  status.textContent='Running agent harness...';
+  status.className='discovery-status';
+  try{
+    const cfg=collectConfig();
+    const payload={case_file:caseFile,use_llm:Boolean(cfg.api_key)};
+    const resp=await fetch('/api/ai-ready/agent-harness',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('aiReadyFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    renderAiReady(data);
+    status.textContent=t('aiReadyDone');
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('aiReadyFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,'Run harness');
+  }
+}
+
+async function buildAiReadyFromAgentRun(){
+  const agentRunDir=document.getElementById('aiReadyAgentRunDir').value.trim();
+  const status=document.getElementById('aiReadyStatus');
+  if(!agentRunDir){
+    status.textContent=t('aiReadyNeedsAgentRunDir');
+    status.className='discovery-status error';
+    return;
+  }
+  const btn=document.getElementById('aiReadyAgentRunBuildBtn');
+  setButtonBusy(btn,true,t('aiReadySmoking'));
+  status.textContent=t('aiReadySmoking');
+  status.className='discovery-status';
+  try{
+    const payload={
+      agent_run_dir:agentRunDir,
+      task_types:[document.getElementById('aiReadyTaskType').value],
+      peaklists:aiReadyLines('aiReadyPeaklists')
+    };
+    const resp=await fetch('/api/ai-ready/build-from-agent-run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('aiReadyFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    renderAiReady(data);
+    status.textContent=t('aiReadyDone');
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('aiReadyFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,t('buildFromAgentRun'));
+  }
+}
+
+async function validateMiniE2E(){
+  const agentRunDir=document.getElementById('aiReadyAgentRunDir').value.trim();
+  const status=document.getElementById('aiReadyStatus');
+  if(!agentRunDir){
+    status.textContent=t('aiReadyNeedsAgentRunDir');
+    status.className='discovery-status error';
+    return;
+  }
+  const btn=document.getElementById('aiReadyMiniE2EBtn');
+  setButtonBusy(btn,true,t('aiReadyValidating'));
+  status.textContent=t('aiReadyValidating');
+  status.className='discovery-status';
+  try{
+    const payload={
+      agent_run_dir:agentRunDir,
+      task_types:[document.getElementById('aiReadyTaskType').value],
+      peaklists:aiReadyLines('aiReadyPeaklists')
+    };
+    const resp=await fetch('/api/ai-ready/mini-e2e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('aiReadyFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    renderAiReady(data);
+    status.textContent=t('aiReadyDone');
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('aiReadyFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,t('validateMiniE2E'));
+  }
+}
+
+async function validateAiReadyBuild(){
+  const buildDir=document.getElementById('aiReadyBuildDir').value.trim();
+  const status=document.getElementById('aiReadyStatus');
+  const btn=document.getElementById('aiReadyValidateBtn');
+  setButtonBusy(btn,true,t('aiReadyValidating'));
+  status.textContent=t('aiReadyValidating');
+  status.className='discovery-status';
+  try{
+    const payload={build_dir:buildDir,task_type:document.getElementById('aiReadyTaskType').value};
+    const resp=await fetch('/api/ai-ready/validate-build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('aiReadyFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    renderAiReady(data);
+    status.textContent=t('aiReadyDone');
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('aiReadyFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,t('validateAiReadyBuild'));
+  }
+}
+
+async function makeDatasetRecipe(){
+  const batchDir=document.getElementById('aiReadyRecipeBatchDir').value.trim();
+  const discoveryManifest=document.getElementById('aiReadyRecipeDiscoveryManifest').value.trim();
+  const repositoryAudit=document.getElementById('aiReadyRecipeRepositoryAudit').value.trim();
+  const splitStrategy=document.getElementById('aiReadyRecipeSplitStrategy').value;
+  const status=document.getElementById('aiReadyStatus');
+  if(!batchDir){
+    status.textContent='Batch/benchmark directory is required.';
+    status.className='discovery-status error';
+    return;
+  }
+  const btn=document.getElementById('aiReadyRecipeBtn');
+  setButtonBusy(btn,true,'Making...');
+  status.textContent='Generating recipe, leakage report, coverage gap report, and evidence graph...';
+  status.className='discovery-status';
+  try{
+    const payload={batch_dir:batchDir,discovery_manifest:discoveryManifest,repository_audit:repositoryAudit,split_strategy:splitStrategy};
+    const resp=await fetch('/api/ai-ready/make-dataset-recipe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('aiReadyFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    renderAiReady(data);
+    status.textContent=t('aiReadyDone');
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('aiReadyFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,t('makeDatasetRecipe'));
+  }
+}
+
+async function runDatasetModelLoop(){
+  const recipeDir=document.getElementById('aiReadyModelLoopRecipeDir').value.trim();
+  const adapter=document.getElementById('aiReadyModelLoopAdapter').value||'dry_run';
+  const metricsFile=document.getElementById('aiReadyModelLoopMetricsFile').value.trim();
+  const adapterCommand=document.getElementById('aiReadyModelLoopAdapterCommand').value.trim();
+  const taskType=document.getElementById('aiReadyTaskType').value;
+  const status=document.getElementById('aiReadyStatus');
+  if(!recipeDir){
+    status.textContent='Recipe directory is required.';
+    status.className='discovery-status error';
+    return;
+  }
+  const btn=document.getElementById('aiReadyModelLoopBtn');
+  setButtonBusy(btn,true,'Running...');
+  status.textContent='Running model-loop smoke and generating model-informed gap report...';
+  status.className='discovery-status';
+  try{
+    const payload={recipe_dir:recipeDir,task_type:taskType,mode:'smoke',adapter:adapterCommand?'external_command':adapter,metrics_file:metricsFile,adapter_command:adapterCommand};
+    const resp=await fetch('/api/ai-ready/model-loop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('aiReadyFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    renderAiReady(data);
+    status.textContent=t('aiReadyDone');
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('aiReadyFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,t('runDatasetModelLoop'));
+  }
+}
+
+async function makeDataScientistAgentReport(){
+  const recipeDir=document.getElementById('aiReadyModelLoopRecipeDir').value.trim();
+  const modelLoopDir=document.getElementById('aiReadyDataScientistModelLoopDir').value.trim();
+  const discoveryManifest=document.getElementById('aiReadyRecipeDiscoveryManifest').value.trim();
+  const batchDir=document.getElementById('aiReadyRecipeBatchDir').value.trim();
+  const status=document.getElementById('aiReadyStatus');
+  if(!recipeDir){
+    status.textContent='Recipe directory is required.';
+    status.className='discovery-status error';
+    return;
+  }
+  const btn=document.getElementById('aiReadyDataScientistReportBtn');
+  setButtonBusy(btn,true,'Generating...');
+  status.textContent='Generating data scientist agent report...';
+  status.className='discovery-status';
+  try{
+    const payload={recipe_dir:recipeDir,model_loop_dir:modelLoopDir,benchmark_dir:batchDir,discovery_manifest:discoveryManifest};
+    const resp=await fetch('/api/ai-ready/data-scientist-report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('aiReadyFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    renderAiReady(data);
+    status.textContent=t('aiReadyDone');
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('aiReadyFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,t('makeDataScientistAgentReport'));
+  }
+}
+
+async function makeGuidanceAlignmentReport(){
+  const recipeDir=document.getElementById('aiReadyModelLoopRecipeDir').value.trim();
+  const modelLoopDir=document.getElementById('aiReadyDataScientistModelLoopDir').value.trim();
+  const discoveryManifest=document.getElementById('aiReadyRecipeDiscoveryManifest').value.trim();
+  const batchDir=document.getElementById('aiReadyRecipeBatchDir').value.trim();
+  const status=document.getElementById('aiReadyStatus');
+  const btn=document.getElementById('aiReadyGuidanceAlignmentBtn');
+  setButtonBusy(btn,true,'Auditing...');
+  status.textContent='Auditing guidance alignment evidence...';
+  status.className='discovery-status';
+  try{
+    const payload={recipe_dir:recipeDir,model_loop_dir:modelLoopDir,benchmark_dir:batchDir,discovery_manifest:discoveryManifest};
+    const resp=await fetch('/api/ai-ready/guidance-alignment',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('aiReadyFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    renderAiReady(data);
+    status.textContent=t('aiReadyDone');
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('aiReadyFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,t('makeGuidanceAlignmentReport'));
+  }
+}
+
+async function runDataScientistAgentLoop(){
+  const batchDir=document.getElementById('aiReadyRecipeBatchDir').value.trim();
+  const discoveryManifest=document.getElementById('aiReadyRecipeDiscoveryManifest').value.trim();
+  const repositorySmokeDirs=document.getElementById('aiReadyRepositorySmokeDirs').value.trim();
+  const splitStrategy=document.getElementById('aiReadyRecipeSplitStrategy').value;
+  const taskType=document.getElementById('aiReadyTaskType').value||'auto';
+  const adapter=document.getElementById('aiReadyModelLoopAdapter').value||'dry_run';
+  const metricsFile=document.getElementById('aiReadyModelLoopMetricsFile').value.trim();
+  const adapterCommand=document.getElementById('aiReadyModelLoopAdapterCommand').value.trim();
+  const status=document.getElementById('aiReadyStatus');
+  if(!batchDir){
+    status.textContent='Batch/benchmark directory is required.';
+    status.className='discovery-status error';
+    return;
+  }
+  const btn=document.getElementById('aiReadyDataScientistLoopBtn');
+  setButtonBusy(btn,true,'Running...');
+  status.textContent='Running data scientist agent loop...';
+  status.className='discovery-status';
+  try{
+    const payload={batch_dir:batchDir,task_type:taskType,split_strategy:splitStrategy,discovery_manifest:discoveryManifest,repository_smoke_dirs:repositorySmokeDirs,adapter:adapterCommand?'external_command':adapter,metrics_file:metricsFile,adapter_command:adapterCommand};
+    const resp=await fetch('/api/ai-ready/data-scientist-loop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('aiReadyFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    renderAiReady(data);
+    status.textContent=t('aiReadyDone');
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('aiReadyFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,t('runDataScientistAgentLoop'));
+  }
+}
+
+function collectDiscoveryReviews(){
+  const rows=document.querySelectorAll('#discoveryFileTable tbody tr[data-project-accession]');
+  const reviews=[];
+  rows.forEach(row=>{
+    const decision=row.querySelector('[data-discovery-review="decision"]')?.value||'';
+    if(!decision)return;
+    reviews.push({
+      project_accession:row.dataset.projectAccession||'',
+      file_name:row.dataset.fileName||'',
+      decision,
+      reason:row.querySelector('[data-discovery-review="reason"]')?.value||'unclear',
+      note:row.querySelector('[data-discovery-review="note"]')?.value||''
+    });
+  });
+  return reviews;
+}
+
+async function saveDiscoveryReviews(){
+  if(!currentDiscoveryId)return;
+  const reviews=collectDiscoveryReviews();
+  const status=document.getElementById('discoveryStatus');
+  if(!reviews.length){
+    status.textContent=t('discoveryReviewEmpty');
+    status.className='discovery-status';
+    return;
+  }
+  const btn=document.getElementById('discoveryReviewBtn');
+  setButtonBusy(btn,true,t('discoveryReviewSaving'));
+  status.textContent=t('discoveryReviewSaving');
+  status.className='discovery-status';
+  try{
+    const resp=await fetch('/api/discovery/'+encodeURIComponent(currentDiscoveryId)+'/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviews})});
+    const data=await resp.json();
+    if(data.error){
+      status.textContent=tf('discoveryReviewFailed',data.error);
+      status.className='discovery-status error';
+      return;
+    }
+    if(data.record)renderDiscovery(data.record);
+    status.textContent=tf('discoveryReviewSaved',data.review_decisions||0);
+    status.className='discovery-status ok';
+  }catch(e){
+    status.textContent=tf('discoveryReviewFailed',e);
+    status.className='discovery-status error';
+  }finally{
+    setButtonBusy(btn,false,t('saveDiscoveryReviews'));
+  }
 }
 
 function validateConfig(){
@@ -1358,7 +4296,7 @@ function validateBatchSubmitter(){
 }
 
 document.addEventListener('input',e=>{
-  if(e.target&&['cfgApiKey','submitter','batchSubmitter','inputValue','batchInput'].includes(e.target.id))clearFormAlert();
+  if(e.target&&['cfgApiKey','submitter','batchSubmitter','inputValue','batchInput','discoverySpecies','discoveryLocalDir','discoveryMaxProjects','discoveryMaxFiles','discoveryFilesPerProject'].includes(e.target.id))clearFormAlert();
   if(e.target&&e.target.id==='cfgApiKey'){
     e.target.classList.remove('error');
     e.target.setAttribute('aria-invalid','false');
@@ -1369,7 +4307,13 @@ document.addEventListener('input',e=>{
   if(e.target&&e.target.id==='submitter'){e.target.classList.remove('error');e.target.setAttribute('aria-invalid','false')}
   if(e.target&&e.target.id==='batchSubmitter'){e.target.classList.remove('error');e.target.setAttribute('aria-invalid','false')}
   if(e.target&&e.target.id==='inputValue')e.target.setAttribute('aria-invalid','false');
-  if(e.target&&e.target.id==='batchInput'){e.target.classList.remove('error');e.target.setAttribute('aria-invalid','false')}
+  if(e.target&&e.target.id==='batchInput'){
+    e.target.classList.remove('error');
+    e.target.setAttribute('aria-invalid','false');
+    currentBatchInputRecords=[];
+  }
+  if(e.target&&e.target.id==='discoverySpecies')e.target.classList.remove('error');
+  if(e.target&&e.target.id==='discoveryLocalDir'){e.target.classList.remove('error');e.target.setAttribute('aria-invalid','false')}
 });
 
 function collectConfig(){
@@ -1871,6 +4815,9 @@ async function loadAgentAudit(){
 setRunMode(localStorage.getItem('runMode')||'prepare');
 setWorkflowTab(localStorage.getItem('workflowTab')||'single',false);
 setLanguage(localStorage.getItem('uiLanguage')||'en');
+toggleDiscoverySourceControls();
+toggleDiscoveryGoalControls();
+toggleAiReadySource();
 loadConfig();
 pollHealth();
 setInterval(loadResults,30000);

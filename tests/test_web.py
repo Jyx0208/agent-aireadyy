@@ -14,7 +14,7 @@ import pytest
 
 import agent.web.app as web_app
 from agent.web.app import StderrCapture, WebReporter, _create_task_inner, _tasks
-from agent.web.app import _build_review_summary, _cleanup_expired_results, _list_public_results, _zip_output_dir
+from agent.web.app import _build_review_summary, _cleanup_expired_results, _list_public_results, _primary_project_error, _zip_output_dir
 from agent.web.app import _start_ready_queued_tasks, _strip_ansi, submit_task_review
 from agent.web.app import _try_start_queued_task, download_results, get_task, health, list_project_history
 
@@ -36,6 +36,81 @@ def _value(value, confidence=0.9, source="test", conflict_flag=False):
         evidence_excerpt="test evidence",
         conflict_flag=conflict_flag,
     )
+
+
+def test_primary_project_error_allows_known_project_local_source():
+    result = SimpleNamespace(
+        resolution=SimpleNamespace(
+            primary_project=SimpleNamespace(
+                project_accession="PXD079072",
+                match_type="known_project_local_source",
+                match_score=100,
+                matched_file="Xinyi3_-80.mzML",
+            ),
+            needs_review=False,
+            resolution_reason="local cached source",
+        )
+    )
+
+    assert _primary_project_error(result) == ""
+
+
+def test_known_local_source_reuses_manifest_context_dir(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    sample = tmp_path / "data" / "local_mzml_samples" / "PXD079072" / "Xinyi3_-80.mzML"
+    sample.parent.mkdir(parents=True)
+    sample.write_text("mzml", encoding="utf-8")
+    context_dir = tmp_path / "runs" / "Xinyi3_previous"
+    context_dir.mkdir(parents=True)
+    (context_dir / "metadata.json").write_text("{}", encoding="utf-8")
+    (context_dir / "attributes.json").write_text("{}", encoding="utf-8")
+    manifest = [
+        {
+            "project_accession": "PXD079072",
+            "file_name": "Xinyi3_-80.mzML",
+            "local_path": "data/local_mzml_samples/PXD079072/Xinyi3_-80.mzML",
+            "web_full_run_dir": "runs/Xinyi3_previous",
+        }
+    ]
+    manifest_path = tmp_path / "data" / "local_mzml_samples" / "local_mzml_samples_manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    source = web_app._known_local_source_from_input(str(sample))
+
+    assert source is not None
+    assert source["project_accession"] == "PXD079072"
+    assert source["context_dir"] == str(context_dir)
+
+
+def test_known_local_source_falls_back_to_runs_context(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    sample = tmp_path / "data" / "local_mzml_samples" / "PXD079072" / "Xinyi3_-80.mzML"
+    sample.parent.mkdir(parents=True)
+    sample.write_text("mzml", encoding="utf-8")
+    stale_context_dir = tmp_path / "runs" / "Xinyi3_missing"
+    fallback_context_dir = tmp_path / "runs" / "Xinyi3_-80__previous_success"
+    fallback_context_dir.mkdir(parents=True)
+    (fallback_context_dir / "metadata.json").write_text("{}", encoding="utf-8")
+    (fallback_context_dir / "attributes.json").write_text("{}", encoding="utf-8")
+    (fallback_context_dir / "task_state.json").write_text(
+        json.dumps({"project_accession": "PXD079072"}),
+        encoding="utf-8",
+    )
+    manifest = [
+        {
+            "project_accession": "PXD079072",
+            "file_name": "Xinyi3_-80.mzXML",
+            "prepared_mzml_path": "data/local_mzml_samples/PXD079072/Xinyi3_-80.mzML",
+            "web_full_run_dir": str(stale_context_dir),
+        }
+    ]
+    manifest_path = tmp_path / "data" / "local_mzml_samples" / "local_mzml_samples_manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    source = web_app._known_local_source_from_input(str(sample))
+
+    assert source is not None
+    assert source["context_dir"] == str(fallback_context_dir)
 
 
 def _write_minimal_dda_mzml(path: Path) -> None:
@@ -499,6 +574,28 @@ def test_list_public_results_discovers_existing_run_directories(monkeypatch, tmp
     assert results[0]["expires_in_seconds"] <= 1800
 
 
+def test_list_public_results_skips_protected_directories(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setenv("AGENT_PROTECTED_RESULT_DIRS", "configured-protected")
+
+    public = tmp_path / "public-project"
+    public.mkdir()
+    (public / "result.txt").write_text("ok", encoding="utf-8")
+
+    marked = tmp_path / "marked-protected"
+    marked.mkdir()
+    (marked / ".agent_keep").write_text("keep", encoding="utf-8")
+    (marked / "large.txt").write_text("skip", encoding="utf-8")
+
+    configured = tmp_path / "configured-protected"
+    configured.mkdir()
+    (configured / "large.txt").write_text("skip", encoding="utf-8")
+
+    results = _list_public_results()
+
+    assert [item["result_id"] for item in results] == ["public-project"]
+
+
 def test_cleanup_results_keeps_only_four_latest_downloadable_runs(monkeypatch, tmp_path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setenv("AGENT_MAX_RESULT_PROJECTS", "4")
@@ -554,6 +651,62 @@ def test_cleanup_results_removes_expired_process_directories(monkeypatch, tmp_pa
     assert set(removed) == {"failed-process", "completed-process"}
     assert not (tmp_path / "failed-process").exists()
     assert not (tmp_path / "completed-process").exists()
+
+
+def test_cleanup_results_preserves_protected_validation_directories(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setenv("AGENT_RESULT_RETENTION_SECONDS", "1800")
+    monkeypatch.delenv("AGENT_PROTECTED_RESULT_DIRS", raising=False)
+    old_stamp = time.time() - 1900
+    for name in ["baseline_validation", "ai_ready_builds", "marked-old-run", "ordinary-old-run"]:
+        project = tmp_path / name
+        project.mkdir()
+        (project / "result.txt").write_text(name, encoding="utf-8")
+        if name == "marked-old-run":
+            (project / ".agent_keep").write_text("keep", encoding="utf-8")
+        (project / "task_history.json").write_text(
+            json.dumps({"task_id": name, "status": "completed", "input_value": f"{name}.mzML"}),
+            encoding="utf-8",
+        )
+        for path in project.rglob("*"):
+            os.utime(path, (old_stamp, old_stamp))
+        os.utime(project, (old_stamp, old_stamp))
+
+    removed = _cleanup_expired_results()
+
+    assert "ordinary-old-run" in removed
+    assert "baseline_validation" not in removed
+    assert "ai_ready_builds" not in removed
+    assert "marked-old-run" not in removed
+    assert (tmp_path / "baseline_validation").exists()
+    assert (tmp_path / "ai_ready_builds").exists()
+    assert (tmp_path / "marked-old-run").exists()
+    assert not (tmp_path / "ordinary-old-run").exists()
+
+
+def test_known_local_source_from_input_detects_pxd_acquisition_file(tmp_path):
+    source = tmp_path / "data" / "PXD123456" / "sample.mzML"
+    source.parent.mkdir(parents=True)
+    source.write_text("mzml", encoding="utf-8")
+
+    result = web_app._known_local_source_from_input(str(source))
+
+    assert result == {
+        "source_path": str(source),
+        "project_accession": "PXD123456",
+        "matched_file": "sample.mzML",
+    }
+
+
+def test_known_local_source_from_input_ignores_non_acquisition_or_unknown_project(tmp_path):
+    search_result = tmp_path / "PXD123456" / "psm.tsv"
+    search_result.parent.mkdir(parents=True)
+    search_result.write_text("psm", encoding="utf-8")
+    no_project = tmp_path / "sample.mzML"
+    no_project.write_text("mzml", encoding="utf-8")
+
+    assert web_app._known_local_source_from_input(str(search_result)) is None
+    assert web_app._known_local_source_from_input(str(no_project)) is None
 
 
 def test_cleanup_pride_cache_removes_old_files_only_when_idle(monkeypatch, tmp_path):
@@ -841,6 +994,43 @@ def test_create_parameter_batch_persists_manifest_without_api_key(monkeypatch, t
         assert detail["batch_id"] == batch_id
         assert detail["status"] == "queued"
         assert detail["can_download"] is False
+    finally:
+        if batch_id:
+            web_app._batches.pop(batch_id, None)
+
+
+def test_create_parameter_batch_persists_discovery_context(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr("agent.web.app._run_llm_check", _llm_ok, raising=False)
+    monkeypatch.setattr("agent.web.app._start_parameter_batch_thread", lambda _batch_id: None, raising=False)
+
+    result = asyncio.run(
+        web_app.create_parameter_batch(
+            {
+                "inputs": ["sample_a.raw"],
+                "input_records": [
+                    {
+                        "file_name": "sample_a.raw",
+                        "project_accession": "PXD000001",
+                        "download_url": "https://example.test/sample_a.raw",
+                        "file_role": "raw_acquisition",
+                        "task_readiness_status": "weak_ready",
+                    }
+                ],
+                "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
+            }
+        )
+    )
+
+    batch_id = result.get("batch_id")
+    try:
+        manifest = json.loads((tmp_path / "_batches" / batch_id / "batch_manifest.json").read_text(encoding="utf-8"))
+        context = manifest["items"][0]["discovery_context"]
+        assert context["project_accession"] == "PXD000001"
+        assert context["file_name"] == "sample_a.raw"
+        assert context["download_url"] == "https://example.test/sample_a.raw"
+        public = asyncio.run(web_app.get_parameter_batch(batch_id))
+        assert public["items"][0]["discovery_context"]["project_accession"] == "PXD000001"
     finally:
         if batch_id:
             web_app._batches.pop(batch_id, None)
@@ -1613,6 +1803,14 @@ def test_full_batch_item_failure_writes_recovery_audit(monkeypatch, tmp_path):
         assert recovery["failure"]["category"] == "missing_msdt_output"
         assert recovery["task"]["run_mode"] == "full"
         assert recovery["recovery"]["decision"] == "manual_required"
+        assert result["workflow_outcome"] == "failed_with_usable_partial_outputs"
+        assert result["usable_partial_outputs"] is True
+        assert result["recovery_primary_issue"] == "partial_outputs_available"
+        report = json.loads((item_dir / "agent_recovery_report.json").read_text(encoding="utf-8"))
+        assert report["workflow_outcome"] == "failed_with_usable_partial_outputs"
+        detail = asyncio.run(web_app.get_parameter_batch(batch_id))
+        assert detail["items"][0]["workflow_outcome"] == "failed_with_usable_partial_outputs"
+        assert detail["items"][0]["usable_partial_outputs"] is True
     finally:
         with web_app._batches_lock:
             web_app._batches.pop(batch_id, None)
@@ -2470,11 +2668,20 @@ def test_full_mode_failure_writes_recovery_audit(monkeypatch, tmp_path):
         web_app._run_pipeline(task_id)
 
         assert _tasks[task_id]["status"] == "failed"
+        assert _tasks[task_id]["workflow_outcome"] == "failed_with_usable_partial_outputs"
+        assert _tasks[task_id]["usable_partial_outputs"] is True
+        assert _tasks[task_id]["recovery_primary_issue"] == "partial_outputs_available"
         recovery = json.loads((output_dir / "recovery_audit.json").read_text(encoding="utf-8"))
         assert recovery["schema_version"] == "recovery-audit/v1"
         assert recovery["failure"]["category"] == "missing_msdt_output"
         assert recovery["task"]["run_mode"] == "full"
         assert any(item["kind"] == "missing_output" for item in recovery["failure"]["evidence"])
+        recovery_report = json.loads((output_dir / "agent_recovery_report.json").read_text(encoding="utf-8"))
+        assert recovery_report["workflow_outcome"] == "failed_with_usable_partial_outputs"
+        detail = asyncio.run(get_task(task_id))
+        assert detail["status"] == "failed"
+        assert detail["workflow_outcome"] == "failed_with_usable_partial_outputs"
+        assert detail["usable_partial_outputs"] is True
     finally:
         _tasks.pop(task_id, None)
 

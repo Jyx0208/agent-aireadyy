@@ -1,0 +1,31 @@
+{
+  "primary_metric": "sequence_accuracy",
+  "higher_is_better": true,
+  "sequence_accuracy": 0.62,
+  "train": {
+    "sequence_accuracy": 0.91
+  },
+  "heldout_project": {
+    "sequence_accuracy": 0.58
+  },
+  "heldout_instrument": {
+    "sequence_accuracy": 0.64
+  },
+  "slices": {
+    "phosphotyrosine": {
+      "sequence_accuracy": 0.31,
+      "n": 12
+    },
+    "high_charge": {
+      "sequence_accuracy": 0.43,
+      "n": 8
+    }
+  },
+  "thresholds": {
+    "sequence_accuracy": 0.7,
+    "heldout_project.sequence_accuracy": 0.65,
+    "heldout_instrument.sequence_accuracy": 0.65,
+    "phosphotyrosine.sequence_accuracy": 0.6,
+    "high_charge.sequence_accuracy": 0.6
+  }
+}

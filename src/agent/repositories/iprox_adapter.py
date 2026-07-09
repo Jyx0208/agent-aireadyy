@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -27,10 +28,13 @@ from agent.repositories.matching import (
 
 
 _IPROX_INDEX_ENV = "AGENT_IPROX_INDEX_XLSX"
+_IPROX_JSONL_INDEX_DIR_ENV = "AGENT_IPROX_INDEX_DIR"
 _IPROX_METADATA_CACHE_ENV = "AGENT_IPROX_METADATA_CACHE_DIR"
 _IPROX_ACCESSION_RE = re.compile(r"\bIPX\d{6,}\b", re.IGNORECASE)
 _REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
 _DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+_IPROX_PUBLIC_BASE = "https://www.iprox.cn"
+_IPROX_PUBLIC_DOWNLOAD_BASE = "https://download.iprox.cn"
 
 
 def default_iprox_index_path() -> Path:
@@ -43,6 +47,22 @@ def default_iprox_index_path() -> Path:
         if matches:
             return matches[0]
     return roots[0] / "iprox.xlsx"
+
+
+def default_iprox_index_dir() -> Path:
+    configured = os.getenv(_IPROX_JSONL_INDEX_DIR_ENV)
+    if configured:
+        return Path(configured)
+    roots = [Path.cwd(), Path(__file__).resolve().parents[3]]
+    for root in roots:
+        candidate = root / "data" / "iprox_index"
+        if candidate.exists():
+            return candidate
+    return roots[0] / "data" / "iprox_index"
+
+
+def default_iprox_file_index_path() -> Path:
+    return default_iprox_index_dir() / "iprox_file_index.jsonl"
 
 
 def default_iprox_metadata_cache_dir() -> Path:
@@ -214,6 +234,17 @@ def _quote_download_url(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
 
 
+def _normalize_public_iprox_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    text = str(url).strip()
+    if text.startswith("http://download.iprox.org/"):
+        text = "https://download.iprox.cn/" + text[len("http://download.iprox.org/") :]
+    elif text.startswith("https://download.iprox.org/"):
+        text = "https://download.iprox.cn/" + text[len("https://download.iprox.org/") :]
+    return _quote_download_url(text)
+
+
 @dataclass(frozen=True)
 class IproxFileRecord:
     project_id: str
@@ -236,7 +267,7 @@ class IproxFileRecord:
             file_name=str(row.get("file_name") or "").strip(),
             file_path=_first_text(row.get("file_path")),
             org_file_path=_first_text(row.get("org_file_path")),
-            download_url=_first_text(row.get("down_url")),
+            download_url=_normalize_public_iprox_url(_first_text(row.get("down_url"))),
             file_size=_to_int(row.get("file_size")),
             checksum=_first_text(row.get("checksum")),
             file_type=_first_text(row.get("file_type")),
@@ -320,6 +351,201 @@ def parse_iprox_project_xml(xml_text: str | bytes) -> IproxProjectMetadata:
     )
 
 
+def _read_json_payload(text: str) -> dict[str, Any]:
+    text = text.strip()
+    if text.startswith("{"):
+        payload = json.loads(text)
+        return payload if isinstance(payload, dict) else {"data": payload}
+    match = re.search(r"\((\{.*\})\)\s*;?\s*$", text, flags=re.DOTALL)
+    if match:
+        payload = json.loads(match.group(1))
+        return payload if isinstance(payload, dict) else {"data": payload}
+    raise ValueError("Unsupported iProX JSON/JSONP response.")
+
+
+def _fetch_text(url: str, timeout: int = 45) -> str:
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def _project_ids_for_year(year: int, *, base_url: str = _IPROX_PUBLIC_BASE) -> list[str]:
+    url = f"{base_url.rstrip('/')}/projectFileList/getProjectDataFileByYear.jsonp?date={int(year)}"
+    payload = _read_json_payload(_fetch_text(url))
+    data = payload.get("data") or []
+    return [str(item).strip().upper() for item in data if str(item).strip()]
+
+
+def _xml_url_for_project(project_id: str, *, download_base: str = _IPROX_PUBLIC_DOWNLOAD_BASE) -> str:
+    project_id = str(project_id or "").strip().upper()
+    return f"{download_base.rstrip('/')}/{project_id}/PX_{project_id}.xml"
+
+
+def _iprox_accessions_from_url(url: str | None) -> list[str]:
+    if not url:
+        return []
+    return extract_iprox_accessions(unquote(urlsplit(str(url)).path))
+
+
+def _suffix_file_type(file_name: str) -> str | None:
+    lower = file_name.casefold()
+    for suffix in (".raw", ".mzml", ".mzxml", ".mgf", ".wiff", ".d", ".tsv", ".txt", ".csv", ".xml", ".mzid"):
+        if lower.endswith(suffix):
+            return suffix.lstrip(".")
+    return None
+
+
+def _parse_file_records_from_project_xml(project_id: str, xml_text: str | bytes) -> list[dict[str, Any]]:
+    if isinstance(xml_text, bytes):
+        xml_text = xml_text.decode("utf-8", errors="replace")
+    root = ElementTree.fromstring(xml_text)
+    records: list[dict[str, Any]] = []
+    for node in root.iter():
+        if _local_name(node.tag) != "DatasetFile":
+            continue
+        file_name = str(node.attrib.get("name") or "").strip()
+        if not file_name:
+            continue
+        url = None
+        for param in node.iter():
+            if _local_name(param.tag) != "cvParam":
+                continue
+            name = str(param.attrib.get("name") or "").casefold()
+            value = str(param.attrib.get("value") or "").strip()
+            if value and ("uri" in name or value.startswith(("http://", "https://", "ftp://"))):
+                url = _normalize_public_iprox_url(value)
+                break
+        file_type = _suffix_file_type(file_name)
+        record_project_ids = [str(project_id or "").strip().upper()]
+        for accession in _iprox_accessions_from_url(url):
+            if accession not in record_project_ids:
+                record_project_ids.append(accession)
+        for record_project_id in record_project_ids:
+            records.append(
+                {
+                    "project_id": record_project_id,
+                    "parent_project_id": project_id if record_project_id != project_id else "",
+                    "file_name": file_name,
+                    "file_path": url,
+                    "org_file_path": url,
+                    "down_url": url,
+                    "file_size": "",
+                    "checksum": "",
+                    "file_type": file_type or "",
+                    "is_dia": "1" if file_type == "mzml" and "dia" in file_name.casefold() else "0",
+                    "is_dda": "1" if file_type in {"raw", "mzml", "mzxml", "mgf"} else "0",
+                    "is_raw": "1" if file_type in {"raw", "mzml", "mzxml", "wiff", "d", "mgf"} else "0",
+                }
+            )
+    return records
+
+
+def refresh_public_iprox_index(
+    *,
+    years: Iterable[int] = (),
+    project_ids: Iterable[str] | None = None,
+    output_dir: str | Path,
+    base_url: str = _IPROX_PUBLIC_BASE,
+    download_base: str = _IPROX_PUBLIC_DOWNLOAD_BASE,
+    max_projects: int | None = None,
+) -> dict[str, Any]:
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    project_index_path = output / "iprox_project_index.jsonl"
+    file_index_path = output / "iprox_file_index.jsonl"
+    summary_path = output / "iprox_index_summary.json"
+    xml_dir = output / "project_xml"
+    xml_dir.mkdir(parents=True, exist_ok=True)
+
+    project_rows: list[dict[str, Any]] = []
+    file_rows: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    seen_projects: set[str] = set()
+
+    requested_projects = _dedupe_text(str(item).strip().upper() for item in (project_ids or []) if str(item).strip())
+    year_project_pairs: list[tuple[int | None, str]] = [(None, project_id) for project_id in requested_projects]
+    for year in years:
+        try:
+            year_project_pairs.extend((int(year), project_id) for project_id in _project_ids_for_year(int(year), base_url=base_url))
+        except Exception as exc:
+            failures.append({"stage": "list_projects", "year": int(year), "error": str(exc)})
+            continue
+    if not year_project_pairs:
+        failures.append({"stage": "list_projects", "error": "no_years_or_projects_requested"})
+
+    for year, project_id in year_project_pairs:
+        if project_id in seen_projects:
+            continue
+        if max_projects is not None and len(seen_projects) >= max_projects:
+            break
+        seen_projects.add(project_id)
+        xml_url = _xml_url_for_project(project_id, download_base=download_base)
+        project_row = {
+            "repository": "iprox",
+            "project_id": project_id,
+            "native_accession": project_id,
+            "px_accession": "",
+            "year": int(year) if year is not None else "",
+            "xml_url": xml_url,
+        }
+        try:
+            xml_text = _fetch_text(xml_url)
+            (xml_dir / f"{project_id}.xml").write_text(xml_text, encoding="utf-8")
+            metadata = parse_iprox_project_xml(xml_text)
+            project_row.update(
+                {
+                    "title": metadata.title or "",
+                    "description": metadata.description or "",
+                    "organisms": list(metadata.organisms),
+                    "instruments": list(metadata.instruments),
+                    "experiment_types": list(metadata.experiment_types),
+                    "keywords": list(metadata.keywords),
+                    "publication_date": metadata.publication_date or "",
+                }
+            )
+            file_rows.extend(_parse_file_records_from_project_xml(project_id, xml_text))
+            file_rows.append(
+                {
+                    "project_id": project_id,
+                    "file_name": f"PX_{project_id}.xml",
+                    "file_path": xml_url,
+                    "org_file_path": xml_url,
+                    "down_url": xml_url,
+                    "file_size": "",
+                    "checksum": "",
+                    "file_type": "xml",
+                    "is_dia": "0",
+                    "is_dda": "0",
+                    "is_raw": "0",
+                }
+            )
+        except Exception as exc:
+            project_row["xml_status"] = "unavailable"
+            failures.append({"stage": "download_project_xml", "project_id": project_id, "url": xml_url, "error": str(exc)})
+        project_rows.append(project_row)
+        if max_projects is not None and len(seen_projects) >= max_projects:
+            break
+
+    with project_index_path.open("w", encoding="utf-8") as handle:
+        for row in project_rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    with file_index_path.open("w", encoding="utf-8") as handle:
+        for row in file_rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    summary = {
+        "status": "ready" if file_rows else "blocked",
+        "years": [int(year) for year in years],
+        "requested_projects": requested_projects,
+        "project_count": len(project_rows),
+        "file_count": len(file_rows),
+        "project_index": str(project_index_path),
+        "file_index": str(file_index_path),
+        "failures": failures,
+        "next_step": "set_AGENT_IPROX_INDEX_DIR_or_pass_index_path" if file_rows else "retry_refresh_iprox_index_or_set_agent_iprox_index_xlsx",
+    }
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return summary
+
+
 class IproxXlsxIndex:
     _CACHE: ClassVar[
         dict[tuple[str, int, int], tuple[list[IproxFileRecord], dict[str, list[IproxFileRecord]], dict[str, list[IproxFileRecord]]]]
@@ -368,6 +594,10 @@ class IproxXlsxIndex:
         self.load()
         return list(self._records_by_project.get(str(accession or "").strip().upper(), []))
 
+    def all_records(self) -> list[IproxFileRecord]:
+        self.load()
+        return list(self._records)
+
     def find_file_records(self, file_name: str) -> list[IproxFileRecord]:
         self.load()
         task = normalize_input(file_name)
@@ -381,16 +611,79 @@ class IproxXlsxIndex:
         return matches
 
 
+class IproxJsonlIndex:
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.path = Path(path) if path is not None else default_iprox_file_index_path()
+        self._loaded = False
+        self._records: list[IproxFileRecord] = []
+        self._records_by_project: dict[str, list[IproxFileRecord]] = {}
+        self._records_by_name: dict[str, list[IproxFileRecord]] = {}
+
+    def load(self) -> None:
+        if self._loaded:
+            return
+        if not self.path.exists():
+            raise FileNotFoundError(f"iProX public JSONL index not found: {self.path}")
+        records: list[IproxFileRecord] = []
+        by_project: dict[str, list[IproxFileRecord]] = {}
+        by_name: dict[str, list[IproxFileRecord]] = {}
+        with self.path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                record = IproxFileRecord.from_row({key: "" if value is None else str(value) for key, value in row.items()})
+                if not record.project_id or not record.file_name:
+                    continue
+                records.append(record)
+                by_project.setdefault(record.project_id, []).append(record)
+                by_name.setdefault(normalize_input(record.file_name).normalized_name, []).append(record)
+        self._records = records
+        self._records_by_project = by_project
+        self._records_by_name = by_name
+        self._loaded = True
+
+    def records_for_project(self, accession: str) -> list[IproxFileRecord]:
+        self.load()
+        return list(self._records_by_project.get(str(accession or "").strip().upper(), []))
+
+    def all_records(self) -> list[IproxFileRecord]:
+        self.load()
+        return list(self._records)
+
+    def find_file_records(self, file_name: str) -> list[IproxFileRecord]:
+        self.load()
+        task = normalize_input(file_name)
+        exact = list(self._records_by_name.get(task.normalized_name, []))
+        if exact:
+            return exact
+        return [record for record in self._records if score_file_match(task, record.file_name) is not None]
+
+
+def _make_iprox_index(index_path: str | Path | None = None) -> IproxXlsxIndex | IproxJsonlIndex:
+    if index_path is not None:
+        path = Path(index_path)
+        if path.is_dir():
+            return IproxJsonlIndex(path / "iprox_file_index.jsonl")
+        if path.suffix.lower() == ".jsonl":
+            return IproxJsonlIndex(path)
+        return IproxXlsxIndex(path)
+    jsonl_path = default_iprox_file_index_path()
+    if jsonl_path.exists():
+        return IproxJsonlIndex(jsonl_path)
+    return IproxXlsxIndex(default_iprox_index_path())
+
+
 class IproxAdapter:
     name = "iprox"
 
     def __init__(
         self,
         index_path: str | Path | None = None,
-        index: IproxXlsxIndex | None = None,
+        index: IproxXlsxIndex | IproxJsonlIndex | None = None,
         metadata_cache_dir: str | Path | None = None,
     ) -> None:
-        self.index = index or IproxXlsxIndex(index_path)
+        self.index = index or _make_iprox_index(index_path)
         self.metadata_cache_dir = Path(metadata_cache_dir) if metadata_cache_dir is not None else default_iprox_metadata_cache_dir()
 
     def can_handle_accession(self, value: str) -> bool:
@@ -433,7 +726,7 @@ class IproxAdapter:
                 matched_file = task.file_name
             else:
                 continue
-            evidence = ["iProX XLSX file-to-project mapping"]
+            evidence = [f"iProX index file-to-project mapping: {self.index.path}"]
             if explicit_accession:
                 evidence.append("iProX accession input")
             candidates.append(
@@ -485,6 +778,37 @@ class IproxAdapter:
                 },
             },
         )
+
+    def search_projects(self, query: str, limit: int = 30) -> list[CanonicalProject]:
+        query_text = str(query or "").casefold()
+        query_tokens = [token for token in re.split(r"[^a-zA-Z0-9]+", query_text) if len(token) >= 3]
+        try:
+            records = self.index.all_records()
+        except FileNotFoundError:
+            raise
+        scores: dict[str, int] = {}
+        for record in records:
+            haystack = " ".join(
+                str(value or "")
+                for value in [
+                    record.project_id,
+                    record.file_name,
+                    record.file_path,
+                    record.org_file_path,
+                    record.file_type,
+                    "dda" if record.is_dda else "",
+                    "dia" if record.is_dia else "",
+                    "raw" if record.is_raw else "",
+                ]
+            ).casefold()
+            score = 0
+            if record.project_id.casefold() in query_text:
+                score += 100
+            score += sum(1 for token in query_tokens if token in haystack)
+            if score > 0:
+                scores[record.project_id] = max(scores.get(record.project_id, 0), score)
+        ordered = sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:limit]
+        return [self.get_project(project_id) for project_id, _score in ordered]
 
     def list_project_files(self, project: CanonicalProject) -> list[CanonicalFile]:
         try:
@@ -641,7 +965,8 @@ class IproxAdapter:
         asset_type = classify_asset_type(record.file_name)
         category = "raw" if record.is_raw or asset_type in {"raw", "mzml", "mzxml", "tims", "wiff", "mgf", "mzid"} else "metadata"
         file_format = _first_text(record.file_type, asset_type if asset_type != "unknown" else None)
-        download_urls = [record.download_url] if record.download_url else []
+        primary_url = _normalize_public_iprox_url(record.download_url)
+        download_urls = [primary_url] if primary_url else []
         return CanonicalFile(
             repository=self.name,
             project_accession=project.primary_accession,
@@ -652,7 +977,7 @@ class IproxAdapter:
             size_bytes=record.file_size,
             checksum=record.checksum,
             download_urls=download_urls,
-            transfer_method=_url_transfer_method(record.download_url),
+            transfer_method=_url_transfer_method(primary_url),
             raw_record=record.raw or {},
         )
 
@@ -698,13 +1023,18 @@ class IproxAdapter:
         cache_path = self.metadata_cache_dir / f"{accession}.xml"
         if not cache_path.exists():
             xml_record = self._metadata_xml_record(accession, records)
+            candidate_urls = []
             if xml_record is not None and xml_record.download_url:
+                candidate_urls.append(xml_record.download_url)
+            candidate_urls.extend(self._inferred_metadata_xml_urls(accession, records))
+            for candidate_url in candidate_urls:
                 try:
                     cache_path.parent.mkdir(parents=True, exist_ok=True)
-                    with urllib.request.urlopen(_quote_download_url(xml_record.download_url), timeout=30) as response:
+                    with urllib.request.urlopen(_quote_download_url(candidate_url), timeout=30) as response:
                         cache_path.write_bytes(response.read())
+                    break
                 except Exception:
-                    return IproxProjectMetadata()
+                    continue
         try:
             if cache_path.exists():
                 return parse_iprox_project_xml(cache_path.read_bytes())
@@ -720,6 +1050,17 @@ class IproxAdapter:
             if record.file_name.lower() == exact_name:
                 return record
         return xml_records[0] if xml_records else None
+
+    @staticmethod
+    def _inferred_metadata_xml_urls(accession: str, records: list[IproxFileRecord]) -> list[str]:
+        accession = str(accession or "").strip().upper()
+        urls: list[str] = []
+        for record in records:
+            accessions = _iprox_accessions_from_url(record.download_url)
+            if len(accessions) >= 2 and accessions[-1] == accession:
+                parent = accessions[-2]
+                urls.append(f"{_IPROX_PUBLIC_DOWNLOAD_BASE}/{parent}/{accession}/{accession}.xml")
+        return _dedupe_text(urls)
 
     @staticmethod
     def _dedupe_files(files: list[CanonicalFile]) -> list[CanonicalFile]:

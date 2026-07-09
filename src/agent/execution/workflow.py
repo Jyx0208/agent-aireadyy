@@ -57,6 +57,34 @@ _ALLOWED_WORKFLOW_OVERRIDE_KEYS = frozenset(
         "msfragger.search_enzyme_sense_2",
     }
 )
+_NUMERIC_WORKFLOW_OVERRIDE_KEYS = frozenset(
+    {
+        "msfragger.allowed_missed_cleavage_1",
+        "msfragger.allowed_missed_cleavage_2",
+        "msfragger.digest_max_length",
+        "msfragger.digest_min_length",
+        "msfragger.fragment_mass_tolerance",
+        "msfragger.max_fragment_charge",
+        "msfragger.max_variable_mods_combinations",
+        "msfragger.max_variable_mods_per_peptide",
+        "msfragger.min_fragments_modelling",
+        "msfragger.min_matched_fragments",
+        "msfragger.min_sequence_matches",
+        "msfragger.misc.fragger.digest-mass-hi",
+        "msfragger.misc.fragger.digest-mass-lo",
+        "msfragger.num_enzyme_termini",
+        "msfragger.precursor_mass_lower",
+        "msfragger.precursor_mass_upper",
+        "msfragger.precursor_true_tolerance",
+    }
+)
+_UNIT_WORKFLOW_OVERRIDE_KEYS = frozenset(
+    {
+        "msfragger.fragment_mass_units",
+        "msfragger.precursor_mass_units",
+        "msfragger.precursor_true_units",
+    }
+)
 _ENZYME_DROPDOWN_ALIASES = {
     "argc": "argc",
     "arg-c": "argc",
@@ -181,6 +209,25 @@ def _render_workflow_override_value(value: Any) -> str | None:
     return None
 
 
+def _sanitize_workflow_override_value(key: str, rendered: str) -> str | None:
+    if key in _NUMERIC_WORKFLOW_OVERRIDE_KEYS:
+        parsed = _parse_tolerance(rendered)
+        if parsed is None:
+            return rendered
+        amount, _unit = parsed
+        if amount.startswith("+"):
+            amount = amount[1:]
+        return amount
+
+    if key in _UNIT_WORKFLOW_OVERRIDE_KEYS:
+        normalized = rendered.strip().lower()
+        if normalized in {"0", "da", "dalton", "daltons"}:
+            return "0"
+        if normalized in {"1", "ppm"}:
+            return "1"
+    return rendered
+
+
 def _iter_workflow_override_items(raw: Any):
     if isinstance(raw, Mapping):
         yield from raw.items()
@@ -216,6 +263,9 @@ def _workflow_parameter_overrides(attributes: AttributeSet) -> dict[str, str]:
             if key_text not in _ALLOWED_WORKFLOW_OVERRIDE_KEYS:
                 continue
             rendered = _render_workflow_override_value(value)
+            if rendered is None:
+                continue
+            rendered = _sanitize_workflow_override_value(key_text, rendered)
             if rendered is None:
                 continue
             overrides[key_text] = rendered

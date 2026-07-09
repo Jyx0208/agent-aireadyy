@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import zipfile
 from xml.sax.saxutils import escape
@@ -245,7 +246,7 @@ def test_iprox_xlsx_index_streams_project_rows(tmp_path: Path):
     assert len(records) == 2
     assert records[0].project_id == "IPX0015463001"
     assert records[0].file_name == "OsGF14f interacting proteins.raw"
-    assert records[0].download_url == "https://download.iprox.cn/IPX0015463000/IPX0015463001/OsGF14f interacting proteins.raw"
+    assert records[0].download_url == "https://download.iprox.cn/IPX0015463000/IPX0015463001/OsGF14f%20interacting%20proteins.raw"
     assert records[0].is_raw is True
 
 
@@ -268,8 +269,111 @@ def test_iprox_adapter_resolves_file_name_from_spreadsheet(tmp_path: Path):
     assert context.project_files[0]["fileName"] == "OsGF14f interacting proteins.raw"
     assert asset.repository == "iprox"
     assert asset.matched_project_file == "OsGF14f interacting proteins.raw"
-    assert asset.download_url == "https://download.iprox.cn/IPX0015463000/IPX0015463001/OsGF14f interacting proteins.raw"
+    assert asset.download_url == "https://download.iprox.cn/IPX0015463000/IPX0015463001/OsGF14f%20interacting%20proteins.raw"
     assert asset.transfer_method == "https"
+
+
+def test_iprox_jsonl_index_resolves_file_name(tmp_path: Path):
+    from agent.repositories.iprox_adapter import IproxAdapter
+
+    index_path = tmp_path / "iprox_file_index.jsonl"
+    row = {
+        "project_id": "IPX0015463001",
+        "file_name": "OsGF14f interacting proteins.raw",
+        "file_path": "/IPX0015463000/IPX0015463001/OsGF14f interacting proteins.raw",
+        "org_file_path": "raw/OsGF14f interacting proteins.raw",
+        "down_url": "http://download.iprox.org/IPX0015463000/IPX0015463001/OsGF14f interacting proteins.raw",
+        "file_size": "780276859",
+        "file_type": "raw",
+        "is_dia": "0",
+        "is_dda": "1",
+        "is_raw": "1",
+    }
+    index_path.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    adapter = IproxAdapter(index_path=index_path)
+
+    resolution = adapter.resolve_project("OsGF14f interacting proteins.raw")
+    context = adapter.build_project_context(resolution, "OsGF14f interacting proteins.raw")
+    asset = adapter.resolve_file_asset(normalize_input("OsGF14f interacting proteins.raw"), context, tmp_path)
+
+    assert resolution.primary_project is not None
+    assert resolution.primary_project.project_accession == "IPX0015463001"
+    assert asset.repository == "iprox"
+    assert asset.transfer_method == "https"
+    assert asset.download_url.startswith("https://download.iprox.cn/")
+
+
+def test_iprox_public_xml_parser_extracts_dataset_files():
+    from agent.repositories.iprox_adapter import _parse_file_records_from_project_xml
+
+    xml_text = """<ProteomeXchangeDataset id="PXD000001">
+  <DatasetFileList>
+    <DatasetFile id="FILE_0" name="sample.raw">
+      <cvParam name="Associated raw file URI" value="http://download.iprox.org/IPX000001/IPX000002/sample.raw"/>
+    </DatasetFile>
+  </DatasetFileList>
+</ProteomeXchangeDataset>"""
+
+    rows = _parse_file_records_from_project_xml("IPX000001", xml_text)
+
+    assert rows[0]["project_id"] == "IPX000001"
+    assert rows[0]["file_name"] == "sample.raw"
+    assert rows[0]["down_url"] == "https://download.iprox.cn/IPX000001/IPX000002/sample.raw"
+    assert rows[0]["is_raw"] == "1"
+    assert any(row["project_id"] == "IPX000002" and row["file_name"] == "sample.raw" for row in rows)
+
+
+def test_refresh_public_iprox_index_writes_jsonl(monkeypatch, tmp_path: Path):
+    from agent.repositories import iprox_adapter
+    from agent.repositories.iprox_adapter import refresh_public_iprox_index
+
+    xml_text = """<ProteomeXchangeDataset id="PXD000001">
+  <DatasetSummary announceDate="2024-01-01" title="Human DDA dataset">
+    <Description>Human phospho DDA.</Description>
+  </DatasetSummary>
+  <SpeciesList><Species><cvParam name="taxonomy: scientific name" value="Homo sapiens"/></Species></SpeciesList>
+  <InstrumentList><Instrument><cvParam name="Q Exactive"/></Instrument></InstrumentList>
+  <DatasetFileList>
+    <DatasetFile id="FILE_0" name="sample.raw">
+      <cvParam name="Associated raw file URI" value="http://download.iprox.org/IPX0001/IPX0002/sample.raw"/>
+    </DatasetFile>
+  </DatasetFileList>
+</ProteomeXchangeDataset>"""
+    monkeypatch.setattr(iprox_adapter, "_project_ids_for_year", lambda year, base_url="https://www.iprox.cn": ["IPX0001"])
+    monkeypatch.setattr(iprox_adapter, "_fetch_text", lambda url, timeout=45: xml_text)
+
+    summary = refresh_public_iprox_index(years=[2024], output_dir=tmp_path)
+    rows = [json.loads(line) for line in (tmp_path / "iprox_file_index.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    assert summary["status"] == "ready"
+    assert summary["project_count"] == 1
+    assert any(row["file_name"] == "sample.raw" for row in rows)
+    assert any(row["file_name"] == "PX_IPX0001.xml" for row in rows)
+
+
+def test_refresh_public_iprox_index_accepts_known_project(monkeypatch, tmp_path: Path):
+    from agent.repositories import iprox_adapter
+    from agent.repositories.iprox_adapter import refresh_public_iprox_index
+
+    xml_text = """<ProteomeXchangeDataset id="PXD000001">
+  <DatasetSummary announceDate="2024-01-01" title="Known iProX parent">
+    <Description>Known public project.</Description>
+  </DatasetSummary>
+  <DatasetFileList>
+    <DatasetFile id="FILE_0" name="known.raw">
+      <cvParam name="Associated raw file URI" value="http://download.iprox.org/IPX000001/IPX000002/known.raw"/>
+    </DatasetFile>
+  </DatasetFileList>
+</ProteomeXchangeDataset>"""
+    monkeypatch.setattr(iprox_adapter, "_project_ids_for_year", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("year listing should not run")))
+    monkeypatch.setattr(iprox_adapter, "_fetch_text", lambda url, timeout=45: xml_text)
+
+    summary = refresh_public_iprox_index(project_ids=["IPX000001"], output_dir=tmp_path)
+    rows = [json.loads(line) for line in (tmp_path / "iprox_file_index.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    assert summary["status"] == "ready"
+    assert summary["requested_projects"] == ["IPX000001"]
+    assert any(row["project_id"] == "IPX000002" and row["file_name"] == "known.raw" for row in rows)
 
 
 def test_iprox_adapter_merges_project_xml_metadata_into_context(tmp_path: Path):

@@ -1,26 +1,77 @@
-# PRIDE AI-ready Agent
+# Task-aware AI-ready Data Agent
 
-PRIDE AI-ready Agent is a production-oriented proteomics workflow system that turns a raw file name or accession into a reproducible planning package, a prepared MSDT-Converter input package, or a full end-to-end execution run.
+Task-aware AI-ready Data Agent is a proteomics data-discovery and AI-ready dataset-building agent. It can search for task-fit public or local proteomics data, score readiness and data value, run or reuse search workflows, build AI-ready task tables, and generate reproducible dataset recipes with split, leakage, hard-benchmark, curation, and model-loop smoke reports.
 
-## What It Does
+The current handoff version is a **small/medium real-data v1 smoke release**, not a claim of arbitrary large-scale one-click reproduction or full model-training closure.
 
-- Resolves PRIDE, MassIVE, and iProX projects through a repository adapter layer.
-- Infers project metadata, species, instrument, digestion, modifications, and search parameters.
-- Builds actual FragPipe and MSDT-Converter inputs, including workflow and FASTA selection.
-- Writes auditable Agent artifacts for observation, plan, decision trace, and bounded recovery.
-- Supports three run modes for single-file and batch use:
-  - `parameters` - infer parameters only, no large downloads or Docker.
-  - `prepare` - prepare the input package, but do not run Docker.
-  - `full` - prepare, run Docker, validate outputs, and package results.
-- Runs a preflight check before execution to catch Docker, disk, and repository-specific blockers early.
-- Produces benchmark Excel reports for batch parameter audits.
+## Current Status
+
+The final protected benchmark and handoff evidence are preserved under:
+
+```text
+runs/_protected_benchmark_20260624_4_5_sample_pool
+```
+
+Protected pool summary:
+
+```text
+files: 1074
+size: about 1506 MB
+keep marker: .agent_keep
+```
+
+The protected pool contains:
+
+```text
+samples/
+batches/
+agent_runs/
+ai_ready_builds/
+model_loop/
+reports/
+```
+
+Key candidates in the v3 smoke benchmark:
+
+```text
+PXD079076: clean completed / TMT10 / MSDT + AI-ready parquet
+PXD027067: usable partial output / partial-output recovery
+PXD079072: blocked / spectrum or export mismatch
+PXD074954: drug treatment / phospho discovery parameters evidence
+PXD077080: HLA / immunopeptidomics discovery parameters evidence
+```
+
+## Main Capabilities
+
+- General dataset discovery from natural language or structured form input.
+- Task-aware readiness and data-value scoring.
+- PRIDE-first online route, plus MassIVE and iProX repository-aware smoke paths.
+- Batch parameters/full/partial workflow handoff.
+- AI-ready task table export for:
+  - `rt_prediction`
+  - `fragment_intensity_prediction`
+  - `psm_scoring`
+  - `denovo`
+  - `ptm_denovo`
+  - `chimeric_interpretation`
+- Leakage-aware dataset recipe generation.
+- Hard benchmark, evidence graph, and active curation queue.
+- Dry-run model-loop smoke and model-informed gap plan.
+- Web UI with simplified AI-ready Build flow:
+
+```text
+Input source -> Task and build -> Results and next step
+```
+
+Low-frequency debug tools are under Advanced sections.
 
 ## Quick Start
 
-Start the Web UI:
+Recommended Docker path:
 
 ```powershell
-.\start-web.ps1
+# From the repository root:
+docker compose up -d web
 ```
 
 Open:
@@ -29,116 +80,130 @@ Open:
 http://127.0.0.1:8000
 ```
 
-Create a single task from CLI:
+Health check:
 
 ```powershell
-python -m agent.cli one-click-run "HeLa_ArgC-Try_CID_1.raw" --mode parameters
-python -m agent.cli one-click-run "HeLa_ArgC-Try_CID_1.raw" --mode prepare --repository pride
-python -m agent.cli one-click-run "HeLa_ArgC-Try_CID_1.raw" --mode full --resource-policy conservative
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/health
 ```
 
-## Web Workflow
+CLI inside Docker:
 
-The UI provides:
+```powershell
+docker compose exec web python -m agent.cli check-runtime
+```
 
-- Single-file planning and execution.
-- Batch benchmark planning with Excel export.
-- English and Chinese UI switching.
-- Project History with submitter, timestamps, mode, status, download links, and failure reasons.
-- Preflight feedback before batch creation and single-task creation.
+## Reproduce the Protected Benchmark
 
-Batch mode also supports `parameters`, `prepare`, and `full`.
-
-## Output Contract
-
-Single-file runs are written under:
+See the full reproduction guide:
 
 ```text
-runs\<task_name>\
+docs/README_reproduction.md
 ```
 
-Key artifacts:
+Current v3 expected outputs:
 
 ```text
-converter_config.json
-msdt_input_manifest.json
-project_resolution.json
-metadata.json
-asset_resolution.json
-attributes.json
-decision_trace.json
-agent_observation.json
-agent_plan.json
-agent_decision_trace.json
-recovery_audit.json
-parameter_audit.json
-task_state.json
-workflows\*.workflow
-fragpipe\fragger.params
-fragpipe\msbooster_params.txt
-logs\runtime.log
-rawspectrum\
-msdt\
-ai_ready\
+runs/ai_ready_builds/mini_e2e_batch_20260624_protected_pool_v3
+runs/ai_ready_builds/dataset_recipe_20260624_protected_pool_v3
+runs/model_loop/model_loop_20260624_protected_pool_v3
 ```
 
-Batch runs are written under:
+Protected copies are also under:
 
 ```text
-runs\_batches\<batch_id>\
+runs/_protected_benchmark_20260624_4_5_sample_pool/ai_ready_builds/
+runs/_protected_benchmark_20260624_4_5_sample_pool/model_loop/
 ```
 
-and produce:
+Expected v3 summary:
 
-- `benchmark_results.xlsx`
-- `batch_manifest.json`
-- `batch_parameter_audit.zip`
+```text
+runs: 5
+completed: 2
+blocked: 3
+selected task outputs: 4
+excluded task outputs: 6
+split strategy: file_disjoint
+split counts: train 2 / val 2
+leakage status: passed
+hard benchmark rows: 10
+curation queue rows: 10
+model-loop status: completed
+RT rows: 636
+smoke score: 0.7165
+```
 
-## Documentation
+## Handoff Documents
 
-- [System architecture](docs/module-architecture.md)
-- [Agent MVP audit and recovery contract](docs/agent_mvp.md)
-- [Project report summary](docs/project-report.md)
-- [Batch Excel design](docs/batch_excel_system_design.md)
-- [Frontend component architecture](docs/frontend_component_architecture.md)
-- [Repository adapter architecture](docs/repository-adapters.md)
-- [Deployment guide](docs/one-click-deploy.md)
+- `docs/final_agent_capability_report.md` - concise capability report for PPT and final handoff.
+- `docs/known_limitations_and_next_stage.md` - current boundaries and next-stage priorities.
+- `docs/README_reproduction.md` - protected v3 benchmark and Web/CLI reproduction guide.
+- `docs/README.md` - documentation index for handoff.
+- `docs/docker_reproducibility.md` - Docker reproducibility notes.
+- `docs/model-adapter-metrics.md` - model adapter metric schema.
+- `runs/_protected_benchmark_20260624_4_5_sample_pool/reports/final_delivery_checklist.md` - goal-by-goal closure audit.
+- `runs/_protected_benchmark_20260624_4_5_sample_pool/reports/web_smoke/web_ui_smoke_report.md` - browser-level Web UI smoke evidence.
 
-## Engineering Notes
+## Verification
 
-- PRIDE is the default first-class source, but the downstream pipeline is repository-agnostic.
-- Preflight is separated from execution so the UI can stop bad runs before they consume disk or time.
-- Parameter-only mode is intentionally lightweight and does not download RAW or run Docker.
-- Prepare mode writes the exact input package for MSDT-Converter without executing the full workflow.
-- Full mode is the only path that executes Docker and produces the execution result ZIP.
+Recent Docker targeted regression:
 
-## Requirements
+```text
+tests/test_dataset_recipe.py
+tests/test_model_loop.py
+tests/test_web_ai_ready.py
+tests/test_frontend_template.py
+selected public-results / cleanup tests
 
-- Python 3.13+
-- Network access to PRIDE, UniProt, and the selected LLM API
-- Docker Desktop or Docker Engine for `prepare` and `full`
-- ProteoWizard `msconvert` if available locally; otherwise Docker fallback is used
+68 passed
+```
 
-## Testing
+Recovery / harness / data-scientist loop regression:
 
-Run the focused regression suite:
+```text
+tests/test_agentic_recovery.py
+tests/test_mini_e2e.py
+tests/test_mini_e2e_batch.py
+tests/test_agent_recovery.py
+tests/test_agent_harness.py
+tests/test_data_scientist_loop.py
+tests/test_guidance_alignment.py
+
+59 passed
+```
+
+Focused local command:
 
 ```powershell
-python -m pytest tests\test_oneclick.py tests\test_web.py tests\test_frontend_template.py tests\test_cli_entrypoint.py -q
+python -m pytest tests/test_frontend_template.py
 ```
 
-Run the full suite:
+Docker targeted command:
 
 ```powershell
-python -m pytest -q
+docker compose exec web python -m pytest tests/test_dataset_recipe.py tests/test_model_loop.py tests/test_web_ai_ready.py tests/test_frontend_template.py
 ```
 
-## Deployment
+## Repository Notes
 
-One-command server deployment:
+Current repository maturity:
+
+```text
+PRIDE: mature online-first path
+MassIVE: adapter / discovery v1 / smoke path
+iProX: index-first path using refresh-iprox-index and local JSONL cache
+```
+
+iProX is not treated as real-time online search. Refresh an index first:
 
 ```powershell
-.\scripts\deploy.ps1 -CommitMessage "docs: update report-ready documentation"
+python -m agent.cli refresh-iprox-index --help
 ```
 
-The deployment script pushes to GitHub and refreshes the server-side Docker Compose deployment.
+## Known Limits
+
+- The protected v3 benchmark is a small/medium smoke, not a large-scale training corpus.
+- Model-loop is currently dry-run / metric-schema smoke, not real model training.
+- MassIVE and iProX need more real-project validation before matching PRIDE maturity.
+- RAW/WIFF-like conversion and nativeID mismatch remain separate compatibility work.
+- Parameters-only candidates are discovery evidence only; they need search outputs before AI-ready Build can export training rows.

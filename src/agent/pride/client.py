@@ -9,10 +9,15 @@ import httpx
 
 
 class PrideClient:
-    def __init__(self, base_url: str = "https://www.ebi.ac.uk/pride/ws/archive/v2", timeout: float = 60.0):
+    def __init__(
+        self,
+        base_url: str = "https://www.ebi.ac.uk/pride/ws/archive/v2",
+        timeout: float = 60.0,
+        read_timeout: float | None = None,
+    ):
         self._client = httpx.Client(
             base_url=base_url,
-            timeout=httpx.Timeout(timeout, read=max(timeout, 120.0)),
+            timeout=httpx.Timeout(timeout, read=max(timeout, 120.0) if read_timeout is None else read_timeout),
             follow_redirects=True,
         )
 

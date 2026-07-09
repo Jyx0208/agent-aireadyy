@@ -213,8 +213,15 @@ def _can_reuse_prepared_asset(asset: FileAsset, local_path: Path | None = None) 
 
 
 def _looks_like_corrupt_vendor_file_error(exc: Exception) -> bool:
-    text = str(exc).lower()
+    text = _preparation_error_message(exc).lower()
     return "corrupt raw file" in text or "rawfileimpl::ctor" in text or "error processing file" in text
+
+
+def _preparation_error_message(exc: Exception) -> str:
+    output = getattr(exc, "output", None) or getattr(exc, "stdout", None)
+    if output:
+        return f"{exc}\n{output}"
+    return str(exc)
 
 
 def prepare_file_asset(
@@ -296,4 +303,73 @@ def prepare_file_asset(
                         f"{retry_exc}；已尝试删除缓存并重新下载一次，仍转换失败。请检查 PRIDE 原始文件是否损坏，或尝试安装本地 ProteoWizard msconvert。",
                         local_path=redownloaded_path,
                     ) from retry_exc
-            raise AssetPreparationError(str(fallback_exc), local_path=local_path) from fallback_exc
+            raise AssetPreparationError(_preparation_error_message(fallback_exc), local_path=local_path) from fallback_exc
+
+
+def prepare_local_file_asset(
+    asset: FileAsset,
+    converter: RawToMzMLConverter,
+    fallback_converter=None,
+    report: Callable[[str], None] | None = None,
+) -> Path:
+    """Prepare an already-local source file without requiring a download URL."""
+    if _can_reuse_prepared_asset(asset):
+        emit(report, f"Reusing prepared local asset: {asset.prepared_path}")
+        return asset.prepared_path  # type: ignore[return-value]
+    if asset.local_path is None:
+        raise AssetPreparationError("Local source asset requires local_path.")
+    local_path = Path(asset.local_path)
+    if not local_path.exists():
+        raise AssetPreparationError(f"Local source file does not exist: {local_path}", local_path=local_path)
+    if local_path.is_file() and local_path.stat().st_size == 0:
+        raise AssetPreparationError(f"Local source file is empty: {local_path}", local_path=local_path)
+    if _can_reuse_prepared_asset(asset, local_path=local_path):
+        emit(report, f"Reusing prepared local asset: {asset.prepared_path}")
+        return asset.prepared_path  # type: ignore[return-value]
+    if (
+        asset.resolved_asset_type in {"mzml", "mgf", "mzid"}
+        and asset.prepared_path is not None
+        and local_path != asset.prepared_path
+        and local_path.name.lower().endswith((".mzml.gz", ".mgf.gz", ".mzid.gz"))
+    ):
+        asset.prepared_path.parent.mkdir(parents=True, exist_ok=True)
+        emit(report, f"Decompressing local gzip asset: {local_path.name} -> {asset.prepared_path.name}")
+        with gzip.open(local_path, "rb") as source, asset.prepared_path.open("wb") as target:
+            shutil.copyfileobj(source, target)
+        emit(report, f"Local gzip asset decompressed: {asset.prepared_path}")
+        return asset.prepared_path
+    if (
+        asset.resolved_asset_type == "tims"
+        and asset.prepared_path is not None
+        and local_path != asset.prepared_path
+        and local_path.name.lower().endswith((".d.zip", ".d.tar.gz", ".d.tgz"))
+    ):
+        emit(report, f"Extracting local Bruker .d archive: {local_path.name} -> {asset.prepared_path.name}")
+        return _extract_archive(local_path, asset.prepared_path)
+    if not asset.requires_conversion:
+        emit(report, f"Using local data file directly: {local_path}")
+        return local_path
+    if not asset.prepared_path:
+        raise ValueError("Convertible local source asset must define prepared_path.")
+    conversion_source = local_path
+    if local_path.name.lower().endswith(".raw.zip"):
+        emit(report, f"Extracting local RAW zip archive: {local_path.name}")
+        conversion_source = _extract_single_file(local_path, local_path.parent, (".raw",))
+    elif asset.resolved_asset_type == "mzxml" and local_path.name.lower().endswith(".mzxml.gz"):
+        conversion_source = local_path.with_suffix("")
+        if not conversion_source.exists() or conversion_source.stat().st_size == 0:
+            emit(report, f"Decompressing local mzXML gzip asset: {local_path.name} -> {conversion_source.name}")
+            with gzip.open(local_path, "rb") as source, conversion_source.open("wb") as target:
+                shutil.copyfileobj(source, target)
+    emit(report, f"Local source requires format conversion: {conversion_source.name} -> {asset.prepared_path.name}")
+    try:
+        return converter.convert_to_mzml(conversion_source, asset.prepared_path)
+    except Exception as exc:
+        emit(report, f"Primary local converter failed: {_preparation_error_message(exc)}")
+        if fallback_converter is None:
+            raise AssetPreparationError(_preparation_error_message(exc), local_path=local_path) from exc
+        emit(report, "Switching to fallback local converter.")
+        try:
+            return fallback_converter.convert_to_mzml(conversion_source, asset.prepared_path)
+        except Exception as fallback_exc:
+            raise AssetPreparationError(_preparation_error_message(fallback_exc), local_path=local_path) from fallback_exc

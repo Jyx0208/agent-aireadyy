@@ -1,9 +1,13 @@
 import json
+import subprocess
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 from agent.msdt_converter.docker_runner import DockerMSDTConverterRunner
 from agent.models import DdaExecutionPlan, MaterializedTaskBundle
+from agent.utils import run_command_streaming
 
 
 def test_docker_runner_builds_expected_command(tmp_path: Path):
@@ -50,7 +54,10 @@ def test_docker_runner_builds_expected_command(tmp_path: Path):
     runner = DockerMSDTConverterRunner(image="guomics2017/msdt-converter:v1.3")
     cmd = runner.build_command(bundle)
 
-    assert cmd[:4] == ["docker", "run", "--rm", "-v"]
+    assert cmd[:3] == ["docker", "run", "--rm"]
+    assert "--cidfile" in cmd
+    assert "--label" in cmd
+    assert "-v" in cmd
     assert "-e" in cmd
     assert "TZ=Asia/Shanghai" in cmd
     assert "guomics2017/msdt-converter:v1.3" in cmd
@@ -73,6 +80,39 @@ def test_docker_runner_maps_container_runs_path_for_host_docker(monkeypatch, tmp
     assert f"{host_runs.resolve() / 'task_out'}:/workspace" in cmd
 
 
+def test_docker_runner_preserves_windows_host_path_for_nested_docker(monkeypatch, tmp_path: Path):
+    container_runs = tmp_path / "container_runs"
+    task_root = container_runs / "task_out"
+    task_root.mkdir(parents=True)
+    config_path = task_root / "converter_config.docker.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("AGENT_CONTAINER_RUNS_DIR", str(container_runs))
+    monkeypatch.setenv("AGENT_HOST_RUNS_DIR", r"C:\Users\ASUS\Desktop\WestLake\agent-aireadyy_project\agent-aireadyy\runs")
+
+    runner = DockerMSDTConverterRunner(image="guomics2017/msdt-converter:v1.3")
+    cmd = runner.build_command(SimpleNamespace(task_root=task_root, converter_config_path=config_path))
+
+    assert r"C:\Users\ASUS\Desktop\WestLake\agent-aireadyy_project\agent-aireadyy\runs\task_out:/workspace" in cmd
+
+
+def test_docker_runner_can_inherit_agent_container_volumes(monkeypatch, tmp_path: Path):
+    task_root = tmp_path / "task_out"
+    task_root.mkdir(parents=True)
+    config_path = task_root / "converter_config.docker.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("AGENT_DOCKER_VOLUMES_FROM", "pride-agent-web")
+
+    runner = DockerMSDTConverterRunner(image="guomics2017/msdt-converter:v1.3")
+    cmd = runner.build_command(SimpleNamespace(task_root=task_root, converter_config_path=config_path))
+
+    assert "--volumes-from" in cmd
+    assert "pride-agent-web" in cmd
+    assert "-w" not in cmd
+    assert not any(str(part).endswith(":/workspace") for part in cmd)
+    assert config_path.resolve().as_posix() in cmd
+    assert "/workspace/converter_config.docker.json" not in cmd
+
+
 def test_docker_runner_passes_fragpipe_java_heap_to_converter_container(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("AGENT_FRAGPIPE_RAM_GB", "6")
     task_root = tmp_path / "task_out"
@@ -85,6 +125,71 @@ def test_docker_runner_passes_fragpipe_java_heap_to_converter_container(monkeypa
 
     assert "-e" in cmd
     assert "_JAVA_OPTIONS=-Xmx6G" in cmd
+
+
+def test_run_command_streaming_aborts_on_low_psm_marker_quickly():
+    started = time.monotonic()
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import sys,time;"
+            "print('RT regression using 0 PSMs', flush=True);"
+            "time.sleep(30)"
+        ),
+    ]
+
+    try:
+        run_command_streaming(
+            command,
+            abort_predicate=lambda line, _lines: "low_psm_msbooster"
+            if "RT regression using 0 PSMs" in line
+            else None,
+        )
+    except subprocess.CalledProcessError as exc:
+        elapsed = time.monotonic() - started
+        assert elapsed < 5
+        assert "agent_watchdog_abort:low_psm_msbooster" in exc.output
+    else:
+        raise AssertionError("Expected watchdog abort")
+
+
+def test_docker_runner_low_psm_abort_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("AGENT_MSDT_ABORT_ON_LOW_PSM", "0")
+    runner = DockerMSDTConverterRunner()
+
+    assert runner._abort_reason_from_output("RT regression using 0 PSMs", []) is None
+
+
+def test_docker_runner_low_psm_abort_requires_zero_search_evidence_by_default(monkeypatch):
+    monkeypatch.delenv("AGENT_MSDT_ABORT_ON_LOW_PSM", raising=False)
+    runner = DockerMSDTConverterRunner()
+
+    lines = [
+        "MSBooster v1.1.28",
+        "0 unique peptides from 0 PSMs",
+        "RT regression using 0 PSMs",
+    ]
+    assert runner._abort_reason_from_output(lines[-1], lines) == "zero_psm_msbooster"
+
+
+def test_docker_runner_low_psm_abort_marks_rt_zero_as_partial_when_search_has_psms(monkeypatch):
+    monkeypatch.delenv("AGENT_MSDT_ABORT_ON_LOW_PSM", raising=False)
+    runner = DockerMSDTConverterRunner()
+
+    lines = [
+        "MSBooster v1.1.28",
+        "138 unique peptides from 144 PSMs",
+        "RT regression using 0 PSMs",
+    ]
+    assert runner._abort_reason_from_output(lines[-1], lines) == "low_psm_msbooster"
+
+
+def test_docker_runner_low_psm_abort_strict_mode_keeps_immediate_abort(monkeypatch):
+    monkeypatch.setenv("AGENT_MSDT_ABORT_ON_LOW_PSM", "strict")
+    runner = DockerMSDTConverterRunner()
+
+    assert runner._abort_reason_from_output("RT regression using 0 PSMs", []) == "low_psm_msbooster"
 
 
 def test_docker_runner_writes_container_compatible_config(tmp_path: Path):

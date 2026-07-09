@@ -159,7 +159,8 @@ def test_plan_dda_execution_generates_converter_compatible_paths(tmp_path: Path)
     assert "UP000005640" in plan.fasta_download_url
     assert plan.fragpipe_workflow_path.name == "Default.workflow"
     assert plan.manifest_path.name == "fragpipe-files.fp-manifest"
-    assert plan.expected_pin_glob.endswith("sample_edited.pin")
+    assert plan.expected_pin_path.name == "sample_edited.pin"
+    assert plan.expected_pin_glob.endswith("sample*.pin")
     assert plan.output_paths["fp_msdt"].suffix == ".parquet"
 
 
@@ -850,6 +851,53 @@ def test_plan_dda_execution_uses_existing_llm_recommended_workflow(tmp_path: Pat
     )
 
     assert plan.fragpipe_workflow_path.name == "TMT10.workflow"
+
+
+def test_plan_dda_execution_maps_tmt6_alias_to_packaged_workflow(tmp_path: Path):
+    attributes = _dda_attributes()
+    attributes.search_parameter_hints = AttributeValue(
+        value={"recommended_workflow_name": "TMT6.workflow"},
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="LLM confirmed lower-plex TMT workflow",
+        conflict_flag=False,
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-llm-workflow-alias",
+        source_file_name="sample.raw",
+        source_data_path=tmp_path / "sample.mzML",
+        project_resolution=_resolved_resolution(),
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.fragpipe_workflow_path.name == "TMT10.workflow"
+    assert not any("workflow" in issue.lower() and "不存在" in issue for issue in plan.blocking_issues)
+
+
+def test_plan_dda_execution_uses_plain_pin_for_non_msbooster_workflow(tmp_path: Path):
+    attributes = _dda_attributes()
+    attributes.search_parameter_hints = AttributeValue(
+        value={"recommended_workflow_name": "TMT10-phospho.workflow"},
+        confidence=0.9,
+        source="llm_confirmed",
+        evidence_excerpt="LLM confirmed phospho workflow",
+        conflict_flag=False,
+    )
+
+    plan = plan_dda_execution(
+        task_id="task-no-msbooster-workflow",
+        source_file_name="sample.raw",
+        source_data_path=tmp_path / "sample.mzML",
+        project_resolution=_resolved_resolution(),
+        attributes=attributes,
+        output_dir=tmp_path,
+    )
+
+    assert plan.fragpipe_workflow_path.name == "TMT10-phospho.workflow"
+    assert plan.expected_pin_path.name == "sample.pin"
+    assert plan.expected_pin_glob.endswith("sample*.pin")
 
 
 def test_plan_dda_execution_ignores_unknown_llm_recommended_workflow(tmp_path: Path):
