@@ -1,0 +1,39 @@
+[
+  {
+    "id": "empty_then_success",
+    "expected_usable_min": 1,
+    "must_preserve_pool": true
+  },
+  {
+    "id": "success_then_empty",
+    "expected_usable_min": 1,
+    "must_preserve_pool": true
+  },
+  {
+    "id": "small_incremental_gains",
+    "expected_usable_min": 3,
+    "must_stop_before_hard_limit": true
+  },
+  {
+    "id": "quantity_good_quality_poor",
+    "expected_review_or_valid_min": 1,
+    "must_target_quality_gap": true
+  },
+  {
+    "id": "review_only",
+    "expected_status": "completed_with_review"
+  },
+  {
+    "id": "repeated_queries",
+    "max_duplicate_query_rate": 0.05
+  },
+  {
+    "id": "persistent_no_results",
+    "expected_status": "blocked"
+  },
+  {
+    "id": "cross_repository_success",
+    "expected_usable_min": 1,
+    "required_repository_count": 2
+  }
+]

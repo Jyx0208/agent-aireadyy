@@ -174,6 +174,34 @@ Legacy scripts may continue using `--max-rounds`, `--max-turns`, and
 ignored by dynamic search allocation in `multi_agent`; model-turn and tool-call
 values remain safety ceilings in both modes.
 
+## Replay Evaluation Gate
+
+The release gate is implemented by
+`scripts/evaluate_dynamic_discovery_budget.py`. It pairs single-Agent and
+multi-Agent artifacts by the eight replay IDs in
+`tests/fixtures/dynamic_budget_replays.json`. Each replay directory must contain
+both `agents_discovery_summary.json` and `dataset_manifest.json`; missing or
+malformed evidence is an evaluation error rather than a zero-quality run.
+
+```powershell
+python scripts/evaluate_dynamic_discovery_budget.py `
+  --baseline-dir runs/discovery/eval_single_agent `
+  --dynamic-dir runs/discovery/eval_multi_agent `
+  --output runs/discovery/dynamic_budget_evaluation.json
+```
+
+The gate requires at least 95% usable recall, at least 20% repository-request
+reduction, a false early-stop rate below 5%, no per-replay valid-share
+regression, and zero hard-constraint violations. Exit code `0` means the gate
+passed, `1` means complete evidence failed a target, and `2` means evaluation
+inputs were missing or malformed.
+
+Local core verification on 2026-07-10 completed with `741 passed in 130.56s`.
+The release-gate command currently exits `2` because the repository does not
+yet contain the required eight paired baseline and dynamic replay directories.
+Accordingly, `single_agent` remains the documented and Compose default; this is
+an evidence gap, not a synthetic gate pass.
+
 Install the optional runtime outside Docker with:
 
 ```powershell
