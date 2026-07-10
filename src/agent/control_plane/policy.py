@@ -4,6 +4,8 @@ from agent.control_plane.models import AgentRunRecord, PolicyDecision, ToolRisk
 
 
 TOOL_RISKS: dict[str, ToolRisk] = {
+    "request_search_budget": "read_only",
+    "submit_budget_decision": "read_only",
     "search_repository_datasets": "read_only",
     "get_discovery_state": "read_only",
     "select_discovery_manifest": "bounded_write",

@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from agent.control_plane.models import (
+    AgentBudget,
     AgentRunRecord,
     BudgetDecision,
     BudgetDecisionInput,
@@ -13,6 +14,7 @@ from agent.control_plane.models import (
     SearchProposalInput,
     SearchProposalRecord,
 )
+from agent.control_plane.budget_governor import BudgetGovernor
 from agent.control_plane.discovery_metrics import evaluate_round_metrics
 from agent.control_plane.store import AgentRunStore
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
@@ -262,3 +264,101 @@ def test_round_metrics_reward_new_usable_candidates_and_penalize_repeated_querie
     assert novel.strategy_novelty > repeated.strategy_novelty
     assert repeated.query_repetition == 1.0
     assert novel.counts["usable_files"] == 5
+
+
+def _dynamic_store_and_run(
+    tmp_path: Path,
+    *,
+    max_query_units: int = 30,
+) -> tuple[AgentRunStore, AgentRunRecord]:
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        AgentRunRecord(
+            run_id="dynamic_run",
+            workflow="discovery",
+            status="running",
+            dynamic_budget_enabled=True,
+            dynamic_limits=DynamicBudgetLimits(
+                max_query_units=max_query_units,
+                max_repository_requests=200,
+            ),
+            budget=AgentBudget(max_turns=50, max_tool_calls=100),
+        )
+    )
+    return store, run
+
+
+def _proposal(queries: list[str]) -> SearchProposalInput:
+    return SearchProposalInput(
+        objective="Improve metadata coverage",
+        reasoning_summary="The measured metadata gap is high.",
+        evidence_refs=["metadata_gap:0.7"],
+        queries=queries,
+        expected_gain_dimensions=["metadata_completeness"],
+        expected_gain="More usable metadata",
+        alternatives_considered=["generic broad search"],
+        stop_condition="No new usable files",
+    )
+
+
+def _grant_decision(proposal_id: str, indexes: list[int]) -> BudgetDecision:
+    return BudgetDecision(
+        proposal_id=proposal_id,
+        decision="grant",
+        approved_query_indexes=indexes,
+        reasoning_summary="The approved queries target measured gaps.",
+    )
+
+
+def test_governor_issues_subset_grant_and_rejects_tamper_and_replay(tmp_path: Path) -> None:
+    store, run = _dynamic_store_and_run(tmp_path, max_query_units=3)
+    governor = BudgetGovernor(store, run.run_id)
+    proposal = governor.register_proposal(
+        SearchProposalInput(
+            objective="Improve metadata",
+            reasoning_summary="Metadata gap is high.",
+            queries=["human plasma SDRF", "human plasma Orbitrap"],
+            expected_gain="More usable metadata",
+            stop_condition="No new usable files",
+        )
+    )
+    result = governor.apply_decision(
+        BudgetDecision(
+            proposal_id=proposal.proposal_id,
+            decision="shrink",
+            approved_query_indexes=[0],
+            rejected_query_indexes=[1],
+            reasoning_summary="The first query targets the measured gap.",
+        )
+    )
+    assert result.outcome == "granted"
+    assert result.grant is not None
+    assert result.grant.approved_queries == ["human plasma SDRF"]
+    with pytest.raises(ValueError, match="search_grant_query_mismatch"):
+        governor.consume_grant(result.grant.grant_id, ["changed query"])
+    governor.consume_grant(result.grant.grant_id, ["human plasma SDRF"])
+    with pytest.raises(ValueError, match="grant_already_consumed"):
+        governor.consume_grant(result.grant.grant_id, ["human plasma SDRF"])
+
+
+def test_governor_denies_grant_over_remaining_query_units(tmp_path: Path) -> None:
+    store, run = _dynamic_store_and_run(tmp_path, max_query_units=1)
+    governor = BudgetGovernor(store, run.run_id)
+    proposal = governor.register_proposal(_proposal(["query one", "query two"]))
+    result = governor.apply_decision(_grant_decision(proposal.proposal_id, [0, 1]))
+    assert result.outcome == "denied"
+    assert result.reason == "hard_query_unit_limit"
+    assert result.grant is None
+
+
+def test_governor_rejects_exact_consumed_query_without_retryable_failure(tmp_path: Path) -> None:
+    store, run = _dynamic_store_and_run(tmp_path)
+    governor = BudgetGovernor(store, run.run_id)
+    first = governor.register_proposal(_proposal(["human plasma SDRF"]))
+    first_review = governor.apply_decision(_grant_decision(first.proposal_id, [0]))
+    assert first_review.grant is not None
+    governor.consume_grant(first_review.grant.grant_id, ["human plasma SDRF"])
+    second = governor.register_proposal(_proposal(["human   plasma SDRF"]))
+    second_review = governor.apply_decision(_grant_decision(second.proposal_id, [0]))
+    assert second_review.outcome == "denied"
+    assert second_review.reason == "duplicate_query_not_authorized"

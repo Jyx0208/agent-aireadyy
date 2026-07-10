@@ -384,6 +384,17 @@ class AgentRunStore:
             return None
         return SearchGrant.model_validate(json.loads(row["payload_json"]))
 
+    def list_search_grants(self, run_id: str) -> list[SearchGrant]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload_json FROM agent_search_grants
+                WHERE run_id = ? ORDER BY created_at, grant_id
+                """,
+                (run_id,),
+            ).fetchall()
+        return [SearchGrant.model_validate(json.loads(row["payload_json"])) for row in rows]
+
     def consume_search_grant(self, run_id: str, grant_id: str, query_hash: str) -> SearchGrant:
         connection = self._connect()
         try:
