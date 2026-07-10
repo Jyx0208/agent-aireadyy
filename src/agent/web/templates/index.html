@@ -769,26 +769,10 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
               <span class="status-pill blocked" id="discoveryAgentCredentialStatus" data-i18n="discoveryAgentServerKeyNeeded">Server key needed</span>
             </div>
           </div>
-          <div class="agent-budget-mode">
-            <label for="discoveryAgentBudgetMode"><span data-i18n="discoveryAgentBudgetMode">Search intensity</span>
-              <select id="discoveryAgentBudgetMode" onchange="toggleDiscoveryAgentBudgetMode()">
-                <option value="auto" data-i18n="discoveryAgentBudgetAuto">Auto (recommended)</option>
-                <option value="fast" data-i18n="discoveryAgentBudgetFast">Fast</option>
-                <option value="standard" data-i18n="discoveryAgentBudgetStandard">Standard</option>
-                <option value="deep" data-i18n="discoveryAgentBudgetDeep">Deep</option>
-                <option value="custom" data-i18n="discoveryAgentBudgetCustom">Custom</option>
-              </select>
-            </label>
-            <div class="agent-budget-mode-help" id="discoveryAgentBudgetModeHelp" data-i18n="discoveryAgentBudgetAutoHelp">The server chooses a bounded profile from task complexity and hard constraints.</div>
+          <div class="agent-autonomy-status" id="discoveryAgentBudgetAutonomous">
+            <span class="status-pill completed" data-i18n="discoveryAgentAutonomous">Agent autonomous budget</span>
+            <span id="discoveryAgentResourceUse"></span>
           </div>
-          <details class="agent-budget-advanced" id="discoveryAgentBudgetAdvanced">
-            <summary data-i18n="discoveryAgentBudgetAdvanced">Advanced limits</summary>
-            <div class="agent-budget-grid">
-              <label class="agent-budget-field" for="discoveryAgentMaxRounds"><span data-i18n="discoveryAgentMaxRounds">Search rounds</span><input type="number" id="discoveryAgentMaxRounds" min="1" max="8" value="3"></label>
-              <label class="agent-budget-field" for="discoveryAgentMaxTurns"><span data-i18n="discoveryAgentMaxTurns">Model turns</span><input type="number" id="discoveryAgentMaxTurns" min="2" max="50" value="10"></label>
-              <label class="agent-budget-field" for="discoveryAgentMaxToolCalls"><span data-i18n="discoveryAgentMaxToolCalls">Tool calls</span><input type="number" id="discoveryAgentMaxToolCalls" min="1" max="100" value="16"></label>
-            </div>
-          </details>
         </div>
         <div class="discovery-toolbar">
           <button class="btn btn-primary btn-small" id="discoveryStartBtn" type="button" onclick="startDiscovery()" data-i18n="startDiscovery">Run discovery</button>
@@ -800,7 +784,14 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
             <span class="batch-log-title" data-i18n="discoveryLogTitle">Discovery log</span>
             <span class="batch-log-meta" id="discoveryLogMeta" data-i18n="discoveryLogEmpty">No discovery events yet.</span>
           </div>
-          <div class="batch-log-box discovery-log-box" id="discoveryLogBox" role="log" aria-live="polite"></div>
+          <div class="segmented-control discovery-log-tabs" role="tablist">
+            <button type="button" class="active" data-log-tab="activity" onclick="setDiscoveryLogTab('activity')" data-i18n="discoveryLogActivity">Activity</button>
+            <button type="button" data-log-tab="tools" onclick="setDiscoveryLogTab('tools')" data-i18n="discoveryLogTools">Tools and metrics</button>
+            <button type="button" data-log-tab="raw" onclick="setDiscoveryLogTab('raw')" data-i18n="discoveryLogRaw">Raw events</button>
+          </div>
+          <div class="batch-log-box discovery-log-box" id="discoveryLogActivity" role="log" aria-live="polite"></div>
+          <div class="batch-log-box discovery-log-box" id="discoveryLogTools" role="log" aria-live="polite" hidden></div>
+          <div class="batch-log-box discovery-log-box" id="discoveryLogRaw" role="log" aria-live="polite" hidden></div>
         </div>
         <div class="discovery-results" id="discoveryResults" hidden>
           <div class="discovery-summary" id="discoverySummary"></div>
@@ -817,6 +808,7 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
               <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('agents_discovery_report_md')" data-i18n="downloadAgentReport">Agent report</button>
               <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('agents_discovery_events_json')" data-i18n="downloadAgentEvents">Event log</button>
               <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('agents_discovery_summary_json')" data-i18n="downloadAgentSummary">Run summary</button>
+              <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('agents_discovery_budget_json')" data-i18n="downloadAgentBudget">Budget audit</button>
             </div>
           </section>
           <div class="discovery-actions">
@@ -1168,7 +1160,8 @@ let currentBatchId=null,batchPollTimer=null,currentBatchRecord=null;
 let currentWorkflowTab='single';
 let currentDiscoveryId=null;
 let currentDiscoveryRecord=null;
-let currentDiscoveryJobId=null,discoveryPollTimer=null,lastDiscoveryLogsFingerprint='';
+let currentDiscoveryJobId=null,discoveryPollTimer=null,activeDiscoveryLogTab='activity';
+let discoveryLogSequences={jobId:null,activity:0,tools:0,raw:0};
 let currentDiscoveryRuntime='workflow';
 let currentBatchInputRecords=[];
 let currentModelDiscoveryRequests=[];
@@ -1269,21 +1262,7 @@ const I18N={
     discoveryAgentServerKeyReady:'Server key ready',
     discoveryAgentServerKeyNeeded:'Server key needed',
     discoveryAgentWebKeyReady:'Web key ready for this run',
-    discoveryAgentBudgetMode:'Search intensity',
-    discoveryAgentBudgetAuto:'Auto (recommended)',
-    discoveryAgentBudgetFast:'Fast',
-    discoveryAgentBudgetStandard:'Standard',
-    discoveryAgentBudgetDeep:'Deep',
-    discoveryAgentBudgetCustom:'Custom',
-    discoveryAgentBudgetAutoHelp:'The server chooses a bounded profile from task complexity and hard constraints.',
-    discoveryAgentBudgetFastHelp:'One focused search round for a quick feasibility check.',
-    discoveryAgentBudgetStandardHelp:'Balanced multi-round discovery for most requests.',
-    discoveryAgentBudgetDeepHelp:'More rounds for strict, PTM, immunopeptidomics, or broad requests.',
-    discoveryAgentBudgetCustomHelp:'Use the advanced limits below.',
-    discoveryAgentBudgetAdvanced:'Advanced limits',
-    discoveryAgentMaxRounds:'Search rounds',
-    discoveryAgentMaxTurns:'Model turns',
-    discoveryAgentMaxToolCalls:'Tool calls',
+    discoveryAgentAutonomous:'Agent autonomous budget',
     discoveryAgentPromptRequired:'Enter a natural-language discovery request for OpenAI Agent mode.',
     discoveryAgentResultTitle:'OpenAI Agent result',
     discoveryAgentBlocked:'Agent finished without selected files.',
@@ -1293,6 +1272,7 @@ const I18N={
     downloadAgentReport:'Agent report',
     downloadAgentEvents:'Event log',
     downloadAgentSummary:'Run summary',
+    downloadAgentBudget:'Budget audit',
     discoveryGoalPrompt:'Discovery request',
     discoveryGoalPlaceholder:'Find small DDA proteomics datasets for HLA ligandome, drug treatment, or another future modeling use case. Prioritize diversity.',
     parseDiscoveryGoal:'Parse request',
@@ -1336,6 +1316,9 @@ const I18N={
     discoveryLogEmpty:'No discovery events yet.',
     discoveryLogCount:n=>`${n} event(s)`,
     discoveryLogRenderFailed:'Discovery log display failed; polling continues.',
+    discoveryLogActivity:'Activity',
+    discoveryLogTools:'Tools and metrics',
+    discoveryLogRaw:'Raw events',
     discoveryDone:(projects,files)=>`Discovery completed: ${projects} projects, ${files} files.`,
     discoveryFailed:e=>`Discovery failed: ${e}`,
     discoveryRequired:'Please provide positive project/file limits.',
@@ -1922,6 +1905,11 @@ const CLEAN_ZH_I18N={
   discoveryLogEmpty:'暂无 Discovery 事件。',
   discoveryLogCount:n=>`${n} 条事件`,
   discoveryLogRenderFailed:'Discovery 日志显示失败，轮询会继续。',
+  discoveryAgentAutonomous:'Agent 自主预算',
+  discoveryLogActivity:'活动',
+  discoveryLogTools:'工具和指标',
+  discoveryLogRaw:'原始事件',
+  downloadAgentBudget:'预算审计',
   discoveryDone:(projects,files)=>`Discovery 完成：${projects} 个项目，${files} 个文件。`,
   discoveryFailed:e=>`Discovery 失败：${e}`,
   discoveryRequired:'请确保项目和文件数量限制为正数。',
@@ -2305,6 +2293,13 @@ const UI={
   batchEvent(event){
     const level=String(event.level||'info').toLowerCase();
     return '<div class="batch-event '+esc(level)+'"><span class="batch-event-time">'+esc(event.ts||'')+'</span><span class="batch-event-level">'+esc(level)+'</span><span class="batch-event-message">'+esc(event.message||'')+'</span></div>';
+  },
+  discoveryAgentEvent(event,raw=false){
+    const level=String(event&&event.level||'info').toLowerCase();
+    const ts=String(event&&event.ts||'').split('T').pop().slice(0,8)||now();
+    const actor=String(event&&event.actor||'Discovery Agent');
+    const message=raw?JSON.stringify(event&&event.payload||{}):String(event&&event.message||event&&event.type||'');
+    return '<div class="log-line" data-sequence="'+esc(String(event&&event.sequence||0))+'"><span class="ts">'+esc(ts)+'</span><span class="badge '+esc(level==='warning'?'debug':level)+'">'+esc(actor)+'</span><span class="msg '+esc(level)+'">'+esc(message)+'</span></div>';
   },
   taskRow(item,options={}){
     const title=item.display_name||item.input_value||item.output_dir||item.task_id||item.name||t('unknown');
@@ -2868,24 +2863,6 @@ function setDiscoveryRuntime(runtime){
   }
 }
 
-function toggleDiscoveryAgentBudgetMode(){
-  const mode=document.getElementById('discoveryAgentBudgetMode')?.value||'auto';
-  const advanced=document.getElementById('discoveryAgentBudgetAdvanced');
-  const custom=mode==='custom';
-  if(advanced)advanced.open=custom;
-  ['discoveryAgentMaxRounds','discoveryAgentMaxTurns','discoveryAgentMaxToolCalls'].forEach(id=>{
-    const input=document.getElementById(id);
-    if(input)input.disabled=!custom;
-  });
-  const help=document.getElementById('discoveryAgentBudgetModeHelp');
-  if(help){
-    const suffix=mode==='fast'?'Fast':mode==='standard'?'Standard':mode==='deep'?'Deep':mode==='custom'?'Custom':'Auto';
-    const key='discoveryAgentBudget'+suffix+'Help';
-    help.dataset.i18n=key;
-    help.textContent=t(key);
-  }
-}
-
 function discoverySelectedGoal(){
   return document.getElementById('discoveryGoal')?.value||'general';
 }
@@ -2936,10 +2913,6 @@ function collectDiscoveryIntentFields(){
     max_files_per_project:discoveryInt('discoveryFilesPerProject',20),
     agentic_rounds:discoveryInt('discoveryAgenticRounds',1),
     runtime:currentDiscoveryRuntime,
-    agent_budget_mode:document.getElementById('discoveryAgentBudgetMode').value,
-    agent_max_rounds:discoveryInt('discoveryAgentMaxRounds',3),
-    agent_max_turns:discoveryInt('discoveryAgentMaxTurns',10),
-    agent_max_tool_calls:discoveryInt('discoveryAgentMaxToolCalls',16),
     diversity_strategy:document.getElementById('discoveryDiversityStrategy').value,
     agentic:currentDiscoveryRuntime==='workflow'&&document.getElementById('discoveryAgentic').checked
   };
@@ -2966,12 +2939,7 @@ function applyDiscoveryGoalFields(fields){
   if(data.max_files!==undefined)document.getElementById('discoveryMaxFiles').value=String(Math.max(1,Math.min(2000,parseInt(data.max_files,10)||50)));
   if(data.max_files_per_project!==undefined)document.getElementById('discoveryFilesPerProject').value=String(Math.max(1,Math.min(100,parseInt(data.max_files_per_project,10)||20)));
   if(data.agentic_rounds!==undefined)discoverySetSelect('discoveryAgenticRounds',String(Math.max(1,Math.min(2,parseInt(data.agentic_rounds,10)||1))));
-  if(data.agent_max_rounds!==undefined)document.getElementById('discoveryAgentMaxRounds').value=String(Math.max(1,Math.min(8,parseInt(data.agent_max_rounds,10)||3)));
-  if(data.agent_max_turns!==undefined)document.getElementById('discoveryAgentMaxTurns').value=String(Math.max(2,Math.min(50,parseInt(data.agent_max_turns,10)||8)));
-  if(data.agent_max_tool_calls!==undefined)document.getElementById('discoveryAgentMaxToolCalls').value=String(Math.max(1,Math.min(100,parseInt(data.agent_max_tool_calls,10)||12)));
-  if(data.agent_budget_mode!==undefined)discoverySetSelect('discoveryAgentBudgetMode',String(data.agent_budget_mode||'auto'));
   if(data.runtime!==undefined)setDiscoveryRuntime(String(data.runtime||'workflow'));
-  toggleDiscoveryAgentBudgetMode();
   document.getElementById('discoveryAgentic').checked=data.agentic!==false;
 }
 
@@ -3202,10 +3170,6 @@ function collectDiscoveryPayload(){
     diversity_strategy:diversityStrategy,
     agentic:currentDiscoveryRuntime==='workflow'&&agentic,
     agentic_rounds:discoveryInt('discoveryAgenticRounds',1),
-    agent_budget_mode:document.getElementById('discoveryAgentBudgetMode').value,
-    agent_max_rounds:discoveryInt('discoveryAgentMaxRounds',3),
-    agent_max_turns:discoveryInt('discoveryAgentMaxTurns',10),
-    agent_max_tool_calls:discoveryInt('discoveryAgentMaxToolCalls',16),
     llm_config:collectConfig(),
     prompt:buildDiscoveryPrompt()
   };
@@ -3329,15 +3293,17 @@ function renderDiscoveryAgentResult(data){
   status.textContent=state;
   status.className='status-pill '+(state==='completed'?'completed':state==='completed_with_review'?'needs_review':state==='blocked'?'blocked':'queued');
   const meta=document.getElementById('discoveryAgentResultMeta');
-  const budgetLabel=[agent.budget_mode,agent.budget_profile].filter((value,index,items)=>value&&items.indexOf(value)===index).join('/');
   const selectedRound=agent.selected_round_index===0?'pool':agent.selected_round_index?('round '+agent.selected_round_index):'fallback';
   meta.innerHTML=[
-    '<span>rounds '+esc(String(agent.discovery_rounds||0))+'</span>',
-    '<span>tools '+esc(String(agent.tool_calls||0))+'</span>',
-    budgetLabel?'<span>budget '+esc(budgetLabel)+'</span>':'',
+    '<span>queries '+esc(String(agent.query_units||0))+'</span>',
+    '<span>repository requests '+esc(String(agent.repository_requests||0))+'</span>',
+    '<span>batches '+esc(String(agent.search_batches||0))+'</span>',
+    '<span>pool files '+esc(String(agent.pooled_selected_files||0))+'</span>',
     '<span>selected '+esc(selectedRound)+'</span>',
-    '<span>stop '+esc(agent.stop_reason||'not recorded')+'</span>'
+    agent.stop_reason?'<span>stop '+esc(String(agent.stop_reason))+'</span>':''
   ].filter(Boolean).join('');
+  const resourceUse=document.getElementById('discoveryAgentResourceUse');
+  if(resourceUse)resourceUse.textContent='queries '+String(agent.query_units||0)+' · requests '+String(agent.repository_requests||0)+' · batches '+String(agent.search_batches||0);
   const warnings=Array.isArray(agent.warnings)?agent.warnings:[];
   const blockers=Array.isArray(agent.blockers)?agent.blockers:[];
   const flags=document.getElementById('discoveryAgentResultFlags');
@@ -3654,31 +3620,51 @@ function renderDiscovery(data){
   document.getElementById('discoveryResults').hidden=false;
 }
 
-function renderDiscoveryJobLogs(logs){
-  const box=document.getElementById('discoveryLogBox');
-  const meta=document.getElementById('discoveryLogMeta');
-  const items=Array.isArray(logs)?logs:[];
-  if(meta)meta.textContent=items.length?tf('discoveryLogCount',items.length):t('discoveryLogEmpty');
-  if(!box)return;
-  const fingerprint=JSON.stringify(items.map(item=>[
-    String(item?.ts||''),
-    String(item?.level||''),
-    String(item?.message||'')
-  ]));
-  if(fingerprint===lastDiscoveryLogsFingerprint)return;
+function discoveryLogCategory(item){
+  const type=String(item&&item.type||'');
+  if(type.startsWith('sdk_')||type.startsWith('tool_')||type.includes('grant')||type==='round_value_evaluated'||type==='repository_request_started')return 'tools';
+  return 'activity';
+}
+
+function setDiscoveryLogTab(tab){
+  activeDiscoveryLogTab=['activity','tools','raw'].includes(tab)?tab:'activity';
+  document.querySelectorAll('[data-log-tab]').forEach(button=>button.classList.toggle('active',button.dataset.logTab===activeDiscoveryLogTab));
+  [['activity','discoveryLogActivity'],['tools','discoveryLogTools'],['raw','discoveryLogRaw']].forEach(([name,id])=>{
+    const box=document.getElementById(id);
+    if(box)box.hidden=name!==activeDiscoveryLogTab;
+  });
+}
+
+function appendDiscoveryLogRows(box,items,lastSequence,raw=false){
+  if(!box)return lastSequence;
+  const fresh=items.filter(item=>Number(item.sequence||0)>lastSequence);
   const shouldFollow=box.scrollHeight-box.scrollTop-box.clientHeight<=16;
-  lastDiscoveryLogsFingerprint=fingerprint;
-  if(!items.length){
-    box.innerHTML='<div class="empty">'+esc(t('discoveryLogEmpty'))+'</div>';
-    return;
+  fresh.forEach(item=>box.insertAdjacentHTML('beforeend',UI.discoveryAgentEvent(item,raw)));
+  if(shouldFollow&&fresh.length)box.scrollTop=box.scrollHeight;
+  return fresh.reduce((value,item)=>Math.max(value,Number(item.sequence||0)),lastSequence);
+}
+
+function renderDiscoveryJobLogs(logs){
+  const source=Array.isArray(logs)?logs:[];
+  const items=source.map((item,index)=>({...item,sequence:Number(item&&item.sequence||index+1)}));
+  const meta=document.getElementById('discoveryLogMeta');
+  if(meta)meta.textContent=items.length?tf('discoveryLogCount',items.length):t('discoveryLogEmpty');
+  const jobKey=currentDiscoveryJobId||'pending';
+  if(discoveryLogSequences.jobId!==jobKey){
+    discoveryLogSequences={jobId:jobKey,activity:0,tools:0,raw:0};
+    ['discoveryLogActivity','discoveryLogTools','discoveryLogRaw'].forEach(id=>{const box=document.getElementById(id);if(box)box.innerHTML='';});
   }
-  box.innerHTML=items.map(item=>{
-    const level=String(item.level||'info').toLowerCase();
-    const ts=String(item.ts||'').split('T').pop().slice(0,8)||now();
-    const badge=level==='warning'?'debug':level;
-    return '<div class="log-line"><span class="ts">'+esc(ts)+'</span><span class="badge '+esc(badge)+'">'+esc(level.toUpperCase())+'</span><span class="msg '+esc(level)+'">'+esc(item.message||'')+'</span></div>';
-  }).join('');
-  if(shouldFollow)box.scrollTop=box.scrollHeight;
+  const maxSequence=items.reduce((value,item)=>Math.max(value,Number(item.sequence||0)),0);
+  if(maxSequence&&maxSequence<Math.max(discoveryLogSequences.activity,discoveryLogSequences.tools,discoveryLogSequences.raw)){
+    discoveryLogSequences={jobId:jobKey,activity:0,tools:0,raw:0};
+    ['discoveryLogActivity','discoveryLogTools','discoveryLogRaw'].forEach(id=>{const box=document.getElementById(id);if(box)box.innerHTML='';});
+  }
+  const activity=items.filter(item=>discoveryLogCategory(item)==='activity');
+  const tools=items.filter(item=>discoveryLogCategory(item)==='tools');
+  discoveryLogSequences.activity=appendDiscoveryLogRows(document.getElementById('discoveryLogActivity'),activity,discoveryLogSequences.activity);
+  discoveryLogSequences.tools=appendDiscoveryLogRows(document.getElementById('discoveryLogTools'),tools,discoveryLogSequences.tools);
+  discoveryLogSequences.raw=appendDiscoveryLogRows(document.getElementById('discoveryLogRaw'),items,discoveryLogSequences.raw,true);
+  setDiscoveryLogTab(activeDiscoveryLogTab);
 }
 
 function safeRenderDiscoveryJobLogs(logs){
@@ -3823,7 +3809,7 @@ async function startDiscovery(){
   const status=document.getElementById('discoveryStatus');
   if(discoveryPollTimer){clearTimeout(discoveryPollTimer);discoveryPollTimer=null;}
   currentDiscoveryJobId=null;
-  lastDiscoveryLogsFingerprint='';
+  discoveryLogSequences={jobId:null,activity:0,tools:0,raw:0};
   safeRenderDiscoveryJobLogs([{ts:new Date().toISOString(),level:'info',message:t('discoverySubmitting')}]);
   setButtonBusy(btn,true,t('discoveryRunning'));
   cancelBtn.disabled=true;
@@ -5124,7 +5110,6 @@ setWorkflowTab(localStorage.getItem('workflowTab')||'single',false);
 setLanguage(localStorage.getItem('uiLanguage')||'en');
 toggleDiscoverySourceControls();
 setDiscoveryRuntime('workflow');
-toggleDiscoveryAgentBudgetMode();
 toggleDiscoveryGoalControls();
 toggleAiReadySource();
 loadConfig();

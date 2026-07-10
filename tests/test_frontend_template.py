@@ -136,7 +136,9 @@ def test_frontend_template_exposes_discovery_workflow():
 
     assert 'id="discoveryStartBtn"' in html
     assert 'id="discoveryCancelBtn"' in html
-    assert 'id="discoveryLogBox"' in html
+    assert 'id="discoveryLogActivity"' in html
+    assert 'id="discoveryLogTools"' in html
+    assert 'id="discoveryLogRaw"' in html
     assert 'for="discoverySpecies"' in html
     assert 'for="discoveryMaxProjects"' in html
     assert 'id="discoveryUseMemory"' in html
@@ -148,23 +150,16 @@ def test_frontend_template_exposes_discovery_workflow():
     assert 'id="discoveryRuntimeAgent"' in html
     assert "setDiscoveryRuntime('openai_agents')" in html
     assert 'id="discoveryAgentControls" hidden' in html
-    assert 'id="discoveryAgentBudgetMode"' in html
-    assert '<option value="auto"' in html
-    assert '<option value="custom"' in html
-    assert 'id="discoveryAgentBudgetAdvanced"' in html
-    assert 'id="discoveryAgentMaxRounds"' in html
-    assert 'id="discoveryAgentMaxTurns"' in html
-    assert 'id="discoveryAgentMaxToolCalls"' in html
+    assert 'id="discoveryAgentBudgetAutonomous"' in html
     assert 'id="discoveryAgentCredentialStatus"' in html
     assert "discoveryAgentServerKeyReady" in html
     assert "discoveryAgentServerKeyNeeded" in html
     assert "discoveryAgentWebKeyReady" in html
     assert "runtime:currentDiscoveryRuntime" in html
-    assert "agent_budget_mode:document.getElementById('discoveryAgentBudgetMode').value" in html
-    assert "agent_max_rounds:discoveryInt('discoveryAgentMaxRounds',3)" in html
-    assert "agent_max_turns:discoveryInt('discoveryAgentMaxTurns',10)" in html
-    assert "agent_max_tool_calls:discoveryInt('discoveryAgentMaxToolCalls',16)" in html
-    assert "toggleDiscoveryAgentBudgetMode()" in html
+    assert "agent_budget_mode:" not in html
+    assert "agent_max_rounds:" not in html
+    assert "agent_max_turns:" not in html
+    assert "agent_max_tool_calls:" not in html
     assert "state==='completed_with_review'?'needs_review'" in html
     assert "llm_config:collectConfig()" in html
     assert 'id="discoveryAgentResult"' in html
@@ -172,6 +167,7 @@ def test_frontend_template_exposes_discovery_workflow():
     assert "agents_discovery_report_md" in html
     assert "agents_discovery_events_json" in html
     assert "agents_discovery_summary_json" in html
+    assert "agents_discovery_budget_json" in html
     assert 'id="discoveryPrompt"' in html
     assert 'id="discoveryResults"' in html
     assert "startDiscovery()" in html
@@ -179,8 +175,9 @@ def test_frontend_template_exposes_discovery_workflow():
     assert "cancelDiscoveryJob()" in html
     assert "renderDiscoveryJobLogs" in html
     assert "safeRenderDiscoveryJobLogs" in html
-    assert "lastDiscoveryLogsFingerprint" in html
-    assert "if(fingerprint===lastDiscoveryLogsFingerprint)return;" in html
+    assert "appendDiscoveryLogRows" in html
+    assert "discoveryLogSequences" in html
+    assert "lastDiscoveryLogsFingerprint" not in html
     assert "const shouldFollow=box.scrollHeight-box.scrollTop-box.clientHeight<=16;" in html
     assert "discoverySubmitting" in html
     assert "正在提交 Discovery 请求" in html

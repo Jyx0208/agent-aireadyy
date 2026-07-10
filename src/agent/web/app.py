@@ -42,7 +42,7 @@ from agent.ai_ready.model_informed_discovery import (
 from agent.ai_ready.model_loop import run_dataset_model_loop
 from agent.ai_ready.real_smoke import run_ai_ready_real_smoke
 from agent.ai_ready.validation import validate_ai_ready_build
-from agent.control_plane.models import AgentBudget
+from agent.control_plane.models import AgentBudget, AgentEvent, DynamicBudgetLimits
 from agent.control_plane.openai_agents import run_openai_agents_discovery
 from agent.discovery.agentic import OpenAICompatibleDiscoveryLLM, default_agentic_discovery_planner, default_discovery_llm_client
 from agent.discovery.agentic_runner import run_agentic_discovery
@@ -157,6 +157,7 @@ _DISCOVERY_DOWNLOAD_FILES = {
     "agents_discovery_summary_json": ("agents_discovery_summary.json", "application/json"),
     "agents_discovery_events_json": ("agents_discovery_events.json", "application/json"),
     "agents_discovery_report_md": ("agents_discovery_report.md", "text/markdown"),
+    "agents_discovery_budget_json": ("agents_discovery_budget.json", "application/json"),
 }
 _AI_READY_DOWNLOAD_FILES = {
     "input_profile_json": ("ai_ready_input_profile.json", "application/json"),
@@ -1126,58 +1127,30 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int
     return max(minimum, min(parsed, maximum))
 
 
-_AGENT_BUDGET_PRESETS: dict[str, AgentBudget] = {
-    "fast": AgentBudget(max_discovery_rounds=1, max_turns=5, max_tool_calls=6),
-    "standard": AgentBudget(max_discovery_rounds=3, max_turns=10, max_tool_calls=16),
-    "deep": AgentBudget(max_discovery_rounds=5, max_turns=18, max_tool_calls=30),
-}
-
-
-def _agent_budget_for_discovery(
+def _agent_discovery_configuration(
     body: dict[str, Any],
-    request: DatasetRequest,
-    task_type: str | None,
-) -> tuple[str, str, AgentBudget]:
-    raw_mode = _clean_text(body.get("agent_budget_mode")).lower()
-    has_legacy_limits = any(
-        key in body for key in ("agent_max_rounds", "agent_max_turns", "agent_max_tool_calls")
+) -> tuple[str, AgentBudget, DynamicBudgetLimits]:
+    mode = _clean_text(os.getenv("AGENT_DISCOVERY_MODE") or "single_agent").lower()
+    if mode not in {"single_agent", "multi_agent"}:
+        mode = "single_agent"
+    budget = AgentBudget(
+        max_turns=_bounded_int(os.getenv("AGENT_MAX_MODEL_TURNS"), default=50, minimum=1, maximum=50),
+        max_tool_calls=_bounded_int(os.getenv("AGENT_MAX_TOOL_CALLS"), default=100, minimum=1, maximum=100),
+        max_discovery_rounds=3,
     )
-    mode = raw_mode or ("custom" if has_legacy_limits else "auto")
-    if mode not in {"auto", "fast", "standard", "deep", "custom"}:
-        mode = "auto"
-    if mode == "custom":
-        return (
-            mode,
-            mode,
-            AgentBudget(
-                max_turns=_bounded_int(body.get("agent_max_turns"), default=10, minimum=2, maximum=50),
-                max_tool_calls=_bounded_int(body.get("agent_max_tool_calls"), default=16, minimum=1, maximum=100),
-                max_discovery_rounds=_bounded_int(body.get("agent_max_rounds"), default=3, minimum=1, maximum=8),
-            ),
-        )
-    if mode != "auto":
-        return mode, mode, _AGENT_BUDGET_PRESETS[mode].model_copy(deep=True)
-
-    complexity = 0
-    if request.goal != "general":
-        complexity += 2
-    if request.species_policy in {"include_only", "exclude"}:
-        complexity += 1
-    if task_type:
-        complexity += 1
-    if request.ptm_types or request.hla_alleles or request.hla_class:
-        complexity += 2
-    if request.repository == "auto":
-        complexity += 1
-    if request.max_projects >= 10 or request.max_files >= 100:
-        complexity += 1
-    if complexity >= 4:
-        profile = "deep"
-    elif complexity == 0 and request.max_projects <= 3 and request.max_files <= 20:
-        profile = "fast"
-    else:
-        profile = "standard"
-    return mode, profile, _AGENT_BUDGET_PRESETS[profile].model_copy(deep=True)
+    limits = DynamicBudgetLimits(
+        max_query_units=_bounded_int(os.getenv("AGENT_MAX_QUERY_UNITS"), default=30, minimum=1, maximum=500),
+        max_repository_requests=_bounded_int(
+            os.getenv("AGENT_MAX_REPOSITORY_REQUESTS"), default=200, minimum=1, maximum=5000
+        ),
+        max_elapsed_seconds=_bounded_int(
+            os.getenv("AGENT_MAX_ELAPSED_SECONDS"), default=1200, minimum=30, maximum=86400
+        ),
+        budget_agent_max_turns=_bounded_int(
+            os.getenv("AGENT_BUDGET_AGENT_MAX_TURNS"), default=3, minimum=2, maximum=10
+        ),
+    )
+    return mode, budget, limits
 
 
 def _clean_discovery_species(value: Any, *, default: list[str] | None = None) -> list[str]:
@@ -2163,6 +2136,7 @@ def _run_web_discovery(
     body: dict[str, Any],
     report: Callable[[str], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    agent_event_callback: Callable[[AgentEvent], None] | None = None,
 ) -> dict[str, Any]:
     def _report(message: str) -> None:
         if report is not None:
@@ -2261,11 +2235,7 @@ def _run_web_discovery(
         )
         output_dir = _discovery_root_dir() / discovery_id
         normalized_task_type = normalize_task_type(task_type) if task_type else None
-        budget_mode, budget_profile, budget = _agent_budget_for_discovery(
-            body,
-            request,
-            normalized_task_type,
-        )
+        discovery_mode, budget, dynamic_limits = _agent_discovery_configuration(body)
 
         def _agent_discovery_func(
             discovery_request: DatasetRequest,
@@ -2285,8 +2255,7 @@ def _run_web_discovery(
             return observed
 
         _report(
-            "Reason: OpenAI Agents SDK is planning a bounded repository search "
-            f"with {budget_mode}/{budget_profile} budget."
+            "Reason: OpenAI Agents SDK is planning repository search within server safety ceilings."
         )
         result = run_openai_agents_discovery(
             prompt=prompt,
@@ -2296,9 +2265,12 @@ def _run_web_discovery(
             state_db=output_dir / "agent_control.sqlite",
             memory=prior_memory,
             budget=budget,
+            mode=discovery_mode,
+            dynamic_limits=dynamic_limits,
             run_id=discovery_id,
             discovery_func=_agent_discovery_func,
             llm_config=agent_llm_config,
+            event_callback=agent_event_callback,
             stream_events=True,
         )
         _check_cancel()
@@ -2314,6 +2286,8 @@ def _run_web_discovery(
             raise RuntimeError("OpenAI Agents discovery finished without a persisted dataset manifest.")
         manifest = DatasetManifest.model_validate(json.loads(manifest_path.read_text(encoding="utf-8")))
         control_summary = _read_json_if_exists(output_dir / "agents_discovery_summary.json")
+        dynamic_usage = control_summary.get("dynamic_usage") or {}
+        budget_audit = control_summary.get("budget_audit") or {}
         save_memory = body.get("save_memory", True) is not False
         agent_summary = {
             "runtime": "openai_agents",
@@ -2327,9 +2301,15 @@ def _run_web_discovery(
             "blockers": list(result.blockers),
             "selected_round_index": result.selected_round_index,
             "selection_rationale": result.selection_rationale,
-            "budget_mode": budget_mode,
-            "budget_profile": budget_profile,
+            "mode": discovery_mode,
             "budget": budget.model_dump(mode="json"),
+            "dynamic_limits": dynamic_limits.model_dump(mode="json"),
+            "query_units": int(dynamic_usage.get("query_units") or 0),
+            "repository_requests": int(dynamic_usage.get("repository_requests") or 0),
+            "search_batches": int(dynamic_usage.get("search_batches") or 0),
+            "budget_reviews": int(dynamic_usage.get("budget_reviews") or 0),
+            "pooled_selected_files": int(manifest.summary.get("selected_files") or len(manifest.files)),
+            "hard_limits_reached": bool(budget_audit.get("hard_limits_reached")),
         }
         summary = {
             **manifest.summary,
@@ -5551,7 +5531,95 @@ def _append_discovery_job_log(job_id: str, level: str, message: str) -> None:
         if not job:
             return
         logs = job.setdefault("logs", [])
-        logs.append({"ts": _now_app_iso(), "level": level, "message": _redact_secrets(str(message))})
+        sequence = max((int(item.get("sequence") or 0) for item in logs if isinstance(item, dict)), default=0) + 1
+        logs.append(
+            {
+                "sequence": sequence,
+                "ts": _now_app_iso(),
+                "level": level,
+                "actor": "Discovery Agent",
+                "type": "job_message",
+                "message": _redact_secrets(str(message)),
+                "reasoning_summary": "",
+                "evidence_refs": [],
+                "metrics": {},
+                "payload": {},
+            }
+        )
+        if len(logs) > _MAX_PERSISTED_LOGS:
+            del logs[: len(logs) - _MAX_PERSISTED_LOGS]
+        _persist_discovery_job(job)
+
+
+def _event_actor(event_type: str) -> str:
+    if event_type.startswith("budget_"):
+        return "Budget Agent"
+    if "grant" in event_type or event_type == "dynamic_search_stopped":
+        return "BudgetGovernor"
+    if event_type.startswith("sdk_"):
+        return "OpenAI Agents SDK"
+    if event_type.startswith("tool_") or event_type == "repository_request_started":
+        return "Repository tool"
+    return "Discovery Agent"
+
+
+def _event_level(event_type: str) -> str:
+    if "invalid" in event_type or "rejected" in event_type or "failed" in event_type:
+        return "warning"
+    return "info"
+
+
+def _event_message(event: AgentEvent) -> str:
+    payload = event.payload
+    return _redact_secrets(
+        str(
+            payload.get("reasoning_summary")
+            or payload.get("reason")
+            or payload.get("message")
+            or event.event_type.replace("_", " ")
+        )
+    )
+
+
+def _sanitize_log_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize_log_payload(item)
+            for key, item in value.items()
+            if str(key).casefold() not in {"api_key", "authorization", "sdk_state_json"}
+        }
+    if isinstance(value, list):
+        return [_sanitize_log_payload(item) for item in value]
+    if isinstance(value, str):
+        return _redact_secrets(value)
+    return _json_safe(value)
+
+
+def _append_discovery_job_event(job_id: str, event: AgentEvent) -> None:
+    entry = {
+        "source_sequence": event.sequence,
+        "ts": event.created_at,
+        "level": _event_level(event.event_type),
+        "actor": _event_actor(event.event_type),
+        "type": event.event_type,
+        "message": _event_message(event),
+        "reasoning_summary": _redact_secrets(str(event.payload.get("reasoning_summary") or "")),
+        "evidence_refs": _sanitize_log_payload(event.payload.get("evidence_refs") or []),
+        "metrics": _sanitize_log_payload(
+            event.payload if event.event_type == "round_value_evaluated" else event.payload.get("metrics") or {}
+        ),
+        "payload": _sanitize_log_payload(event.payload),
+    }
+    with _discovery_jobs_lock:
+        job = _discovery_jobs.get(job_id)
+        if not job:
+            return
+        logs = job.setdefault("logs", [])
+        entry["sequence"] = max(
+            (int(item.get("sequence") or 0) for item in logs if isinstance(item, dict)),
+            default=0,
+        ) + 1
+        logs.append(entry)
         if len(logs) > _MAX_PERSISTED_LOGS:
             del logs[: len(logs) - _MAX_PERSISTED_LOGS]
         _persist_discovery_job(job)
@@ -5585,7 +5653,12 @@ def _run_discovery_job(job_id: str) -> None:
     try:
         if should_cancel():
             raise InterruptedError("Discovery cancelled.")
-        record = _run_web_discovery(body, report=report, should_cancel=should_cancel)
+        record = _run_web_discovery(
+            body,
+            report=report,
+            should_cancel=should_cancel,
+            agent_event_callback=lambda event: _append_discovery_job_event(job_id, event),
+        )
         with _discovery_jobs_lock:
             job = _discovery_jobs.get(job_id)
             if not job:

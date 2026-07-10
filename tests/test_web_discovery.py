@@ -7,7 +7,7 @@ from pathlib import Path
 
 import agent.web.app as web_app
 from fastapi import BackgroundTasks
-from agent.control_plane.models import OpenAIAgentsDiscoveryResult
+from agent.control_plane.models import AgentEvent, OpenAIAgentsDiscoveryResult
 from agent.discovery.agentic import AgenticDiscoveryPlanner
 from agent.discovery.memory import DiscoveryMemory
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
@@ -68,6 +68,40 @@ def _manifest(request: DatasetRequest) -> DatasetManifest:
             "validity_reason_counts": {"strong_ptm_evidence": 1},
         },
     )
+
+
+def test_discovery_job_event_is_structured_and_recursively_sanitized(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    job_id = "structured_event"
+    with web_app._discovery_jobs_lock:
+        web_app._discovery_jobs[job_id] = {"job_id": job_id, "status": "running", "logs": []}
+    try:
+        web_app._append_discovery_job_event(
+            job_id,
+            AgentEvent(
+                sequence=7,
+                run_id="run_1",
+                event_type="budget_decision_recorded",
+                created_at="2026-07-10T19:55:00+08:00",
+                payload={
+                    "reasoning_summary": "Use measured metadata gap",
+                    "api_key": "sk-secret-value",
+                    "nested": {"authorization": "Bearer secret", "message": "sk-hidden-value"},
+                },
+            ),
+        )
+        entry = web_app._discovery_jobs[job_id]["logs"][0]
+        serialized = json.dumps(entry)
+        assert entry["actor"] == "Budget Agent"
+        assert entry["type"] == "budget_decision_recorded"
+        assert entry["source_sequence"] == 7
+        assert "api_key" not in serialized
+        assert "authorization" not in serialized
+        assert "sk-secret" not in serialized
+        assert "sk-hidden" not in serialized
+    finally:
+        with web_app._discovery_jobs_lock:
+            web_app._discovery_jobs.pop(job_id, None)
 
 
 class _FakeDiscoveryLLM:
@@ -695,47 +729,25 @@ def test_web_discovery_agentic_falls_back_without_llm_planner(monkeypatch, tmp_p
     assert "agentic_plan" not in created["downloads"]
 
 
-def test_web_agent_budget_profiles_are_automatic_but_keep_legacy_custom_limits():
-    fast_mode, fast_profile, fast_budget = web_app._agent_budget_for_discovery(
-        {"agent_budget_mode": "auto"},
-        DatasetRequest(repository="pride", max_projects=2, max_files=10),
-        None,
+def test_web_agent_uses_server_dynamic_limits_not_request_presets(monkeypatch):
+    monkeypatch.setenv("AGENT_DISCOVERY_MODE", "multi_agent")
+    monkeypatch.setenv("AGENT_MAX_MODEL_TURNS", "50")
+    monkeypatch.setenv("AGENT_MAX_TOOL_CALLS", "100")
+    monkeypatch.setenv("AGENT_MAX_QUERY_UNITS", "24")
+    monkeypatch.setenv("AGENT_MAX_REPOSITORY_REQUESTS", "120")
+    mode, budget, limits = web_app._agent_discovery_configuration(
+        {"agent_budget_mode": "deep", "agent_max_rounds": 8}
     )
-    assert (fast_mode, fast_profile) == ("auto", "fast")
-    assert fast_budget.max_discovery_rounds == 1
-
-    auto_mode, auto_profile, auto_budget = web_app._agent_budget_for_discovery(
-        {"agent_budget_mode": "auto"},
-        DatasetRequest(
-            repository="pride",
-            goal="ptm",
-            ptm_type="phospho",
-            ptm_types=["phospho"],
-            species=["human"],
-            species_policy="include_only",
-        ),
-        "rt_prediction",
-    )
-    assert (auto_mode, auto_profile) == ("auto", "deep")
-    assert auto_budget.max_discovery_rounds == 5
-
-    custom_mode, custom_profile, custom_budget = web_app._agent_budget_for_discovery(
-        {"agent_max_rounds": 2, "agent_max_turns": 9, "agent_max_tool_calls": 7},
-        DatasetRequest(repository="pride"),
-        None,
-    )
-    assert (custom_mode, custom_profile) == ("custom", "custom")
-    assert custom_budget.model_dump() == {
-        "max_turns": 9,
-        "max_tool_calls": 7,
-        "max_discovery_rounds": 2,
-        "max_expensive_actions": 0,
-        "max_download_bytes": 0,
-    }
+    assert mode == "multi_agent"
+    assert budget.max_turns == 50
+    assert budget.max_tool_calls == 100
+    assert limits.max_query_units == 24
+    assert limits.max_repository_requests == 120
 
 
 def test_web_discovery_openai_agents_runtime_reuses_existing_result_contract(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setenv("AGENT_DISCOVERY_MODE", "multi_agent")
     captured: dict[str, object] = {}
 
     def fake_run_openai_agents_discovery(**kwargs) -> OpenAIAgentsDiscoveryResult:
@@ -746,9 +758,11 @@ def test_web_discovery_openai_agents_runtime_reuses_existing_result_contract(mon
         summary_path = output_dir / "agents_discovery_summary.json"
         events_path = output_dir / "agents_discovery_events.json"
         report_path = output_dir / "agents_discovery_report.md"
-        summary_path.write_text('{"tool_call_count":2,"stop_reason":"manifest_selected"}', encoding="utf-8")
+        budget_path = output_dir / "agents_discovery_budget.json"
+        summary_path.write_text('{"tool_call_count":2,"stop_reason":"manifest_selected","dynamic_usage":{"query_units":1,"repository_requests":3,"search_batches":1,"budget_reviews":1},"budget_audit":{"hard_limits_reached":false}}', encoding="utf-8")
         events_path.write_text("[]", encoding="utf-8")
         report_path.write_text("# Agent report\n", encoding="utf-8")
+        budget_path.write_text('{"mode":"multi_agent_dynamic"}', encoding="utf-8")
         return OpenAIAgentsDiscoveryResult(
             status="completed",
             run_id=str(kwargs["run_id"]),
@@ -764,6 +778,7 @@ def test_web_discovery_openai_agents_runtime_reuses_existing_result_contract(mon
                 "agents_discovery_summary_json": str(summary_path),
                 "agents_discovery_events_json": str(events_path),
                 "agents_discovery_report_md": str(report_path),
+                "agents_discovery_budget_json": str(budget_path),
             },
         )
 
@@ -795,18 +810,21 @@ def test_web_discovery_openai_agents_runtime_reuses_existing_result_contract(mon
     assert created["file_count"] == 1
     assert created["agent"]["status"] == "completed"
     assert created["agent"]["tool_calls"] == 2
-    assert created["agent"]["budget_mode"] == "custom"
-    assert created["agent"]["budget_profile"] == "custom"
+    assert created["agent"]["mode"] == "multi_agent"
+    assert created["agent"]["query_units"] == 1
+    assert created["agent"]["repository_requests"] == 3
     assert created["agent"]["selected_round_index"] == 0
     assert created["agent"]["selection_rationale"] == "The merged candidate pool is the strongest manifest."
     assert created["summary"]["agent_runtime"]["final_output"] == "Accepted the persisted manifest."
     assert "agents_discovery_summary_json" in created["downloads"]
     assert "agents_discovery_events_json" in created["downloads"]
     assert "agents_discovery_report_md" in created["downloads"]
+    assert "agents_discovery_budget_json" in created["downloads"]
     assert captured["task_type"] == "rt_prediction"
-    assert captured["budget"].max_discovery_rounds == 2
-    assert captured["budget"].max_turns == 9
-    assert captured["budget"].max_tool_calls == 7
+    assert captured["mode"] == "multi_agent"
+    assert captured["budget"].max_turns == 50
+    assert captured["budget"].max_tool_calls == 100
+    assert captured["dynamic_limits"].max_query_units == 30
     assert captured["llm_config"] == {
         "api_key": "temporary-web-key",
         "base_url": "https://example.test/v1",
