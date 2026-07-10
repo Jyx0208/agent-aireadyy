@@ -3,10 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from agent.control_plane.models import AgentEvent, AgentRunRecord, ToolExecutionRecord, utc_now_iso
+from agent.control_plane.models import (
+    AgentEvent,
+    AgentRunRecord,
+    BudgetDecision,
+    SearchGrant,
+    SearchProposalRecord,
+    ToolExecutionRecord,
+    utc_now_iso,
+)
 
 
 def canonical_json(payload: Any) -> str:
@@ -67,6 +76,38 @@ class AgentRunStore:
                     FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_run ON agent_tool_calls(run_id, created_at);
+                CREATE TABLE IF NOT EXISTS agent_search_proposals (
+                    proposal_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    query_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_search_proposals_run
+                ON agent_search_proposals(run_id, created_at);
+                CREATE TABLE IF NOT EXISTS agent_budget_decisions (
+                    proposal_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES agent_runs(run_id),
+                    FOREIGN KEY(proposal_id) REFERENCES agent_search_proposals(proposal_id)
+                );
+                CREATE TABLE IF NOT EXISTS agent_search_grants (
+                    grant_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    proposal_id TEXT NOT NULL,
+                    query_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES agent_runs(run_id),
+                    FOREIGN KEY(proposal_id) REFERENCES agent_search_proposals(proposal_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_search_grants_run
+                ON agent_search_grants(run_id, created_at);
                 """
             )
 
@@ -230,6 +271,249 @@ class AgentRunStore:
             raise KeyError(f"Unknown agent run: {run_id}")
         return self.save_run(run.model_copy(update={"sdk_state_json": sdk_state_json}))
 
+    def save_search_proposal(self, proposal: SearchProposalRecord) -> SearchProposalRecord:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO agent_search_proposals (
+                    proposal_id, run_id, query_hash, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(proposal_id) DO UPDATE SET
+                    run_id = excluded.run_id,
+                    query_hash = excluded.query_hash,
+                    payload_json = excluded.payload_json,
+                    created_at = excluded.created_at
+                """,
+                (
+                    proposal.proposal_id,
+                    proposal.run_id,
+                    proposal.query_hash,
+                    canonical_json(proposal.model_dump(mode="json")),
+                    proposal.created_at,
+                ),
+            )
+        return proposal
+
+    def load_search_proposal(self, proposal_id: str) -> SearchProposalRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM agent_search_proposals WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SearchProposalRecord.model_validate(json.loads(row["payload_json"]))
+
+    def list_search_proposals(self, run_id: str) -> list[SearchProposalRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload_json FROM agent_search_proposals
+                WHERE run_id = ? ORDER BY created_at, proposal_id
+                """,
+                (run_id,),
+            ).fetchall()
+        return [SearchProposalRecord.model_validate(json.loads(row["payload_json"])) for row in rows]
+
+    def save_budget_decision(self, run_id: str, decision: BudgetDecision) -> BudgetDecision:
+        created_at = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO agent_budget_decisions (proposal_id, run_id, payload_json, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(proposal_id) DO UPDATE SET
+                    run_id = excluded.run_id,
+                    payload_json = excluded.payload_json,
+                    created_at = excluded.created_at
+                """,
+                (
+                    decision.proposal_id,
+                    run_id,
+                    canonical_json(decision.model_dump(mode="json")),
+                    created_at,
+                ),
+            )
+        return decision
+
+    def load_budget_decision(self, proposal_id: str) -> BudgetDecision | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM agent_budget_decisions WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return BudgetDecision.model_validate(json.loads(row["payload_json"]))
+
+    def issue_search_grant(self, grant: SearchGrant) -> SearchGrant:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO agent_search_grants (
+                    grant_id, run_id, proposal_id, query_hash, status, payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(grant_id) DO NOTHING
+                """,
+                (
+                    grant.grant_id,
+                    grant.run_id,
+                    grant.proposal_id,
+                    grant.query_hash,
+                    grant.status,
+                    canonical_json(grant.model_dump(mode="json")),
+                    grant.created_at,
+                    grant.updated_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT payload_json FROM agent_search_grants WHERE grant_id = ?",
+                (grant.grant_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("search_grant_not_persisted")
+        return SearchGrant.model_validate(json.loads(row["payload_json"]))
+
+    def load_search_grant(self, grant_id: str) -> SearchGrant | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM agent_search_grants WHERE grant_id = ?",
+                (grant_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SearchGrant.model_validate(json.loads(row["payload_json"]))
+
+    def consume_search_grant(self, run_id: str, grant_id: str, query_hash: str) -> SearchGrant:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload_json, status, run_id, query_hash FROM agent_search_grants WHERE grant_id = ?",
+                (grant_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("search_grant_not_found")
+            if str(row["run_id"]) != run_id:
+                raise ValueError("search_grant_run_mismatch")
+            if str(row["query_hash"]) != query_hash:
+                raise ValueError("search_grant_query_mismatch")
+            if str(row["status"]) != "issued":
+                raise ValueError(f"grant_already_{row['status']}")
+            grant = SearchGrant.model_validate(json.loads(row["payload_json"]))
+            consumed = grant.model_copy(update={"status": "consumed", "updated_at": utc_now_iso()})
+            connection.execute(
+                """
+                UPDATE agent_search_grants
+                SET status = ?, payload_json = ?, updated_at = ? WHERE grant_id = ?
+                """,
+                (
+                    consumed.status,
+                    canonical_json(consumed.model_dump(mode="json")),
+                    consumed.updated_at,
+                    grant_id,
+                ),
+            )
+            connection.commit()
+            return consumed
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def increment_dynamic_usage(
+        self,
+        run_id: str,
+        *,
+        query_units: int = 0,
+        repository_requests: int = 0,
+        search_batches: int = 0,
+        budget_reviews: int = 0,
+        enforce_limits: bool = True,
+    ) -> AgentRunRecord:
+        deltas = {
+            "query_units": query_units,
+            "repository_requests": repository_requests,
+            "search_batches": search_batches,
+            "budget_reviews": budget_reviews,
+        }
+        if any(delta < 0 for delta in deltas.values()):
+            raise ValueError("dynamic_usage_deltas_must_be_non_negative")
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload_json, sdk_state_json FROM agent_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown agent run: {run_id}")
+            run = self._run_record(row)
+            usage = run.dynamic_usage.model_copy(
+                update={field: getattr(run.dynamic_usage, field) + delta for field, delta in deltas.items()}
+            )
+            if enforce_limits:
+                limits = run.dynamic_limits
+                if usage.query_units > limits.max_query_units:
+                    raise ValueError("query_unit_budget_exhausted")
+                if usage.repository_requests > limits.max_repository_requests:
+                    raise ValueError("repository_request_budget_exhausted")
+                started_at = datetime.fromisoformat(usage.started_at)
+                if started_at.tzinfo is None:
+                    started_at = started_at.replace(tzinfo=UTC)
+                elapsed_seconds = (datetime.now(UTC) - started_at).total_seconds()
+                if elapsed_seconds > limits.max_elapsed_seconds:
+                    raise ValueError("elapsed_time_budget_exhausted")
+            updated = run.model_copy(update={"dynamic_usage": usage, "updated_at": utc_now_iso()})
+            connection.execute(
+                "UPDATE agent_runs SET payload_json = ?, updated_at = ? WHERE run_id = ?",
+                (
+                    canonical_json(updated.model_dump(mode="json", exclude={"sdk_state_json"})),
+                    updated.updated_at,
+                    run_id,
+                ),
+            )
+            connection.commit()
+            return updated
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def increment_tool_call_count(self, run_id: str) -> AgentRunRecord:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload_json, sdk_state_json FROM agent_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown agent run: {run_id}")
+            run = self._run_record(row)
+            next_count = run.tool_call_count + 1
+            if next_count > run.budget.max_tool_calls:
+                raise ValueError("tool_call_budget_exhausted")
+            updated = run.model_copy(update={"tool_call_count": next_count, "updated_at": utc_now_iso()})
+            connection.execute(
+                "UPDATE agent_runs SET payload_json = ?, updated_at = ? WHERE run_id = ?",
+                (
+                    canonical_json(updated.model_dump(mode="json", exclude={"sdk_state_json"})),
+                    updated.updated_at,
+                    run_id,
+                ),
+            )
+            connection.commit()
+            return updated
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     @staticmethod
     def _tool_record(row: sqlite3.Row) -> ToolExecutionRecord:
         return ToolExecutionRecord(
@@ -243,3 +527,9 @@ class AgentRunStore:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
         )
+
+    @staticmethod
+    def _run_record(row: sqlite3.Row) -> AgentRunRecord:
+        payload = json.loads(row["payload_json"])
+        payload["sdk_state_json"] = row["sdk_state_json"]
+        return AgentRunRecord.model_validate(payload)
