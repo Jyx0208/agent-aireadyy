@@ -5,7 +5,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agent.control_plane.models import (
     AgentEvent,
@@ -28,8 +28,13 @@ def tool_idempotency_key(run_id: str, tool_name: str, arguments: dict[str, Any])
 
 
 class AgentRunStore:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        event_listener: Callable[[AgentEvent], None] | None = None,
+    ) -> None:
         self.path = Path(path)
+        self.event_listener = event_listener
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
@@ -159,13 +164,23 @@ class AgentRunStore:
                 (run_id, event_type, canonical_json(payload or {}), created_at),
             )
             sequence = int(cursor.lastrowid)
-        return AgentEvent(
+        event = AgentEvent(
             sequence=sequence,
             run_id=run_id,
             event_type=event_type,
             payload=payload or {},
             created_at=created_at,
         )
+        self._notify_event(event)
+        return event
+
+    def _notify_event(self, event: AgentEvent) -> None:
+        if self.event_listener is None:
+            return
+        try:
+            self.event_listener(event)
+        except Exception:
+            return
 
     def list_events(self, run_id: str) -> list[AgentEvent]:
         with self._connect() as connection:

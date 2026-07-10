@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from agent.control_plane.budget_governor import BudgetGovernor
 from agent.control_plane.discovery import DiscoveryToolService
 from agent.control_plane.models import (
     AgentBudget,
+    AgentEvent,
     AgentRunRecord,
     BudgetDecision,
     DynamicBudgetLimits,
@@ -187,6 +189,50 @@ def test_agent_run_store_round_trips_events_and_idempotent_tool_calls(tmp_path: 
     assert cached.output == {"selected_files": 2}
     assert store.load_run(run.run_id) is not None
     assert [event.event_type for event in store.list_events(run.run_id)] == ["run_started"]
+
+
+def test_agent_store_listener_receives_committed_events(tmp_path: Path) -> None:
+    received: list[AgentEvent] = []
+    store = AgentRunStore(tmp_path / "state.sqlite", event_listener=received.append)
+    store.save_run(_run("listener_1"))
+    event = store.append_event("listener_1", "search_plan_proposed", {"reasoning_summary": "Plan"})
+    assert received == [event]
+
+
+def test_streamed_runner_persists_public_lifecycle_not_raw_deltas(tmp_path: Path) -> None:
+    from agent.control_plane.openai_agents import _run_streamed_to_completion
+
+    class AgentUpdatedStreamEvent:
+        new_agent = SimpleNamespace(name="Proteomics Discovery Agent")
+
+    class RawResponsesStreamEvent:
+        data = {"reasoning": "must not persist"}
+
+    class FakeStreamedResult:
+        async def stream_events(self):
+            yield AgentUpdatedStreamEvent()
+            yield RawResponsesStreamEvent()
+
+    class FakeRunner:
+        @staticmethod
+        def run_streamed(**kwargs: Any) -> FakeStreamedResult:
+            return FakeStreamedResult()
+
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    store.save_run(_run("stream_1"))
+    context = SimpleNamespace(service=SimpleNamespace(run_id="stream_1"))
+    asyncio.run(
+        _run_streamed_to_completion(
+            sdk={"Runner": FakeRunner},
+            store=store,
+            starting_agent=object(),
+            input="test",
+            context=context,
+        )
+    )
+    events = store.list_events("stream_1")
+    assert [event.event_type for event in events] == ["sdk_agent_updated"]
+    assert "reasoning" not in json.dumps(events[0].model_dump(mode="json"))
 
 
 def test_control_plane_policy_separates_safe_expensive_biological_and_forbidden_tools() -> None:
@@ -765,6 +811,11 @@ def test_openai_agents_runner_executes_multi_agent_budget_loop(monkeypatch, tmp_
     assert "budget_decision_recorded" in event_types
     assert "search_grant_consumed" in event_types
     assert "manifest_selected" in event_types
+    budget_path = Path(result.files["agents_discovery_budget_json"])
+    payload = json.loads(budget_path.read_text(encoding="utf-8"))
+    assert payload["mode"] == "multi_agent_dynamic"
+    assert payload["approved_queries"] == 1
+    assert payload["search_batches"] == 1
 
 
 def test_openai_agents_setup_failure_is_persisted(monkeypatch, tmp_path: Path) -> None:

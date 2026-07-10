@@ -714,6 +714,7 @@ def agents_discover_dataset_command(
                 max_tool_calls=max_tool_calls,
                 max_discovery_rounds=max_rounds,
             ),
+            stream_events=True,
         )
     except (OpenAIAgentsRuntimeUnavailable, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc

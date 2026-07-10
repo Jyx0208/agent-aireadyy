@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -153,7 +154,7 @@ def run_openai_agents_discovery(
     state_db = Path(state_db) if state_db is not None else output_dir / "agent_control.sqlite"
     run_id = run_id or _new_run_id()
     budget = budget or AgentBudget()
-    store = AgentRunStore(state_db)
+    store = AgentRunStore(state_db, event_listener=event_callback)
     if store.load_run(run_id) is not None:
         raise ValueError(f"Agent run already exists: {run_id}")
     run = store.save_run(
@@ -231,13 +232,19 @@ def run_openai_agents_discovery(
                 pre_approval_tool_input_guardrails=True,
             ),
         )
-        result = sdk["Runner"].run_sync(
-            starting_agent=agent,
-            input=_runner_input(prompt, request, task_type=task_type),
-            context=context,
-            max_turns=budget.max_turns,
-            run_config=run_config,
-        )
+        runner_kwargs = {
+            "starting_agent": agent,
+            "input": _runner_input(prompt, request, task_type=task_type),
+            "context": context,
+            "max_turns": budget.max_turns,
+            "run_config": run_config,
+        }
+        if stream_events:
+            result = asyncio.run(
+                _run_streamed_to_completion(sdk=sdk, store=store, **runner_kwargs)
+            )
+        else:
+            result = sdk["Runner"].run_sync(**runner_kwargs)
     except Exception as exc:
         run = store.load_run(run_id) or run
         run = store.save_run(
@@ -334,6 +341,44 @@ def run_openai_agents_discovery(
         blockers=run.blockers,
         files=files,
     )
+
+
+async def _run_streamed_to_completion(
+    *,
+    sdk: dict[str, Any],
+    store: AgentRunStore,
+    **kwargs: Any,
+) -> Any:
+    streamed = sdk["Runner"].run_streamed(**kwargs)
+    async for event in streamed.stream_events():
+        payload = _public_sdk_event(event)
+        if payload is not None:
+            store.append_event(
+                kwargs["context"].service.run_id,
+                payload["event_type"],
+                payload["payload"],
+            )
+    return streamed
+
+
+def _public_sdk_event(event: Any) -> dict[str, Any] | None:
+    event_name = type(event).__name__
+    if event_name == "AgentUpdatedStreamEvent":
+        agent = getattr(event, "new_agent", None)
+        return {
+            "event_type": "sdk_agent_updated",
+            "payload": {"agent": str(getattr(agent, "name", "") or "")},
+        }
+    if event_name == "RunItemStreamEvent":
+        item = getattr(event, "item", None)
+        return {
+            "event_type": "sdk_run_item",
+            "payload": {
+                "item_type": type(item).__name__,
+                "name": str(getattr(event, "name", "") or ""),
+            },
+        }
+    return None
 
 
 def _load_agents_sdk() -> dict[str, Any]:
@@ -512,21 +557,32 @@ def _write_run_outputs(
     summary_path = output_dir / "agents_discovery_summary.json"
     events_path = output_dir / "agents_discovery_events.json"
     report_path = output_dir / "agents_discovery_report.md"
+    budget_path = output_dir / "agents_discovery_budget.json"
     files = {
         "agents_discovery_summary_json": str(summary_path),
         "agents_discovery_events_json": str(events_path),
         "agents_discovery_report_md": str(report_path),
+        "agents_discovery_budget_json": str(budget_path),
         "agent_control_sqlite": str(store.path),
         **selected_files,
     }
+    budget_audit = _budget_audit(store, run)
     summary = {
-        "schema_version": "openai-agents-discovery/v1",
+        "schema_version": "openai-agents-discovery/v2",
         "status": run.status,
         "run_id": run.run_id,
         "runtime": run.runtime,
         "workflow": run.workflow,
         "request": run.request,
         "budget": run.budget.model_dump(mode="json"),
+        "agents": {
+            "discovery_manager": "Proteomics Discovery Agent",
+            "budget_agent": "Discovery Budget Agent" if run.dynamic_budget_enabled else None,
+        },
+        "dynamic_limits": run.dynamic_limits.model_dump(mode="json"),
+        "dynamic_usage": run.dynamic_usage.model_dump(mode="json"),
+        "latest_metrics": run.latest_metrics.model_dump(mode="json") if run.latest_metrics else None,
+        "budget_audit": budget_audit,
         "tool_call_count": run.tool_call_count,
         "discovery_round_count": run.discovery_round_count,
         "selected_manifest_path": run.current_manifest_path,
@@ -541,12 +597,13 @@ def _write_run_outputs(
         "files": files,
     }
     write_json(summary_path, summary)
+    write_json(budget_path, budget_audit)
     events = [event.model_dump(mode="json") for event in store.list_events(run.run_id)]
     write_json(events_path, events)
     report_path.write_text(_markdown_report(summary), encoding="utf-8")
     artifacts = dict(run.artifacts)
     artifacts["agents_discovery_summary"] = ArtifactReference(
-        path=str(summary_path), artifact_type="agent_summary", schema_version="openai-agents-discovery/v1"
+        path=str(summary_path), artifact_type="agent_summary", schema_version="openai-agents-discovery/v2"
     )
     artifacts["agents_discovery_events"] = ArtifactReference(
         path=str(events_path), artifact_type="agent_event_log", schema_version="agent-event/v1"
@@ -554,11 +611,40 @@ def _write_run_outputs(
     artifacts["agents_discovery_report"] = ArtifactReference(
         path=str(report_path), artifact_type="agent_report"
     )
+    artifacts["agents_discovery_budget"] = ArtifactReference(
+        path=str(budget_path), artifact_type="agent_budget_audit", schema_version="agent-budget/v1"
+    )
     store.save_run(run.model_copy(update={"artifacts": artifacts}))
     return files
 
 
+def _budget_audit(store: AgentRunStore, run: AgentRunRecord) -> dict[str, Any]:
+    proposals = store.list_search_proposals(run.run_id)
+    decisions = [
+        decision
+        for proposal in proposals
+        if (decision := store.load_budget_decision(proposal.proposal_id)) is not None
+    ]
+    grants = store.list_search_grants(run.run_id)
+    stop = next((decision for decision in reversed(decisions) if decision.decision == "stop"), None)
+    return {
+        "mode": "multi_agent_dynamic" if run.dynamic_budget_enabled else "single_agent_baseline",
+        "proposed_queries": sum(len(proposal.queries) for proposal in proposals),
+        "approved_queries": sum(grant.query_units for grant in grants),
+        "rejected_queries": sum(len(decision.rejected_query_indexes) for decision in decisions),
+        "query_units": run.dynamic_usage.query_units,
+        "repository_requests": run.dynamic_usage.repository_requests,
+        "search_batches": run.dynamic_usage.search_batches,
+        "budget_reviews": run.dynamic_usage.budget_reviews,
+        "stop_decision": stop.reasoning_summary if stop is not None else "",
+        "hard_limits_reached": bool(
+            run.search_stop_reason and str(run.search_stop_reason).startswith("hard_")
+        ),
+    }
+
+
 def _markdown_report(summary: dict[str, Any]) -> str:
+    audit = summary.get("budget_audit") or {}
     lines = [
         "# OpenAI Agents Discovery Report",
         "",
@@ -570,6 +656,29 @@ def _markdown_report(summary: dict[str, Any]) -> str:
         f"- Selected manifest: `{summary.get('selected_manifest_path') or ''}`",
         f"- Selected source: `{'candidate_pool' if summary.get('selected_round_index') == 0 else 'round_' + str(summary.get('selected_round_index')) if summary.get('selected_round_index') else 'none'}`",
         f"- Selection rationale: {summary.get('selection_rationale') or 'Not recorded.'}",
+        "",
+        "## Plan",
+        "",
+        f"- Proposed queries: {audit.get('proposed_queries', 0)}",
+        f"- Approved queries: {audit.get('approved_queries', 0)}",
+        f"- Rejected queries: {audit.get('rejected_queries', 0)}",
+        "",
+        "## Budget Decisions",
+        "",
+        f"- Reviews: {audit.get('budget_reviews', 0)}",
+        f"- Stop decision: {audit.get('stop_decision') or 'None'}",
+        f"- Hard limits reached: {bool(audit.get('hard_limits_reached'))}",
+        "",
+        "## Resource Use",
+        "",
+        f"- Query units: {audit.get('query_units', 0)}",
+        f"- Repository requests: {audit.get('repository_requests', 0)}",
+        f"- Search batches: {audit.get('search_batches', 0)}",
+        "",
+        "## Final Selection",
+        "",
+        f"- Manifest: `{summary.get('selected_manifest_path') or ''}`",
+        f"- Rationale: {summary.get('selection_rationale') or 'Not recorded.'}",
         "",
         "## Warnings And Blockers",
         "",

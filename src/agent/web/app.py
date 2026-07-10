@@ -2299,6 +2299,7 @@ def _run_web_discovery(
             run_id=discovery_id,
             discovery_func=_agent_discovery_func,
             llm_config=agent_llm_config,
+            stream_events=True,
         )
         _check_cancel()
         if result.status == "failed":
