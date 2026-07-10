@@ -470,7 +470,7 @@ class AgentRunStore:
                 if usage.query_units > limits.max_query_units:
                     raise ValueError("query_unit_budget_exhausted")
                 if usage.repository_requests > limits.max_repository_requests:
-                    raise ValueError("repository_request_budget_exhausted")
+                    raise ValueError("hard_repository_request_limit")
                 started_at = datetime.fromisoformat(usage.started_at)
                 if started_at.tzinfo is None:
                     started_at = started_at.replace(tzinfo=UTC)

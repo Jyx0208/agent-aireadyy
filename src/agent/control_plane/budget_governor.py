@@ -16,6 +16,10 @@ from agent.control_plane.policy import evaluate_tool_policy
 from agent.control_plane.store import AgentRunStore, canonical_json
 
 
+class RepositoryRequestBudgetExceeded(RuntimeError):
+    pass
+
+
 def canonicalize_queries(queries: list[str]) -> list[str]:
     if len(queries) > 40:
         raise ValueError("search_proposal_query_limit_exceeded")
@@ -113,6 +117,27 @@ class BudgetGovernor:
 
     def stop_for_hard_limit(self, reason: str) -> None:
         self._mark_search_stopped(reason)
+
+    def record_repository_request(self, repository: str, operation: str) -> None:
+        if self.elapsed_seconds() >= self._require_run().dynamic_limits.max_elapsed_seconds:
+            self.stop_for_hard_limit("hard_elapsed_time_limit")
+            raise RepositoryRequestBudgetExceeded("hard_elapsed_time_limit")
+        try:
+            usage = self.store.increment_dynamic_usage(self.run_id, repository_requests=1)
+        except ValueError as exc:
+            if str(exc) != "hard_repository_request_limit":
+                raise
+            self.stop_for_hard_limit("hard_repository_request_limit")
+            raise RepositoryRequestBudgetExceeded("hard_repository_request_limit") from exc
+        self.store.append_event(
+            self.run_id,
+            "repository_request_started",
+            {
+                "repository": repository,
+                "operation": operation,
+                "repository_requests": usage.dynamic_usage.repository_requests,
+            },
+        )
 
     def elapsed_seconds(self) -> float:
         return elapsed_seconds_since(self._require_run().dynamic_usage.started_at)
