@@ -1,6 +1,6 @@
 # AI-ready Data Agent 项目交接文档
 
-更新时间：2026-06-26
+更新时间：2026-07-10
 
 ## 1. 项目当前定位
 
@@ -896,6 +896,75 @@ src/agent/discovery/
 src/agent/ai_ready/
 ```
 
-## 15. 一句话总结
+## 15. 动态双 Agent Discovery（实验性、默认关闭）
+
+当前 OpenAI Agents SDK 路径已经从固定轮数的单 Agent Discovery 扩展为可选的双 Agent 控制平面，运行时固定使用 `openai-agents==0.18.1`，没有引入 LangGraph。
+
+```text
+Discovery Manager
+-> 根据当前证据提出 SearchProposal
+-> 调用 Budget Agent 评估边际价值
+-> Budget Agent 返回 grant / shrink / replan / stop
+-> 确定性 BudgetGovernor 校验硬上限并签发一次性 SearchGrant
+-> Discovery Manager 使用授权查询仓库
+-> 更新观测、继续提案或选择最终 manifest
+```
+
+Discovery Manager 负责搜索目标、候选查询、观测解释和最终 manifest；Budget Agent 只负责审查增量搜索是否值得继续，不能自行改写或执行查询。每个授权都绑定批准后的 query 哈希且只能消费一次，实际 PRIDE、MassIVE、iProX HTTP 请求在发出前计量，分页和重试也会占用请求上限。
+
+### 15.1 发布配置
+
+该能力采用 opt-in 发布，部署默认仍为：
+
+```text
+AGENT_DISCOVERY_MODE=single_agent
+```
+
+启用双 Agent 时设置 `AGENT_DISCOVERY_MODE=multi_agent`。以下值由服务器配置，是不可突破的安全上限，不要求 Web 用户提前设计搜索轮数：
+
+```text
+AGENT_MAX_MODEL_TURNS=50
+AGENT_MAX_TOOL_CALLS=100
+AGENT_MAX_QUERY_UNITS=30
+AGENT_MAX_REPOSITORY_REQUESTS=200
+AGENT_MAX_ELAPSED_SECONDS=1200
+AGENT_BUDGET_AGENT_MAX_TURNS=3
+```
+
+旧 CLI 参数 `--max-rounds`、`--max-turns`、`--max-tool-calls` 保持兼容。`--max-rounds` 只控制 `single_agent`，在 `multi_agent` 中不参与动态搜索分配；模型回合和工具调用仍作为总安全上限。
+
+### 15.2 Web 和模型配置
+
+Web 选择 `Dataset discovery -> Execution -> OpenAI Agent` 后，搜索预算由 Agent 在服务器硬上限内动态决定。日志分为活动、工具、原始事件三个视图，展示可审计的证据摘要、工具结果、预算决策、计数器和停止原因。这里的“推理”是面向用户的公开证据摘要，不是模型隐藏思维链；原始 reasoning delta 会被丢弃。
+
+Discovery Manager 与 Budget Agent 默认共享同一个 OpenAI-compatible 模型配置，可直接使用现有 DeepSeek-compatible 配置：
+
+```text
+AGENT_LLM_API_KEY
+AGENT_LLM_BASE_URL
+AGENT_LLM_MODEL
+```
+
+浏览器临时填写的 key 仅用于该次请求，不写入结果、日志、下载文件或持久化 job 状态。Agents SDK tracing 默认关闭。
+
+### 15.3 审计产物和当前边界
+
+每次 Agent Discovery 主要生成：
+
+```text
+agent_control.sqlite
+agents_discovery_summary.json
+agents_discovery_events.json
+agents_discovery_report.md
+agents_discovery_budget.json
+round_*/dataset_manifest.json
+dataset_manifest.json
+```
+
+该路径仍只负责发现与选择，不会下载文件、运行 shell、启动完整搜索工作流、训练模型或绕过生物学约束。正式切换默认值前，应完成固定 replay、与单 Agent/legacy 路径的 shadow comparison，以及真实 DeepSeek 小规模 smoke；因此当前应描述为“可测试的实验性多 Agent Discovery”，不能单独据此宣称整个项目已达到无人值守生产发行标准。
+
+详细设计和命令见 `docs/openai-agents-control-plane.md`。
+
+## 16. 一句话总结
 
 AI-ready Data Agent 当前已经完成“通用数据发现 -> 任务适配与数据价值判断 -> Batch/full/partial evidence -> AI-ready 训练表 -> recipe/split/leakage/hard benchmark/curation -> model-loop smoke”的小中规模真实数据闭环；下一阶段应重点推进真实模型训练 adapter、多库真实项目验证、RAW/WIFF 兼容和更稳定的复现包。

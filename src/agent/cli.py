@@ -40,7 +40,7 @@ from agent.ai_ready.validation import validate_ai_ready_build as write_ai_ready_
 from agent.agent_core.recovery_report import analyze_agent_recovery
 from agent.agent_core.harness import run_agent_harness
 from agent.assets.preparer import AssetPreparationError
-from agent.control_plane.models import AgentBudget
+from agent.control_plane.models import AgentBudget, DynamicBudgetLimits
 from agent.control_plane.openai_agents import (
     OpenAIAgentsRuntimeUnavailable,
     run_openai_agents_discovery,
@@ -674,6 +674,11 @@ def agents_discover_dataset_command(
     max_rounds: int = typer.Option(3, "--max-rounds", min=1, max=8, help="Maximum repository-search rounds."),
     max_turns: int = typer.Option(8, "--max-turns", min=1, max=50, help="Maximum Agents SDK turns."),
     max_tool_calls: int = typer.Option(12, "--max-tool-calls", min=1, max=100),
+    discovery_mode: str = typer.Option("single_agent", "--discovery-mode", help="Agent mode: single_agent or multi_agent."),
+    max_query_units: int = typer.Option(30, "--max-query-units", min=1, max=500),
+    max_repository_requests: int = typer.Option(200, "--max-repository-requests", min=1, max=5000),
+    max_elapsed_seconds: int = typer.Option(1200, "--max-elapsed-seconds", min=30, max=86400),
+    budget_agent_max_turns: int = typer.Option(3, "--budget-agent-max-turns", min=2, max=10),
     state_db: Path | None = typer.Option(None, "--state-db", help="Optional SQLite control-plane database."),
     use_memory: bool = typer.Option(True, "--use-memory/--no-use-memory"),
     memory_dir: Path = typer.Option(Path("runs") / "discovery_memory", "--memory-dir"),
@@ -713,6 +718,13 @@ def agents_discover_dataset_command(
                 max_turns=max_turns,
                 max_tool_calls=max_tool_calls,
                 max_discovery_rounds=max_rounds,
+            ),
+            mode=discovery_mode,
+            dynamic_limits=DynamicBudgetLimits(
+                max_query_units=max_query_units,
+                max_repository_requests=max_repository_requests,
+                max_elapsed_seconds=max_elapsed_seconds,
+                budget_agent_max_turns=budget_agent_max_turns,
             ),
             stream_events=True,
         )

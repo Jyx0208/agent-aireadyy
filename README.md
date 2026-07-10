@@ -94,29 +94,44 @@ docker compose exec web python -m agent.cli check-runtime
 
 ## OpenAI Agents SDK Discovery (Experimental)
 
-P0 includes an opt-in OpenAI Agents SDK control plane for bounded ReAct-style
-repository discovery. The existing `discover-dataset` path remains unchanged.
+The project includes an opt-in OpenAI Agents SDK control plane for bounded
+ReAct-style repository discovery. The existing `discover-dataset` path remains
+unchanged. `single_agent` preserves the original fixed-round behavior;
+`multi_agent` adds a Discovery Manager and a separate Budget Agent so search
+depth is decided from observed marginal value inside server-enforced ceilings.
 
 ```powershell
 docker compose exec web python -m agent.cli agents-discover-dataset `
   --prompt "Find human phosphoproteomics DDA data for RT prediction" `
   --repository pride `
   --task-type rt_prediction `
-  --max-rounds 3 `
+  --discovery-mode multi_agent `
+  --max-query-units 30 `
+  --max-repository-requests 200 `
+  --max-elapsed-seconds 1200 `
   --output-dir runs/discovery/agents_sdk_smoke
 ```
 
-This path exposes only read-only repository search and state-inspection tools.
-It cannot download files, run shell commands, start a full search workflow, or
-change biological constraints. It writes a SQLite run ledger, an event log,
-per-round manifests, and the selected compatibility manifest. See
-`docs/openai-agents-control-plane.md`.
+In multi-Agent mode, each proposed search batch must be reviewed by the Budget
+Agent. Its `grant`, `shrink`, `replan`, or `stop` decision is validated by the
+deterministic governor. An issued grant is query-bound and single-use. The
+runtime still cannot download files, run shell commands, start a full search
+workflow, train a model, or change biological constraints.
+
+Each run writes a SQLite run ledger, public structured events, per-round
+manifests, the selected compatibility manifest, and
+`agents_discovery_budget.json`. The visible activity log contains concise
+evidence summaries and tool outcomes, not raw hidden model chain-of-thought.
+See `docs/openai-agents-control-plane.md`.
 
 The same runtime is available in the Web UI under `Dataset discovery` by
 switching `Execution` from `Workflow` to `OpenAI Agent`. The page can use the
 API key entered for that run, or fall back to server environment variables.
 Browser-supplied keys are kept only for the active request and are not written
-to discovery results, logs, or downloads.
+to discovery results, logs, or downloads. Search allocation is autonomous in
+the Web UI; operators configure only hard ceilings through server environment
+variables. The activity, tools, and raw-event tabs expose the public audit
+stream without displaying hidden chain-of-thought.
 
 ## Reproduce the Protected Benchmark
 
