@@ -40,6 +40,11 @@ from agent.ai_ready.validation import validate_ai_ready_build as write_ai_ready_
 from agent.agent_core.recovery_report import analyze_agent_recovery
 from agent.agent_core.harness import run_agent_harness
 from agent.assets.preparer import AssetPreparationError
+from agent.control_plane.models import AgentBudget
+from agent.control_plane.openai_agents import (
+    OpenAIAgentsRuntimeUnavailable,
+    run_openai_agents_discovery,
+)
 from agent.discovery.agentic import (
     AgenticDiscoveryPlanner,
     default_agentic_discovery_planner,
@@ -647,6 +652,72 @@ def discover_dataset(
             }
         )
     )
+
+
+@app.command("agents-discover-dataset")
+def agents_discover_dataset_command(
+    prompt: str = typer.Option(..., "--prompt", help="Natural-language proteomics data goal."),
+    output_dir: Path = typer.Option(..., "--output-dir", help="Directory for manifests, events, and agent state."),
+    goal: str = typer.Option("general", "--goal", help="Discovery target: general, ptm, or immunopeptidomics."),
+    task_type: str | None = typer.Option(None, "--task-type", help="Optional downstream AI-ready task type."),
+    ptm: str = typer.Option("phospho", "--ptm", help="PTM type for PTM-oriented discovery."),
+    species: list[str] = typer.Option([], "--species", help="Requested species; repeat for multiple species."),
+    species_policy: str = typer.Option("open", "--species-policy", help="Species policy: open, include_only, or exclude."),
+    acquisition: str = typer.Option("dda", "--acquisition", help="Target acquisition mode."),
+    labeling: str = typer.Option("label_free", "--labeling", help="Target labeling strategy."),
+    repository: str = typer.Option("pride", "--repository", help="Repository: pride, massive, iprox, or auto."),
+    query_term: list[str] = typer.Option([], "--query-term", help="Additional deterministic query seed; repeatable."),
+    max_projects: int = typer.Option(100, "--max-projects", min=1),
+    max_files: int = typer.Option(2000, "--max-files", min=1),
+    max_candidate_projects: int = typer.Option(300, "--max-candidate-projects", min=1),
+    max_files_per_project: int = typer.Option(50, "--max-files-per-project", min=1),
+    max_rounds: int = typer.Option(3, "--max-rounds", min=1, max=8, help="Maximum repository-search rounds."),
+    max_turns: int = typer.Option(8, "--max-turns", min=1, max=50, help="Maximum Agents SDK turns."),
+    max_tool_calls: int = typer.Option(12, "--max-tool-calls", min=1, max=100),
+    state_db: Path | None = typer.Option(None, "--state-db", help="Optional SQLite control-plane database."),
+    use_memory: bool = typer.Option(True, "--use-memory/--no-use-memory"),
+    memory_dir: Path = typer.Option(Path("runs") / "discovery_memory", "--memory-dir"),
+) -> None:
+    query_terms = list(query_term or [])
+    if goal.lower() == "general":
+        query_terms = [*query_terms, *general_query_terms_from_text(prompt)]
+    request = _dataset_request_from_cli(
+        repository=repository,
+        goal=goal,
+        ptm=ptm,
+        species=species,
+        species_policy=species_policy,
+        acquisition=acquisition,
+        labeling=labeling,
+        max_projects=max_projects,
+        max_files=max_files,
+        max_candidate_projects=max_candidate_projects,
+        max_files_per_project=max_files_per_project,
+        query_terms=query_terms,
+    )
+    normalized_task_type = None
+    if task_type:
+        try:
+            normalized_task_type = normalize_task_type(task_type)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    try:
+        result = run_openai_agents_discovery(
+            prompt=prompt,
+            request=request,
+            output_dir=output_dir,
+            task_type=normalized_task_type,
+            state_db=state_db,
+            memory=DiscoveryMemory(memory_dir) if use_memory else None,
+            budget=AgentBudget(
+                max_turns=max_turns,
+                max_tool_calls=max_tool_calls,
+                max_discovery_rounds=max_rounds,
+            ),
+        )
+    except (OpenAIAgentsRuntimeUnavailable, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(json.dumps(result.model_dump(mode="json"), ensure_ascii=True, indent=2))
 
 
 @app.command("preflight-pride-download-candidates")

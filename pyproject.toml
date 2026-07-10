@@ -18,6 +18,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+agents-sdk = [
+  "openai-agents==0.18.1",
+]
 dev = [
   "pytest>=8.2,<9",
 ]

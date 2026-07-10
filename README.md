@@ -92,6 +92,32 @@ CLI inside Docker:
 docker compose exec web python -m agent.cli check-runtime
 ```
 
+## OpenAI Agents SDK Discovery (Experimental)
+
+P0 includes an opt-in OpenAI Agents SDK control plane for bounded ReAct-style
+repository discovery. The existing `discover-dataset` path remains unchanged.
+
+```powershell
+docker compose exec web python -m agent.cli agents-discover-dataset `
+  --prompt "Find human phosphoproteomics DDA data for RT prediction" `
+  --repository pride `
+  --task-type rt_prediction `
+  --max-rounds 3 `
+  --output-dir runs/discovery/agents_sdk_smoke
+```
+
+This path exposes only read-only repository search and state-inspection tools.
+It cannot download files, run shell commands, start a full search workflow, or
+change biological constraints. It writes a SQLite run ledger, an event log,
+per-round manifests, and the selected compatibility manifest. See
+`docs/openai-agents-control-plane.md`.
+
+The same runtime is available in the Web UI under `Dataset discovery` by
+switching `Execution` from `Workflow` to `OpenAI Agent`. The page can use the
+API key entered for that run, or fall back to server environment variables.
+Browser-supplied keys are kept only for the active request and are not written
+to discovery results, logs, or downloads.
+
 ## Reproduce the Protected Benchmark
 
 See the full reproduction guide:

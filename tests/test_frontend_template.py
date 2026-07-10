@@ -143,6 +143,35 @@ def test_frontend_template_exposes_discovery_workflow():
     assert 'id="discoveryTaskType"' in html
     assert 'id="discoveryAgentic" checked' in html
     assert 'id="discoveryAgenticRounds"' in html
+    assert 'id="discoveryRuntime" value="workflow"' in html
+    assert 'id="discoveryRuntimeWorkflow"' in html
+    assert 'id="discoveryRuntimeAgent"' in html
+    assert "setDiscoveryRuntime('openai_agents')" in html
+    assert 'id="discoveryAgentControls" hidden' in html
+    assert 'id="discoveryAgentBudgetMode"' in html
+    assert '<option value="auto"' in html
+    assert '<option value="custom"' in html
+    assert 'id="discoveryAgentBudgetAdvanced"' in html
+    assert 'id="discoveryAgentMaxRounds"' in html
+    assert 'id="discoveryAgentMaxTurns"' in html
+    assert 'id="discoveryAgentMaxToolCalls"' in html
+    assert 'id="discoveryAgentCredentialStatus"' in html
+    assert "discoveryAgentServerKeyReady" in html
+    assert "discoveryAgentServerKeyNeeded" in html
+    assert "discoveryAgentWebKeyReady" in html
+    assert "runtime:currentDiscoveryRuntime" in html
+    assert "agent_budget_mode:document.getElementById('discoveryAgentBudgetMode').value" in html
+    assert "agent_max_rounds:discoveryInt('discoveryAgentMaxRounds',3)" in html
+    assert "agent_max_turns:discoveryInt('discoveryAgentMaxTurns',10)" in html
+    assert "agent_max_tool_calls:discoveryInt('discoveryAgentMaxToolCalls',16)" in html
+    assert "toggleDiscoveryAgentBudgetMode()" in html
+    assert "state==='completed_with_review'?'needs_review'" in html
+    assert "llm_config:collectConfig()" in html
+    assert 'id="discoveryAgentResult"' in html
+    assert "renderDiscoveryAgentResult(data)" in html
+    assert "agents_discovery_report_md" in html
+    assert "agents_discovery_events_json" in html
+    assert "agents_discovery_summary_json" in html
     assert 'id="discoveryPrompt"' in html
     assert 'id="discoveryResults"' in html
     assert "startDiscovery()" in html
@@ -150,6 +179,9 @@ def test_frontend_template_exposes_discovery_workflow():
     assert "cancelDiscoveryJob()" in html
     assert "renderDiscoveryJobLogs" in html
     assert "safeRenderDiscoveryJobLogs" in html
+    assert "lastDiscoveryLogsFingerprint" in html
+    assert "if(fingerprint===lastDiscoveryLogsFingerprint)return;" in html
+    assert "const shouldFollow=box.scrollHeight-box.scrollTop-box.clientHeight<=16;" in html
     assert "discoverySubmitting" in html
     assert "正在提交 Discovery 请求" in html
     assert "safeRenderDiscoveryJobLogs([{ts:new Date().toISOString(),level:'info',message:t('discoverySubmitting')}])" in html

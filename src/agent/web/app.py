@@ -42,6 +42,8 @@ from agent.ai_ready.model_informed_discovery import (
 from agent.ai_ready.model_loop import run_dataset_model_loop
 from agent.ai_ready.real_smoke import run_ai_ready_real_smoke
 from agent.ai_ready.validation import validate_ai_ready_build
+from agent.control_plane.models import AgentBudget
+from agent.control_plane.openai_agents import run_openai_agents_discovery
 from agent.discovery.agentic import OpenAICompatibleDiscoveryLLM, default_agentic_discovery_planner, default_discovery_llm_client
 from agent.discovery.agentic_runner import run_agentic_discovery
 from agent.discovery.features import extract_file_features, extract_project_features
@@ -152,6 +154,9 @@ _DISCOVERY_DOWNLOAD_FILES = {
     "data_value_strategy_eval_md": ("data_value_strategy_eval.md", "text/markdown"),
     "agentic_plan": ("agentic_plan.json", "application/json"),
     "agentic_rounds": ("agentic_rounds.json", "application/json"),
+    "agents_discovery_summary_json": ("agents_discovery_summary.json", "application/json"),
+    "agents_discovery_events_json": ("agents_discovery_events.json", "application/json"),
+    "agents_discovery_report_md": ("agents_discovery_report.md", "text/markdown"),
 }
 _AI_READY_DOWNLOAD_FILES = {
     "input_profile_json": ("ai_ready_input_profile.json", "application/json"),
@@ -1121,6 +1126,60 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int
     return max(minimum, min(parsed, maximum))
 
 
+_AGENT_BUDGET_PRESETS: dict[str, AgentBudget] = {
+    "fast": AgentBudget(max_discovery_rounds=1, max_turns=5, max_tool_calls=6),
+    "standard": AgentBudget(max_discovery_rounds=3, max_turns=10, max_tool_calls=16),
+    "deep": AgentBudget(max_discovery_rounds=5, max_turns=18, max_tool_calls=30),
+}
+
+
+def _agent_budget_for_discovery(
+    body: dict[str, Any],
+    request: DatasetRequest,
+    task_type: str | None,
+) -> tuple[str, str, AgentBudget]:
+    raw_mode = _clean_text(body.get("agent_budget_mode")).lower()
+    has_legacy_limits = any(
+        key in body for key in ("agent_max_rounds", "agent_max_turns", "agent_max_tool_calls")
+    )
+    mode = raw_mode or ("custom" if has_legacy_limits else "auto")
+    if mode not in {"auto", "fast", "standard", "deep", "custom"}:
+        mode = "auto"
+    if mode == "custom":
+        return (
+            mode,
+            mode,
+            AgentBudget(
+                max_turns=_bounded_int(body.get("agent_max_turns"), default=10, minimum=2, maximum=50),
+                max_tool_calls=_bounded_int(body.get("agent_max_tool_calls"), default=16, minimum=1, maximum=100),
+                max_discovery_rounds=_bounded_int(body.get("agent_max_rounds"), default=3, minimum=1, maximum=8),
+            ),
+        )
+    if mode != "auto":
+        return mode, mode, _AGENT_BUDGET_PRESETS[mode].model_copy(deep=True)
+
+    complexity = 0
+    if request.goal != "general":
+        complexity += 2
+    if request.species_policy in {"include_only", "exclude"}:
+        complexity += 1
+    if task_type:
+        complexity += 1
+    if request.ptm_types or request.hla_alleles or request.hla_class:
+        complexity += 2
+    if request.repository == "auto":
+        complexity += 1
+    if request.max_projects >= 10 or request.max_files >= 100:
+        complexity += 1
+    if complexity >= 4:
+        profile = "deep"
+    elif complexity == 0 and request.max_projects <= 3 and request.max_files <= 20:
+        profile = "fast"
+    else:
+        profile = "standard"
+    return mode, profile, _AGENT_BUDGET_PRESETS[profile].model_copy(deep=True)
+
+
 def _clean_discovery_species(value: Any, *, default: list[str] | None = None) -> list[str]:
     if isinstance(value, list):
         values = [_clean_text(item) for item in value]
@@ -1530,7 +1589,16 @@ def _public_discovery_record(
     manifest: DatasetManifest,
     paths: dict[str, Path] | None = None,
     memory_saved: bool = False,
+    status: str = "completed",
+    runtime: str = "workflow",
+    agent: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    persisted_agent = manifest.summary.get("agent_runtime")
+    if agent is None and isinstance(persisted_agent, dict):
+        agent = dict(persisted_agent)
+    if agent is not None:
+        runtime = "openai_agents"
+        status = _clean_text(agent.get("status")) or status
     download_files = paths or {
         key: output_dir / filename
         for key, (filename, _media_type) in _DISCOVERY_DOWNLOAD_FILES.items()
@@ -1550,7 +1618,9 @@ def _public_discovery_record(
     return {
         "discovery_id": discovery_id,
         "run_id": manifest.run_id,
-        "status": "completed",
+        "status": status,
+        "runtime": runtime,
+        "agent": agent,
         "request": manifest.request.model_dump(mode="json"),
         "summary": {
             **manifest.summary,
@@ -2168,6 +2238,135 @@ def _run_web_discovery(
             )
         finally:
             pride_client.close()
+
+    runtime = _clean_text(body.get("runtime") or body.get("discovery_runtime") or "workflow").lower()
+    if runtime in {"agent", "agents", "openai-agent", "openai_agents_sdk"}:
+        runtime = "openai_agents"
+    if runtime not in {"workflow", "openai_agents"}:
+        raise ValueError(f"Unsupported discovery runtime: {runtime}")
+
+    if runtime == "openai_agents":
+        _check_cancel()
+        prompt = _clean_text(body.get("prompt"))
+        if not prompt:
+            raise ValueError("Discovery request is required for OpenAI Agents mode.")
+        web_llm_config = body.get("llm_config")
+        agent_llm_config: dict[str, str] | None = None
+        if isinstance(web_llm_config, dict) and _clean_text(web_llm_config.get("api_key")):
+            agent_llm_config, config_error = _build_llm_config(web_llm_config)
+            if config_error or agent_llm_config is None:
+                raise ValueError(config_error or "Invalid LLM configuration.")
+        discovery_id = safe_output_stem(
+            f"agents_{datetime.now(_APP_TZ).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        )
+        output_dir = _discovery_root_dir() / discovery_id
+        normalized_task_type = normalize_task_type(task_type) if task_type else None
+        budget_mode, budget_profile, budget = _agent_budget_for_discovery(
+            body,
+            request,
+            normalized_task_type,
+        )
+
+        def _agent_discovery_func(
+            discovery_request: DatasetRequest,
+            memory: DiscoveryMemory | None = None,
+            queries: list[str] | None = None,
+        ) -> DatasetManifest:
+            _check_cancel()
+            query_list = list(queries or [])
+            preview = "; ".join(query_list[:4])
+            _report(f"Act: repository search with {len(query_list)} query term(s){': ' + preview if preview else ''}")
+            observed = _discover_for_web(discovery_request, memory=memory, queries=query_list)
+            _report(
+                "Observe: "
+                f"{int(observed.summary.get('selected_projects') or len(observed.projects))} project(s), "
+                f"{int(observed.summary.get('selected_files') or len(observed.files))} file(s)."
+            )
+            return observed
+
+        _report(
+            "Reason: OpenAI Agents SDK is planning a bounded repository search "
+            f"with {budget_mode}/{budget_profile} budget."
+        )
+        result = run_openai_agents_discovery(
+            prompt=prompt,
+            request=request,
+            output_dir=output_dir,
+            task_type=normalized_task_type,
+            state_db=output_dir / "agent_control.sqlite",
+            memory=prior_memory,
+            budget=budget,
+            run_id=discovery_id,
+            discovery_func=_agent_discovery_func,
+            llm_config=agent_llm_config,
+        )
+        _check_cancel()
+        if result.status == "failed":
+            detail = "; ".join(result.blockers or result.warnings) or "OpenAI Agents discovery failed."
+            raise RuntimeError(detail)
+        manifest_path = Path(
+            result.selected_manifest_path
+            or result.files.get("dataset_manifest_json")
+            or output_dir / "dataset_manifest.json"
+        )
+        if not manifest_path.exists():
+            raise RuntimeError("OpenAI Agents discovery finished without a persisted dataset manifest.")
+        manifest = DatasetManifest.model_validate(json.loads(manifest_path.read_text(encoding="utf-8")))
+        control_summary = _read_json_if_exists(output_dir / "agents_discovery_summary.json")
+        save_memory = body.get("save_memory", True) is not False
+        agent_summary = {
+            "runtime": "openai_agents",
+            "status": result.status,
+            "run_id": result.run_id,
+            "discovery_rounds": result.discovery_round_count,
+            "tool_calls": int(control_summary.get("tool_call_count") or 0),
+            "stop_reason": _clean_text(control_summary.get("stop_reason")),
+            "final_output": result.final_output,
+            "warnings": list(result.warnings),
+            "blockers": list(result.blockers),
+            "selected_round_index": result.selected_round_index,
+            "selection_rationale": result.selection_rationale,
+            "budget_mode": budget_mode,
+            "budget_profile": budget_profile,
+            "budget": budget.model_dump(mode="json"),
+        }
+        summary = {
+            **manifest.summary,
+            "run_id": result.run_id,
+            "memory_used": use_memory,
+            "memory_saved": save_memory,
+            "agent_runtime": agent_summary,
+        }
+        manifest = manifest.model_copy(update={"run_id": result.run_id, "summary": summary})
+        paths = write_dataset_manifest(manifest, output_dir)
+        for key, raw_path in result.files.items():
+            path = Path(raw_path)
+            if key in _DISCOVERY_DOWNLOAD_FILES and path.exists():
+                paths[key] = path
+        if save_memory:
+            memory = DiscoveryMemory(_discovery_memory_dir())
+            memory.append_run(
+                build_run_record(
+                    run_id=result.run_id,
+                    manifest=manifest,
+                    output_dir=output_dir,
+                    manifest_path=paths["dataset_manifest_json"],
+                )
+            )
+        _report(
+            f"Final: Agent discovery {result.status}; "
+            f"{len(manifest.projects)} project(s), {len(manifest.files)} file(s)."
+        )
+        return _public_discovery_record(
+            discovery_id=discovery_id,
+            output_dir=output_dir,
+            manifest=manifest,
+            paths=paths,
+            memory_saved=save_memory,
+            status=result.status,
+            runtime="openai_agents",
+            agent=agent_summary,
+        )
 
     if agentic_enabled:
         _check_cancel()
@@ -5371,6 +5570,8 @@ def _run_discovery_job(job_id: str) -> None:
         job["status"] = "running"
         job["started_at"] = _now_app_iso()
         body = dict(job.get("body") or {})
+        # Keep the request credential only in this worker's local copy.
+        job["body"].pop("llm_config", None)
         _persist_discovery_job(job)
     _append_discovery_job_log(job_id, "info", "Discovery job started.")
 

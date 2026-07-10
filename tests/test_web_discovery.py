@@ -7,6 +7,7 @@ from pathlib import Path
 
 import agent.web.app as web_app
 from fastapi import BackgroundTasks
+from agent.control_plane.models import OpenAIAgentsDiscoveryResult
 from agent.discovery.agentic import AgenticDiscoveryPlanner
 from agent.discovery.memory import DiscoveryMemory
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
@@ -692,6 +693,184 @@ def test_web_discovery_agentic_falls_back_without_llm_planner(monkeypatch, tmp_p
     assert created["summary"]["agentic"]["requested"] is True
     assert created["summary"]["agentic"]["fallback"]["reason"] == "llm_unavailable"
     assert "agentic_plan" not in created["downloads"]
+
+
+def test_web_agent_budget_profiles_are_automatic_but_keep_legacy_custom_limits():
+    fast_mode, fast_profile, fast_budget = web_app._agent_budget_for_discovery(
+        {"agent_budget_mode": "auto"},
+        DatasetRequest(repository="pride", max_projects=2, max_files=10),
+        None,
+    )
+    assert (fast_mode, fast_profile) == ("auto", "fast")
+    assert fast_budget.max_discovery_rounds == 1
+
+    auto_mode, auto_profile, auto_budget = web_app._agent_budget_for_discovery(
+        {"agent_budget_mode": "auto"},
+        DatasetRequest(
+            repository="pride",
+            goal="ptm",
+            ptm_type="phospho",
+            ptm_types=["phospho"],
+            species=["human"],
+            species_policy="include_only",
+        ),
+        "rt_prediction",
+    )
+    assert (auto_mode, auto_profile) == ("auto", "deep")
+    assert auto_budget.max_discovery_rounds == 5
+
+    custom_mode, custom_profile, custom_budget = web_app._agent_budget_for_discovery(
+        {"agent_max_rounds": 2, "agent_max_turns": 9, "agent_max_tool_calls": 7},
+        DatasetRequest(repository="pride"),
+        None,
+    )
+    assert (custom_mode, custom_profile) == ("custom", "custom")
+    assert custom_budget.model_dump() == {
+        "max_turns": 9,
+        "max_tool_calls": 7,
+        "max_discovery_rounds": 2,
+        "max_expensive_actions": 0,
+        "max_download_bytes": 0,
+    }
+
+
+def test_web_discovery_openai_agents_runtime_reuses_existing_result_contract(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_run_openai_agents_discovery(**kwargs) -> OpenAIAgentsDiscoveryResult:
+        captured.update(kwargs)
+        output_dir = Path(kwargs["output_dir"])
+        manifest = _manifest(kwargs["request"]).model_copy(update={"run_id": kwargs["run_id"]})
+        paths = web_app.write_dataset_manifest(manifest, output_dir)
+        summary_path = output_dir / "agents_discovery_summary.json"
+        events_path = output_dir / "agents_discovery_events.json"
+        report_path = output_dir / "agents_discovery_report.md"
+        summary_path.write_text('{"tool_call_count":2,"stop_reason":"manifest_selected"}', encoding="utf-8")
+        events_path.write_text("[]", encoding="utf-8")
+        report_path.write_text("# Agent report\n", encoding="utf-8")
+        return OpenAIAgentsDiscoveryResult(
+            status="completed",
+            run_id=str(kwargs["run_id"]),
+            output_dir=str(output_dir),
+            state_db=str(output_dir / "agent_control.sqlite"),
+            selected_manifest_path=str(paths["dataset_manifest_json"]),
+            selected_round_index=0,
+            selection_rationale="The merged candidate pool is the strongest manifest.",
+            discovery_round_count=1,
+            final_output="Accepted the persisted manifest.",
+            files={
+                **{key: str(path) for key, path in paths.items()},
+                "agents_discovery_summary_json": str(summary_path),
+                "agents_discovery_events_json": str(events_path),
+                "agents_discovery_report_md": str(report_path),
+            },
+        )
+
+    monkeypatch.setattr(web_app, "run_openai_agents_discovery", fake_run_openai_agents_discovery)
+    created = asyncio.run(
+        web_app.create_discovery(
+            {
+                "runtime": "openai_agents",
+                "prompt": "Find human phospho DDA data for RT prediction",
+                "species": ["human"],
+                "task_type": "rt_prediction",
+                "max_projects": 1,
+                "max_files": 1,
+                "agent_max_rounds": 2,
+                "agent_max_turns": 9,
+                "agent_max_tool_calls": 7,
+                "llm_config": {
+                    "api_key": "temporary-web-key",
+                    "base_url": "https://example.test/v1",
+                    "model": "test-model",
+                },
+            }
+        )
+    )
+
+    assert created["status"] == "completed"
+    assert created["runtime"] == "openai_agents"
+    assert created["project_count"] == 1
+    assert created["file_count"] == 1
+    assert created["agent"]["status"] == "completed"
+    assert created["agent"]["tool_calls"] == 2
+    assert created["agent"]["budget_mode"] == "custom"
+    assert created["agent"]["budget_profile"] == "custom"
+    assert created["agent"]["selected_round_index"] == 0
+    assert created["agent"]["selection_rationale"] == "The merged candidate pool is the strongest manifest."
+    assert created["summary"]["agent_runtime"]["final_output"] == "Accepted the persisted manifest."
+    assert "agents_discovery_summary_json" in created["downloads"]
+    assert "agents_discovery_events_json" in created["downloads"]
+    assert "agents_discovery_report_md" in created["downloads"]
+    assert captured["task_type"] == "rt_prediction"
+    assert captured["budget"].max_discovery_rounds == 2
+    assert captured["budget"].max_turns == 9
+    assert captured["budget"].max_tool_calls == 7
+    assert captured["llm_config"] == {
+        "api_key": "temporary-web-key",
+        "base_url": "https://example.test/v1",
+        "model": "test-model",
+        "timeout": "1200",
+    }
+    assert "temporary-web-key" not in json.dumps(created)
+
+    reloaded = asyncio.run(web_app.get_discovery(created["discovery_id"]))
+    assert reloaded["runtime"] == "openai_agents"
+    assert reloaded["status"] == "completed"
+    assert reloaded["agent"]["final_output"] == "Accepted the persisted manifest."
+
+
+def test_web_discovery_openai_agents_blocked_manifest_is_renderable(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+
+    def fake_blocked_run(**kwargs) -> OpenAIAgentsDiscoveryResult:
+        output_dir = Path(kwargs["output_dir"])
+        manifest = DatasetManifest(
+            request=kwargs["request"],
+            run_id=kwargs["run_id"],
+            summary={"selected_projects": 0, "selected_files": 0},
+        )
+        paths = web_app.write_dataset_manifest(manifest, output_dir)
+        summary_path = output_dir / "agents_discovery_summary.json"
+        summary_path.write_text(
+            '{"tool_call_count":1,"stop_reason":"no_selected_files_after_agent_rounds"}',
+            encoding="utf-8",
+        )
+        return OpenAIAgentsDiscoveryResult(
+            status="blocked",
+            run_id=str(kwargs["run_id"]),
+            output_dir=str(output_dir),
+            state_db=str(output_dir / "agent_control.sqlite"),
+            selected_manifest_path=str(paths["dataset_manifest_json"]),
+            discovery_round_count=1,
+            final_output="No files matched the hard constraints.",
+            blockers=["no_selected_files"],
+            files={
+                **{key: str(path) for key, path in paths.items()},
+                "agents_discovery_summary_json": str(summary_path),
+            },
+        )
+
+    monkeypatch.setattr(web_app, "run_openai_agents_discovery", fake_blocked_run)
+    created = asyncio.run(
+        web_app.create_discovery(
+            {
+                "runtime": "openai_agents",
+                "prompt": "Find a constrained dataset",
+                "max_projects": 1,
+                "max_files": 1,
+                "save_memory": False,
+            }
+        )
+    )
+
+    assert created["status"] == "blocked"
+    assert created["project_count"] == 0
+    assert created["file_count"] == 0
+    assert created["agent"]["blockers"] == ["no_selected_files"]
+    assert created["summary"]["agent_runtime"]["stop_reason"] == "no_selected_files_after_agent_rounds"
+    assert "dataset_manifest_json" in created["downloads"]
 
 
 def test_review_discovery_run_writes_memory_and_updates_manifest(monkeypatch, tmp_path: Path):
