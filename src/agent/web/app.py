@@ -3575,10 +3575,18 @@ def _list_project_history_records_fast() -> list[dict[str, Any]]:
         item["can_download"] = bool(item.get("can_download"))
         records.append(_decorate_history_item(item))
 
-    for batch in _list_parameter_batch_history_records(include_file_stats=False):
+    for batch in _list_parameter_batch_history_records(include_file_stats=True):
         if batch.get("status") in _ACTIVE_STATUSES:
             continue
         records.append(_decorate_history_item(batch))
+
+    for result in _list_public_results():
+        task_updated_at = result.get("task_updated_at") or result.get("finished_at") or result.get("started_at") or result.get("created_at")
+        if task_updated_at:
+            result["updated_at"] = task_updated_at
+        if result.get("status") in _ACTIVE_STATUSES and not _history_item_is_active(result, active_task_ids, active_history_ids):
+            result = _mark_interrupted_history_item(result)
+        records.append(_decorate_history_item(result))
 
     with _tasks_lock:
         for task_id, task in _tasks.items():
@@ -4278,13 +4286,15 @@ async def list_public_results():
 @app.get("/api/history")
 async def list_project_history(fast: bool = True, refresh: bool = False):
     if fast and not refresh:
+        if not _read_history_index():
+            _sync_history_index_from_disk()
         with _tasks_lock:
             active_tasks = [
                 _public_task_record_locked(task_id, task)
                 for task_id, task in _tasks.items()
                 if task.get("status") in _ACTIVE_STATUSES
             ]
-        active_tasks.extend(batch for batch in _list_parameter_batch_history_records(include_file_stats=False) if batch.get("status") in _ACTIVE_STATUSES)
+        active_tasks.extend(batch for batch in _list_parameter_batch_history_records(include_file_stats=True) if batch.get("status") in _ACTIVE_STATUSES)
         active_tasks.sort(key=lambda item: str(item.get("created_at") or ""))
         active_task_ids = {str(item.get("task_id") or "") for item in active_tasks}
         active_history_ids = {str(item.get("history_id") or "") for item in active_tasks}
