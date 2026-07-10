@@ -6,8 +6,16 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from agent.cli import app
+from agent.control_plane.budget_governor import BudgetGovernor
 from agent.control_plane.discovery import DiscoveryToolService
-from agent.control_plane.models import AgentBudget, AgentRunRecord, OpenAIAgentsDiscoveryResult
+from agent.control_plane.models import (
+    AgentBudget,
+    AgentRunRecord,
+    BudgetDecision,
+    DynamicBudgetLimits,
+    OpenAIAgentsDiscoveryResult,
+    SearchProposalInput,
+)
 from agent.control_plane.policy import evaluate_tool_policy
 from agent.control_plane.store import AgentRunStore, tool_idempotency_key
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
@@ -24,6 +32,128 @@ def _run(run_id: str = "run_001") -> AgentRunRecord:
             max_expensive_actions=1,
         ),
     )
+
+
+def _dynamic_discovery_service(
+    tmp_path: Path,
+    *,
+    with_valid_candidate: bool = False,
+) -> tuple[DiscoveryToolService, BudgetGovernor, list[list[str]]]:
+    request = DatasetRequest(repository="pride", max_projects=2, max_files=10)
+    calls: list[list[str]] = []
+
+    def fake_discovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
+        calls.append(list(queries or []))
+        project = DiscoveredProject(project_accession="PXD_DYNAMIC", project_title="Dynamic fixture")
+        file = DiscoveredFile(
+            project_accession=project.project_accession,
+            project_title=project.project_title,
+            file_name="dynamic.raw",
+            file_type=".raw",
+            validity_status="valid",
+            evidence_level="file",
+        )
+        return DatasetManifest(
+            request=request,
+            projects=[project],
+            files=[file],
+            summary={"selected_projects": 1, "selected_files": 1},
+        )
+
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("dynamic_service").model_copy(
+            update={
+                "status": "running",
+                "dynamic_budget_enabled": True,
+                "dynamic_limits": DynamicBudgetLimits(),
+            }
+        )
+    )
+    governor = BudgetGovernor(store, run.run_id)
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        discovery_func=fake_discovery,
+        dynamic_budget=True,
+        budget_governor=governor,
+    )
+    if with_valid_candidate:
+        proposal = governor.register_proposal(
+            SearchProposalInput(
+                objective="Create a persisted candidate pool",
+                reasoning_summary="The pool is empty.",
+                queries=["seed query"],
+                expected_gain="One valid candidate",
+                stop_condition="A valid candidate is found",
+            )
+        )
+        review = governor.apply_decision(
+            BudgetDecision(
+                proposal_id=proposal.proposal_id,
+                decision="grant",
+                approved_query_indexes=[0],
+                reasoning_summary="The seed query is required.",
+            )
+        )
+        assert review.grant is not None
+        service.search_repository_datasets(["seed query"], grant_id=review.grant.grant_id)
+    return service, governor, calls
+
+
+def test_dynamic_discovery_requires_and_consumes_matching_grant(tmp_path: Path) -> None:
+    service, governor, calls = _dynamic_discovery_service(tmp_path)
+    denied = service.search_repository_datasets(["human plasma SDRF"])
+    assert denied.blockers == ["search_grant_required"]
+    proposal = governor.register_proposal(
+        SearchProposalInput(
+            objective="Improve metadata coverage",
+            reasoning_summary="The metadata gap is high.",
+            queries=["human plasma SDRF"],
+            expected_gain="More usable metadata",
+            stop_condition="No new usable files",
+        )
+    )
+    review = governor.apply_decision(
+        BudgetDecision(
+            proposal_id=proposal.proposal_id,
+            decision="grant",
+            approved_query_indexes=[0],
+            reasoning_summary="The query targets the gap.",
+        )
+    )
+    assert review.grant is not None
+    observation = service.search_repository_datasets(
+        ["human plasma SDRF"],
+        grant_id=review.grant.grant_id,
+    )
+    assert observation.status == "completed"
+    assert observation.metrics is not None
+    assert calls == [["human plasma SDRF"]]
+    replay = service.search_repository_datasets(
+        ["human plasma SDRF"],
+        grant_id=review.grant.grant_id,
+    )
+    assert replay.blockers == ["grant_already_consumed"]
+
+
+def test_dynamic_stop_blocks_search_but_allows_final_manifest_selection(tmp_path: Path) -> None:
+    service, _, _ = _dynamic_discovery_service(tmp_path, with_valid_candidate=True)
+    run = service.store.load_run(service.run_id)
+    assert run is not None
+    service.store.save_run(
+        run.model_copy(update={"search_stopped": True, "search_stop_reason": "budget_agent_stop"})
+    )
+    blocked = service.search_repository_datasets(["another query"], grant_id="grant_unused")
+    assert blocked.blockers == ["dynamic_search_stopped"]
+    selected = service.select_discovery_manifest(
+        0,
+        "The persisted candidate pool is the strongest available manifest.",
+    )
+    assert selected["status"] == "completed"
+    assert selected["round_index"] == 0
 
 
 def test_agent_run_store_round_trips_events_and_idempotent_tool_calls(tmp_path: Path) -> None:

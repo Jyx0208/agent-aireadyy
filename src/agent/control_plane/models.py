@@ -225,6 +225,7 @@ class DiscoveryRoundObservation(JsonModel):
     recommended_action: str = "review_manifest"
     warnings: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)
+    metrics: RoundMetrics | None = None
     files: dict[str, str] = Field(default_factory=dict)
 
 

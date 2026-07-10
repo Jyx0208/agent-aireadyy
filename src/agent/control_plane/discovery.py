@@ -5,10 +5,14 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
+from agent.control_plane.budget_governor import BudgetGovernor
+from agent.control_plane.discovery_metrics import evaluate_round_metrics
 from agent.control_plane.models import (
     AgentRunRecord,
     ArtifactReference,
     DiscoveryRoundObservation,
+    DynamicBudgetLimits,
+    RoundMetrics,
 )
 from agent.control_plane.policy import evaluate_tool_policy
 from agent.control_plane.store import AgentRunStore
@@ -18,6 +22,7 @@ from agent.discovery.memory import DiscoveryMemory
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
 from agent.discovery.repository_discovery import discover_repository_dataset
 from agent.discovery.task_readiness import annotate_manifest_task_readiness
+from agent.repositories.metering import meter_repository_requests
 
 
 DiscoveryFunction = Callable[..., DatasetManifest]
@@ -34,6 +39,8 @@ class DiscoveryToolService:
         task_type: str | None = None,
         memory: DiscoveryMemory | None = None,
         discovery_func: DiscoveryFunction = discover_repository_dataset,
+        dynamic_budget: bool = False,
+        budget_governor: BudgetGovernor | None = None,
     ) -> None:
         self.run_id = run_id
         self.request = request
@@ -42,11 +49,19 @@ class DiscoveryToolService:
         self.task_type = task_type
         self.memory = memory
         self.discovery_func = discovery_func
+        self.dynamic_budget = dynamic_budget
+        self.budget_governor = budget_governor
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def search_repository_datasets(self, queries: list[str]) -> DiscoveryRoundObservation:
+    def search_repository_datasets(
+        self,
+        queries: list[str],
+        grant_id: str | None = None,
+    ) -> DiscoveryRoundObservation:
         queries = _normalize_queries(queries)
         run = self._require_run()
+        if self.dynamic_budget and run.search_stopped:
+            return self._blocked_observation(queries, "dynamic_search_stopped")
         if run.selected_round_index is not None:
             return DiscoveryRoundObservation(
                 status="blocked",
@@ -70,14 +85,31 @@ class DiscoveryToolService:
                 {"tool": "search_repository_datasets", "policy": policy.model_dump(mode="json")},
             )
             return observation
-        if run.discovery_round_count >= run.budget.max_discovery_rounds:
-            return DiscoveryRoundObservation(
-                status="blocked",
-                round_index=run.discovery_round_count + 1,
-                queries=queries,
-                recommended_action="stop",
-                blockers=["discovery_round_budget_exhausted"],
-            )
+        if self.dynamic_budget:
+            if self.budget_governor is None:
+                raise RuntimeError("dynamic_budget_governor_required")
+            if not grant_id:
+                return self._blocked_observation(queries, "search_grant_required")
+            try:
+                self.budget_governor.consume_grant(grant_id, queries)
+            except ValueError as exc:
+                return self._blocked_observation(queries, str(exc))
+        elif run.discovery_round_count >= run.budget.max_discovery_rounds:
+            return self._blocked_observation(queries, "discovery_round_budget_exhausted")
+
+        run = self._require_run()
+        previous_pool = (
+            _load_manifest(Path(run.candidate_pool_manifest_path))
+            if run.candidate_pool_manifest_path and Path(run.candidate_pool_manifest_path).exists()
+            else None
+        )
+        prior_queries = [
+            str(query)
+            for event in self.store.list_events(self.run_id)
+            if event.event_type == "tool_started"
+            and event.payload.get("tool") == "search_repository_datasets"
+            for query in event.payload.get("queries", [])
+        ]
 
         arguments = {
             "queries": queries,
@@ -132,7 +164,26 @@ class DiscoveryToolService:
         )
 
         try:
-            manifest = self.discovery_func(self.request, memory=self.memory, queries=queries)
+            if self.dynamic_budget:
+                assert self.budget_governor is not None
+                request_callback = self.budget_governor.record_repository_request
+            else:
+                self.store.increment_dynamic_usage(
+                    self.run_id,
+                    query_units=len(queries),
+                    search_batches=1,
+                    enforce_limits=False,
+                )
+
+                def request_callback(repository: str, operation: str) -> None:
+                    self.store.increment_dynamic_usage(
+                        self.run_id,
+                        repository_requests=1,
+                        enforce_limits=False,
+                    )
+
+            with meter_repository_requests(request_callback):
+                manifest = self.discovery_func(self.request, memory=self.memory, queries=queries)
             if self.task_type:
                 manifest = annotate_manifest_task_readiness(manifest, self.task_type)
             summary = dict(manifest.summary)
@@ -173,6 +224,17 @@ class DiscoveryToolService:
                 queries=queries,
                 paths=pool_paths,
             )
+            metered_run = self._require_run()
+            metrics = evaluate_round_metrics(
+                pool_manifest,
+                previous_pool,
+                request=self.request,
+                queries=queries,
+                prior_queries=prior_queries,
+                usage=metered_run.dynamic_usage,
+                limits=metered_run.dynamic_limits,
+                round_index=round_index,
+            )
             artifacts["candidate_pool"] = ArtifactReference(
                 path=str(pool_paths["dataset_manifest_json"]),
                 artifact_type="dataset_manifest",
@@ -184,13 +246,14 @@ class DiscoveryToolService:
                     "candidate_pool_manifest_path": str(pool_paths["dataset_manifest_json"]),
                     "pooled_selected_projects": pool_observation.selected_projects,
                     "pooled_selected_files": pool_observation.selected_files,
+                    "metrics": metrics,
                 }
             )
             self.store.complete_tool_call(
                 tool_call.idempotency_key,
                 observation.model_dump(mode="json"),
             )
-            run = run.model_copy(
+            run = metered_run.model_copy(
                 update={
                     "artifacts": artifacts,
                     "candidate_pool_manifest_path": str(pool_paths["dataset_manifest_json"]),
@@ -201,9 +264,15 @@ class DiscoveryToolService:
                     ),
                     "warnings": pool_observation.warnings,
                     "blockers": pool_observation.blockers,
+                    "latest_metrics": metrics,
                 }
             )
             self.store.save_run(run)
+            self.store.append_event(
+                self.run_id,
+                "round_value_evaluated",
+                metrics.model_dump(mode="json"),
+            )
             self.store.append_event(
                 self.run_id,
                 "tool_completed",
@@ -408,7 +477,53 @@ class DiscoveryToolService:
             "selection_rationale": run.selection_rationale,
             "warnings": run.warnings,
             "blockers": run.blockers,
+            "dynamic_budget_enabled": run.dynamic_budget_enabled,
+            "dynamic_limits": run.dynamic_limits.model_dump(mode="json"),
+            "dynamic_usage": run.dynamic_usage.model_dump(mode="json"),
+            "active_grant_id": run.active_grant_id,
+            "search_stopped": run.search_stopped,
+            "search_stop_reason": run.search_stop_reason,
+            "latest_metrics": run.latest_metrics.model_dump(mode="json") if run.latest_metrics else None,
         }
+
+    @property
+    def dynamic_limits(self) -> DynamicBudgetLimits:
+        return self._require_run().dynamic_limits
+
+    def current_metrics(self) -> RoundMetrics:
+        run = self._require_run()
+        if run.latest_metrics is not None:
+            return run.latest_metrics
+        empty = DatasetManifest(
+            run_id=self.run_id,
+            request=self.request,
+            summary={"selected_projects": 0, "selected_files": 0},
+        )
+        return evaluate_round_metrics(
+            empty,
+            None,
+            request=self.request,
+            queries=[],
+            prior_queries=[],
+            usage=run.dynamic_usage,
+            limits=run.dynamic_limits,
+            round_index=0,
+        )
+
+    def _blocked_observation(self, queries: list[str], reason: str) -> DiscoveryRoundObservation:
+        run = self._require_run()
+        self.store.append_event(
+            self.run_id,
+            "tool_denied",
+            {"tool": "search_repository_datasets", "reason": reason, "queries": queries},
+        )
+        return DiscoveryRoundObservation(
+            status="blocked",
+            round_index=run.discovery_round_count + 1,
+            queries=queries,
+            recommended_action="stop" if run.search_stopped else "revise_queries_or_request_budget",
+            blockers=[reason],
+        )
 
     def _manifest_path_for_selection(self, run: AgentRunRecord, round_index: int) -> Path | None:
         if round_index == 0:
