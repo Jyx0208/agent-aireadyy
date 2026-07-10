@@ -452,6 +452,7 @@ def _build_model(
     return sdk["OpenAIChatCompletionsModel"](
         model=model_name,
         openai_client=client,
+        buffer_streamed_tool_calls=True,
     )
 
 

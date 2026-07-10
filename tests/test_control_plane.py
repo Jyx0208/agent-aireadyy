@@ -676,6 +676,32 @@ def test_openai_agents_runner_executes_real_function_tool_loop(tmp_path: Path) -
     assert "manifest_selected" in [event["event_type"] for event in events]
 
 
+def test_openai_chat_completions_model_buffers_streamed_tool_calls() -> None:
+    from agent.control_plane.openai_agents import _build_model
+
+    captured: dict[str, Any] = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["client"] = kwargs
+
+    class FakeChatCompletionsModel:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["model"] = kwargs
+
+    _build_model(
+        {
+            "AsyncOpenAI": FakeClient,
+            "OpenAIChatCompletionsModel": FakeChatCompletionsModel,
+        },
+        api_key="test-key",
+        base_url="https://api.deepseek.com",
+        model_name="deepseek-v4-pro",
+    )
+
+    assert captured["model"]["buffer_streamed_tool_calls"] is True
+
+
 def test_openai_agents_runner_executes_multi_agent_budget_loop(monkeypatch, tmp_path: Path) -> None:
     from agents.items import ModelResponse
     from agents.models.interface import Model
