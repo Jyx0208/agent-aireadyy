@@ -8,11 +8,14 @@ from agent.control_plane.models import (
     BudgetDecision,
     BudgetDecisionInput,
     DynamicBudgetLimits,
+    DynamicBudgetUsage,
     SearchGrant,
     SearchProposalInput,
     SearchProposalRecord,
 )
+from agent.control_plane.discovery_metrics import evaluate_round_metrics
 from agent.control_plane.store import AgentRunStore
+from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
 
 
 def test_dynamic_budget_contracts_reject_invalid_decision_shapes() -> None:
@@ -189,3 +192,73 @@ def test_store_enforces_tool_call_budget_atomically(tmp_path: Path) -> None:
     unchanged = store.load_run(run.run_id)
     assert unchanged is not None
     assert unchanged.tool_call_count == 1
+
+
+def _manifest_with_files(
+    request: DatasetRequest,
+    *,
+    valid: int,
+    weak_keep: int,
+    needs_review: int,
+) -> DatasetManifest:
+    statuses = ["valid"] * valid + ["weak_keep"] * weak_keep + ["needs_review"] * needs_review
+    project = DiscoveredProject(project_accession="PXD_METRICS", project_title="Metrics fixture")
+    files = [
+        DiscoveredFile(
+            project_accession=project.project_accession,
+            project_title=project.project_title,
+            file_name=f"sample_{index}.raw",
+            file_type=".raw",
+            validity_status=status,
+            evidence_level="file",
+        )
+        for index, status in enumerate(statuses)
+    ]
+    return DatasetManifest(
+        request=request,
+        projects=[project],
+        files=files,
+        summary={
+            "selected_projects": 1,
+            "selected_files": len(files),
+            "validity_status_counts": {
+                "valid": valid,
+                "weak_keep": weak_keep,
+                "needs_review": needs_review,
+            },
+            "instrument_family_distribution": {"orbitrap": len(files)},
+            "unknown_counts": {"fragmentation_method": needs_review},
+        },
+    )
+
+
+def test_round_metrics_reward_new_usable_candidates_and_penalize_repeated_queries() -> None:
+    request = DatasetRequest(repository="pride", max_files=50)
+    previous = DatasetManifest(request=request, summary={"selected_files": 0})
+    current = _manifest_with_files(request, valid=4, weak_keep=1, needs_review=1)
+    limits = DynamicBudgetLimits(max_query_units=20, max_repository_requests=100)
+    usage = DynamicBudgetUsage(query_units=5, repository_requests=12, search_batches=1)
+    novel = evaluate_round_metrics(
+        current,
+        previous,
+        request=request,
+        queries=["human plasma DDA SDRF"],
+        prior_queries=["mouse liver phosphoproteomics"],
+        usage=usage,
+        limits=limits,
+        round_index=2,
+    )
+    repeated = evaluate_round_metrics(
+        current,
+        previous,
+        request=request,
+        queries=["human plasma DDA SDRF"],
+        prior_queries=["human plasma DDA SDRF"],
+        usage=usage,
+        limits=limits,
+        round_index=2,
+    )
+    assert novel.last_round_yield > 0
+    assert novel.strategy_novelty > repeated.strategy_novelty
+    assert repeated.query_repetition == 1.0
+    assert novel.counts["usable_files"] == 5
