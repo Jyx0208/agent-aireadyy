@@ -11,6 +11,7 @@ external/
 dist/
 sample_task/
 .agent_cache/
+.agent_secrets/
 .codex/
 .codex_ssh/
 .codex_online_ssh/

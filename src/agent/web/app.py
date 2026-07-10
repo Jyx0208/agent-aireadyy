@@ -87,6 +87,7 @@ from agent.repositories.registry import RepositoryRegistry
 from agent.runtime.system_metrics import collect_system_metrics
 from agent.utils import write_json
 from agent.web.history import history_timestamp, merge_project_history_records, with_history_identity
+from agent.web.llm_config_store import LLMConfigStore
 
 
 @asynccontextmanager
@@ -283,7 +284,7 @@ _UI_LANGUAGES = {"en", "zh"}
 # 默认配置（不从 .env 加载，由用户在页面填写）
 _DEFAULT_CONFIG = {
     "base_url": "https://api.deepseek.com",
-    "model": "deepseek-v4-flash",
+    "model": "deepseek-v4-pro",
     "timeout": "1200",
 }
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\[\d{1,3}(?:;\d{1,3})*m")
@@ -4096,14 +4097,50 @@ def _start_ready_queued_tasks() -> list[str]:
     return started
 
 
+def _llm_config_store() -> LLMConfigStore:
+    return LLMConfigStore(os.getenv("AGENT_LLM_CONFIG_PATH") or ".agent_secrets/llm_config.json")
+
+
+def _server_llm_config() -> tuple[dict[str, str] | None, str]:
+    saved = _llm_config_store().load()
+    if saved is not None:
+        return saved, "saved"
+    api_key = _clean_text(
+        os.getenv("AGENT_LLM_API_KEY")
+        or os.getenv("DEEPSEEK_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+    )
+    if not api_key:
+        return None, "default"
+    return {
+        "api_key": api_key,
+        "base_url": _clean_text(os.getenv("AGENT_LLM_BASE_URL")) or _DEFAULT_CONFIG["base_url"],
+        "model": _clean_text(os.getenv("AGENT_LLM_MODEL")) or _DEFAULT_CONFIG["model"],
+        "timeout": _clean_text(os.getenv("AGENT_LLM_TIMEOUT")) or _DEFAULT_CONFIG["timeout"],
+    }, "environment"
+
+
+def _public_llm_config() -> dict[str, Any]:
+    config, source = _server_llm_config()
+    return {
+        "api_key_set": config is not None,
+        "base_url": (config or {}).get("base_url") or _DEFAULT_CONFIG["base_url"],
+        "model": (config or {}).get("model") or _DEFAULT_CONFIG["model"],
+        "timeout": (config or {}).get("timeout") or _DEFAULT_CONFIG["timeout"],
+        "source": source,
+    }
+
+
 def _build_llm_config(llm_config: dict[str, Any]) -> tuple[dict[str, str] | None, str | None]:
-    api_key = _clean_text(llm_config.get("api_key"))
+    server_config, _ = _server_llm_config()
+    fallback = server_config or {}
+    api_key = _clean_text(llm_config.get("api_key")) or fallback.get("api_key", "")
     if not api_key:
         return None, "请先填写本次任务使用的 API Key"
 
-    base_url = _clean_text(llm_config.get("base_url")) or os.getenv("AGENT_LLM_BASE_URL") or _DEFAULT_CONFIG["base_url"]
-    model = _clean_text(llm_config.get("model")) or os.getenv("AGENT_LLM_MODEL") or _DEFAULT_CONFIG["model"]
-    timeout = _clean_text(llm_config.get("timeout")) or os.getenv("AGENT_LLM_TIMEOUT") or _DEFAULT_CONFIG["timeout"]
+    base_url = _clean_text(llm_config.get("base_url")) or fallback.get("base_url") or _DEFAULT_CONFIG["base_url"]
+    model = _clean_text(llm_config.get("model")) or fallback.get("model") or _DEFAULT_CONFIG["model"]
+    timeout = _clean_text(llm_config.get("timeout")) or fallback.get("timeout") or _DEFAULT_CONFIG["timeout"]
     try:
         if float(timeout) <= 0:
             return None, "大模型超时时间必须大于 0"
@@ -4388,6 +4425,30 @@ async def _run_llm_check(config: dict[str, str]) -> tuple[bool, str]:
     return await _check_llm_api(config)
 
 
+async def _fetch_llm_models(config: dict[str, str]) -> list[str]:
+    timeout = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.get(
+            f"{config['base_url']}/models",
+            headers={"Authorization": f"Bearer {config['api_key']}"},
+        )
+        response.raise_for_status()
+    payload = response.json()
+    records = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        raise ValueError("Model API response has no data list")
+    models = [
+        _clean_text(record.get("id"))
+        for record in records
+        if isinstance(record, dict) and _clean_text(record.get("id"))
+    ]
+    return list(dict.fromkeys(models))
+
+
+def _ordered_models(models: list[str], selected: str) -> list[str]:
+    return [model for model in dict.fromkeys([selected, *models]) if model]
+
+
 # ── 页面 ──────────────────────────────────────────────────────────
 def _start_result_cleanup_worker() -> None:
     global _cleanup_thread_started
@@ -4409,7 +4470,7 @@ async def health():
         queue_state = _queue_state_locked()
     return {
         "status": "ok",
-        "llm_configured": False,
+        "llm_configured": _server_llm_config()[0] is not None,
         "per_task_api_keys": True,
         "result_retention_seconds": _result_retention_seconds(),
         "max_result_projects": _max_result_projects(),
@@ -4426,15 +4487,60 @@ async def get_config():
         queue_state = _queue_state_locked()
     return {
         "api_key_masked": "",
-        "api_key_set": False,
+        **_public_llm_config(),
         "per_task_api_keys": True,
-        "base_url": os.getenv("AGENT_LLM_BASE_URL") or _DEFAULT_CONFIG["base_url"],
-        "model": os.getenv("AGENT_LLM_MODEL") or _DEFAULT_CONFIG["model"],
-        "timeout": os.getenv("AGENT_LLM_TIMEOUT") or _DEFAULT_CONFIG["timeout"],
         "result_retention_seconds": _result_retention_seconds(),
         "max_result_projects": _max_result_projects(),
         "full_workflow_enabled": _full_workflow_enabled(),
         **queue_state,
+    }
+
+
+@app.get("/api/llm/config")
+async def get_llm_config():
+    return _public_llm_config()
+
+
+@app.put("/api/llm/config")
+async def save_llm_config(body: dict[str, Any]):
+    payload = body.get("llm_config", body)
+    if not isinstance(payload, dict):
+        payload = {}
+    existing = _llm_config_store().load() or {}
+    api_key = _clean_text(payload.get("api_key")) or existing.get("api_key", "")
+    if not api_key:
+        return {"ok": False, "error": "API Key is required before saving configuration."}
+    config, error = _build_llm_config({**existing, **payload, "api_key": api_key})
+    if error or config is None:
+        return {"ok": False, "error": error}
+    ok, message = await _run_llm_check(config)
+    if not ok:
+        return {"ok": False, "error": message}
+    _llm_config_store().save(config)
+    return {"ok": True, **_public_llm_config(), "message": message}
+
+
+@app.delete("/api/llm/config")
+async def delete_llm_config():
+    return {"ok": True, "deleted": _llm_config_store().delete()}
+
+
+@app.post("/api/llm/models")
+async def list_llm_models(body: dict[str, Any]):
+    payload = body.get("llm_config", body)
+    if not isinstance(payload, dict):
+        payload = {}
+    config, error = _build_llm_config(payload)
+    if error or config is None:
+        return {"ok": False, "error": error, "models": []}
+    try:
+        models = await _fetch_llm_models(config)
+    except Exception as exc:
+        return {"ok": False, "error": _llm_check_error(exc), "models": []}
+    return {
+        "ok": True,
+        "models": _ordered_models(models, config["model"]),
+        "selected": config["model"],
     }
 
 

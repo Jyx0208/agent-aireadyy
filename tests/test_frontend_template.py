@@ -56,6 +56,23 @@ def test_frontend_template_has_reusable_ui_components_and_button_loading_state()
     assert "aria-checked" in html
 
 
+def test_frontend_template_saves_config_discovers_models_and_clears_transient_key():
+    html = _html()
+
+    assert 'id="saveApiConfigBtn"' in html
+    assert 'id="deleteApiConfigBtn"' in html
+    assert 'id="refreshModelsBtn"' in html
+    assert 'id="modelOptions"' in html
+    assert "/api/llm/config" in html
+    assert "/api/llm/models" in html
+    assert "async function saveLLMConfig()" in html
+    assert "async function deleteLLMConfig()" in html
+    assert "async function loadLLMModels(" in html
+    assert "function clearTransientApiKey()" in html
+    assert "clearTransientApiKey();" in html
+    assert 'placeholder="deepseek-v4-pro"' in html
+
+
 def test_frontend_template_exposes_batch_excel_workflow():
     html = _html()
 

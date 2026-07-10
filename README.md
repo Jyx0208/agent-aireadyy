@@ -133,6 +133,12 @@ the Web UI; operators configure only hard ceilings through server environment
 variables. The activity, tools, and raw-event tabs expose the public audit
 stream without displaying hidden chain-of-thought.
 
+For a trusted local deployment, the API Configuration panel can validate and
+save the provider key in `.agent_secrets/llm_config.json`, which is excluded
+from Git and never returned to the browser. The panel can fetch the provider's
+available models from `/models`; `deepseek-v4-pro` is the default. Use the
+delete action before sharing or moving a working copy.
+
 ## Reproduce the Protected Benchmark
 
 See the full reproduction guide:

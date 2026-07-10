@@ -1075,10 +1075,13 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
         <div class="config-body" id="configBody">
           <div class="form-row"><label for="cfgApiKey">API Key *</label><input type="password" id="cfgApiKey" aria-required="true" aria-invalid="false" autocomplete="off" data-i18n-placeholder="apiKeyPlaceholder" placeholder="Your API key for this task"></div>
           <div class="form-row"><label for="cfgBaseUrl">Base URL</label><input type="text" id="cfgBaseUrl" inputmode="url" placeholder="https://api.deepseek.com"></div>
-          <div class="form-row"><label for="cfgModel" data-i18n="model">Model</label><input type="text" id="cfgModel" placeholder="deepseek-v4-flash"></div>
+          <div class="form-row"><label for="cfgModel" data-i18n="model">Model</label><input type="text" id="cfgModel" list="modelOptions" placeholder="deepseek-v4-pro"><datalist id="modelOptions"><option value="deepseek-v4-pro"></option><option value="deepseek-v4-flash"></option></datalist></div>
           <div class="form-row"><label for="cfgTimeout" data-i18n="timeout">Timeout</label><input type="number" id="cfgTimeout" min="1" placeholder="1200"></div>
           <div class="config-actions">
             <button class="btn btn-secondary btn-small" id="checkApiBtn" onclick="checkLLMConfig()" data-i18n="checkApi">Check API Key</button>
+            <button class="btn btn-primary btn-small" id="saveApiConfigBtn" onclick="saveLLMConfig()" data-i18n="saveApiConfig">Save config</button>
+            <button class="btn btn-secondary btn-small" id="refreshModelsBtn" onclick="loadLLMModels()" data-i18n="refreshModels">Get models</button>
+            <button class="btn btn-secondary btn-small" id="deleteApiConfigBtn" onclick="deleteLLMConfig()" data-i18n="deleteApiConfig">Delete saved</button>
             <span class="inline-status" id="resultRetention"></span>
           </div>
         </div>
@@ -1155,6 +1158,7 @@ let taskId=null,ws=null,currentFilter='all',allLogs=[],startTime=null,timerInter
 let currentLanguage='en';
 let currentRunMode='prepare';
 let fullWorkflowEnabled=false;
+let serverLlmConfigured=false;
 let lastReviewSummary=null;
 let currentBatchId=null,batchPollTimer=null,currentBatchRecord=null;
 let currentWorkflowTab='single';
@@ -1454,6 +1458,13 @@ const I18N={
     model:'Model',
     timeout:'Timeout',
     checkApi:'Check API Key',
+    saveApiConfig:'Save config',
+    deleteApiConfig:'Delete saved',
+    refreshModels:'Get models',
+    savedApiKeyPlaceholder:'Saved on this server; enter a key to replace it',
+    apiConfigSaved:'API configuration saved on this server.',
+    apiConfigDeleted:'Saved API configuration deleted.',
+    modelsLoaded:n=>`${n} model(s) loaded.`,
     apiWarning:'The API key is checked when a task starts and is not written to public history.',
     projectHistory:'Project History',
     refresh:'Refresh',
@@ -1598,6 +1609,13 @@ const I18N={
     model:'模型',
     timeout:'超时',
     checkApi:'检查 API Key',
+    saveApiConfig:'保存配置',
+    deleteApiConfig:'删除已保存配置',
+    refreshModels:'获取模型',
+    savedApiKeyPlaceholder:'服务器已保存；输入新 Key 可替换',
+    apiConfigSaved:'API 配置已保存到本机服务器。',
+    apiConfigDeleted:'已删除服务器保存的 API 配置。',
+    modelsLoaded:n=>`已获取 ${n} 个模型。`,
     apiWarning:'任务启动前会检查本次填写的 API Key，且不会写入公开历史。',
     projectHistory:'项目历史',
     refresh:'刷新',
@@ -2045,6 +2063,13 @@ const CLEAN_ZH_I18N={
   model:'模型',
   timeout:'超时',
   checkApi:'检查 API Key',
+  saveApiConfig:'保存配置',
+  deleteApiConfig:'删除已保存配置',
+  refreshModels:'获取模型',
+  savedApiKeyPlaceholder:'服务器已保存；输入新 Key 可替换',
+  apiConfigSaved:'API 配置已保存到本机服务器。',
+  apiConfigDeleted:'已删除服务器保存的 API 配置。',
+  modelsLoaded:n=>`已获取 ${n} 个模型。`,
   apiWarning:'API Key 只在任务启动时检查，不会写入公开历史。',
   projectHistory:'项目历史',
   refresh:'刷新',
@@ -2435,6 +2460,10 @@ async function loadConfig(){
     document.getElementById('cfgBaseUrl').value=d.base_url||'';
     document.getElementById('cfgModel').value=d.model||'';
     document.getElementById('cfgTimeout').value=d.timeout||'';
+    serverLlmConfigured=!!d.api_key_set;
+    const keyInput=document.getElementById('cfgApiKey');
+    keyInput.placeholder=serverLlmConfigured?t('savedApiKeyPlaceholder'):t('apiKeyPlaceholder');
+    keyInput.setAttribute('aria-required',serverLlmConfigured?'false':'true');
     document.getElementById('configBody').classList.add('open');
     document.getElementById('configToggle').setAttribute('aria-expanded','true');
     document.getElementById('configStatus').textContent='';
@@ -2442,6 +2471,7 @@ async function loadConfig(){
     updateFullWorkflowAvailability(!!d.full_workflow_enabled);
     setRunMode(localStorage.getItem('runMode')||(fullWorkflowEnabled?'full':'prepare'),false);
     updateServerStatus(d);
+    if(serverLlmConfigured)loadLLMModels(true);
   }catch(e){}
 }
 
@@ -3816,7 +3846,9 @@ async function startDiscovery(){
   status.textContent=t('discoveryQueued');
   status.className='discovery-status';
   try{
-    const resp=await fetch('/api/discovery/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const request=fetch('/api/discovery/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    clearTransientApiKey();
+    const resp=await request;
     const data=await resp.json();
     if(data.error){
       status.textContent=tf('discoveryFailed',data.error);
@@ -4556,7 +4588,7 @@ async function saveDiscoveryReviews(){
 function validateConfig(){
   const key=document.getElementById('cfgApiKey').value.trim();
   const input=document.getElementById('cfgApiKey');
-  if(!key){input.classList.add('error');input.setAttribute('aria-invalid','true');input.focus();document.getElementById('configBody').classList.add('open');document.getElementById('configToggle').setAttribute('aria-expanded','true');return false}
+  if(!key&&!serverLlmConfigured){input.classList.add('error');input.setAttribute('aria-invalid','true');input.focus();document.getElementById('configBody').classList.add('open');document.getElementById('configToggle').setAttribute('aria-expanded','true');return false}
   input.classList.remove('error');
   input.setAttribute('aria-invalid','false');
   return true;
@@ -4620,6 +4652,77 @@ function collectConfig(){
   if(mo)cfg.model=mo;
   if(to)cfg.timeout=to;
   return cfg;
+}
+
+function clearTransientApiKey(){
+  const input=document.getElementById('cfgApiKey');
+  if(!input)return;
+  input.value='';
+  input.classList.remove('error');
+  input.setAttribute('aria-invalid','false');
+  input.placeholder=serverLlmConfigured?t('savedApiKeyPlaceholder'):t('apiKeyPlaceholder');
+}
+
+function populateModelOptions(models){
+  const list=document.getElementById('modelOptions');
+  list.replaceChildren();
+  (models||[]).forEach(model=>{
+    const option=document.createElement('option');
+    option.value=String(model||'');
+    if(option.value)list.appendChild(option);
+  });
+}
+
+async function loadLLMModels(silent=false){
+  if(!validateConfig()){if(!silent)showFormAlert(t('apiRequired'));return false}
+  const btn=document.getElementById('refreshModelsBtn'),status=document.getElementById('apiCheckStatus');
+  setButtonBusy(btn,true,t('checking'));
+  try{
+    const resp=await fetch('/api/llm/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({llm_config:collectConfig()})});
+    const data=await resp.json();
+    if(!data.ok){if(!silent){status.textContent=data.error||t('apiFailed');status.className='inline-status error'}return false}
+    populateModelOptions(data.models||[]);
+    if(data.selected)document.getElementById('cfgModel').value=data.selected;
+    if(!silent){status.textContent=tf('modelsLoaded',data.models?.length||0);status.className='inline-status ok'}
+    return true;
+  }catch(e){
+    if(!silent){status.textContent=t('checkRequestFailed');status.className='inline-status error'}
+    return false;
+  }finally{setButtonBusy(btn,false,t('refreshModels'))}
+}
+
+async function saveLLMConfig(){
+  if(!validateConfig()){showFormAlert(t('apiRequired'));return false}
+  clearFormAlert();
+  const btn=document.getElementById('saveApiConfigBtn'),status=document.getElementById('apiCheckStatus');
+  setButtonBusy(btn,true,t('checking'));
+  try{
+    const resp=await fetch('/api/llm/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({llm_config:collectConfig()})});
+    const data=await resp.json();
+    if(!data.ok){status.textContent=data.error||t('apiFailed');status.className='inline-status error';return false}
+    serverLlmConfigured=true;
+    clearTransientApiKey();
+    status.textContent=t('apiConfigSaved');status.className='inline-status ok';
+    await loadConfig();
+    return true;
+  }catch(e){status.textContent=t('checkRequestFailed');status.className='inline-status error';return false}
+  finally{setButtonBusy(btn,false,t('saveApiConfig'))}
+}
+
+async function deleteLLMConfig(){
+  const btn=document.getElementById('deleteApiConfigBtn'),status=document.getElementById('apiCheckStatus');
+  setButtonBusy(btn,true,t('checking'));
+  try{
+    const resp=await fetch('/api/llm/config',{method:'DELETE'});
+    const data=await resp.json();
+    if(!data.ok){status.textContent=data.error||t('apiFailed');status.className='inline-status error';return false}
+    serverLlmConfigured=false;
+    clearTransientApiKey();
+    status.textContent=t('apiConfigDeleted');status.className='inline-status ok';
+    await loadConfig();
+    return true;
+  }catch(e){status.textContent=t('checkRequestFailed');status.className='inline-status error';return false}
+  finally{setButtonBusy(btn,false,t('deleteApiConfig'))}
 }
 
 async function checkLLMConfig(){

@@ -196,7 +196,7 @@ regression, and zero hard-constraint violations. Exit code `0` means the gate
 passed, `1` means complete evidence failed a target, and `2` means evaluation
 inputs were missing or malformed.
 
-Local core verification on 2026-07-10 completed with `741 passed in 130.56s`.
+Local core verification on 2026-07-11 completed with `749 passed in 138.28s`.
 The release-gate command currently exits `2` because the repository does not
 yet contain the required eight paired baseline and dynamic replay directories.
 Accordingly, `single_agent` remains the documented and Compose default; this is

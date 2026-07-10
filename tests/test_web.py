@@ -3206,7 +3206,7 @@ def test_running_and_failed_tasks_are_not_downloadable(monkeypatch, tmp_path):
     assert failed_download == {"error": "任务未完成，不能下载结果"}
 
 
-def test_web_task_requires_each_user_api_key_in_request(monkeypatch):
+def test_web_task_uses_server_api_key_when_browser_key_is_absent(monkeypatch):
     monkeypatch.setattr("agent.web.app._check_llm_api", _llm_ok, raising=False)
     monkeypatch.setenv("AGENT_LLM_API_KEY", "sk-server-global")
     monkeypatch.delenv("AGENT_LLM_BASE_URL", raising=False)
@@ -3215,7 +3215,14 @@ def test_web_task_requires_each_user_api_key_in_request(monkeypatch):
 
     result = asyncio.run(_create_task_inner({"input_value": "../outside", "llm_config": {}}))
 
-    assert result == {"error": "请先填写本次任务使用的 API Key"}
+    task_id = result.get("task_id")
+    try:
+        assert "error" not in result
+        assert _tasks[task_id]["llm_config"]["api_key"] == "sk-server-global"
+        assert _tasks[task_id]["llm_config"]["model"] == "deepseek-v4-pro"
+    finally:
+        if task_id:
+            _tasks.pop(task_id, None)
 
 
 def test_create_task_keeps_output_dir_inside_runs_for_pathlike_input(monkeypatch):
@@ -3540,3 +3547,85 @@ def test_zip_output_rebuilds_cached_archive_missing_parameter_files(tmp_path):
         names = set(archive.namelist())
     assert "msdt/sample_fp_msdt.parquet" in names
     assert "fragpipe/fragger.params" in names
+
+
+def test_saved_llm_config_is_masked_and_used_without_browser_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_LLM_CONFIG_PATH", str(tmp_path / "secrets" / "llm_config.json"))
+    monkeypatch.setattr("agent.web.app._run_llm_check", _llm_ok)
+
+    saved = asyncio.run(
+        web_app.save_llm_config(
+            {
+                "llm_config": {
+                    "api_key": "saved-secret",
+                    "base_url": "https://api.deepseek.com",
+                    "model": "deepseek-v4-pro",
+                    "timeout": "1200",
+                }
+            }
+        )
+    )
+    public = asyncio.run(web_app.get_llm_config())
+    effective, error = web_app._build_llm_config({})
+
+    assert saved["ok"] is True
+    assert saved["api_key_set"] is True
+    assert "api_key" not in saved
+    assert public == {
+        "api_key_set": True,
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-v4-pro",
+        "timeout": "1200",
+        "source": "saved",
+    }
+    assert effective == {
+        "api_key": "saved-secret",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-v4-pro",
+        "timeout": "1200",
+    }
+    assert error is None
+    assert "saved-secret" not in json.dumps(saved)
+    assert "saved-secret" not in json.dumps(public)
+
+
+def test_saved_llm_config_can_be_deleted(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_LLM_CONFIG_PATH", str(tmp_path / "llm_config.json"))
+    monkeypatch.setattr("agent.web.app._run_llm_check", _llm_ok)
+    asyncio.run(
+        web_app.save_llm_config(
+            {"llm_config": {"api_key": "saved-secret", "model": "deepseek-v4-pro"}}
+        )
+    )
+
+    deleted = asyncio.run(web_app.delete_llm_config())
+    public = asyncio.run(web_app.get_llm_config())
+
+    assert deleted == {"ok": True, "deleted": True}
+    assert public["api_key_set"] is False
+
+
+def test_list_llm_models_uses_saved_config_without_returning_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_LLM_CONFIG_PATH", str(tmp_path / "llm_config.json"))
+    monkeypatch.setattr("agent.web.app._run_llm_check", _llm_ok)
+    asyncio.run(
+        web_app.save_llm_config(
+            {"llm_config": {"api_key": "saved-secret", "model": "deepseek-v4-pro"}}
+        )
+    )
+    captured = {}
+
+    async def fake_fetch(config):
+        captured.update(config)
+        return ["deepseek-v4-flash", "deepseek-v4-pro"]
+
+    monkeypatch.setattr("agent.web.app._fetch_llm_models", fake_fetch)
+    result = asyncio.run(web_app.list_llm_models({"llm_config": {}}))
+
+    assert result == {
+        "ok": True,
+        "models": ["deepseek-v4-pro", "deepseek-v4-flash"],
+        "selected": "deepseek-v4-pro",
+    }
+    assert captured["api_key"] == "saved-secret"
+    assert "saved-secret" not in json.dumps(result)

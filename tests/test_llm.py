@@ -472,7 +472,7 @@ def test_no_sdrf_llm_context_includes_parameter_and_fasta_files():
 def test_openai_compatible_reasoner_defaults_to_gpt_5_4():
     reasoner = OpenAICompatibleReasoner(api_key="test-key")
 
-    assert reasoner.model == "deepseek-v4-flash"
+    assert reasoner.model == "deepseek-v4-pro"
     assert reasoner.timeout == 300.0
 
 
