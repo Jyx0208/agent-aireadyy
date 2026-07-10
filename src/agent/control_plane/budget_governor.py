@@ -76,6 +76,12 @@ class BudgetGovernor:
             raise ValueError("budget_proposal_not_found")
         self._validate_indexes(proposal, decision)
         self.store.save_budget_decision(self.run_id, decision)
+        self.store.increment_dynamic_usage(self.run_id, budget_reviews=1)
+        self.store.append_event(
+            self.run_id,
+            "budget_decision_recorded",
+            decision.model_dump(mode="json"),
+        )
         if decision.decision == "replan":
             return BudgetReviewResult(outcome="replan", decision=decision, reason="budget_agent_requested_replan")
         if decision.decision == "stop":

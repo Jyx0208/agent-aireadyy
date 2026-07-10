@@ -1,7 +1,9 @@
+from agent.control_plane.budget_governor import BudgetGovernor
 from agent.control_plane.models import (
     AgentBudget,
     AgentRunRecord,
     AgentRunStatus,
+    DynamicBudgetLimits,
     PolicyDecision,
     ToolRisk,
 )
@@ -12,6 +14,8 @@ __all__ = [
     "AgentRunRecord",
     "AgentRunStatus",
     "AgentRunStore",
+    "BudgetGovernor",
+    "DynamicBudgetLimits",
     "PolicyDecision",
     "ToolRisk",
 ]

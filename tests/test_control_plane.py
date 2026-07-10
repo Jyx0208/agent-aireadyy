@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 from typer.testing import CliRunner
 
@@ -626,6 +628,143 @@ def test_openai_agents_runner_executes_real_function_tool_loop(tmp_path: Path) -
     assert "Accept the current manifest" in result.final_output
     events = json.loads(Path(result.files["agents_discovery_events_json"]).read_text(encoding="utf-8"))
     assert "manifest_selected" in [event["event_type"] for event in events]
+
+
+def test_openai_agents_runner_executes_multi_agent_budget_loop(monkeypatch, tmp_path: Path) -> None:
+    from agents.items import ModelResponse
+    from agents.models.interface import Model
+    from agents.usage import Usage
+    from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputText
+
+    from agent.control_plane.openai_agents import run_openai_agents_discovery
+
+    class FakeScriptedToolModel(Model):
+        def __init__(self, actions: list[tuple[str, dict[str, Any] | str]]) -> None:
+            self.actions = actions
+            self.calls = 0
+
+        async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+            action, payload = self.actions[self.calls]
+            self.calls += 1
+            if action == "final":
+                output = [
+                    ResponseOutputMessage(
+                        id=f"message_{self.calls}",
+                        content=[
+                            ResponseOutputText(annotations=[], text=str(payload), type="output_text")
+                        ],
+                        role="assistant",
+                        status="completed",
+                        type="message",
+                    )
+                ]
+            else:
+                output = [
+                    ResponseFunctionToolCall(
+                        arguments=json.dumps(payload),
+                        call_id=f"call_{self.calls}",
+                        name=action,
+                        type="function_call",
+                        status="completed",
+                    )
+                ]
+            return ModelResponse(output=output, usage=Usage(requests=1), response_id=None)
+
+        async def stream_response(self, *args: Any, **kwargs: Any):
+            if False:
+                yield None
+
+    proposal = {
+        "objective": "Improve metadata coverage",
+        "reasoning_summary": "The current pool lacks sample-level metadata.",
+        "evidence_refs": ["metadata_gap:0.7"],
+        "queries": ["human plasma SDRF"],
+        "expected_gain_dimensions": ["metadata_completeness"],
+        "expected_gain": "More sample metadata",
+        "alternatives_considered": ["generic broad search"],
+        "stop_condition": "No new usable files",
+    }
+    discovery_model = FakeScriptedToolModel(
+        [
+            ("request_search_budget", {"proposal": proposal}),
+            (
+                "search_repository_datasets_with_grant",
+                {"grant_id": "grant_" + "1" * 32, "queries": ["human plasma SDRF"]},
+            ),
+            (
+                "select_discovery_manifest",
+                {"round_index": 0, "rationale": "The pool contains valid candidates."},
+            ),
+            ("final", "Selected the merged candidate pool."),
+        ]
+    )
+    budget_model = FakeScriptedToolModel(
+        [
+            (
+                "submit_budget_decision",
+                {
+                    "decision": {
+                        "proposal_id": "proposal_" + "1" * 32,
+                        "decision": "grant",
+                        "approved_query_indexes": [0],
+                        "reasoning_summary": "The query targets the measured metadata gap.",
+                    }
+                },
+            ),
+            ("final", "Budget decision submitted."),
+        ]
+    )
+    request = DatasetRequest(repository="pride", max_projects=2, max_files=10)
+
+    def fake_discovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
+        project = DiscoveredProject(project_accession="PXD_MULTI", project_title="Multi-agent fixture")
+        file = DiscoveredFile(
+            project_accession=project.project_accession,
+            project_title=project.project_title,
+            file_name="multi.raw",
+            file_type=".raw",
+            validity_status="valid",
+            evidence_level="file",
+        )
+        return DatasetManifest(
+            request=request,
+            projects=[project],
+            files=[file],
+            summary={"selected_projects": 1, "selected_files": 1},
+        )
+
+    monkeypatch.setattr(
+        "agent.control_plane.budget_governor.uuid.uuid4",
+        lambda: SimpleNamespace(hex="1" * 32),
+    )
+    state_db = tmp_path / "agent_control.sqlite"
+    result = run_openai_agents_discovery(
+        prompt="Find human plasma DDA data",
+        request=request,
+        output_dir=tmp_path / "output",
+        state_db=state_db,
+        run_id="multi_agent_run",
+        mode="multi_agent",
+        dynamic_limits=DynamicBudgetLimits(),
+        budget=AgentBudget(max_turns=12, max_tool_calls=20),
+        discovery_func=fake_discovery,
+        model=discovery_model,
+        budget_model=budget_model,
+        stream_events=False,
+    )
+    store = AgentRunStore(state_db)
+    assert result.status == "completed"
+    assert result.selected_round_index == 0
+    run = store.load_run(result.run_id)
+    assert run is not None
+    assert run.dynamic_usage.budget_reviews == 1
+    assert run.dynamic_usage.search_batches == 1
+    assert run.dynamic_usage.query_units == 1
+    assert store.list_search_grants(run.run_id)[0].status == "consumed"
+    event_types = [event.event_type for event in store.list_events(run.run_id)]
+    assert "budget_decision_recorded" in event_types
+    assert "search_grant_consumed" in event_types
+    assert "manifest_selected" in event_types
 
 
 def test_openai_agents_setup_failure_is_persisted(monkeypatch, tmp_path: Path) -> None:
