@@ -1,8 +1,16 @@
+import asyncio
+import json
 from pathlib import Path
+from typing import Any
 
 import pytest
+from agents.items import ModelResponse
+from agents.models.interface import Model
+from agents.usage import Usage
+from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputText
 from pydantic import ValidationError
 
+from agent.control_plane.budget_agent import run_budget_agent_review
 from agent.control_plane.models import (
     AgentBudget,
     AgentRunRecord,
@@ -10,6 +18,7 @@ from agent.control_plane.models import (
     BudgetDecisionInput,
     DynamicBudgetLimits,
     DynamicBudgetUsage,
+    RoundMetrics,
     SearchGrant,
     SearchProposalInput,
     SearchProposalRecord,
@@ -17,6 +26,7 @@ from agent.control_plane.models import (
 from agent.control_plane.budget_governor import BudgetGovernor
 from agent.control_plane.discovery_metrics import evaluate_round_metrics
 from agent.control_plane.store import AgentRunStore
+from agent.control_plane.openai_agents import _load_agents_sdk
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
 
 
@@ -362,3 +372,122 @@ def test_governor_rejects_exact_consumed_query_without_retryable_failure(tmp_pat
     second_review = governor.apply_decision(_grant_decision(second.proposal_id, [0]))
     assert second_review.outcome == "denied"
     assert second_review.reason == "duplicate_query_not_authorized"
+
+
+class FakeBudgetDecisionModel(Model):
+    def __init__(self, payloads: dict[str, Any] | list[dict[str, Any]]) -> None:
+        self.payloads = payloads if isinstance(payloads, list) else [payloads]
+        self.calls = 0
+
+    async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        self.calls += 1
+        if self.calls <= len(self.payloads):
+            output = [
+                ResponseFunctionToolCall(
+                    arguments=json.dumps(self.payloads[self.calls - 1]),
+                    call_id=f"budget_call_{self.calls}",
+                    name="submit_budget_decision",
+                    type="function_call",
+                    status="completed",
+                )
+            ]
+        else:
+            output = [
+                ResponseOutputMessage(
+                    id="budget_message",
+                    content=[
+                        ResponseOutputText(
+                            annotations=[],
+                            text="Budget decision submitted.",
+                            type="output_text",
+                        )
+                    ],
+                    role="assistant",
+                    status="completed",
+                    type="message",
+                )
+            ]
+        return ModelResponse(output=output, usage=Usage(requests=1), response_id=None)
+
+    async def stream_response(self, *args: Any, **kwargs: Any):
+        if False:
+            yield None
+
+
+def _metrics() -> RoundMetrics:
+    return RoundMetrics(
+        candidate_shortfall=0.6,
+        quality_gap=0.3,
+        metadata_gap=0.7,
+        diversity_gap=0.4,
+        strategy_novelty=0.8,
+        last_round_yield=0.5,
+        query_repetition=0.2,
+        budget_pressure=0.1,
+    )
+
+
+def test_budget_agent_submits_structured_grant_with_fake_model(tmp_path: Path) -> None:
+    store, run = _dynamic_store_and_run(tmp_path)
+    governor = BudgetGovernor(store, run.run_id)
+    proposal = governor.register_proposal(_proposal(["human plasma SDRF"]))
+    model = FakeBudgetDecisionModel(
+        {
+            "decision": {
+                "proposal_id": proposal.proposal_id,
+                "decision": "grant",
+                "approved_query_indexes": [0],
+                "reasoning_summary": "The query targets the measured metadata gap.",
+            }
+        }
+    )
+    result = asyncio.run(
+        run_budget_agent_review(
+            sdk=_load_agents_sdk(),
+            model=model,
+            proposal=proposal,
+            metrics=_metrics(),
+            governor=governor,
+            max_turns=3,
+        )
+    )
+    assert result.outcome == "granted"
+    assert result.grant is not None
+    assert model.calls == 2
+
+
+def test_budget_agent_corrects_invalid_stop_to_replan(tmp_path: Path) -> None:
+    store, run = _dynamic_store_and_run(tmp_path)
+    governor = BudgetGovernor(store, run.run_id)
+    proposal = governor.register_proposal(_proposal(["human plasma SDRF"]))
+    model = FakeBudgetDecisionModel(
+        [
+            {
+                "decision": {
+                    "proposal_id": proposal.proposal_id,
+                    "decision": "stop",
+                    "reasoning_summary": "Stop without counterfactual fields",
+                }
+            },
+            {
+                "decision": {
+                    "proposal_id": proposal.proposal_id,
+                    "decision": "replan",
+                    "reasoning_summary": "Try a materially different metadata strategy.",
+                }
+            },
+        ]
+    )
+    result = asyncio.run(
+        run_budget_agent_review(
+            sdk=_load_agents_sdk(),
+            model=model,
+            proposal=proposal,
+            metrics=_metrics(),
+            governor=governor,
+            max_turns=3,
+        )
+    )
+    assert result.outcome == "replan"
+    assert result.grant is None
+    assert model.calls == 3
