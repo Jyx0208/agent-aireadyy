@@ -96,6 +96,16 @@ def prepare_pride_search_queries(queries: list[str]) -> list[str]:
     return prepared
 
 
+def classify_pride_query_strategy(queries: list[str]) -> str:
+    normalized = [" ".join(str(query).strip().split()) for query in queries if str(query).strip()]
+    prepared = prepare_pride_search_queries(normalized)
+    normalized_keys = [re.sub(r"[-_\s]+", " ", value.casefold()).strip() for value in normalized]
+    prepared_keys = [re.sub(r"[-_\s]+", " ", value.casefold()).strip() for value in prepared]
+    if normalized_keys and normalized_keys == prepared_keys:
+        return "atomic_seed"
+    return "compound_semantic"
+
+
 def build_pride_queries(request: DatasetRequest) -> list[str]:
     queries: list[str] = []
 

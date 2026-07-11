@@ -474,6 +474,189 @@ def test_discovery_tool_service_enforces_round_budget(tmp_path: Path) -> None:
     assert stored.blockers == ["no_selected_files"]
 
 
+def test_discovery_requires_atomic_recovery_after_zero_yield_compound_search(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride", max_projects=1, max_files=1)
+    calls: list[list[str]] = []
+
+    def discovery_with_recovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
+        calls.append(list(queries or []))
+        if queries == ["human", "DDA"]:
+            project = DiscoveredProject(project_accession="PXD_RECOVERED", project_title="Recovered")
+            file = DiscoveredFile(
+                project_accession=project.project_accession,
+                file_name="recovered.raw",
+                file_type=".raw",
+                validity_status="valid",
+                evidence_level="file",
+            )
+            return DatasetManifest(
+                request=request,
+                projects=[project],
+                files=[file],
+                summary={
+                    "queries": ["human", "DDA"],
+                    "candidate_projects_seen": 1,
+                    "selected_projects": 1,
+                    "selected_files": 1,
+                },
+            )
+        return DatasetManifest(
+            request=request,
+            summary={
+                "queries": list(queries or []),
+                "candidate_projects_seen": 0,
+                "selected_projects": 0,
+                "selected_files": 0,
+                "failures": [],
+            },
+        )
+
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(_run("recovery_001").model_copy(update={"status": "running"}))
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        discovery_func=discovery_with_recovery,
+    )
+
+    first = service.search_repository_datasets(["human DDA Orbitrap"])
+    repeated = service.search_repository_datasets(["human DDA label-free"])
+
+    assert first.diagnosis is not None
+    assert first.diagnosis.health == "selectivity_suspected"
+    assert first.diagnosis.recovery_required is True
+    assert first.recommended_action == "retry_with_atomic_repository_seeds"
+    assert repeated.status == "blocked"
+    assert repeated.blockers == ["search_recovery_requires_atomic_queries"]
+    assert repeated.recommended_action == "retry_with_atomic_repository_seeds"
+    assert calls == [["human DDA Orbitrap"]]
+    assert store.load_run(run.run_id).discovery_round_count == 1
+
+    premature_selection = service.select_discovery_manifest(1, "No files were found.")
+    assert premature_selection["blockers"] == ["search_recovery_required"]
+
+    recovered = service.search_repository_datasets(["human", "DDA"])
+
+    assert recovered.status == "completed"
+    assert recovered.diagnosis is not None
+    assert recovered.diagnosis.health == "healthy_yield"
+    assert recovered.diagnosis.recovery_attempted is True
+    stored = store.load_run(run.run_id)
+    assert stored is not None
+    assert stored.search_recovery_required is False
+    assert stored.search_recovery_attempts == 1
+    event_types = [event.event_type for event in store.list_events(run.run_id)]
+    assert "search_diagnosis_recorded" in event_types
+    assert "search_strategy_rejected" in event_types
+    assert "search_recovery_succeeded" in event_types
+
+
+def test_discovery_classifies_repository_failure_separately_from_zero_match(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride")
+
+    def unavailable_discovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
+        raise RuntimeError("PRIDE upstream unavailable")
+
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(_run("repository_failure_001").model_copy(update={"status": "running"}))
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        discovery_func=unavailable_discovery,
+    )
+
+    observation = service.search_repository_datasets(["human"])
+
+    assert observation.status == "failed"
+    assert observation.diagnosis is not None
+    assert observation.diagnosis.health == "repository_unavailable"
+    assert observation.diagnosis.recovery_required is False
+    assert observation.recommended_action == "retry_repository_or_stop"
+
+
+def test_discovery_classifies_invalid_repository_response(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride")
+
+    def invalid_response_discovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
+        raise ValueError("invalid repository response schema")
+
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(_run("invalid_response_001").model_copy(update={"status": "running"}))
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        discovery_func=invalid_response_discovery,
+    )
+
+    observation = service.search_repository_datasets(["human"])
+
+    assert observation.diagnosis is not None
+    assert observation.diagnosis.health == "response_invalid"
+    assert observation.recommended_action == "retry_repository_or_stop"
+
+
+def test_budget_governor_denies_compound_queries_when_atomic_recovery_is_required(tmp_path: Path) -> None:
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = AgentRunRecord(
+        run_id="recovery_budget_001",
+        workflow="discovery",
+        status="running",
+        request={"repository": "pride"},
+        dynamic_budget_enabled=True,
+        search_recovery_required=True,
+    )
+    store.save_run(run)
+    governor = BudgetGovernor(store, run.run_id)
+
+    proposal = governor.register_proposal(
+        SearchProposalInput(
+            objective="Recover from zero-yield PRIDE search",
+            reasoning_summary="The previous compound strategy returned no candidates.",
+            queries=["human DDA Orbitrap"],
+            expected_gain="Test whether another compound query changes yield.",
+            stop_condition="candidate found",
+        )
+    )
+    denied = governor.apply_decision(
+        BudgetDecision(
+            proposal_id=proposal.proposal_id,
+            decision="grant",
+            approved_query_indexes=[0],
+            reasoning_summary="Retry the same strategy.",
+        )
+    )
+
+    assert denied.outcome == "denied"
+    assert denied.reason == "search_recovery_requires_atomic_queries"
+
+    atomic_proposal = governor.register_proposal(
+        SearchProposalInput(
+            objective="Run atomic PRIDE recovery",
+            reasoning_summary="Atomic seeds separate query selectivity from a genuine no-match.",
+            queries=["human", "DDA"],
+            expected_gain="Identify whether the repository contains broad matching candidates.",
+            stop_condition="candidate found or atomic seeds exhausted",
+        )
+    )
+    granted = governor.apply_decision(
+        BudgetDecision(
+            proposal_id=atomic_proposal.proposal_id,
+            decision="grant",
+            approved_query_indexes=[0, 1],
+            reasoning_summary="Use a materially different atomic strategy.",
+        )
+    )
+
+    assert granted.outcome == "granted"
+    assert granted.grant is not None
+
+
 def test_discovery_state_tool_is_budgeted_and_audited(tmp_path: Path) -> None:
     store = AgentRunStore(tmp_path / "state.sqlite")
     run = AgentRunRecord(

@@ -13,6 +13,7 @@ from agent.control_plane.models import (
     DiscoveryRoundObservation,
     DynamicBudgetLimits,
     RoundMetrics,
+    SearchDiagnosis,
 )
 from agent.control_plane.policy import evaluate_tool_policy
 from agent.control_plane.store import AgentRunStore
@@ -21,6 +22,7 @@ from agent.discovery.manifest import write_dataset_manifest
 from agent.discovery.memory import DiscoveryMemory
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
 from agent.discovery.repository_discovery import discover_repository_dataset
+from agent.discovery.query_builder import classify_pride_query_strategy
 from agent.discovery.task_readiness import annotate_manifest_task_readiness
 from agent.repositories.metering import meter_repository_requests
 
@@ -96,6 +98,32 @@ class DiscoveryToolService:
                 return self._blocked_observation(queries, str(exc))
         elif run.discovery_round_count >= run.budget.max_discovery_rounds:
             return self._blocked_observation(queries, "discovery_round_budget_exhausted")
+
+        proposed_strategy = self._query_strategy(queries)
+        if run.search_recovery_required and proposed_strategy != "atomic_seed":
+            diagnosis = SearchDiagnosis(
+                health="selectivity_suspected",
+                strategy=proposed_strategy,
+                proposed_queries=queries,
+                executed_queries=[],
+                consecutive_zero_yield=run.consecutive_zero_yield,
+                recovery_required=True,
+                reason="Previous zero-yield search requires atomic high-recall repository seeds.",
+            )
+            observation = DiscoveryRoundObservation(
+                status="blocked",
+                round_index=run.discovery_round_count + 1,
+                queries=queries,
+                recommended_action="retry_with_atomic_repository_seeds",
+                blockers=["search_recovery_requires_atomic_queries"],
+                diagnosis=diagnosis,
+            )
+            self.store.append_event(
+                self.run_id,
+                "search_strategy_rejected",
+                diagnosis.model_dump(mode="json"),
+            )
+            return observation
 
         run = self._require_run()
         previous_pool = (
@@ -201,6 +229,21 @@ class DiscoveryToolService:
                 queries=queries,
                 paths=paths,
             )
+            diagnosis = self._diagnose_search_result(
+                run=run,
+                proposed_queries=queries,
+                summary=manifest.summary,
+            )
+            recommendation = observation.recommended_action
+            if diagnosis.health == "selectivity_suspected":
+                recommendation = "retry_with_atomic_repository_seeds"
+            elif diagnosis.health == "repository_unavailable":
+                recommendation = "retry_repository_or_stop"
+            elif diagnosis.health == "no_match_after_recovery":
+                recommendation = "stop_or_adjust_hard_constraints"
+            observation = observation.model_copy(
+                update={"diagnosis": diagnosis, "recommended_action": recommendation}
+            )
             artifacts = dict(run.artifacts)
             artifacts[f"discovery_round_{round_index:02d}"] = ArtifactReference(
                 path=str(paths["dataset_manifest_json"]),
@@ -241,12 +284,26 @@ class DiscoveryToolService:
                 schema_version="dataset-manifest/v1",
             )
             retained_previous_candidates = observation.selected_files <= 0 and pool_observation.selected_files > 0
+            if retained_previous_candidates and diagnosis.recovery_required:
+                diagnosis = diagnosis.model_copy(
+                    update={
+                        "recovery_required": False,
+                        "reason": (
+                            f"{diagnosis.reason} A prior round still provides a usable candidate pool, "
+                            "so selection may proceed."
+                        ),
+                    }
+                )
             observation = observation.model_copy(
                 update={
                     "candidate_pool_manifest_path": str(pool_paths["dataset_manifest_json"]),
                     "pooled_selected_projects": pool_observation.selected_projects,
                     "pooled_selected_files": pool_observation.selected_files,
                     "metrics": metrics,
+                    "diagnosis": diagnosis,
+                    "recommended_action": (
+                        "accept_candidate_pool_or_retry" if retained_previous_candidates else recommendation
+                    ),
                 }
             )
             self.store.complete_tool_call(
@@ -265,9 +322,26 @@ class DiscoveryToolService:
                     "warnings": pool_observation.warnings,
                     "blockers": pool_observation.blockers,
                     "latest_metrics": metrics,
+                    "consecutive_zero_yield": diagnosis.consecutive_zero_yield,
+                    "search_recovery_required": diagnosis.recovery_required,
+                    "search_recovery_attempts": (
+                        metered_run.search_recovery_attempts + (1 if diagnosis.recovery_attempted else 0)
+                    ),
+                    "last_search_strategy": diagnosis.strategy,
                 }
             )
             self.store.save_run(run)
+            self.store.append_event(
+                self.run_id,
+                "search_diagnosis_recorded",
+                diagnosis.model_dump(mode="json"),
+            )
+            if diagnosis.recovery_attempted and diagnosis.health == "healthy_yield":
+                self.store.append_event(
+                    self.run_id,
+                    "search_recovery_succeeded",
+                    diagnosis.model_dump(mode="json"),
+                )
             self.store.append_event(
                 self.run_id,
                 "round_value_evaluated",
@@ -286,13 +360,29 @@ class DiscoveryToolService:
             )
             return observation
         except Exception as exc:
+            failure_text = str(exc).casefold()
+            failure_health = (
+                "response_invalid"
+                if any(term in failure_text for term in ("json", "response schema", "response shape", "decode"))
+                else "repository_unavailable"
+            )
+            diagnosis = SearchDiagnosis(
+                health=failure_health,
+                strategy=self._query_strategy(queries),
+                proposed_queries=queries,
+                executed_queries=[],
+                consecutive_zero_yield=run.consecutive_zero_yield,
+                recovery_required=False,
+                reason=str(exc),
+            )
             observation = DiscoveryRoundObservation(
                 status="failed",
                 round_index=round_index,
                 queries=queries,
-                recommended_action="revise_queries_or_stop",
+                recommended_action="retry_repository_or_stop",
                 warnings=["repository_discovery_tool_failed"],
                 blockers=[str(exc)],
+                diagnosis=diagnosis,
             )
             self.store.complete_tool_call(
                 tool_call.idempotency_key,
@@ -302,6 +392,11 @@ class DiscoveryToolService:
             )
             warnings = _dedupe([*run.warnings, f"repository_discovery_tool_failed:{exc}"])
             self.store.save_run(run.model_copy(update={"warnings": warnings}))
+            self.store.append_event(
+                self.run_id,
+                "search_diagnosis_recorded",
+                diagnosis.model_dump(mode="json"),
+            )
             self.store.append_event(
                 self.run_id,
                 "tool_failed",
@@ -315,6 +410,8 @@ class DiscoveryToolService:
 
     def select_discovery_manifest(self, round_index: int, rationale: str) -> dict[str, Any]:
         run = self._require_run()
+        if run.search_recovery_required:
+            return self._selection_rejected(round_index, "search_recovery_required")
         policy = evaluate_tool_policy("select_discovery_manifest", run)
         if policy.outcome != "allow":
             payload = {"status": "blocked", "round_index": round_index, "blockers": [policy.reason]}
@@ -484,7 +581,79 @@ class DiscoveryToolService:
             "search_stopped": run.search_stopped,
             "search_stop_reason": run.search_stop_reason,
             "latest_metrics": run.latest_metrics.model_dump(mode="json") if run.latest_metrics else None,
+            "consecutive_zero_yield": run.consecutive_zero_yield,
+            "search_recovery_required": run.search_recovery_required,
+            "search_recovery_attempts": run.search_recovery_attempts,
+            "last_search_strategy": run.last_search_strategy,
         }
+
+    def _query_strategy(self, queries: list[str]) -> str:
+        if self.request.repository in {"pride", "auto"}:
+            return classify_pride_query_strategy(queries)
+        return "repository_semantic"
+
+    def _diagnose_search_result(
+        self,
+        *,
+        run: AgentRunRecord,
+        proposed_queries: list[str],
+        summary: dict[str, Any],
+    ) -> SearchDiagnosis:
+        executed_queries = [str(value) for value in summary.get("queries", []) if str(value).strip()]
+        if not executed_queries:
+            executed_queries = proposed_queries
+        strategy = self._query_strategy(executed_queries)
+        candidate_projects = max(
+            int(summary.get("candidate_projects_seen") or 0),
+            int(summary.get("selected_projects") or 0),
+            1 if int(summary.get("selected_files") or 0) > 0 else 0,
+        )
+        failures = summary.get("failures") if isinstance(summary.get("failures"), list) else []
+        recovery_attempted = run.search_recovery_required and strategy == "atomic_seed"
+        if candidate_projects > 0:
+            return SearchDiagnosis(
+                health="healthy_yield",
+                strategy=strategy,
+                proposed_queries=proposed_queries,
+                executed_queries=executed_queries,
+                consecutive_zero_yield=0,
+                recovery_required=False,
+                recovery_attempted=recovery_attempted,
+                reason=f"Repository returned {candidate_projects} candidate project(s).",
+            )
+        if failures:
+            return SearchDiagnosis(
+                health="repository_unavailable",
+                strategy=strategy,
+                proposed_queries=proposed_queries,
+                executed_queries=executed_queries,
+                consecutive_zero_yield=run.consecutive_zero_yield,
+                recovery_required=False,
+                recovery_attempted=recovery_attempted,
+                reason="Repository requests failed before candidates could be evaluated.",
+            )
+        consecutive = run.consecutive_zero_yield + 1
+        if strategy == "atomic_seed":
+            return SearchDiagnosis(
+                health="no_match_after_recovery",
+                strategy=strategy,
+                proposed_queries=proposed_queries,
+                executed_queries=executed_queries,
+                consecutive_zero_yield=consecutive,
+                recovery_required=False,
+                recovery_attempted=recovery_attempted or self._query_strategy(proposed_queries) != strategy,
+                reason="Atomic high-recall repository seeds returned no candidate projects.",
+            )
+        return SearchDiagnosis(
+            health="selectivity_suspected",
+            strategy=strategy,
+            proposed_queries=proposed_queries,
+            executed_queries=executed_queries,
+            consecutive_zero_yield=consecutive,
+            recovery_required=True,
+            recovery_attempted=False,
+            reason="Compound repository queries returned no candidates; retry with atomic seeds.",
+        )
 
     @property
     def dynamic_limits(self) -> DynamicBudgetLimits:

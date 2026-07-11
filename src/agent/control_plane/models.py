@@ -132,6 +132,23 @@ class RoundMetrics(JsonModel):
     deltas: dict[str, int] = Field(default_factory=dict)
 
 
+class SearchDiagnosis(JsonModel):
+    health: Literal[
+        "healthy_yield",
+        "selectivity_suspected",
+        "repository_unavailable",
+        "response_invalid",
+        "no_match_after_recovery",
+    ]
+    strategy: str
+    proposed_queries: list[str] = Field(default_factory=list)
+    executed_queries: list[str] = Field(default_factory=list)
+    consecutive_zero_yield: int = Field(default=0, ge=0)
+    recovery_required: bool = False
+    recovery_attempted: bool = False
+    reason: str = ""
+
+
 class BudgetReviewResult(JsonModel):
     outcome: BudgetReviewOutcome
     decision: BudgetDecision
@@ -203,6 +220,10 @@ class AgentRunRecord(JsonModel):
     search_stopped: bool = False
     search_stop_reason: str | None = None
     latest_metrics: RoundMetrics | None = None
+    consecutive_zero_yield: int = 0
+    search_recovery_required: bool = False
+    search_recovery_attempts: int = 0
+    last_search_strategy: str | None = None
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
 
@@ -226,6 +247,7 @@ class DiscoveryRoundObservation(JsonModel):
     warnings: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)
     metrics: RoundMetrics | None = None
+    diagnosis: SearchDiagnosis | None = None
     files: dict[str, str] = Field(default_factory=dict)
 
 

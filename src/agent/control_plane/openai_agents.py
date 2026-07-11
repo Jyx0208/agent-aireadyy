@@ -304,8 +304,21 @@ def run_openai_agents_discovery(
     else:
         selected_files = _selected_file_count(run.current_manifest_path)
         status = _manifest_completion_status(run.current_manifest_path) if selected_files > 0 else "blocked"
-        stop_reason = "manifest_selected" if selected_files > 0 else "no_selected_files_after_agent_rounds"
-        blockers = [] if selected_files > 0 else _dedupe([*run.blockers, "no_selected_files"])
+        recovery_incomplete = selected_files <= 0 and run.search_recovery_required
+        stop_reason = (
+            "manifest_selected"
+            if selected_files > 0
+            else "search_recovery_incomplete"
+            if recovery_incomplete
+            else "no_selected_files_after_agent_rounds"
+        )
+        blockers = (
+            []
+            if selected_files > 0
+            else _dedupe(
+                [*run.blockers, "search_recovery_required" if recovery_incomplete else "no_selected_files"]
+            )
+        )
         run = store.save_run(
             run.model_copy(
                 update={
@@ -475,6 +488,8 @@ def _discovery_instructions(
         "When selected files are zero, broaden semantic query terms without relaxing hard constraints. "
         "PRIDE keyword search treats multiple words as a strict intersection: propose one high-recall concept per query "
         "such as a species, cell line, PTM domain, instrument family, or acquisition term; do not combine all constraints in one query. "
+        "If an observation recommends retry_with_atomic_repository_seeds, the next action must be a search using atomic seeds; "
+        "do not select a manifest or finish until that recovery attempt completes. "
         "When metadata or diversity warnings are returned, target the missing evidence with concise queries. "
         "Call get_discovery_state at most once after a search; when the discovery-round budget is exhausted, finish immediately. "
         "A non-empty manifest_path means a manifest was persisted even when selected_files is zero; describe that state accurately. "
@@ -502,6 +517,7 @@ def _multi_agent_discovery_instructions(
         "download files, run workflows, train models, or change species, acquisition mode, task type, PTM "
         "scope, or repository policy. PRIDE keyword search treats multiple words as a strict intersection, "
         "so each proposed query should contain one high-recall concept rather than all constraints. "
+        "When recovery is required, propose atomic seeds and obtain a new grant before selecting or stopping. "
         "Use concise public reasoning summaries only. "
         f"Task type: {task_type or 'not specified'}. "
         f"Hard request JSON: {request.model_dump_json()}"

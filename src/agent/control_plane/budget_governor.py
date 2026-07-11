@@ -14,6 +14,7 @@ from agent.control_plane.models import (
 )
 from agent.control_plane.policy import evaluate_tool_policy
 from agent.control_plane.store import AgentRunStore, canonical_json
+from agent.discovery.query_builder import classify_pride_query_strategy
 
 
 class RepositoryRequestBudgetExceeded(RuntimeError):
@@ -177,6 +178,13 @@ class BudgetGovernor:
             return "hard_elapsed_time_limit"
         if run.dynamic_usage.query_units + len(approved) > run.dynamic_limits.max_query_units:
             return "hard_query_unit_limit"
+        repository = str(run.request.get("repository") or "pride")
+        if (
+            run.search_recovery_required
+            and repository in {"pride", "auto"}
+            and classify_pride_query_strategy(approved) != "atomic_seed"
+        ):
+            return "search_recovery_requires_atomic_queries"
         consumed_queries = {
             " ".join(query.casefold().split())
             for grant in self.store.list_search_grants(self.run_id)
