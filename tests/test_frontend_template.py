@@ -54,6 +54,9 @@ def test_frontend_template_has_reusable_ui_components_and_button_loading_state()
     assert "aria-busy" in html
     assert "aria-pressed" in html
     assert "aria-checked" in html
+    assert "function formatEventTime(value)" in html
+    assert "toLocaleTimeString" in html
+    assert ".split('T').pop().slice(0,8)" not in html
 
 
 def test_frontend_template_saves_config_discovers_models_and_clears_transient_key():

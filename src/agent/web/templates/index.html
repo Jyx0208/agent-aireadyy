@@ -2321,7 +2321,7 @@ const UI={
   },
   discoveryAgentEvent(event,raw=false){
     const level=String(event&&event.level||'info').toLowerCase();
-    const ts=String(event&&event.ts||'').split('T').pop().slice(0,8)||now();
+    const ts=formatEventTime(event&&event.ts);
     const actor=String(event&&event.actor||'Discovery Agent');
     const message=raw?JSON.stringify(event&&event.payload||{}):String(event&&event.message||event&&event.type||'');
     return '<div class="log-line" data-sequence="'+esc(String(event&&event.sequence||0))+'"><span class="ts">'+esc(ts)+'</span><span class="badge '+esc(level==='warning'?'debug':level)+'">'+esc(actor)+'</span><span class="msg '+esc(level)+'">'+esc(message)+'</span></div>';
@@ -2452,6 +2452,16 @@ function setWorkflowTab(tab,persist=true){
   document.getElementById('batchTaskPanel').hidden=currentWorkflowTab!=='batch';
   document.getElementById('discoveryTaskPanel').hidden=currentWorkflowTab!=='discovery';
   document.getElementById('aiReadyTaskPanel').hidden=currentWorkflowTab!=='ai_ready';
+}
+
+function formatEventTime(value){
+  const raw=String(value||'').trim();
+  if(!raw)return now();
+  const parsed=new Date(raw);
+  if(Number.isNaN(parsed.getTime()))return raw;
+  return parsed.toLocaleTimeString(currentLanguage==='zh'?'zh-CN':'en-US',{
+    hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false,hourCycle:'h23'
+  });
 }
 
 async function loadConfig(){

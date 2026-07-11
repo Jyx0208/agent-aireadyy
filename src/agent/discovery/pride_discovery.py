@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timezone
+from math import ceil
 from typing import Any, Callable
 
 from agent.discovery.diversity import diversity_summary, select_diverse_items, validity_summary
@@ -13,7 +14,7 @@ from agent.discovery.memory import (
     memory_prior_for_project,
 )
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
-from agent.discovery.query_builder import build_pride_queries
+from agent.discovery.query_builder import build_pride_queries, prepare_pride_search_queries
 from agent.discovery.scoring import build_discovered_project, score_file, score_project
 from agent.metadata.context import detect_sdrf_file, load_sdrf_rows, select_sdrf_rows_for_file
 from agent.pride.client import PrideClient
@@ -74,7 +75,8 @@ def discover_pride_dataset(
 ) -> DatasetManifest:
     owns_client = client is None
     pride = client or PrideClient()
-    queries = queries or build_pride_queries(request)
+    proposed_queries = queries or build_pride_queries(request)
+    queries = prepare_pride_search_queries(proposed_queries) or proposed_queries
     searched_records: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
     review_decisions = memory.load_review_decisions() if memory is not None else []
@@ -88,11 +90,17 @@ def discover_pride_dataset(
             raise InterruptedError("Discovery cancelled.")
 
     try:
+        if queries != proposed_queries:
+            _report(
+                f"Adapted {len(proposed_queries)} semantic query term(s) into "
+                f"{len(queries)} high-recall PRIDE keyword seed(s): {'; '.join(queries)}"
+            )
+        search_page_size = max(1, min(100, ceil(request.max_candidate_projects / max(1, len(queries)))))
         for query in queries:
             _check_cancel()
             _report(f"Searching PRIDE projects: {query}")
             try:
-                searched_records.extend(pride.search_projects(query, page_size=100))
+                searched_records.extend(pride.search_projects(query, page_size=search_page_size))
                 _report(f"Project search returned {len(searched_records)} raw records so far.")
             except Exception as exc:  # pragma: no cover - defensive network boundary
                 failures.append({"stage": "search_projects", "query": query, "error": str(exc)})

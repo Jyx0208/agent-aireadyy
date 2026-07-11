@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from agent.discovery.models import DatasetRequest
 from agent.discovery.ontology import (
     immunopeptide_query_terms,
@@ -22,6 +24,76 @@ def _dedupe(values: list[str]) -> list[str]:
         seen.add(key)
         deduped.append(value)
     return deduped
+
+
+_PRIDE_SEARCH_PHRASES = (
+    "homo sapiens",
+    "mus musculus",
+    "rattus norvegicus",
+    "escherichia coli",
+    "saccharomyces cerevisiae",
+    "data dependent",
+    "label free",
+    "q exactive",
+    "fusion lumos",
+    "mass spectrometry",
+)
+_PRIDE_SEARCH_STOPWORDS = {
+    "across",
+    "acquisition",
+    "and",
+    "for",
+    "gradient",
+    "length",
+    "method",
+    "selecting",
+    "the",
+    "when",
+    "with",
+}
+
+
+def _pride_query_seed_candidates(query: str) -> list[str]:
+    value = " ".join(str(query).strip().split())
+    if not value:
+        return []
+    if re.fullmatch(r"PXD\d+", value, flags=re.IGNORECASE):
+        return [value.upper()]
+
+    protected = value
+    phrase_values: dict[str, str] = {}
+    for index, phrase in enumerate(_PRIDE_SEARCH_PHRASES):
+        token = f"PRIDEPHRASE{index}"
+        if re.search(rf"\b{re.escape(phrase)}\b", protected, flags=re.IGNORECASE):
+            protected = re.sub(rf"\b{re.escape(phrase)}\b", token, protected, flags=re.IGNORECASE)
+            phrase_values[token.casefold()] = phrase
+
+    candidates: list[str] = []
+    for token in re.findall(r"[A-Za-z0-9+*.-]+", protected):
+        key = token.casefold()
+        candidate = phrase_values.get(key, token)
+        normalized_key = re.sub(r"[-_\s]+", " ", candidate.casefold()).strip()
+        if normalized_key in _PRIDE_SEARCH_STOPWORDS:
+            continue
+        if len(candidate) < 3 and candidate.casefold() not in {"qe"}:
+            continue
+        candidates.append(candidate)
+    return _dedupe(candidates)
+
+
+def prepare_pride_search_queries(queries: list[str]) -> list[str]:
+    """Convert semantic query descriptions into high-recall PRIDE keyword seeds."""
+    used: set[str] = set()
+    prepared: list[str] = []
+    for query in queries:
+        for candidate in _pride_query_seed_candidates(query):
+            key = re.sub(r"[-_\s]+", " ", candidate.casefold()).strip()
+            if key in used:
+                continue
+            used.add(key)
+            prepared.append(candidate)
+            break
+    return prepared
 
 
 def build_pride_queries(request: DatasetRequest) -> list[str]:
