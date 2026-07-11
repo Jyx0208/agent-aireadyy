@@ -326,6 +326,37 @@ def test_parse_discovery_goal_uses_request_llm_config(monkeypatch):
     assert client.timeout == 9.0
 
 
+def test_parse_discovery_goal_uses_saved_llm_config_without_browser_key(monkeypatch):
+    _FakeConfiguredGoalParseLLM.instances = []
+    web_app._llm_config_store().save(
+        {
+            "api_key": "saved-discovery-key",
+            "base_url": "https://saved.example.test",
+            "model": "saved-model",
+            "timeout": "17",
+        }
+    )
+    monkeypatch.setattr(web_app, "default_discovery_llm_client", lambda: None)
+    monkeypatch.setattr(web_app, "OpenAICompatibleDiscoveryLLM", _FakeConfiguredGoalParseLLM)
+
+    result = asyncio.run(
+        web_app.parse_discovery_goal(
+            {
+                "prompt": "Find human phospho DDA data for fragment intensity",
+                "current": {"agentic_rounds": 2},
+                "llm_config": {},
+            }
+        )
+    )
+
+    assert result["parser"] == "llm"
+    client = _FakeConfiguredGoalParseLLM.instances[0]
+    assert client.api_key == "saved-discovery-key"
+    assert client.base_url == "https://saved.example.test"
+    assert client.model == "saved-model"
+    assert client.timeout == 17.0
+
+
 def test_parse_discovery_goal_supports_species_ptm_and_labeling(monkeypatch):
     monkeypatch.setattr(web_app, "default_discovery_llm_client", lambda: _FakeGeneralizedGoalParseLLM())
 
@@ -729,6 +760,28 @@ def test_web_discovery_agentic_falls_back_without_llm_planner(monkeypatch, tmp_p
     assert "agentic_plan" not in created["downloads"]
 
 
+def test_agentic_discovery_planner_uses_saved_llm_config(monkeypatch):
+    _FakeConfiguredGoalParseLLM.instances = []
+    web_app._llm_config_store().save(
+        {
+            "api_key": "saved-planner-key",
+            "base_url": "https://planner.example.test",
+            "model": "planner-model",
+            "timeout": "23",
+        }
+    )
+    monkeypatch.setattr(web_app, "OpenAICompatibleDiscoveryLLM", _FakeConfiguredGoalParseLLM)
+
+    planner = web_app._agentic_discovery_planner({})
+
+    assert isinstance(planner, AgenticDiscoveryPlanner)
+    client = _FakeConfiguredGoalParseLLM.instances[0]
+    assert client.api_key == "saved-planner-key"
+    assert client.base_url == "https://planner.example.test"
+    assert client.model == "planner-model"
+    assert client.timeout == 23.0
+
+
 def test_web_agent_uses_server_dynamic_limits_not_request_presets(monkeypatch):
     monkeypatch.setenv("AGENT_DISCOVERY_MODE", "multi_agent")
     monkeypatch.setenv("AGENT_MAX_MODEL_TURNS", "50")
@@ -748,6 +801,14 @@ def test_web_agent_uses_server_dynamic_limits_not_request_presets(monkeypatch):
 def test_web_discovery_openai_agents_runtime_reuses_existing_result_contract(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setenv("AGENT_DISCOVERY_MODE", "multi_agent")
+    web_app._llm_config_store().save(
+        {
+            "api_key": "saved-agent-key",
+            "base_url": "https://saved.example.test/v1",
+            "model": "saved-agent-model",
+            "timeout": "1200",
+        }
+    )
     captured: dict[str, object] = {}
 
     def fake_run_openai_agents_discovery(**kwargs) -> OpenAIAgentsDiscoveryResult:
@@ -795,11 +856,6 @@ def test_web_discovery_openai_agents_runtime_reuses_existing_result_contract(mon
                 "agent_max_rounds": 2,
                 "agent_max_turns": 9,
                 "agent_max_tool_calls": 7,
-                "llm_config": {
-                    "api_key": "temporary-web-key",
-                    "base_url": "https://example.test/v1",
-                    "model": "test-model",
-                },
             }
         )
     )
@@ -826,12 +882,12 @@ def test_web_discovery_openai_agents_runtime_reuses_existing_result_contract(mon
     assert captured["budget"].max_tool_calls == 100
     assert captured["dynamic_limits"].max_query_units == 30
     assert captured["llm_config"] == {
-        "api_key": "temporary-web-key",
-        "base_url": "https://example.test/v1",
-        "model": "test-model",
+        "api_key": "saved-agent-key",
+        "base_url": "https://saved.example.test/v1",
+        "model": "saved-agent-model",
         "timeout": "1200",
     }
-    assert "temporary-web-key" not in json.dumps(created)
+    assert "saved-agent-key" not in json.dumps(created)
 
     reloaded = asyncio.run(web_app.get_discovery(created["discovery_id"]))
     assert reloaded["runtime"] == "openai_agents"
@@ -841,6 +897,14 @@ def test_web_discovery_openai_agents_runtime_reuses_existing_result_contract(mon
 
 def test_web_discovery_openai_agents_blocked_manifest_is_renderable(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    web_app._llm_config_store().save(
+        {
+            "api_key": "saved-blocked-agent-key",
+            "base_url": "https://saved.example.test/v1",
+            "model": "saved-agent-model",
+            "timeout": "1200",
+        }
+    )
 
     def fake_blocked_run(**kwargs) -> OpenAIAgentsDiscoveryResult:
         output_dir = Path(kwargs["output_dir"])

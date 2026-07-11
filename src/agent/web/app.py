@@ -44,7 +44,7 @@ from agent.ai_ready.real_smoke import run_ai_ready_real_smoke
 from agent.ai_ready.validation import validate_ai_ready_build
 from agent.control_plane.models import AgentBudget, AgentEvent, DynamicBudgetLimits
 from agent.control_plane.openai_agents import run_openai_agents_discovery
-from agent.discovery.agentic import OpenAICompatibleDiscoveryLLM, default_agentic_discovery_planner, default_discovery_llm_client
+from agent.discovery.agentic import AgenticDiscoveryPlanner, OpenAICompatibleDiscoveryLLM, default_agentic_discovery_planner, default_discovery_llm_client
 from agent.discovery.agentic_runner import run_agentic_discovery
 from agent.discovery.features import extract_file_features, extract_project_features
 from agent.discovery.manifest import write_dataset_manifest
@@ -1496,19 +1496,8 @@ def _run_discovery_goal_parse(body: dict[str, Any]) -> dict[str, Any]:
     prompt = _clean_text(body.get("prompt"))
     if not prompt:
         raise ValueError("Please enter a discovery request.")
-    llm_config = body.get("llm_config")
-    if isinstance(llm_config, dict) and _clean_text(llm_config.get("api_key")):
-        config, config_error = _build_llm_config(llm_config)
-        if config_error or config is None:
-            raise ValueError(config_error or "Invalid LLM configuration.")
-        client = OpenAICompatibleDiscoveryLLM(
-            api_key=config["api_key"],
-            base_url=config["base_url"],
-            model=config["model"],
-            timeout=_positive_float(config["timeout"], 120.0),
-        )
-    else:
-        client = default_discovery_llm_client()
+    llm_config = body.get("llm_config") if isinstance(body.get("llm_config"), dict) else {}
+    client = _discovery_llm_client(llm_config)
     if client is None:
         raise ValueError("No discovery LLM API key found. Fill API Configuration or set DEEPSEEK_API_KEY.")
     current = body.get("current") if isinstance(body.get("current"), dict) else {}
@@ -2225,12 +2214,10 @@ def _run_web_discovery(
         prompt = _clean_text(body.get("prompt"))
         if not prompt:
             raise ValueError("Discovery request is required for OpenAI Agents mode.")
-        web_llm_config = body.get("llm_config")
-        agent_llm_config: dict[str, str] | None = None
-        if isinstance(web_llm_config, dict) and _clean_text(web_llm_config.get("api_key")):
-            agent_llm_config, config_error = _build_llm_config(web_llm_config)
-            if config_error or agent_llm_config is None:
-                raise ValueError(config_error or "Invalid LLM configuration.")
+        web_llm_config = body.get("llm_config") if isinstance(body.get("llm_config"), dict) else {}
+        agent_llm_config, config_error = _build_llm_config(web_llm_config)
+        if config_error or agent_llm_config is None:
+            raise ValueError(config_error or "Invalid LLM configuration.")
         discovery_id = safe_output_stem(
             f"agents_{datetime.now(_APP_TZ).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         )
@@ -2354,7 +2341,8 @@ def _run_web_discovery(
         _check_cancel()
         _report("Starting LLM agentic discovery planning.")
         try:
-            planner = default_agentic_discovery_planner()
+            web_llm_config = body.get("llm_config") if isinstance(body.get("llm_config"), dict) else {}
+            planner = _agentic_discovery_planner(web_llm_config)
         except Exception as exc:
             planner = None
             agentic_fallback = {
@@ -4148,6 +4136,36 @@ def _build_llm_config(llm_config: dict[str, Any]) -> tuple[dict[str, str] | None
         return None, "大模型超时时间必须是数字"
 
     return {"api_key": api_key, "base_url": base_url.rstrip("/"), "model": model, "timeout": timeout}, None
+
+
+def _discovery_llm_client(llm_config: dict[str, Any]):
+    config, config_error = _build_llm_config(llm_config)
+    if config is not None:
+        return OpenAICompatibleDiscoveryLLM(
+            api_key=config["api_key"],
+            base_url=config["base_url"],
+            model=config["model"],
+            timeout=_positive_float(config["timeout"], 120.0),
+        )
+    if llm_config:
+        raise ValueError(config_error or "Invalid LLM configuration.")
+    return default_discovery_llm_client()
+
+
+def _agentic_discovery_planner(llm_config: dict[str, Any]) -> AgenticDiscoveryPlanner | None:
+    config, config_error = _build_llm_config(llm_config)
+    if config is not None:
+        return AgenticDiscoveryPlanner(
+            OpenAICompatibleDiscoveryLLM(
+                api_key=config["api_key"],
+                base_url=config["base_url"],
+                model=config["model"],
+                timeout=_positive_float(config["timeout"], 120.0),
+            )
+        )
+    if llm_config:
+        raise ValueError(config_error or "Invalid LLM configuration.")
+    return default_agentic_discovery_planner()
 
 
 def _task_llm_reasoner(config: dict[str, str]):

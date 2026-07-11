@@ -62,7 +62,8 @@ def test_frontend_template_saves_config_discovers_models_and_clears_transient_ke
     assert 'id="saveApiConfigBtn"' in html
     assert 'id="deleteApiConfigBtn"' in html
     assert 'id="refreshModelsBtn"' in html
-    assert 'id="modelOptions"' in html
+    assert '<select id="cfgModel"' in html
+    assert 'datalist id="modelOptions"' not in html
     assert "/api/llm/config" in html
     assert "/api/llm/models" in html
     assert "async function saveLLMConfig()" in html
@@ -70,7 +71,8 @@ def test_frontend_template_saves_config_discovers_models_and_clears_transient_ke
     assert "async function loadLLMModels(" in html
     assert "function clearTransientApiKey()" in html
     assert "clearTransientApiKey();" in html
-    assert 'placeholder="deepseek-v4-pro"' in html
+    assert "const previousSelection=select.value;" in html
+    assert "models.includes(previousSelection)" in html
 
 
 def test_frontend_template_exposes_batch_excel_workflow():
