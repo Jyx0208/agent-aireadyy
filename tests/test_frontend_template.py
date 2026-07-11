@@ -257,6 +257,12 @@ def test_frontend_template_exposes_discovery_workflow():
     assert "function setDiscoveryGroupSelection(group,selected)" in html
     assert "discoveryFilesByValidity(files)[group]" in html
     assert "setDiscoveryGroupSelection(\\'" in html
+    render_files_body = html.split("function renderDiscoveryFiles(files,options={}){", 1)[1].split(
+        "function renderDiscovery(data)", 1
+    )[0]
+    assert "syncDiscoverySelectionFromDom();" not in render_files_body
+    assert "function goDiscoveryValidityPage(group,page){\n  syncDiscoverySelectionFromDom();" in html
+    assert "function setDiscoveryGroupSelection(group,selected){\n  syncDiscoverySelectionFromDom();" in html
     assert "function goDiscoveryValidityPage(group,page)" in html
     assert "function goDiscoveryFilePage(page)" in html
     assert 'class="discovery-page-input"' in html

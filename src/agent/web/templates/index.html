@@ -3648,7 +3648,6 @@ function renderDiscoveryFiles(files,options={}){
     if(!options.keepSelection)seedDiscoverySelection(files);
     if(!options.keepPage)discoveryValidityPages={valid:1,weak_keep:1,needs_review:1,exclude:1};
   }
-  syncDiscoverySelectionFromDom();
   const allFiles=(currentDiscoveryRecord&&Array.isArray(currentDiscoveryRecord.files))?currentDiscoveryRecord.files:[];
   const box=document.getElementById('discoveryFileTable');
   const legacyPager=document.getElementById('discoveryFilePagination');
