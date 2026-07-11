@@ -1073,7 +1073,7 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
           <span class="inline-status" id="apiCheckStatus" role="status" aria-live="polite"></span>
         </div>
         <div class="config-body" id="configBody">
-          <div class="form-row"><label for="cfgApiKey">API Key *</label><input type="password" id="cfgApiKey" aria-required="true" aria-invalid="false" autocomplete="off" data-i18n-placeholder="apiKeyPlaceholder" placeholder="Your API key for this task"></div>
+          <div class="form-row"><label for="cfgApiKey">API Key <span id="cfgApiKeyRequirement" aria-hidden="true">*</span></label><input type="password" id="cfgApiKey" aria-required="true" aria-invalid="false" autocomplete="off" data-i18n-placeholder="apiKeyPlaceholder" placeholder="Your API key for this task"><div class="form-help" id="cfgApiKeyState" role="status" aria-live="polite"></div></div>
           <div class="form-row"><label for="cfgBaseUrl">Base URL</label><input type="text" id="cfgBaseUrl" inputmode="url" placeholder="https://api.deepseek.com"></div>
           <div class="form-row"><label for="cfgModel" data-i18n="model">Model</label><select id="cfgModel"><option value="deepseek-v4-pro">deepseek-v4-pro</option><option value="deepseek-v4-flash">deepseek-v4-flash</option></select></div>
           <div class="form-row"><label for="cfgTimeout" data-i18n="timeout">Timeout</label><input type="number" id="cfgTimeout" min="1" placeholder="1200"></div>
@@ -2410,6 +2410,7 @@ function setLanguage(lang){
   });
   document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.dataset.i18n)});
   document.querySelectorAll('[data-i18n-placeholder]').forEach(el=>{el.placeholder=t(el.dataset.i18nPlaceholder)});
+  renderApiKeyState();
   document.getElementById('runModeHelp').textContent=runModeHelpText();
   const startBtn=document.getElementById('startBtn');
   if(startBtn.disabled){
@@ -2461,12 +2462,9 @@ async function loadConfig(){
     populateModelOptions([d.model,'deepseek-v4-pro','deepseek-v4-flash'],d.model||'deepseek-v4-pro');
     document.getElementById('cfgTimeout').value=d.timeout||'';
     serverLlmConfigured=!!d.api_key_set;
-    const keyInput=document.getElementById('cfgApiKey');
-    keyInput.placeholder=serverLlmConfigured?t('savedApiKeyPlaceholder'):t('apiKeyPlaceholder');
-    keyInput.setAttribute('aria-required',serverLlmConfigured?'false':'true');
+    renderApiKeyState();
     document.getElementById('configBody').classList.add('open');
     document.getElementById('configToggle').setAttribute('aria-expanded','true');
-    document.getElementById('configStatus').textContent='';
     document.getElementById('resultRetention').textContent=tf('retention',retentionMinutes(d),d.max_result_projects||4);
     updateFullWorkflowAvailability(!!d.full_workflow_enabled);
     setRunMode(localStorage.getItem('runMode')||(fullWorkflowEnabled?'full':'prepare'),false);
@@ -3150,9 +3148,8 @@ async function parseDiscoveryGoal(){
       status.className=warnings?'discovery-helper error':'discovery-helper ok';
     }
   }catch(e){
-    parseDiscoveryGoalFallback(false);
     if(status){
-      status.textContent=tf('discoveryParseFallback',e.message||String(e));
+      status.textContent=e.message||String(e);
       status.className='discovery-helper error';
     }
   }finally{
@@ -4620,6 +4617,7 @@ document.addEventListener('input',e=>{
     const status=document.getElementById('apiCheckStatus');
     status.textContent='';
     status.className='inline-status';
+    renderApiKeyState();
     const agentCredential=document.getElementById('discoveryAgentCredentialStatus');
     if(agentCredential){
       const hasWebKey=!!e.target.value.trim();
@@ -4660,7 +4658,27 @@ function clearTransientApiKey(){
   input.value='';
   input.classList.remove('error');
   input.setAttribute('aria-invalid','false');
+  renderApiKeyState();
+}
+
+function renderApiKeyState(){
+  const input=document.getElementById('cfgApiKey');
+  const state=document.getElementById('cfgApiKeyState');
+  const requirement=document.getElementById('cfgApiKeyRequirement');
+  const configStatus=document.getElementById('configStatus');
+  if(!input||!state||!requirement||!configStatus)return;
+  const hasNewKey=!!input.value.trim();
   input.placeholder=serverLlmConfigured?t('savedApiKeyPlaceholder'):t('apiKeyPlaceholder');
+  input.setAttribute('aria-required',serverLlmConfigured?'false':'true');
+  requirement.hidden=serverLlmConfigured;
+  configStatus.textContent=serverLlmConfigured?'Saved':'';
+  if(serverLlmConfigured){
+    state.textContent=hasNewKey
+      ? t('savedApiKeyPlaceholder')
+      : `${t('apiConfigSaved')} ${t('savedApiKeyPlaceholder')}`;
+  }else{
+    state.textContent=t('apiRequired');
+  }
 }
 
 function populateModelOptions(models,selected=''){

@@ -62,6 +62,8 @@ def test_frontend_template_saves_config_discovers_models_and_clears_transient_ke
     assert 'id="saveApiConfigBtn"' in html
     assert 'id="deleteApiConfigBtn"' in html
     assert 'id="refreshModelsBtn"' in html
+    assert 'id="cfgApiKeyState"' in html
+    assert 'id="cfgApiKeyRequirement"' in html
     assert '<select id="cfgModel"' in html
     assert 'datalist id="modelOptions"' not in html
     assert "/api/llm/config" in html
@@ -70,9 +72,14 @@ def test_frontend_template_saves_config_discovers_models_and_clears_transient_ke
     assert "async function deleteLLMConfig()" in html
     assert "async function loadLLMModels(" in html
     assert "function clearTransientApiKey()" in html
+    assert "function renderApiKeyState()" in html
+    assert "configStatus.textContent=serverLlmConfigured?'Saved':'';" in html
+    assert "requirement.hidden=serverLlmConfigured;" in html
     assert "clearTransientApiKey();" in html
     assert "const previousSelection=select.value;" in html
     assert "models.includes(previousSelection)" in html
+    assert "parseDiscoveryGoalFallback(false);" not in html
+    assert "status.textContent=e.message||String(e);" in html
 
 
 def test_frontend_template_exposes_batch_excel_workflow():
