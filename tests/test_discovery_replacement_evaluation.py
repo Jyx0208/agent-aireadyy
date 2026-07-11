@@ -88,6 +88,30 @@ def test_graded_relevance_rewards_multiple_good_projects_in_rank_order() -> None
     assert reversed_result.ndcg_at_5 < best.ndcg_at_5
 
 
+def test_variant_specific_judgments_override_scenario_seed_labels() -> None:
+    scenario = _scenario().model_copy(
+        update={
+            "variant_relevance_judgments": {
+                "structured": {"PXD000001": 3},
+                "vague": {"PXD000001": 1, "PXD000002": 3},
+            }
+        }
+    )
+
+    structured = score_replacement_run(
+        scenario,
+        _run(runtime="openai_agents", variant_id="structured", accessions=["PXD000001"]),
+    )
+    vague = score_replacement_run(
+        scenario,
+        _run(runtime="openai_agents", variant_id="vague", accessions=["PXD000001"]),
+    )
+
+    assert structured.relevance_grades == [3]
+    assert vague.relevance_grades == [1]
+    assert structured.quality_score > vague.quality_score
+
+
 def test_raw_prompt_runtime_input_does_not_leak_hidden_request() -> None:
     scenario = _scenario()
     raw = build_variant_runtime_input(scenario, scenario.prompt_variants[1])

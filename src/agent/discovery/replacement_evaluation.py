@@ -34,6 +34,7 @@ class ReplacementBenchmarkScenario(JsonModel):
     hidden_request: DatasetRequest
     prompt_variants: list[PromptVariant] = Field(min_length=1)
     relevance_judgments: dict[str, int] = Field(min_length=1)
+    variant_relevance_judgments: dict[str, dict[str, int]] = Field(default_factory=dict)
     task_type: str | None = None
     notes: str = ""
 
@@ -49,6 +50,19 @@ class ReplacementBenchmarkScenario(JsonModel):
         }
         if invalid:
             raise ValueError("relevance judgments must use non-empty accessions and grades 0-3")
+        unknown_variants = set(self.variant_relevance_judgments) - set(variant_ids)
+        if unknown_variants:
+            raise ValueError("variant relevance judgments reference unknown prompt variants")
+        invalid_variant = {
+            f"{variant_id}:{accession}": grade
+            for variant_id, judgments in self.variant_relevance_judgments.items()
+            for accession, grade in judgments.items()
+            if not accession.strip() or isinstance(grade, bool) or grade not in {0, 1, 2, 3}
+        }
+        if invalid_variant:
+            raise ValueError(
+                "variant relevance judgments must use non-empty accessions and grades 0-3"
+            )
         return self
 
 
@@ -127,6 +141,30 @@ class ReplacementBenchmarkReport(JsonModel):
     winning_budget_tier: BudgetTier | None = None
 
 
+class ReplacementJudgmentOverlay(JsonModel):
+    schema_version: str = "discovery-replacement-judgments/v1"
+    variant_relevance_judgments: dict[str, dict[str, dict[str, int]]]
+
+    @model_validator(mode="after")
+    def validate_judgments(self) -> "ReplacementJudgmentOverlay":
+        invalid = {
+            f"{scenario_id}:{variant_id}:{accession}": grade
+            for scenario_id, variants in self.variant_relevance_judgments.items()
+            for variant_id, judgments in variants.items()
+            for accession, grade in judgments.items()
+            if (
+                not scenario_id.strip()
+                or not variant_id.strip()
+                or not accession.strip()
+                or isinstance(grade, bool)
+                or grade not in {0, 1, 2, 3}
+            )
+        }
+        if invalid:
+            raise ValueError("judgment overlay requires non-empty ids and grades 0-3")
+        return self
+
+
 def load_replacement_scenarios(path: str | Path) -> list[ReplacementBenchmarkScenario]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     scenarios = TypeAdapter(list[ReplacementBenchmarkScenario]).validate_python(payload)
@@ -136,6 +174,38 @@ def load_replacement_scenarios(path: str | Path) -> list[ReplacementBenchmarkSce
     if len(ids) != len(set(ids)):
         raise ValueError("replacement benchmark scenario ids must be unique")
     return scenarios
+
+
+def load_replacement_judgment_overlay(path: str | Path) -> ReplacementJudgmentOverlay:
+    return ReplacementJudgmentOverlay.model_validate_json(Path(path).read_text(encoding="utf-8"))
+
+
+def apply_replacement_judgment_overlay(
+    scenarios: Sequence[ReplacementBenchmarkScenario],
+    overlay: ReplacementJudgmentOverlay,
+) -> list[ReplacementBenchmarkScenario]:
+    scenarios_by_id = {scenario.id: scenario for scenario in scenarios}
+    unknown_scenarios = set(overlay.variant_relevance_judgments) - set(scenarios_by_id)
+    if unknown_scenarios:
+        raise ValueError("judgment overlay references unknown scenarios")
+    result: list[ReplacementBenchmarkScenario] = []
+    for scenario in scenarios:
+        updates = overlay.variant_relevance_judgments.get(scenario.id, {})
+        variant_ids = {variant.id for variant in scenario.prompt_variants}
+        if set(updates) - variant_ids:
+            raise ValueError("judgment overlay references unknown prompt variants")
+        merged = {
+            variant_id: dict(judgments)
+            for variant_id, judgments in scenario.variant_relevance_judgments.items()
+        }
+        merged.update(
+            {
+                variant_id: {accession.upper(): grade for accession, grade in judgments.items()}
+                for variant_id, judgments in updates.items()
+            }
+        )
+        result.append(scenario.model_copy(update={"variant_relevance_judgments": merged}))
+    return result
 
 
 def build_variant_runtime_input(
@@ -158,7 +228,11 @@ def score_replacement_run(
         raise ValueError("replacement run scenario does not match")
     if run.variant_id not in {variant.id for variant in scenario.prompt_variants}:
         raise ValueError("replacement run variant does not match scenario")
-    judgments = {key.upper(): grade for key, grade in scenario.relevance_judgments.items()}
+    source_judgments = scenario.variant_relevance_judgments.get(
+        run.variant_id,
+        scenario.relevance_judgments,
+    )
+    judgments = {key.upper(): grade for key, grade in source_judgments.items()}
     accessions = [accession.strip().upper() for accession in run.selected_project_accessions if accession.strip()]
     grades = [judgments.get(accession, 0) for accession in accessions[:5]]
     relevant = {accession for accession, grade in judgments.items() if grade >= 2}

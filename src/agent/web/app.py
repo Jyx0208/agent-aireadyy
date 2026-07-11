@@ -4556,6 +4556,11 @@ async def index():
     return (_templates_dir / "index.html").read_text(encoding="utf-8")
 
 
+@app.get("/benchmark-review", response_class=HTMLResponse)
+async def benchmark_review():
+    return (_templates_dir / "benchmark_review.html").read_text(encoding="utf-8")
+
+
 # ── 健康检查 ──────────────────────────────────────────────────────
 @app.get("/api/health")
 async def health():

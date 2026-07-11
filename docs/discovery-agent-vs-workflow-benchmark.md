@@ -334,3 +334,47 @@ Agent 检查过一些项目，但在最终选择前，旧的确定性规则已�
 之前没有测的是：
 
 > Agent 是否已经在一个公开、专家标注、具有代表性的蛋白质组学 benchmark 上全面超过 Workflow。
+
+## 现在怎么做盲评
+
+本地服务启动后，打开：
+
+```text
+http://127.0.0.1:8000/benchmark-review
+```
+
+然后选择实验目录中的：
+
+```text
+judgment_pool.blinded.json
+```
+
+页面只显示问题和项目证据，不显示 accession，也不显示项目来自 Workflow 还是 Agent。
+
+评审人逐个选择 0、1、2、3 分，填写理由，然后点击“导出评分”。页面会生成：
+
+```text
+judgment_pool.reviewed.json
+```
+
+用下面的命令解盲并生成 benchmark 可以读取的评分文件：
+
+```powershell
+.venv\Scripts\python.exe scripts\compile_discovery_blind_judgments.py `
+  --reviewed-pool judgment_pool.reviewed.json `
+  --key judgment_pool.key.json `
+  --output replacement_judgments.json
+```
+
+最后带着正式评分重新计算 benchmark：
+
+```powershell
+.venv\Scripts\python.exe scripts\run_discovery_replacement_benchmark.py `
+  --judgments replacement_judgments.json `
+  --resume `
+  --tier 2x `
+  --repeat 1 `
+  --output-root 原实验目录
+```
+
+`--resume` 会直接复用已经完成的 Workflow 和 Agent 运行，不会重新消耗模型预算，只重新生成评分报告。

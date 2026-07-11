@@ -15,9 +15,11 @@ from agent.discovery.replacement_evaluation import (
     ReplacementBenchmarkReport,
     ReplacementBenchmarkScenario,
     ReplacementRun,
+    apply_replacement_judgment_overlay,
     build_variant_runtime_input,
     evaluate_replacement,
     load_replacement_scenarios,
+    load_replacement_judgment_overlay,
     replacement_run_from_record,
 )
 from agent.repositories.metering import meter_repository_requests
@@ -310,13 +312,23 @@ def _write_blinded_judgment_pool(
                 "visible_prompt": variant.prompt,
                 "visible_hard_constraint_fields": variant.hard_constraint_fields,
                 "project_title": str(project.get("project_title") or ""),
+                "project_description": str(project.get("project_description") or ""),
                 "species": list(project.get("species") or []),
                 "acquisition_mode": project.get("acquisition_mode"),
                 "labeling_strategy": project.get("labeling_strategy"),
                 "instrument_families": list(project.get("instrument_families") or []),
                 "fragmentation_methods": list(project.get("fragmentation_methods") or []),
+                "immunopeptide_scope": project.get("immunopeptide_scope"),
+                "hla_class": list(project.get("hla_class") or []),
+                "immunopeptide_enrichment_methods": list(
+                    project.get("immunopeptide_enrichment_methods") or []
+                ),
+                "validity_status": project.get("validity_status"),
+                "evidence_completeness": project.get("evidence_completeness"),
+                "selected_file_count": project.get("selected_file_count"),
                 "grade": None,
                 "review_notes": "",
+                "reviewer_id": "",
             }
             current = pooled.get(key)
             if current is None or len(json.dumps(metadata, ensure_ascii=False)) > len(
@@ -430,6 +442,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run the quality-first Discovery Agent replacement benchmark."
     )
     parser.add_argument("--scenarios", type=Path, default=DEFAULT_SCENARIOS)
+    parser.add_argument(
+        "--judgments",
+        type=Path,
+        help="Optional reviewed per-variant relevance judgment overlay.",
+    )
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--tier", action="append", dest="tiers")
     parser.add_argument("--repeat", type=int, default=1)
@@ -456,6 +473,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if any(tier not in TIER_LIMITS for tier in tiers):
             raise ValueError("tier must be one of: 1x, 2x, max_quality")
         scenarios = load_replacement_scenarios(args.scenarios)
+        if args.judgments:
+            scenarios = apply_replacement_judgment_overlay(
+                scenarios,
+                load_replacement_judgment_overlay(args.judgments),
+            )
         if args.scenario_ids:
             selected = set(args.scenario_ids)
             scenarios = [scenario for scenario in scenarios if scenario.id in selected]
