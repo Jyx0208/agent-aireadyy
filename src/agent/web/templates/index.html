@@ -207,6 +207,8 @@ h1{font-size:1.4rem;letter-spacing:-.01em;font-weight:800}
 .discovery-validity-dot.needs_review{background:var(--amber)}
 .discovery-validity-dot.exclude{background:var(--red)}
 .discovery-pagination-inline{display:flex;gap:8px;align-items:center;justify-content:flex-end;padding:9px 12px;border-top:1px solid var(--line);background:var(--surface)}
+.discovery-page-input{width:64px;padding:7px 8px;text-align:center;background:var(--bg);border:1px solid var(--line);border-radius:var(--radius-sm);color:var(--text)}
+.discovery-file-group-meta{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
 .discovery-file-main{display:grid;gap:3px;min-width:230px}
 .discovery-file-name{font-weight:650;color:var(--text);overflow-wrap:anywhere}
 .discovery-file-sub{font-size:.68rem;color:var(--muted);overflow-wrap:anywhere}
@@ -3419,6 +3421,18 @@ function setDiscoverySelection(mode){
   renderDiscoveryFiles(null,{keepPage:true});
 }
 
+function setDiscoveryGroupSelection(group,selected){
+  syncDiscoverySelectionFromDom();
+  const files=(currentDiscoveryRecord&&Array.isArray(currentDiscoveryRecord.files))?currentDiscoveryRecord.files:[];
+  const items=(discoveryFilesByValidity(files)[group]||[]);
+  items.forEach(item=>{
+    const key=discoveryFileKey(item.file,item.index);
+    if(selected)discoverySelectedFileKeys.add(key);
+    else discoverySelectedFileKeys.delete(key);
+  });
+  renderDiscoveryFiles(null,{keepPage:true});
+}
+
 function updateDiscoverySelectionMeta(){
   syncDiscoverySelectionFromDom();
   const files=(currentDiscoveryRecord&&Array.isArray(currentDiscoveryRecord.files))?currentDiscoveryRecord.files:[];
@@ -3523,16 +3537,23 @@ function renderDiscoveryPagination(total){
   const start=(currentDiscoveryFilePage-1)*DISCOVERY_FILE_PAGE_SIZE+1;
   const end=Math.min(total,currentDiscoveryFilePage*DISCOVERY_FILE_PAGE_SIZE);
   box.hidden=false;
-  box.innerHTML='<button class="btn btn-secondary btn-small" type="button" onclick="changeDiscoveryFilePage(-1)" '+(currentDiscoveryFilePage<=1?'disabled':'')+'>'+esc(t('prevPage'))+'</button>'
+  box.innerHTML='<button class="btn btn-secondary btn-small" type="button" title="First page" aria-label="First page" onclick="goDiscoveryFilePage(1)" '+(currentDiscoveryFilePage<=1?'disabled':'')+'>&laquo;</button>'
+    +'<button class="btn btn-secondary btn-small" type="button" onclick="changeDiscoveryFilePage(-1)" '+(currentDiscoveryFilePage<=1?'disabled':'')+'>'+esc(t('prevPage'))+'</button>'
+    +'<input class="discovery-page-input" type="number" min="1" max="'+esc(String(totalPages))+'" value="'+esc(String(currentDiscoveryFilePage))+'" aria-label="Go to page" onchange="goDiscoveryFilePage(this.value)" onkeydown="if(event.key===\'Enter\')this.blur()">'
     +'<span class="discovery-pagination-meta">'+esc(tf('discoveryPage',currentDiscoveryFilePage,totalPages,start,end,total))+'</span>'
-    +'<button class="btn btn-secondary btn-small" type="button" onclick="changeDiscoveryFilePage(1)" '+(currentDiscoveryFilePage>=totalPages?'disabled':'')+'>'+esc(t('nextPage'))+'</button>';
+    +'<button class="btn btn-secondary btn-small" type="button" onclick="changeDiscoveryFilePage(1)" '+(currentDiscoveryFilePage>=totalPages?'disabled':'')+'>'+esc(t('nextPage'))+'</button>'
+    +'<button class="btn btn-secondary btn-small" type="button" title="Last page" aria-label="Last page" onclick="goDiscoveryFilePage('+esc(String(totalPages))+')" '+(currentDiscoveryFilePage>=totalPages?'disabled':'')+'>&raquo;</button>';
 }
 
 function changeDiscoveryFilePage(delta){
+  goDiscoveryFilePage(currentDiscoveryFilePage+delta);
+}
+
+function goDiscoveryFilePage(page){
   syncDiscoverySelectionFromDom();
   const files=(currentDiscoveryRecord&&Array.isArray(currentDiscoveryRecord.files))?currentDiscoveryRecord.files:[];
   const totalPages=Math.max(1,Math.ceil(files.length/DISCOVERY_FILE_PAGE_SIZE));
-  currentDiscoveryFilePage=Math.max(1,Math.min(totalPages,currentDiscoveryFilePage+delta));
+  currentDiscoveryFilePage=Math.max(1,Math.min(totalPages,parseInt(page,10)||1));
   renderDiscoveryFiles(null,{keepPage:true});
 }
 
@@ -3569,19 +3590,26 @@ function renderDiscoveryGroupPager(group,total){
   const start=(page-1)*DISCOVERY_FILE_PAGE_SIZE+1;
   const end=Math.min(total,page*DISCOVERY_FILE_PAGE_SIZE);
   return '<div class="discovery-pagination-inline">'
+    +'<button class="btn btn-secondary btn-small" type="button" title="First page" aria-label="First page" onclick="goDiscoveryValidityPage(\''+esc(group)+'\',1)" '+(page<=1?'disabled':'')+'>&laquo;</button>'
     +'<button class="btn btn-secondary btn-small" type="button" onclick="changeDiscoveryValidityPage(\''+esc(group)+'\',-1)" '+(page<=1?'disabled':'')+'>'+esc(t('prevPage'))+'</button>'
+    +'<input class="discovery-page-input" type="number" min="1" max="'+esc(String(totalPages))+'" value="'+esc(String(page))+'" aria-label="Go to page" onchange="goDiscoveryValidityPage(\''+esc(group)+'\',this.value)" onkeydown="if(event.key===\'Enter\')this.blur()">'
     +'<span class="discovery-pagination-meta">'+esc(tf('discoveryPage',page,totalPages,start,end,total))+'</span>'
     +'<button class="btn btn-secondary btn-small" type="button" onclick="changeDiscoveryValidityPage(\''+esc(group)+'\',1)" '+(page>=totalPages?'disabled':'')+'>'+esc(t('nextPage'))+'</button>'
+    +'<button class="btn btn-secondary btn-small" type="button" title="Last page" aria-label="Last page" onclick="goDiscoveryValidityPage(\''+esc(group)+'\','+esc(String(totalPages))+')" '+(page>=totalPages?'disabled':'')+'>&raquo;</button>'
     +'</div>';
 }
 
 function changeDiscoveryValidityPage(group,delta){
+  goDiscoveryValidityPage(group,(discoveryValidityPages[group]||1)+delta);
+}
+
+function goDiscoveryValidityPage(group,page){
   syncDiscoverySelectionFromDom();
   const files=(currentDiscoveryRecord&&Array.isArray(currentDiscoveryRecord.files))?currentDiscoveryRecord.files:[];
   const grouped=discoveryFilesByValidity(files);
   const total=(grouped[group]||[]).length;
   const totalPages=Math.max(1,Math.ceil(total/DISCOVERY_FILE_PAGE_SIZE));
-  discoveryValidityPages[group]=Math.max(1,Math.min(totalPages,(discoveryValidityPages[group]||1)+delta));
+  discoveryValidityPages[group]=Math.max(1,Math.min(totalPages,parseInt(page,10)||1));
   renderDiscoveryFiles(null,{keepPage:true});
 }
 
@@ -3638,7 +3666,7 @@ function renderDiscoveryFiles(files,options={}){
     const colgroup='<colgroup><col style="width:54px"><col style="width:250px"><col style="width:145px"><col style="width:132px"><col style="width:230px"><col style="width:120px"><col style="width:210px"><col style="width:300px"><col style="width:180px"></colgroup>';
     const table='<table class="discovery-table discovery-file-table">'+colgroup+'<thead><tr><th>Select</th><th>File / Project</th><th>'+esc(t('discoveryRole'))+' / '+esc(t('discoveryEvidenceLevel'))+'</th><th>'+esc(t('discoveryScore'))+' / '+esc(t('discoveryTrust'))+' / AI-ready / Value</th><th>'+esc(t('discoveryTaskReady'))+'</th><th>'+esc(t('discoveryInstrument'))+'</th><th>'+esc(t('discoveryFragmentation'))+' / '+esc(t('discoveryLcGradient'))+'</th><th>Reasons / '+esc(t('discoveryDiversity'))+'</th><th>QC / Review</th></tr></thead><tbody>'+(rows||'<tr><td colspan="9">'+esc(t('discoveryNoResults'))+'</td></tr>')+'</tbody></table>';
     return '<section class="discovery-file-group" data-validity="'+esc(group)+'">'
-      +'<div class="discovery-file-group-head"><div><div class="discovery-file-group-title"><span class="discovery-validity-dot '+esc(group)+'"></span><span>'+esc(discoveryValidityTitle(group))+'</span><span class="status-pill queued">'+esc(String(total))+'</span></div><div class="discovery-file-group-desc">'+esc(discoveryValidityDescription(group))+'</div></div><div class="discovery-file-group-meta"><span>'+esc(tf('discoveryGroupSelected',selected,total))+'</span></div></div>'
+      +'<div class="discovery-file-group-head"><div><div class="discovery-file-group-title"><span class="discovery-validity-dot '+esc(group)+'"></span><span>'+esc(discoveryValidityTitle(group))+'</span><span class="status-pill queued">'+esc(String(total))+'</span></div><div class="discovery-file-group-desc">'+esc(discoveryValidityDescription(group))+'</div></div><div class="discovery-file-group-meta"><span>'+esc(tf('discoveryGroupSelected',selected,total))+'</span><button class="btn btn-secondary btn-small" type="button" onclick="setDiscoveryGroupSelection(\''+esc(group)+'\',true)" '+(total?'':'disabled')+'>'+esc(t('selectAllDiscovery'))+'</button><button class="btn btn-secondary btn-small" type="button" onclick="setDiscoveryGroupSelection(\''+esc(group)+'\',false)" '+(selected?'':'disabled')+'>'+esc(t('clearDiscoverySelection'))+'</button></div></div>'
       +'<div class="discovery-file-group-body">'+table+'</div>'
       +renderDiscoveryGroupPager(group,total)
       +'</section>';

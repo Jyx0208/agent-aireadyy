@@ -254,6 +254,15 @@ def test_frontend_template_exposes_discovery_workflow():
     assert "discoveryGroup_weak_keep" in html
     assert "discoveryGroup_needs_review" in html
     assert "discoveryGroup_exclude" in html
+    assert "function setDiscoveryGroupSelection(group,selected)" in html
+    assert "discoveryFilesByValidity(files)[group]" in html
+    assert "setDiscoveryGroupSelection(\\'" in html
+    assert "function goDiscoveryValidityPage(group,page)" in html
+    assert "function goDiscoveryFilePage(page)" in html
+    assert 'class="discovery-page-input"' in html
+    assert 'aria-label="First page"' in html
+    assert 'aria-label="Last page"' in html
+    assert 'aria-label="Go to page"' in html
     assert "discoverySetSelect('aiReadyTaskType',discoveryTaskType)" in html
     assert "batchRunMode&&fullWorkflowEnabled" in html
     assert "batchRunMode.value='full'" in html
