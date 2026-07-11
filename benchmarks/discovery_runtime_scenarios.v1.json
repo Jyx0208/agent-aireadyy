@@ -1,0 +1,59 @@
+[
+  {
+    "id": "hela_multi_protease_dda",
+    "prompt": "Find a human HeLa multi-protease shotgun proteomics dataset acquired with DDA on Orbitrap-class instruments for broad proteome model development.",
+    "task_type": "psm_scoring",
+    "request": {
+      "repository": "pride",
+      "goal": "general",
+      "species": ["Homo sapiens"],
+      "species_policy": "include_only",
+      "acquisition_mode": "dda",
+      "labeling_strategy": "label_free",
+      "max_projects": 5,
+      "max_files": 20,
+      "max_candidate_projects": 25,
+      "max_files_per_project": 10
+    },
+    "expected_project_accessions": ["PXD000900"],
+    "notes": "Known PRIDE HeLa multi-protease Orbitrap dataset."
+  },
+  {
+    "id": "ipsc_neuroprotection_dda",
+    "prompt": "Find human iPSC-derived sensory neuron DDA proteomics data used to study neuroprotective compounds against chemotherapy-induced peripheral neuropathy.",
+    "task_type": "psm_scoring",
+    "request": {
+      "repository": "pride",
+      "goal": "general",
+      "species": ["Homo sapiens"],
+      "species_policy": "include_only",
+      "acquisition_mode": "dda",
+      "labeling_strategy": "label_free",
+      "max_projects": 5,
+      "max_files": 20,
+      "max_candidate_projects": 25,
+      "max_files_per_project": 10
+    },
+    "expected_project_accessions": ["PXD074954"],
+    "notes": "Known PRIDE human sensory-neuron neuroprotection dataset."
+  },
+  {
+    "id": "human_cell_line_immunopeptidomics",
+    "prompt": "Find human cell-line HLA or MHC immunopeptides isolated by immunoaffinity and measured with label-free DDA on a Q Exactive-class instrument.",
+    "task_type": "psm_scoring",
+    "request": {
+      "repository": "pride",
+      "goal": "immunopeptidomics",
+      "species": ["Homo sapiens"],
+      "species_policy": "include_only",
+      "acquisition_mode": "dda",
+      "labeling_strategy": "label_free",
+      "max_projects": 5,
+      "max_files": 20,
+      "max_candidate_projects": 25,
+      "max_files_per_project": 10
+    },
+    "expected_project_accessions": ["PXD077080"],
+    "notes": "Known PRIDE human cell-line immunopeptidomics dataset."
+  }
+]

@@ -137,13 +137,56 @@ def test_discovery_executes_high_recall_queries_with_balanced_page_sizes():
     )
 
     assert client.calls == [
-        ("human", 5),
-        ("HeLa", 5),
-        ("HEK293", 5),
-        ("DDA", 5),
-        ("label-free", 5),
-        ("Orbitrap", 5),
+        ("human", 20),
+        ("HeLa", 20),
+        ("HEK293", 20),
+        ("DDA", 20),
+        ("label-free", 20),
+        ("Orbitrap", 20),
     ]
+
+
+def test_discovery_ranks_relevant_older_candidates_before_inspection():
+    target = _project(
+        "PXD000900",
+        title="Confetti: A Multi-protease Map of the HeLa Proteome",
+    )
+    distractors = [
+        _project(f"PXD9{index:05d}", title=f"Unrelated recent project {index}")
+        for index in range(19)
+    ]
+
+    class RankedSearchClient:
+        def __init__(self):
+            self.inspected: list[str] = []
+
+        def search_projects(self, keyword: str, page_size: int = 100):
+            return [*distractors, target][:page_size]
+
+        def get_project(self, accession: str):
+            self.inspected.append(accession)
+            return target if accession == "PXD000900" else distractors[0]
+
+        def list_project_files(self, accession: str, **_kwargs):
+            return []
+
+        def close(self):
+            return None
+
+    client = RankedSearchClient()
+    request = DatasetRequest(
+        goal="general",
+        query_terms=["HeLa", "multi-protease"],
+        species=["Homo sapiens"],
+        species_policy="include_only",
+        max_candidate_projects=1,
+        max_projects=1,
+        max_files=1,
+    )
+
+    discover_pride_dataset(request, client=client, queries=["multi-protease"])
+
+    assert client.inspected == ["PXD000900"]
 
 
 def test_scoring_prefers_phospho_project_metadata():

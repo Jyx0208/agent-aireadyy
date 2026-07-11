@@ -1137,7 +1137,9 @@ def _agent_discovery_configuration(
     budget = AgentBudget(
         max_turns=_bounded_int(os.getenv("AGENT_MAX_MODEL_TURNS"), default=50, minimum=1, maximum=50),
         max_tool_calls=_bounded_int(os.getenv("AGENT_MAX_TOOL_CALLS"), default=100, minimum=1, maximum=100),
-        max_discovery_rounds=3,
+        max_discovery_rounds=_bounded_int(
+            os.getenv("AGENT_MAX_DISCOVERY_ROUNDS"), default=3, minimum=1, maximum=3
+        ),
     )
     limits = DynamicBudgetLimits(
         max_query_units=_bounded_int(os.getenv("AGENT_MAX_QUERY_UNITS"), default=30, minimum=1, maximum=500),

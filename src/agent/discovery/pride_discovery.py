@@ -38,6 +38,23 @@ def _dedupe_projects(projects: list[dict[str, Any]], limit: int) -> list[dict[st
     return deduped
 
 
+def _rank_candidate_projects(
+    projects: list[dict[str, Any]], request: DatasetRequest, limit: int
+) -> list[dict[str, Any]]:
+    deduped = _dedupe_projects(projects, len(projects))
+    scored = [(score_project(project, request), project) for project in deduped]
+    ranked = sorted(
+        scored,
+        key=lambda item: (
+            item[0].excluded,
+            item[0].needs_review,
+            -item[0].project_score,
+            _project_accession(item[1]),
+        ),
+    )
+    return [project for _score, project in ranked[:limit]]
+
+
 def _sort_projects(items: list[tuple[DiscoveredProject, list[DiscoveredFile]]]) -> list[tuple[DiscoveredProject, list[DiscoveredFile]]]:
     return sorted(
         items,
@@ -95,7 +112,12 @@ def discover_pride_dataset(
                 f"Adapted {len(proposed_queries)} semantic query term(s) into "
                 f"{len(queries)} high-recall PRIDE keyword seed(s): {'; '.join(queries)}"
             )
-        search_page_size = max(1, min(100, ceil(request.max_candidate_projects / max(1, len(queries)))))
+        # A shallow per-query page systematically hides older but highly relevant projects.
+        # Fetch enough metadata to rank candidates globally; project/file inspection remains bounded.
+        search_page_size = max(
+            20,
+            min(100, ceil(request.max_candidate_projects / max(1, len(queries)))),
+        )
         for query in queries:
             _check_cancel()
             _report(f"Searching PRIDE projects: {query}")
@@ -105,10 +127,10 @@ def discover_pride_dataset(
             except Exception as exc:  # pragma: no cover - defensive network boundary
                 failures.append({"stage": "search_projects", "query": query, "error": str(exc)})
                 _report(f"Project search failed for query '{query}': {exc}")
-            if len(_dedupe_projects(searched_records, request.max_candidate_projects)) >= request.max_candidate_projects:
-                break
 
-        candidates = _dedupe_projects(searched_records, request.max_candidate_projects)
+        candidates = _rank_candidate_projects(
+            searched_records, request, request.max_candidate_projects
+        )
         _report(f"Deduped to {len(candidates)} candidate project(s).")
         scored_items: list[tuple[DiscoveredProject, list[DiscoveredFile]]] = []
         excluded_projects = 0

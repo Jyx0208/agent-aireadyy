@@ -78,7 +78,7 @@ def _species_policy_reasons(candidate_species: list[str], request: DatasetReques
         if not candidate:
             return None, ["missing_species_evidence"]
         if requested and not (candidate & requested):
-            return "needs_review", ["species_hard_constraint_conflict"]
+            return "exclude", ["species_hard_constraint_conflict"]
         return None, ["species_include_only_match"]
     if not candidate:
         return None, ["missing_species_evidence"]
@@ -178,6 +178,20 @@ def assess_file_validity(file: DiscoveredFile, request: DatasetRequest) -> Valid
         return ValidityDecision("exclude", ["unsupported_file_type"], True)
     if file.file_role not in {"raw_acquisition", "converted_peaklist", "unknown"}:
         return ValidityDecision("exclude", ["unsupported_file_role"], True)
+    requested_labeling = normalize_labeling_strategy(request.labeling_strategy)
+    observed_labeling = normalize_labeling_strategy(file.labeling_strategy or "")
+    if (
+        requested_labeling != "unknown"
+        and observed_labeling != "unknown"
+        and observed_labeling != requested_labeling
+    ):
+        return ValidityDecision("exclude", ["labeling_hard_constraint_conflict"], True)
+    if (
+        request.acquisition_mode
+        and file.acquisition_mode
+        and file.acquisition_mode != request.acquisition_mode
+    ):
+        return ValidityDecision("exclude", ["acquisition_hard_constraint_conflict"], True)
 
     immunopeptidomics_goal = is_immunopeptidomics_goal(request.goal)
     general_goal = str(request.goal or "").casefold() == "general"
