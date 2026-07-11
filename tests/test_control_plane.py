@@ -303,6 +303,127 @@ def test_agent_can_filter_inspected_projects_during_final_selection(tmp_path: Pa
     assert {file.project_accession for file in selected_manifest.files} == {"PXD_GOOD"}
 
 
+def test_candidate_pool_preserves_agent_choices_until_final_selection(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride", max_projects=1, max_files=10)
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("agent_owned_selection").model_copy(
+            update={"status": "running", "dynamic_limits": DynamicBudgetLimits()}
+        )
+    )
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=_FakeSearchEnvironment(request),
+    )
+    search = service.search_repository_candidates(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="human immunopeptidomics")],
+            rationale="Find candidates for Agent selection.",
+        )
+    )
+    first_inspection = service.inspect_repository_candidates(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD_HIGH_SCORE", "PXD_AGENT_CHOICE"],
+            rationale="Inspect both candidates before deciding.",
+        )
+    )
+
+    assert first_inspection.inspected_candidate_count == 2
+    assert first_inspection.minimum_high_relevance_inspections == 1
+    assert first_inspection.selection_ready is True
+
+    persisted_run = store.load_run(run.run_id)
+    assert persisted_run is not None
+    pool_path = Path(persisted_run.candidate_pool_manifest_path or "")
+    pool = DatasetManifest.model_validate_json(pool_path.read_text(encoding="utf-8"))
+    premature = service.select_discovery_manifest(0, "Let deterministic ranking decide.", [])
+    selected = service.select_discovery_manifest(
+        0,
+        "The second project is more relevant to the visible request.",
+        ["PXD_AGENT_CHOICE"],
+    )
+
+    assert {project.project_accession for project in pool.projects} == {
+        "PXD_HIGH_SCORE",
+        "PXD_AGENT_CHOICE",
+    }
+    assert premature["status"] == "blocked"
+    assert premature["blockers"] == [
+        "explicit_project_selection_required_for_candidate_pool"
+    ]
+    assert selected["selected_project_accessions"] == ["PXD_AGENT_CHOICE"]
+
+
+def test_selection_waits_for_minimum_high_relevance_inspection_coverage(tmp_path: Path) -> None:
+    class HighRelevanceEnvironment(_FakeSearchEnvironment):
+        def search(self, action: CandidateSearchAction) -> CandidateSearchObservation:
+            return super().search(action).model_copy(
+                update={"high_relevance_candidate_count": 4}
+            )
+
+    request = DatasetRequest(repository="pride", max_projects=2, max_files=10)
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("inspection_coverage").model_copy(
+            update={"status": "running", "dynamic_limits": DynamicBudgetLimits()}
+        )
+    )
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=HighRelevanceEnvironment(request),
+    )
+    search = service.search_repository_candidates(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="human immunopeptidomics")],
+            rationale="Find high-relevance candidates.",
+        )
+    )
+    first_inspection = service.inspect_repository_candidates(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD_FIRST", "PXD_SECOND"],
+            rationale="Inspect the first promising batch.",
+        )
+    )
+    assert first_inspection.inspected_candidate_count == 2
+    assert first_inspection.minimum_high_relevance_inspections == 4
+    assert first_inspection.selection_ready is False
+    assert first_inspection.recommended_action == "inspect_more_high_relevance_candidates"
+
+    premature = service.select_discovery_manifest(
+        0,
+        "The first batch is usable, although other high-relevance candidates remain.",
+        ["PXD_FIRST", "PXD_SECOND"],
+    )
+
+    assert premature["status"] == "blocked"
+    assert premature["blockers"] == ["high_relevance_candidates_require_more_inspection"]
+
+    second_inspection = service.inspect_repository_candidates(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD_THIRD", "PXD_FOURTH"],
+            rationale="Inspect the remaining high-relevance candidates.",
+        )
+    )
+    assert second_inspection.inspected_candidate_count == 4
+    assert second_inspection.selection_ready is True
+    selected = service.select_discovery_manifest(
+        0,
+        "All high-relevance candidates were inspected before final selection.",
+        ["PXD_FIRST", "PXD_SECOND"],
+    )
+
+    assert selected["status"] == "completed"
+
+
 def test_quality_first_search_honors_dynamic_budget_grant(tmp_path: Path) -> None:
     request = DatasetRequest(repository="pride")
     store = AgentRunStore(tmp_path / "state.sqlite")

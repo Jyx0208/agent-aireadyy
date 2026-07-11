@@ -30,6 +30,19 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def minimum_high_relevance_inspections(
+    high_relevance_candidate_count: int,
+    max_projects: int,
+) -> int:
+    if high_relevance_candidate_count <= 0:
+        return 0
+    return min(
+        int(high_relevance_candidate_count),
+        max(1, int(max_projects) * 2),
+        10,
+    )
+
+
 class AgentBudget(JsonModel):
     max_turns: int = Field(default=8, ge=1, le=50)
     max_tool_calls: int = Field(default=12, ge=1, le=100)
@@ -213,6 +226,7 @@ class AgentRunRecord(JsonModel):
     discovery_round_count: int = 0
     candidate_search_count: int = 0
     candidate_inspection_count: int = 0
+    inspected_candidate_accessions: list[str] = Field(default_factory=list)
     no_gain_action_count: int = 0
     latest_candidate_search_id: str | None = None
     latest_high_relevance_candidate_count: int = 0
@@ -265,6 +279,9 @@ class DiscoveryRoundObservation(JsonModel):
     unknown_counts: dict[str, int] = Field(default_factory=dict)
     candidate_search: dict[str, Any] | None = None
     project_assessments: list[dict[str, Any]] = Field(default_factory=list)
+    inspected_candidate_count: int = Field(default=0, ge=0)
+    minimum_high_relevance_inspections: int = Field(default=0, ge=0)
+    selection_ready: bool = False
     recommended_action: str = "review_manifest"
     warnings: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)

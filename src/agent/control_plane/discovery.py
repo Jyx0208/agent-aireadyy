@@ -14,6 +14,7 @@ from agent.control_plane.models import (
     DynamicBudgetLimits,
     RoundMetrics,
     SearchDiagnosis,
+    minimum_high_relevance_inspections,
 )
 from agent.control_plane.policy import evaluate_tool_policy
 from agent.control_plane.store import AgentRunStore
@@ -391,6 +392,7 @@ class DiscoveryToolService:
             round_manifests,
             request=self.request,
             run_id=self.run_id,
+            retain_all_candidates=True,
         )
         pool_paths = write_dataset_manifest(pool_manifest, self.output_dir / "candidate_pool")
         pool_observation = _observation_from_manifest(
@@ -434,13 +436,28 @@ class DiscoveryToolService:
                 "no_gain_streak": metered_run.no_gain_action_count,
             }
         )
+        inspected_accessions = _normalize_accessions(
+            [*metered_run.inspected_candidate_accessions, *action.accessions]
+        )
+        minimum_inspections = minimum_high_relevance_inspections(
+            metered_run.latest_high_relevance_candidate_count,
+            self.request.max_projects,
+        )
+        inspection_budget_remaining = round_index < metered_run.budget.max_discovery_rounds
+        selection_ready = (
+            len(inspected_accessions) >= minimum_inspections
+            or metered_run.search_stopped
+            or not inspection_budget_remaining
+        )
         artifacts["candidate_pool"] = ArtifactReference(
             path=str(pool_paths["dataset_manifest_json"]),
             artifact_type="dataset_manifest",
             schema_version="dataset-manifest/v1",
         )
         unresolved = candidate_search.get("unresolved_intent_terms") or []
-        if unresolved and usable_files > 0:
+        if not selection_ready:
+            recommendation = "inspect_more_high_relevance_candidates"
+        elif unresolved and usable_files > 0:
             recommendation = "search_unresolved_intent_or_finalize_with_explicit_gaps"
         else:
             recommendation = observation.recommended_action
@@ -455,6 +472,9 @@ class DiscoveryToolService:
                     manifest,
                     candidate_search,
                 ),
+                "inspected_candidate_count": len(inspected_accessions),
+                "minimum_high_relevance_inspections": minimum_inspections,
+                "selection_ready": selection_ready,
                 "recommended_action": recommendation,
             }
         )
@@ -474,6 +494,7 @@ class DiscoveryToolService:
                 "consecutive_zero_yield": diagnosis.consecutive_zero_yield,
                 "search_recovery_required": diagnosis.recovery_required,
                 "last_search_strategy": diagnosis.strategy,
+                "inspected_candidate_accessions": inspected_accessions,
             }
         )
         self.store.save_run(run)
@@ -752,6 +773,7 @@ class DiscoveryToolService:
                 round_manifests,
                 request=self.request,
                 run_id=self.run_id,
+                retain_all_candidates=True,
             )
             pool_paths = write_dataset_manifest(pool_manifest, self.output_dir / "candidate_pool")
             pool_observation = _observation_from_manifest(
@@ -929,11 +951,45 @@ class DiscoveryToolService:
 
         selected_accessions = _normalize_accessions(project_accessions or [])
 
+        required_inspections = minimum_high_relevance_inspections(
+            run.latest_high_relevance_candidate_count,
+            self.request.max_projects,
+        )
+        inspected_count = len(run.inspected_candidate_accessions)
+        inspection_budget_remaining = (
+            not run.search_stopped
+            and run.discovery_round_count < run.budget.max_discovery_rounds
+        )
+        if (
+            self.search_environment is not None
+            and inspected_count < required_inspections
+            and inspection_budget_remaining
+        ):
+            return self._selection_rejected(
+                round_index,
+                "high_relevance_candidates_require_more_inspection",
+            )
+
         manifest_path = self._manifest_path_for_selection(run, round_index)
         if manifest_path is None or not manifest_path.exists():
             return self._selection_rejected(round_index, "manifest_round_not_found")
 
         manifest = _load_manifest(manifest_path)
+        candidate_count = len(manifest.projects)
+        if (
+            not selected_accessions
+            and round_index == 0
+            and candidate_count > self.request.max_projects
+        ):
+            return self._selection_rejected(
+                round_index,
+                "explicit_project_selection_required_for_candidate_pool",
+            )
+        if len(selected_accessions) > self.request.max_projects:
+            return self._selection_rejected(
+                round_index,
+                "selection_exceeds_max_projects",
+            )
         if selected_accessions:
             available = {project.project_accession.upper() for project in manifest.projects}
             missing = [accession for accession in selected_accessions if accession not in available]
@@ -980,6 +1036,12 @@ class DiscoveryToolService:
                 request=self.request,
                 run_id=self.run_id,
             )
+        else:
+            manifest = _merge_discovery_manifests(
+                [manifest],
+                request=self.request,
+                run_id=self.run_id,
+            )
         selected_files = _selected_file_count(manifest)
         if selected_files <= 0:
             payload = {
@@ -993,9 +1055,8 @@ class DiscoveryToolService:
             self.store.append_event(self.run_id, "manifest_selection_rejected", payload)
             return payload
 
-        if selected_accessions:
-            paths = write_dataset_manifest(manifest, self.output_dir / "final_selection")
-            manifest_path = paths["dataset_manifest_json"]
+        paths = write_dataset_manifest(manifest, self.output_dir / "final_selection")
+        manifest_path = paths["dataset_manifest_json"]
 
         _, warnings = _recommend_next_action(manifest.summary, selected_files)
         run = self.store.save_run(
@@ -1108,6 +1169,11 @@ class DiscoveryToolService:
             "discovery_round_count": run.discovery_round_count,
             "candidate_search_count": run.candidate_search_count,
             "candidate_inspection_count": run.candidate_inspection_count,
+            "inspected_candidate_accessions": run.inspected_candidate_accessions,
+            "minimum_high_relevance_inspections": minimum_high_relevance_inspections(
+                run.latest_high_relevance_candidate_count,
+                int((run.request or {}).get("max_projects") or 1),
+            ),
             "no_gain_action_count": run.no_gain_action_count,
             "latest_candidate_search_id": run.latest_candidate_search_id,
             "latest_high_relevance_candidate_count": run.latest_high_relevance_candidate_count,
@@ -1336,6 +1402,7 @@ def _merge_discovery_manifests(
     *,
     request: DatasetRequest,
     run_id: str,
+    retain_all_candidates: bool = False,
 ) -> DatasetManifest:
     projects: dict[tuple[str, str], DiscoveredProject] = {}
     files: dict[tuple[str, str, str], DiscoveredFile] = {}
@@ -1359,7 +1426,7 @@ def _merge_discovery_manifests(
         for key, project in projects.items()
         if grouped.get(key)
     ]
-    selected_items = select_diverse_items(items, request)
+    selected_items = items if retain_all_candidates else select_diverse_items(items, request)
     selected_projects = [project for project, _ in selected_items]
     selected_files = [file for _, project_files in selected_items for file in project_files]
     diversity = diversity_summary(selected_files)
@@ -1377,6 +1444,7 @@ def _merge_discovery_manifests(
             "merged_rounds": len(manifests),
             "deduplicated_projects": len(projects),
             "deduplicated_files": len(files),
+            "retains_all_inspected_candidates": retain_all_candidates,
         },
         "openai_agents_control_plane": {
             "run_id": run_id,

@@ -25,6 +25,7 @@ from agent.control_plane.models import (
     DynamicBudgetLimits,
     OpenAIAgentsDiscoveryResult,
     SearchProposalInput,
+    minimum_high_relevance_inspections,
 )
 from agent.control_plane.store import AgentRunStore
 from agent.discovery.memory import DiscoveryMemory
@@ -156,7 +157,7 @@ def select_discovery_manifest(
 
     Args:
         round_index: Use 0 for the merged cross-round candidate pool, or a positive discovery round number.
-        project_accessions: Retain only these inspected project accessions; use an empty list to retain the whole manifest.
+        project_accessions: Exact inspected project accessions to retain. When the pooled candidate count exceeds max_projects, provide a non-empty list within that limit.
         rationale: Concise evidence-based reason for selecting this manifest.
     """
     payload = wrapper.context.service.select_discovery_manifest(
@@ -632,6 +633,9 @@ def _quality_first_discovery_instructions(
         "previews, matched intent terms, semantic coverage, and unresolved terms. "
         "inspect_repository_candidates accepts only accessions from the latest persisted search and "
         "returns a validated manifest observation with per-project assessments. "
+        "The inspection observation reports inspected_candidate_count, "
+        "minimum_high_relevance_inspections, and selection_ready. When selection_ready is false, "
+        "inspect another relevance-coherent batch from the persisted search before finalizing. "
         "select_discovery_manifest finalizes round_index=0 for the merged pool or a positive "
         "inspection round and can retain only explicitly chosen inspected project_accessions. "
         "Search strategy: use precise phrases or distinctive biological concepts when they improve "
@@ -760,6 +764,12 @@ def _write_run_outputs(
         "discovery_round_count": run.discovery_round_count,
         "candidate_search_count": run.candidate_search_count,
         "candidate_inspection_count": run.candidate_inspection_count,
+        "inspected_candidate_accessions": run.inspected_candidate_accessions,
+        "inspected_candidate_count": len(run.inspected_candidate_accessions),
+        "minimum_high_relevance_inspections": minimum_high_relevance_inspections(
+            run.latest_high_relevance_candidate_count,
+            int((run.request or {}).get("max_projects") or 1),
+        ),
         "no_gain_action_count": run.no_gain_action_count,
         "latest_candidate_search_id": run.latest_candidate_search_id,
         "model_usage": {
@@ -837,6 +847,8 @@ def _markdown_report(summary: dict[str, Any]) -> str:
         f"- Discovery rounds: {summary['discovery_round_count']}",
         f"- Candidate searches: {summary.get('candidate_search_count', 0)}",
         f"- Candidate inspections: {summary.get('candidate_inspection_count', 0)}",
+        f"- Inspected candidate accessions: {summary.get('inspected_candidate_count', 0)}",
+        f"- Minimum high-relevance inspections: {summary.get('minimum_high_relevance_inspections', 0)}",
         f"- Tool calls: {summary['tool_call_count']}",
         f"- Stop reason: `{summary.get('stop_reason') or ''}`",
         f"- Selected manifest: `{summary.get('selected_manifest_path') or ''}`",

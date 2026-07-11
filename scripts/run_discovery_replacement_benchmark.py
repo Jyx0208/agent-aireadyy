@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -65,6 +66,7 @@ def run_replacement_benchmark(
     output_root: Path,
     tiers: Sequence[str],
     repeats: int,
+    resume: bool = False,
 ) -> ReplacementBenchmarkReport:
     output_root.mkdir(parents=True, exist_ok=True)
     web_app._runs_dir = output_root / "runs"
@@ -86,25 +88,27 @@ def run_replacement_benchmark(
             for scenario in scenarios:
                 for variant in scenario.prompt_variants:
                     workflow_runs.append(
-                        _run_one(
+                        _run_or_resume(
                             scenario=scenario,
                             variant=variant,
                             runtime="workflow",
                             budget_tier="baseline",
                             repeat=repeat,
                             output_root=output_root,
+                            resume=resume,
                         )
                     )
                     for tier in tiers:
                         _set_agent_tier(tier)
                         agent_runs.append(
-                            _run_one(
+                            _run_or_resume(
                                 scenario=scenario,
                                 variant=variant,
                                 runtime="openai_agents",
                                 budget_tier=tier,
                                 repeat=repeat,
                                 output_root=output_root,
+                                resume=resume,
                             )
                         )
     finally:
@@ -119,7 +123,54 @@ def run_replacement_benchmark(
         agent=agent_runs,
     )
     _write_report(output_root, report, workflow_runs, agent_runs)
+    _write_blinded_judgment_pool(output_root, scenarios)
     return report
+
+
+def _run_or_resume(
+    *,
+    scenario: ReplacementBenchmarkScenario,
+    variant: PromptVariant,
+    runtime: str,
+    budget_tier: str,
+    repeat: int,
+    output_root: Path,
+    resume: bool,
+) -> ReplacementRun:
+    path = _run_result_path(
+        output_root,
+        scenario=scenario,
+        variant=variant,
+        runtime=runtime,
+        budget_tier=budget_tier,
+        repeat=repeat,
+    )
+    if resume and path.is_file():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        run = ReplacementRun.model_validate(payload.get("result"))
+        expected = (scenario.id, variant.id, repeat, runtime, budget_tier)
+        actual = (
+            run.scenario_id,
+            run.variant_id,
+            run.repeat,
+            run.runtime,
+            run.budget_tier,
+        )
+        if actual != expected:
+            raise ValueError(f"resume artifact identity mismatch: {path}")
+        print(
+            f"[{scenario.id}/{variant.id}/repeat-{repeat}] resumed {runtime} {budget_tier}",
+            flush=True,
+        )
+        return run
+    return _run_one(
+        scenario=scenario,
+        variant=variant,
+        runtime=runtime,
+        budget_tier=budget_tier,
+        repeat=repeat,
+        output_root=output_root,
+    )
 
 
 def _run_one(
@@ -180,8 +231,15 @@ def _run_one(
             else request_count
         ),
     )
-    stem = f"{scenario.id}.{variant.id}.repeat-{repeat}.{runtime}.{budget_tier}"
-    (output_root / f"{stem}.json").write_text(
+    path = _run_result_path(
+        output_root,
+        scenario=scenario,
+        variant=variant,
+        runtime=runtime,
+        budget_tier=budget_tier,
+        repeat=repeat,
+    )
+    path.write_text(
         json.dumps(
             {"result": result.model_dump(mode="json"), "record": record},
             ensure_ascii=False,
@@ -197,6 +255,127 @@ def _run_one(
         flush=True,
     )
     return result
+
+
+def _run_result_path(
+    output_root: Path,
+    *,
+    scenario: ReplacementBenchmarkScenario,
+    variant: PromptVariant,
+    runtime: str,
+    budget_tier: str,
+    repeat: int,
+) -> Path:
+    stem = f"{scenario.id}.{variant.id}.repeat-{repeat}.{runtime}.{budget_tier}"
+    return output_root / f"{stem}.json"
+
+
+def _write_blinded_judgment_pool(
+    output_root: Path,
+    scenarios: Sequence[ReplacementBenchmarkScenario],
+) -> None:
+    scenarios_by_id = {scenario.id: scenario for scenario in scenarios}
+    pooled: dict[tuple[str, str, str], dict[str, Any]] = {}
+    provenance: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for path in sorted(output_root.glob("*.repeat-*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        result = payload.get("result") if isinstance(payload, dict) else None
+        record = payload.get("record") if isinstance(payload, dict) else None
+        if not isinstance(result, dict) or not isinstance(record, dict):
+            continue
+        scenario_id = str(result.get("scenario_id") or "")
+        if scenario_id not in scenarios_by_id:
+            continue
+        variant_id = str(result.get("variant_id") or "")
+        scenario = scenarios_by_id[scenario_id]
+        variant = next(
+            (item for item in scenario.prompt_variants if item.id == variant_id),
+            None,
+        )
+        if variant is None:
+            continue
+        projects = [item for item in record.get("projects") or [] if isinstance(item, dict)]
+        for project in projects:
+            accession = str(project.get("project_accession") or "").strip().upper()
+            if not accession:
+                continue
+            key = (scenario_id, variant_id, accession)
+            candidate_id = "candidate_" + hashlib.sha256(
+                f"{scenario_id}:{variant_id}:{accession}".encode("utf-8")
+            ).hexdigest()[:12]
+            metadata = {
+                "candidate_id": candidate_id,
+                "scenario_id": scenario_id,
+                "variant_id": variant_id,
+                "visible_prompt": variant.prompt,
+                "visible_hard_constraint_fields": variant.hard_constraint_fields,
+                "project_title": str(project.get("project_title") or ""),
+                "species": list(project.get("species") or []),
+                "acquisition_mode": project.get("acquisition_mode"),
+                "labeling_strategy": project.get("labeling_strategy"),
+                "instrument_families": list(project.get("instrument_families") or []),
+                "fragmentation_methods": list(project.get("fragmentation_methods") or []),
+                "grade": None,
+                "review_notes": "",
+            }
+            current = pooled.get(key)
+            if current is None or len(json.dumps(metadata, ensure_ascii=False)) > len(
+                json.dumps(current, ensure_ascii=False)
+            ):
+                pooled[key] = metadata
+            provenance.setdefault(key, []).append(
+                {
+                    "runtime": result.get("runtime"),
+                    "budget_tier": result.get("budget_tier"),
+                    "repeat": result.get("repeat"),
+                    "artifact": path.name,
+                }
+            )
+
+    tasks = {
+        f"{scenario.id}:{variant.id}": {
+            "scenario_id": scenario.id,
+            "variant_id": variant.id,
+            "task_type": scenario.task_type,
+            "visible_prompt": variant.prompt,
+            "visible_hard_constraint_fields": variant.hard_constraint_fields,
+        }
+        for scenario in scenarios
+        for variant in scenario.prompt_variants
+    }
+    blinded = {
+        "schema_version": "discovery-judgment-pool/v1",
+        "instructions": {
+            "grade_3": "Directly satisfies the biological task and important explicit constraints.",
+            "grade_2": "Strongly relevant and usable, with a minor scope or evidence gap.",
+            "grade_1": "Related topic but not a suitable answer to the requested task.",
+            "grade_0": "Off-topic or contradicts an explicit hard constraint.",
+            "review_rule": "Judge repository metadata only. Candidate origin is intentionally hidden.",
+        },
+        "tasks": tasks,
+        "candidates": [pooled[key] for key in sorted(pooled)],
+    }
+    key_payload = {
+        "schema_version": "discovery-judgment-key/v1",
+        "candidates": [
+            {
+                "candidate_id": pooled[key]["candidate_id"],
+                "scenario_id": key[0],
+                "variant_id": key[1],
+                "project_accession": key[2],
+                "observed_in": provenance[key],
+            }
+            for key in sorted(pooled)
+        ],
+    }
+    (output_root / "judgment_pool.blinded.json").write_text(
+        json.dumps(blinded, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (output_root / "judgment_pool.key.json").write_text(
+        json.dumps(key_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _set_agent_tier(tier: str) -> None:
@@ -256,6 +435,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--scenario", action="append", dest="scenario_ids")
     parser.add_argument("--variant", action="append", dest="variant_ids")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse validated per-run JSON artifacts already present in output-root.",
+    )
     return parser
 
 
@@ -297,6 +481,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_root=args.output_root,
             tiers=tiers,
             repeats=args.repeat,
+            resume=args.resume,
         )
     except Exception as exc:
         print(f"replacement benchmark error: {exc}", file=sys.stderr)
