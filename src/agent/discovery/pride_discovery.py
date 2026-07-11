@@ -86,15 +86,21 @@ def discover_pride_dataset(
     client: PrideClient | None = None,
     memory: DiscoveryMemory | None = None,
     queries: list[str] | None = None,
+    candidate_records: list[dict[str, Any]] | None = None,
     report: Callable[[str], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
     early_stop_on_limits: bool = False,
 ) -> DatasetManifest:
     owns_client = client is None
     pride = client or PrideClient()
-    proposed_queries = queries or build_pride_queries(request)
-    queries = prepare_pride_search_queries(proposed_queries) or proposed_queries
-    searched_records: list[dict[str, Any]] = []
+    if candidate_records is None:
+        proposed_queries = queries or build_pride_queries(request)
+        queries = prepare_pride_search_queries(proposed_queries) or proposed_queries
+        searched_records: list[dict[str, Any]] = []
+    else:
+        proposed_queries = list(queries or [])
+        queries = list(queries or [])
+        searched_records = list(candidate_records)
     failures: list[dict[str, str]] = []
     review_decisions = memory.load_review_decisions() if memory is not None else []
 
@@ -107,26 +113,27 @@ def discover_pride_dataset(
             raise InterruptedError("Discovery cancelled.")
 
     try:
-        if queries != proposed_queries:
+        if candidate_records is None and queries != proposed_queries:
             _report(
                 f"Adapted {len(proposed_queries)} semantic query term(s) into "
                 f"{len(queries)} high-recall PRIDE keyword seed(s): {'; '.join(queries)}"
             )
         # A shallow per-query page systematically hides older but highly relevant projects.
         # Fetch enough metadata to rank candidates globally; project/file inspection remains bounded.
-        search_page_size = max(
-            20,
-            min(100, ceil(request.max_candidate_projects / max(1, len(queries)))),
-        )
-        for query in queries:
-            _check_cancel()
-            _report(f"Searching PRIDE projects: {query}")
-            try:
-                searched_records.extend(pride.search_projects(query, page_size=search_page_size))
-                _report(f"Project search returned {len(searched_records)} raw records so far.")
-            except Exception as exc:  # pragma: no cover - defensive network boundary
-                failures.append({"stage": "search_projects", "query": query, "error": str(exc)})
-                _report(f"Project search failed for query '{query}': {exc}")
+        if candidate_records is None:
+            search_page_size = max(
+                20,
+                min(100, ceil(request.max_candidate_projects / max(1, len(queries)))),
+            )
+            for query in queries:
+                _check_cancel()
+                _report(f"Searching PRIDE projects: {query}")
+                try:
+                    searched_records.extend(pride.search_projects(query, page_size=search_page_size))
+                    _report(f"Project search returned {len(searched_records)} raw records so far.")
+                except Exception as exc:  # pragma: no cover - defensive network boundary
+                    failures.append({"stage": "search_projects", "query": query, "error": str(exc)})
+                    _report(f"Project search failed for query '{query}': {exc}")
 
         candidates = _rank_candidate_projects(
             searched_records, request, request.max_candidate_projects

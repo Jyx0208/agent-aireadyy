@@ -540,6 +540,53 @@ class AgentRunStore:
         finally:
             connection.close()
 
+    def increment_model_usage(
+        self,
+        run_id: str,
+        *,
+        requests: int = 0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        total_tokens: int = 0,
+    ) -> AgentRunRecord:
+        values = (requests, input_tokens, output_tokens, total_tokens)
+        if any(value < 0 for value in values):
+            raise ValueError("model_usage_deltas_must_be_non_negative")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload_json, sdk_state_json FROM agent_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown agent run: {run_id}")
+            run = self._run_record(row)
+            updated = run.model_copy(
+                update={
+                    "model_requests": run.model_requests + requests,
+                    "model_input_tokens": run.model_input_tokens + input_tokens,
+                    "model_output_tokens": run.model_output_tokens + output_tokens,
+                    "model_total_tokens": run.model_total_tokens + total_tokens,
+                    "updated_at": utc_now_iso(),
+                }
+            )
+            connection.execute(
+                "UPDATE agent_runs SET payload_json = ?, updated_at = ? WHERE run_id = ?",
+                (
+                    canonical_json(updated.model_dump(mode="json", exclude={"sdk_state_json"})),
+                    updated.updated_at,
+                    run_id,
+                ),
+            )
+            connection.commit()
+            return updated
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     @staticmethod
     def _tool_record(row: sqlite3.Row) -> ToolExecutionRecord:
         return ToolExecutionRecord(

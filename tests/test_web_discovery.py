@@ -104,6 +104,41 @@ def test_discovery_job_event_is_structured_and_recursively_sanitized(monkeypatch
             web_app._discovery_jobs.pop(job_id, None)
 
 
+def test_candidate_search_event_exposes_real_search_progress(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    job_id = "candidate_search_event"
+    with web_app._discovery_jobs_lock:
+        web_app._discovery_jobs[job_id] = {"job_id": job_id, "status": "running", "logs": []}
+    try:
+        web_app._append_discovery_job_event(
+            job_id,
+            AgentEvent(
+                sequence=8,
+                run_id="run_1",
+                event_type="candidate_search_completed",
+                created_at="2026-07-11T09:00:00+08:00",
+                payload={
+                    "observation": {
+                        "candidate_count": 14,
+                        "new_candidate_count": 9,
+                        "high_relevance_candidate_count": 4,
+                        "semantic_coverage": 0.75,
+                    },
+                    "metrics": {"duplicate_rate": 0.2, "semantic_coverage_gap": 0.25},
+                },
+            ),
+        )
+        entry = web_app._discovery_jobs[job_id]["logs"][0]
+        assert entry["actor"] == "Repository Search"
+        assert "14 candidate project(s)" in entry["message"]
+        assert "4 high-relevance" in entry["message"]
+        assert "75%" in entry["message"]
+        assert entry["metrics"]["duplicate_rate"] == 0.2
+    finally:
+        with web_app._discovery_jobs_lock:
+            web_app._discovery_jobs.pop(job_id, None)
+
+
 class _FakeDiscoveryLLM:
     def complete_json(self, *, system_prompt: str, user_prompt: str):
         return {
@@ -394,6 +429,33 @@ def test_web_general_discovery_request_does_not_default_to_human():
     assert request.species_policy == "open"
     assert request.ptm_type == "unknown_ptm"
     assert "drug treatment" in request.query_terms
+
+
+def test_raw_prompt_request_does_not_invent_hard_acquisition_or_labeling_constraints():
+    request = web_app._clean_dataset_request(
+        {"prompt": "Find human neuronal proteomics suitable for drug-response modeling."}
+    )
+
+    assert request.acquisition_mode == "unknown"
+    assert request.labeling_strategy == "unknown"
+    assert request.hard_constraint_fields == ["repository"]
+    assert request.constraint_provenance == {"repository": "default"}
+
+
+def test_explicit_web_fields_are_recorded_as_hard_constraints():
+    request = web_app._clean_dataset_request(
+        {
+            "prompt": "Find human DDA data.",
+            "species": ["human"],
+            "species_policy": "include_only",
+            "acquisition_mode": "dda",
+            "labeling_strategy": "label_free",
+        }
+    )
+
+    assert "species" in request.hard_constraint_fields
+    assert "acquisition_mode" in request.hard_constraint_fields
+    assert "labeling_strategy" in request.hard_constraint_fields
 
 
 def test_discovery_job_runs_in_background_and_exposes_logs(monkeypatch, tmp_path: Path):
@@ -880,7 +942,10 @@ def test_web_discovery_openai_agents_runtime_reuses_existing_result_contract(mon
     assert captured["mode"] == "multi_agent"
     assert captured["budget"].max_turns == 50
     assert captured["budget"].max_tool_calls == 100
-    assert captured["dynamic_limits"].max_query_units == 30
+    assert captured["dynamic_limits"].initial_query_units == 12
+    assert captured["dynamic_limits"].expanded_query_units == 30
+    assert captured["dynamic_limits"].max_query_units == 60
+    assert captured["dynamic_limits"].max_repository_requests == 300
     assert captured["llm_config"] == {
         "api_key": "saved-agent-key",
         "base_url": "https://saved.example.test/v1",

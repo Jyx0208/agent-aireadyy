@@ -23,7 +23,7 @@ from agent.control_plane.models import (
     SearchProposalInput,
     SearchProposalRecord,
 )
-from agent.control_plane.budget_governor import BudgetGovernor
+from agent.control_plane.budget_governor import BudgetGovernor, quality_budget_tier
 from agent.control_plane.discovery_metrics import evaluate_round_metrics
 from agent.control_plane.store import AgentRunStore
 from agent.control_plane.openai_agents import _load_agents_sdk
@@ -43,7 +43,12 @@ def test_dynamic_budget_contracts_reject_invalid_decision_shapes() -> None:
     )
     assert len(proposal.queries) == 2
     limits = DynamicBudgetLimits()
-    assert limits.max_query_units == 30
+    assert limits.initial_query_units == 12
+    assert limits.expanded_query_units == 30
+    assert limits.max_query_units == 60
+    assert limits.initial_repository_requests == 80
+    assert limits.expanded_repository_requests == 160
+    assert limits.max_repository_requests == 300
     transport = BudgetDecisionInput(
         proposal_id="proposal_1",
         decision="stop",
@@ -359,6 +364,44 @@ def test_governor_denies_grant_over_remaining_query_units(tmp_path: Path) -> Non
     assert result.outcome == "denied"
     assert result.reason == "hard_query_unit_limit"
     assert result.grant is None
+
+
+def test_quality_budget_expansion_requires_a_measured_gap(tmp_path: Path) -> None:
+    store, run = _dynamic_store_and_run(tmp_path, max_query_units=30)
+    governor = BudgetGovernor(store, run.run_id)
+    store.increment_dynamic_usage(run.run_id, query_units=12)
+    proposal = governor.register_proposal(_proposal(["new intent query"]))
+
+    denied = governor.apply_decision(_grant_decision(proposal.proposal_id, [0]))
+
+    assert denied.outcome == "denied"
+    assert denied.reason == "quality_budget_expansion_requires_measured_gap"
+
+    current = store.load_run(run.run_id)
+    assert current is not None
+    store.save_run(current.model_copy(update={"latest_metrics": _metrics()}))
+    second = governor.register_proposal(_proposal(["orthogonal evidence query"]))
+    granted = governor.apply_decision(_grant_decision(second.proposal_id, [0]))
+
+    assert granted.outcome == "granted"
+    assert granted.grant is not None
+
+
+def test_quality_budget_tier_uses_query_and_repository_usage(tmp_path: Path) -> None:
+    store, run = _dynamic_store_and_run(tmp_path, max_query_units=60)
+    assert quality_budget_tier(run) == "initial"
+    expanded = store.increment_dynamic_usage(
+        run.run_id,
+        query_units=13,
+        repository_requests=81,
+    )
+    assert quality_budget_tier(expanded) == "expanded"
+    maximum = store.increment_dynamic_usage(
+        run.run_id,
+        query_units=18,
+        repository_requests=80,
+    )
+    assert quality_budget_tier(maximum) == "maximum_quality"
 
 
 def test_governor_rejects_exact_consumed_query_without_retryable_failure(tmp_path: Path) -> None:

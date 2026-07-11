@@ -126,6 +126,27 @@ def test_known_labeling_conflict_is_excluded_from_discovery_selection() -> None:
     assert decision.reasons == ["labeling_hard_constraint_conflict"]
 
 
+def test_default_labeling_assumption_does_not_exclude_known_alternative() -> None:
+    from agent.discovery.validity import assess_file_validity
+    from agent.discovery.models import DiscoveredFile
+
+    request = _scenario().request.model_copy(
+        update={"hard_constraint_fields": ["repository"]}
+    )
+    decision = assess_file_validity(
+        DiscoveredFile(
+            project_accession="PXD000001",
+            file_name="tmt.raw",
+            file_type="raw",
+            acquisition_mode="dda",
+            labeling_strategy="TMT",
+        ),
+        request,
+    )
+
+    assert decision.status != "exclude"
+
+
 def test_three_clean_agent_wins_pass_the_improvement_gate() -> None:
     workflow = [_result(str(index), "workflow", 0.60) for index in range(3)]
     agent = [_result(str(index), "openai_agents", 0.70, repository_requests=20) for index in range(3)]

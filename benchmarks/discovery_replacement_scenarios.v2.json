@@ -1,0 +1,161 @@
+[
+  {
+    "id": "hela_multi_protease_dda",
+    "hidden_request": {
+      "repository": "pride",
+      "goal": "general",
+      "query_terms": ["HeLa", "multi-protease", "shotgun proteomics", "Orbitrap"],
+      "species": ["Homo sapiens"],
+      "species_policy": "include_only",
+      "acquisition_mode": "dda",
+      "labeling_strategy": "label_free",
+      "max_projects": 5,
+      "max_files": 20,
+      "max_candidate_projects": 50,
+      "max_files_per_project": 10
+    },
+    "task_type": "psm_scoring",
+    "prompt_variants": [
+      {
+        "id": "structured",
+        "ambiguity_level": "structured",
+        "mode": "parsed_spec",
+        "hard_constraint_fields": ["species", "species_policy", "acquisition_mode", "labeling_strategy"],
+        "prompt": "Find human HeLa multi-protease shotgun proteomics acquired by label-free DDA on Orbitrap-class instruments."
+      },
+      {
+        "id": "clear",
+        "ambiguity_level": "clear",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["species"],
+        "prompt": "I need a HeLa proteome map measured on Orbitrap instruments where several proteases were used to broaden peptide coverage."
+      },
+      {
+        "id": "vague",
+        "ambiguity_level": "vague",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["species"],
+        "prompt": "Find a broad human cell-line proteome dataset that could help a model generalize across different peptide digestion patterns."
+      },
+      {
+        "id": "ambiguous",
+        "ambiguity_level": "ambiguous",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["species"],
+        "prompt": "I want robust human proteomics training data and care more about sequence coverage than one standard sample preparation.",
+        "simulated_clarification": "Prefer a deeply mapped HeLa reference using multiple proteases and DDA rather than a clinical cohort."
+      }
+    ],
+    "relevance_judgments": {
+      "PXD000900": 3,
+      "PXD073683": 1,
+      "PXD077805": 1,
+      "PXD064794": 1
+    },
+    "notes": "Seed judgments; pooled candidates still require blinded review before a replacement claim."
+  },
+  {
+    "id": "ipsc_neuroprotection_dda",
+    "hidden_request": {
+      "repository": "pride",
+      "goal": "general",
+      "query_terms": ["iPSC sensory neuron", "neuroprotective", "chemotherapy neuropathy"],
+      "species": ["Homo sapiens"],
+      "species_policy": "include_only",
+      "acquisition_mode": "dda",
+      "labeling_strategy": "label_free",
+      "max_projects": 5,
+      "max_files": 20,
+      "max_candidate_projects": 50,
+      "max_files_per_project": 10
+    },
+    "task_type": "psm_scoring",
+    "prompt_variants": [
+      {
+        "id": "structured",
+        "ambiguity_level": "structured",
+        "mode": "parsed_spec",
+        "hard_constraint_fields": ["species", "species_policy", "acquisition_mode", "labeling_strategy"],
+        "prompt": "Find human iPSC-derived sensory-neuron label-free DDA proteomics used to study neuroprotective compounds against chemotherapy-induced peripheral neuropathy."
+      },
+      {
+        "id": "clear",
+        "ambiguity_level": "clear",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["species"],
+        "prompt": "Find proteomics from human stem-cell-derived sensory neurons used to test compounds that protect against chemotherapy neuropathy."
+      },
+      {
+        "id": "vague",
+        "ambiguity_level": "vague",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["species"],
+        "prompt": "I need data for a model that studies how drugs might protect human neurons from chemotherapy damage."
+      },
+      {
+        "id": "ambiguous",
+        "ambiguity_level": "ambiguous",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["species"],
+        "prompt": "Find human neuronal proteomics suitable for drug-response modeling.",
+        "simulated_clarification": "The target is chemotherapy-induced peripheral neuropathy in iPSC-derived sensory neurons, not brain tissue."
+      }
+    ],
+    "relevance_judgments": {
+      "PXD074954": 3
+    },
+    "notes": "Seed judgment from verified PRIDE metadata."
+  },
+  {
+    "id": "human_cell_line_immunopeptidomics",
+    "hidden_request": {
+      "repository": "pride",
+      "goal": "immunopeptidomics",
+      "query_terms": ["cell line immunopeptides", "HLA", "immunoaffinity", "Q Exactive"],
+      "species": ["Homo sapiens"],
+      "species_policy": "include_only",
+      "acquisition_mode": "dda",
+      "labeling_strategy": "label_free",
+      "max_projects": 5,
+      "max_files": 20,
+      "max_candidate_projects": 50,
+      "max_files_per_project": 10
+    },
+    "task_type": "psm_scoring",
+    "prompt_variants": [
+      {
+        "id": "structured",
+        "ambiguity_level": "structured",
+        "mode": "parsed_spec",
+        "hard_constraint_fields": ["species", "species_policy", "acquisition_mode", "labeling_strategy"],
+        "prompt": "Find human cell-line HLA or MHC immunopeptides isolated by immunoaffinity and measured with label-free DDA on Q Exactive-class instruments."
+      },
+      {
+        "id": "clear",
+        "ambiguity_level": "clear",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["species"],
+        "prompt": "Find mass-spectrometry data for HLA peptides immunopurified from human cell lines."
+      },
+      {
+        "id": "vague",
+        "ambiguity_level": "vague",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["species"],
+        "prompt": "I need human cell-line data for a model of peptides displayed to the immune system."
+      },
+      {
+        "id": "ambiguous",
+        "ambiguity_level": "ambiguous",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["species"],
+        "prompt": "Find human peptide presentation data for model training.",
+        "simulated_clarification": "Use immunoaffinity-isolated HLA or MHC peptides from cell lines, measured by DDA mass spectrometry."
+      }
+    ],
+    "relevance_judgments": {
+      "PXD077080": 3
+    },
+    "notes": "Seed judgment from verified PRIDE metadata."
+  }
+]

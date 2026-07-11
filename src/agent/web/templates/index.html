@@ -3687,7 +3687,7 @@ function renderDiscovery(data){
 
 function discoveryLogCategory(item){
   const type=String(item&&item.type||'');
-  if(type.startsWith('sdk_')||type.startsWith('tool_')||type.includes('grant')||type==='round_value_evaluated'||type==='repository_request_started')return 'tools';
+  if(type.startsWith('sdk_')||type.startsWith('tool_')||type.startsWith('candidate_search_')||type.startsWith('candidate_inspection_')||type.includes('grant')||type==='round_value_evaluated'||type==='repository_request_started')return 'tools';
   return 'activity';
 }
 

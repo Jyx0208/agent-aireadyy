@@ -99,7 +99,9 @@ def _file_name_species_conflict(file_name: str, request: DatasetRequest) -> bool
 
 
 def _requested_labeling_requires_evidence(request: DatasetRequest) -> bool:
-    return normalize_labeling_strategy(request.labeling_strategy) in {"TMT", "iTRAQ"}
+    return request.is_hard_constraint("labeling_strategy") and normalize_labeling_strategy(
+        request.labeling_strategy
+    ) in {"TMT", "iTRAQ"}
 
 
 def _labeling_matches(candidate: str | None, request: DatasetRequest) -> bool:
@@ -111,7 +113,7 @@ def _labeling_matches(candidate: str | None, request: DatasetRequest) -> bool:
 
 def assess_project_validity(project: DiscoveredProject, request: DatasetRequest) -> ValidityDecision:
     reasons: list[str] = []
-    if _has_negative_acquisition(project.evidence):
+    if request.is_hard_constraint("acquisition_mode") and _has_negative_acquisition(project.evidence):
         return ValidityDecision("exclude", ["unsupported_acquisition"], True)
     if _has_mixed_acquisition(project.evidence):
         reasons.append("mixed_acquisition_project")
@@ -135,7 +137,11 @@ def assess_project_validity(project: DiscoveredProject, request: DatasetRequest)
     if _requested_labeling_requires_evidence(request) and not _labeling_matches(project.labeling_strategy, request):
         reasons.append("missing_labeling_strategy_evidence")
 
-    if request.acquisition_mode and project.acquisition_mode != request.acquisition_mode:
+    if (
+        request.is_hard_constraint("acquisition_mode")
+        and request.acquisition_mode
+        and project.acquisition_mode != request.acquisition_mode
+    ):
         reasons.append("missing_acquisition_evidence")
     if not project.instrument_families:
         reasons.append("missing_instrument")
@@ -172,7 +178,7 @@ def assess_project_validity(project: DiscoveredProject, request: DatasetRequest)
 
 def assess_file_validity(file: DiscoveredFile, request: DatasetRequest) -> ValidityDecision:
     reasons: list[str] = []
-    if _has_negative_acquisition(file.evidence):
+    if request.is_hard_constraint("acquisition_mode") and _has_negative_acquisition(file.evidence):
         return ValidityDecision("exclude", ["unsupported_acquisition"], True)
     if not file.file_type:
         return ValidityDecision("exclude", ["unsupported_file_type"], True)
@@ -181,13 +187,15 @@ def assess_file_validity(file: DiscoveredFile, request: DatasetRequest) -> Valid
     requested_labeling = normalize_labeling_strategy(request.labeling_strategy)
     observed_labeling = normalize_labeling_strategy(file.labeling_strategy or "")
     if (
-        requested_labeling != "unknown"
+        request.is_hard_constraint("labeling_strategy")
+        and requested_labeling != "unknown"
         and observed_labeling != "unknown"
         and observed_labeling != requested_labeling
     ):
         return ValidityDecision("exclude", ["labeling_hard_constraint_conflict"], True)
     if (
-        request.acquisition_mode
+        request.is_hard_constraint("acquisition_mode")
+        and request.acquisition_mode
         and file.acquisition_mode
         and file.acquisition_mode != request.acquisition_mode
     ):
@@ -226,10 +234,15 @@ def assess_file_validity(file: DiscoveredFile, request: DatasetRequest) -> Valid
         reasons.append("project_level_evidence_only")
     if "sdrf_no_file_match" in file.evidence_warnings:
         reasons.append("sdrf_no_file_match")
-    if request.acquisition_mode and file.acquisition_mode != request.acquisition_mode:
+    if (
+        request.is_hard_constraint("acquisition_mode")
+        and request.acquisition_mode
+        and file.acquisition_mode != request.acquisition_mode
+    ):
         reasons.append("missing_acquisition_evidence")
     if (
-        request.acquisition_mode == "dda"
+        request.is_hard_constraint("acquisition_mode")
+        and request.acquisition_mode == "dda"
         and _has_mixed_acquisition(file.evidence)
         and not _has_file_level_dda_evidence(file.evidence)
     ):

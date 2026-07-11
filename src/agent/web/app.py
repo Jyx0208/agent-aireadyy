@@ -69,6 +69,7 @@ from agent.discovery.ontology import (
     species_from_text,
 )
 from agent.discovery.pride_discovery import discover_pride_dataset
+from agent.discovery.search_environment import PrideDiscoverySearchEnvironment
 from agent.discovery.repository_discovery import discover_repository_dataset
 from agent.discovery.scoring import build_discovered_project, classify_file_role, score_file, score_project
 from agent.discovery.task_readiness import annotate_manifest_task_readiness, normalize_task_type
@@ -1131,7 +1132,7 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int
 def _agent_discovery_configuration(
     body: dict[str, Any],
 ) -> tuple[str, AgentBudget, DynamicBudgetLimits]:
-    mode = _clean_text(os.getenv("AGENT_DISCOVERY_MODE") or "single_agent").lower()
+    mode = _clean_text(os.getenv("AGENT_DISCOVERY_MODE") or "multi_agent").lower()
     if mode not in {"single_agent", "multi_agent"}:
         mode = "single_agent"
     budget = AgentBudget(
@@ -1142,12 +1143,24 @@ def _agent_discovery_configuration(
         ),
     )
     limits = DynamicBudgetLimits(
-        max_query_units=_bounded_int(os.getenv("AGENT_MAX_QUERY_UNITS"), default=30, minimum=1, maximum=500),
+        initial_query_units=_bounded_int(
+            os.getenv("AGENT_INITIAL_QUERY_UNITS"), default=12, minimum=1, maximum=500
+        ),
+        expanded_query_units=_bounded_int(
+            os.getenv("AGENT_EXPANDED_QUERY_UNITS"), default=30, minimum=1, maximum=500
+        ),
+        max_query_units=_bounded_int(os.getenv("AGENT_MAX_QUERY_UNITS"), default=60, minimum=1, maximum=500),
+        initial_repository_requests=_bounded_int(
+            os.getenv("AGENT_INITIAL_REPOSITORY_REQUESTS"), default=80, minimum=1, maximum=5000
+        ),
+        expanded_repository_requests=_bounded_int(
+            os.getenv("AGENT_EXPANDED_REPOSITORY_REQUESTS"), default=160, minimum=1, maximum=5000
+        ),
         max_repository_requests=_bounded_int(
-            os.getenv("AGENT_MAX_REPOSITORY_REQUESTS"), default=200, minimum=1, maximum=5000
+            os.getenv("AGENT_MAX_REPOSITORY_REQUESTS"), default=300, minimum=1, maximum=5000
         ),
         max_elapsed_seconds=_bounded_int(
-            os.getenv("AGENT_MAX_ELAPSED_SECONDS"), default=1200, minimum=30, maximum=86400
+            os.getenv("AGENT_MAX_ELAPSED_SECONDS"), default=1800, minimum=30, maximum=86400
         ),
         budget_agent_max_turns=_bounded_int(
             os.getenv("AGENT_BUDGET_AGENT_MAX_TURNS"), default=3, minimum=2, maximum=10
@@ -1179,8 +1192,19 @@ def _clean_discovery_ptm_types(value: Any, *, default: list[str] | None = None) 
 
 
 def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
-    acquisition = _clean_text(body.get("acquisition_mode") or body.get("acquisition") or "dda").lower()
+    acquisition_supplied = any(
+        key in body and bool(_clean_text(body.get(key)))
+        for key in ("acquisition_mode", "acquisition")
+    )
+    labeling_supplied = any(
+        key in body and bool(_clean_text(body.get(key)))
+        for key in ("labeling_strategy", "labeling")
+    )
+    acquisition = _clean_text(
+        body.get("acquisition_mode") or body.get("acquisition") or "unknown"
+    ).lower()
     repository = _clean_repository(body.get("repository") or "pride")
+    goal_supplied = "goal" in body and bool(_clean_text(body.get("goal")))
     goal = _clean_text(body.get("goal") or "general").lower()
     if goal not in {"general", "ptm"} and is_immunopeptidomics_goal(goal):
         goal = "immunopeptidomics"
@@ -1202,11 +1226,32 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
         query_terms = [*query_terms, *general_query_terms_from_text(_clean_text(body.get("prompt")))]
     raw_species = body.get("species")
     species = _clean_discovery_species(raw_species, default=[])
+    species_supplied = "species" in body and bool(species)
     species_policy = _clean_text(body.get("species_policy") or "open").lower()
     if species_policy not in {"open", "include_only", "exclude"}:
         species_policy = "open"
     canonical_species, taxon_ids = normalize_species_values(species)
     immunopeptide = interpret_immunopeptide_metadata(" ".join([goal, _clean_text(body.get("prompt")), _clean_text(body.get("immunopeptide_context"))]))
+    hard_constraint_fields = ["repository"]
+    constraint_provenance = {
+        "repository": "user" if "repository" in body else "default"
+    }
+    if goal_supplied:
+        hard_constraint_fields.append("goal")
+        constraint_provenance["goal"] = "user_or_parsed"
+    if species_supplied:
+        hard_constraint_fields.extend(["species", "species_policy"])
+        constraint_provenance["species"] = "user_or_parsed"
+        constraint_provenance["species_policy"] = "user_or_parsed"
+    if acquisition_supplied:
+        hard_constraint_fields.append("acquisition_mode")
+        constraint_provenance["acquisition_mode"] = "user_or_parsed"
+    if labeling_supplied:
+        hard_constraint_fields.append("labeling_strategy")
+        constraint_provenance["labeling_strategy"] = "user_or_parsed"
+    if goal != "general" and any(key in body for key in ("ptm", "ptm_type", "ptm_types")):
+        hard_constraint_fields.extend(["ptm_type", "ptm_types"])
+        constraint_provenance["ptm_type"] = "user_or_parsed"
     return DatasetRequest(
         repository=repository,
         goal=goal,
@@ -1224,12 +1269,16 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
         immunopeptide_evidence_terms=list(immunopeptide.evidence_terms),
         immunopeptide_enrichment_methods=list(immunopeptide.enrichment_methods),
         immunopeptide_metadata_confidence=immunopeptide.confidence,
-        labeling_strategy=normalize_labeling_strategy(body.get("labeling_strategy") or body.get("labeling") or "label_free"),
+        labeling_strategy=normalize_labeling_strategy(
+            body.get("labeling_strategy") or body.get("labeling") or "unknown"
+        ),
         acquisition_mode=acquisition,
         max_projects=_bounded_int(body.get("max_projects"), default=5, minimum=1, maximum=100),
         max_files=_bounded_int(body.get("max_files"), default=50, minimum=1, maximum=2000),
         max_candidate_projects=_bounded_int(body.get("max_candidate_projects"), default=50, minimum=1, maximum=300),
         max_files_per_project=_bounded_int(body.get("max_files_per_project"), default=20, minimum=1, maximum=100),
+        hard_constraint_fields=list(dict.fromkeys(hard_constraint_fields)),
+        constraint_provenance=constraint_provenance,
     )
 
 
@@ -2245,24 +2294,42 @@ def _run_web_discovery(
             return observed
 
         _report(
-            "Reason: OpenAI Agents SDK is planning repository search within server safety ceilings."
+            "Reason: OpenAI Agents SDK is planning quality-first candidate search and inspection within server safety ceilings."
         )
-        result = run_openai_agents_discovery(
-            prompt=prompt,
-            request=request,
-            output_dir=output_dir,
-            task_type=normalized_task_type,
-            state_db=output_dir / "agent_control.sqlite",
-            memory=prior_memory,
-            budget=budget,
-            mode=discovery_mode,
-            dynamic_limits=dynamic_limits,
-            run_id=discovery_id,
-            discovery_func=_agent_discovery_func,
-            llm_config=agent_llm_config,
-            event_callback=agent_event_callback,
-            stream_events=True,
-        )
+        quality_client: PrideClient | None = None
+        search_environment: PrideDiscoverySearchEnvironment | None = None
+        if request.repository == "pride":
+            quality_client = PrideClient(timeout=15.0, read_timeout=15.0)
+            search_environment = PrideDiscoverySearchEnvironment(
+                request=request,
+                prompt=prompt,
+                state_path=output_dir / "candidate_search_state.json",
+                client=quality_client,
+                memory=prior_memory,
+                report=_report,
+                should_cancel=should_cancel,
+            )
+        try:
+            result = run_openai_agents_discovery(
+                prompt=prompt,
+                request=request,
+                output_dir=output_dir,
+                task_type=normalized_task_type,
+                state_db=output_dir / "agent_control.sqlite",
+                memory=prior_memory,
+                budget=budget,
+                mode=discovery_mode,
+                dynamic_limits=dynamic_limits,
+                run_id=discovery_id,
+                discovery_func=_agent_discovery_func,
+                search_environment=search_environment,
+                llm_config=agent_llm_config,
+                event_callback=agent_event_callback,
+                stream_events=True,
+            )
+        finally:
+            if quality_client is not None:
+                quality_client.close()
         _check_cancel()
         if result.status == "failed":
             detail = "; ".join(result.blockers or result.warnings) or "OpenAI Agents discovery failed."
@@ -2284,6 +2351,12 @@ def _run_web_discovery(
             "status": result.status,
             "run_id": result.run_id,
             "discovery_rounds": result.discovery_round_count,
+            "candidate_searches": int(control_summary.get("candidate_search_count") or 0),
+            "candidate_inspections": int(control_summary.get("candidate_inspection_count") or 0),
+            "no_gain_actions": int(control_summary.get("no_gain_action_count") or 0),
+            "latest_metrics": control_summary.get("latest_metrics") or {},
+            "model_usage": control_summary.get("model_usage") or {},
+            "quality_budget_tier": _clean_text(budget_audit.get("quality_budget_tier")),
             "tool_calls": int(control_summary.get("tool_call_count") or 0),
             "stop_reason": _clean_text(control_summary.get("stop_reason")),
             "final_output": result.final_output,
@@ -5684,6 +5757,10 @@ def _event_actor(event_type: str) -> str:
         return "BudgetGovernor"
     if event_type.startswith("sdk_"):
         return "OpenAI Agents SDK"
+    if event_type.startswith("candidate_search_"):
+        return "Repository Search"
+    if event_type.startswith("candidate_inspection_"):
+        return "Candidate Inspector"
     if event_type.startswith("tool_") or event_type == "repository_request_started":
         return "Repository tool"
     return "Discovery Agent"
@@ -5697,6 +5774,35 @@ def _event_level(event_type: str) -> str:
 
 def _event_message(event: AgentEvent) -> str:
     payload = event.payload
+    observation = payload.get("observation") or {}
+    action = payload.get("action") or {}
+    if event.event_type == "candidate_search_started":
+        queries = payload.get("queries") or []
+        return _redact_secrets(
+            f"Searching repository with {len(queries)} query plan(s): "
+            + "; ".join(str(query) for query in queries[:4])
+        )
+    if event.event_type == "candidate_search_completed":
+        return (
+            "Search observed "
+            f"{int(observation.get('candidate_count') or 0)} candidate project(s), "
+            f"{int(observation.get('new_candidate_count') or 0)} new and "
+            f"{int(observation.get('high_relevance_candidate_count') or 0)} high-relevance; "
+            f"semantic coverage {float(observation.get('semantic_coverage') or 0):.0%}."
+        )
+    if event.event_type == "candidate_inspection_started":
+        accessions = action.get("accessions") or []
+        return _redact_secrets(
+            f"Inspecting {len(accessions)} candidate project(s): "
+            + ", ".join(str(accession) for accession in accessions[:8])
+        )
+    if event.event_type == "candidate_inspection_completed":
+        return (
+            "Inspection produced "
+            f"{int(observation.get('selected_projects') or 0)} selected project(s) and "
+            f"{int(observation.get('selected_files') or 0)} selected file(s); "
+            f"next action: {observation.get('recommended_action') or 'reassess evidence'}."
+        )
     return _redact_secrets(
         str(
             payload.get("reasoning_summary")
@@ -5722,6 +5828,11 @@ def _sanitize_log_payload(value: Any) -> Any:
 
 
 def _append_discovery_job_event(job_id: str, event: AgentEvent) -> None:
+    event_metrics: Any = event.payload.get("metrics") or {}
+    if event.event_type == "round_value_evaluated":
+        event_metrics = event.payload
+    elif event.event_type == "candidate_inspection_completed":
+        event_metrics = (event.payload.get("observation") or {}).get("metrics") or {}
     entry = {
         "source_sequence": event.sequence,
         "ts": event.created_at,
@@ -5731,9 +5842,7 @@ def _append_discovery_job_event(job_id: str, event: AgentEvent) -> None:
         "message": _event_message(event),
         "reasoning_summary": _redact_secrets(str(event.payload.get("reasoning_summary") or "")),
         "evidence_refs": _sanitize_log_payload(event.payload.get("evidence_refs") or []),
-        "metrics": _sanitize_log_payload(
-            event.payload if event.event_type == "round_value_evaluated" else event.payload.get("metrics") or {}
-        ),
+        "metrics": _sanitize_log_payload(event_metrics),
         "payload": _sanitize_log_payload(event.payload),
     }
     with _discovery_jobs_lock:

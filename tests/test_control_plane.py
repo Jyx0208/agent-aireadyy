@@ -23,6 +23,14 @@ from agent.control_plane.models import (
 from agent.control_plane.policy import evaluate_tool_policy
 from agent.control_plane.store import AgentRunStore, tool_idempotency_key
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
+from agent.discovery.search_environment import (
+    CandidateInspectionAction,
+    CandidateInspectionResult,
+    CandidateSearchAction,
+    CandidateSearchObservation,
+    QueryYield,
+    RepositoryQuery,
+)
 
 
 def _run(run_id: str = "run_001") -> AgentRunRecord:
@@ -36,6 +44,34 @@ def _run(run_id: str = "run_001") -> AgentRunRecord:
             max_expensive_actions=1,
         ),
     )
+
+
+def test_model_usage_is_persisted_and_accumulated(tmp_path: Path):
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    store.save_run(_run("model_usage"))
+
+    store.increment_model_usage(
+        "model_usage",
+        requests=1,
+        input_tokens=120,
+        output_tokens=30,
+        total_tokens=150,
+    )
+    updated = store.increment_model_usage(
+        "model_usage",
+        requests=2,
+        input_tokens=80,
+        output_tokens=20,
+        total_tokens=100,
+    )
+
+    assert updated.model_requests == 3
+    assert updated.model_input_tokens == 200
+    assert updated.model_output_tokens == 50
+    assert updated.model_total_tokens == 250
+    persisted = store.load_run("model_usage")
+    assert persisted is not None
+    assert persisted.model_total_tokens == 250
 
 
 def _dynamic_discovery_service(
@@ -105,6 +141,260 @@ def _dynamic_discovery_service(
         assert review.grant is not None
         service.search_repository_datasets(["seed query"], grant_id=review.grant.grant_id)
     return service, governor, calls
+
+
+class _FakeSearchEnvironment:
+    def __init__(self, request: DatasetRequest) -> None:
+        self.request = request
+        self.search_actions: list[CandidateSearchAction] = []
+        self.inspection_actions: list[CandidateInspectionAction] = []
+
+    def search(self, action: CandidateSearchAction) -> CandidateSearchObservation:
+        self.search_actions.append(action)
+        return CandidateSearchObservation(
+            search_id="search_0001",
+            query_yields=[
+                QueryYield(
+                    query=action.queries[0].query,
+                    executed_query=action.queries[0].query,
+                    intent_dimension=action.queries[0].intent_dimension,
+                    requested_depth=action.queries[0].depth,
+                    raw_result_count=3,
+                    new_candidate_count=2,
+                    duplicate_count=1,
+                )
+            ],
+            raw_result_count=3,
+            candidate_count=2,
+            new_candidate_count=2,
+            duplicate_count=1,
+            duplicate_rate=1 / 3,
+            intent_terms=["sensory", "neuropathy"],
+            covered_intent_terms=["sensory"],
+            unresolved_intent_terms=["neuropathy"],
+            semantic_coverage=0.5,
+            high_relevance_candidate_count=1,
+            rationale=action.rationale,
+        )
+
+    def inspect(self, action: CandidateInspectionAction) -> CandidateInspectionResult:
+        self.inspection_actions.append(action)
+        projects = [
+            DiscoveredProject(project_accession=accession, project_title=f"Selected {accession}")
+            for accession in action.accessions
+        ]
+        files = [
+            DiscoveredFile(
+                project_accession=project.project_accession,
+                project_title=project.project_title,
+                file_name=f"{project.project_accession}.raw",
+                file_type=".raw",
+                validity_status="valid",
+                evidence_level="file",
+            )
+            for project in projects
+        ]
+        manifest = DatasetManifest(
+            request=self.request,
+            projects=projects,
+            files=files,
+            summary={"selected_projects": len(projects), "selected_files": len(files)},
+        )
+        return CandidateInspectionResult(
+            search_id=action.search_id,
+            inspected_accessions=action.accessions,
+            manifest=manifest,
+            usable_files=len(files),
+            valid_files=len(files),
+            rationale=action.rationale,
+        )
+
+    def close(self) -> None:
+        return None
+
+
+def test_quality_first_search_and_inspection_are_separate_control_plane_actions(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride", max_projects=2, max_files=10)
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("quality_first").model_copy(
+            update={"status": "running", "dynamic_limits": DynamicBudgetLimits()}
+        )
+    )
+    environment = _FakeSearchEnvironment(request)
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=environment,
+    )
+    search_action = CandidateSearchAction(
+        queries=[RepositoryQuery(query="sensory neuron", depth=40, intent_dimension="cell model")],
+        rationale="Find candidates before expensive inspection.",
+    )
+
+    search = service.search_repository_candidates(search_action)
+    inspection = service.inspect_repository_candidates(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD000001"],
+            rationale="The preview covers the cell model.",
+        )
+    )
+
+    persisted = store.load_run(run.run_id)
+    assert persisted is not None
+    assert search.semantic_coverage == 0.5
+    assert persisted.candidate_search_count == 1
+    assert persisted.candidate_inspection_count == 1
+    assert persisted.latest_metrics is not None
+    assert persisted.latest_metrics.semantic_coverage_gap == 0.5
+    assert inspection.status == "completed"
+    assert inspection.pooled_selected_files == 1
+    assert inspection.candidate_search is not None
+    assert inspection.candidate_search["search_id"] == "search_0001"
+    assert environment.search_actions == [search_action]
+    assert environment.inspection_actions[0].accessions == ["PXD000001"]
+
+
+def test_agent_can_filter_inspected_projects_during_final_selection(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride", max_projects=5, max_files=10)
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("filtered_selection").model_copy(
+            update={"status": "running", "dynamic_limits": DynamicBudgetLimits()}
+        )
+    )
+    environment = _FakeSearchEnvironment(request)
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=environment,
+    )
+    search = service.search_repository_candidates(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="human neuron")],
+            rationale="Create a candidate pool.",
+        )
+    )
+    inspection = service.inspect_repository_candidates(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD_GOOD", "PXD_OFFTOPIC"],
+            rationale="Inspect both candidates before retaining only relevant evidence.",
+        )
+    )
+
+    selection = service.select_discovery_manifest(
+        1,
+        "PXD_GOOD is the only candidate aligned to the requested task.",
+        ["PXD_GOOD"],
+    )
+    selected_manifest = DatasetManifest.model_validate_json(
+        Path(selection["manifest_path"]).read_text(encoding="utf-8")
+    )
+
+    assert len(inspection.project_assessments) == 2
+    assert selection["selected_project_accessions"] == ["PXD_GOOD"]
+    assert [project.project_accession for project in selected_manifest.projects] == ["PXD_GOOD"]
+    assert {file.project_accession for file in selected_manifest.files} == {"PXD_GOOD"}
+
+
+def test_quality_first_search_honors_dynamic_budget_grant(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride")
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("quality_budget").model_copy(
+            update={
+                "status": "running",
+                "dynamic_budget_enabled": True,
+                "dynamic_limits": DynamicBudgetLimits(),
+            }
+        )
+    )
+    governor = BudgetGovernor(store, run.run_id)
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        dynamic_budget=True,
+        budget_governor=governor,
+        search_environment=_FakeSearchEnvironment(request),
+    )
+    action = CandidateSearchAction(
+        queries=[RepositoryQuery(query="sensory neuron")],
+        rationale="Search a missing intent dimension.",
+    )
+    proposal = governor.register_proposal(
+        SearchProposalInput(
+            objective="Find sensory-neuron candidates",
+            reasoning_summary="The candidate pool is empty.",
+            queries=["sensory neuron"],
+            expected_gain="Relevant candidates",
+            stop_condition="At least one relevant candidate is found",
+        )
+    )
+    review = governor.apply_decision(
+        BudgetDecision(
+            proposal_id=proposal.proposal_id,
+            decision="grant",
+            approved_query_indexes=[0],
+            reasoning_summary="The query covers an unresolved concept.",
+        )
+    )
+    assert review.grant is not None
+
+    denied = service.search_repository_candidates(action)
+    allowed = service.search_repository_candidates(action, grant_id=review.grant.grant_id)
+
+    assert denied.status == "blocked"
+    assert denied.failures == ["search_grant_required"]
+    assert allowed.status == "completed"
+
+
+def test_new_but_semantically_redundant_candidates_require_replan_without_hard_stop(
+    tmp_path: Path,
+) -> None:
+    request = DatasetRequest(repository="pride")
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("quality_no_gain").model_copy(
+            update={"status": "running", "dynamic_limits": DynamicBudgetLimits()}
+        )
+    )
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=_FakeSearchEnvironment(request),
+    )
+
+    for index in range(3):
+        result = service.search_repository_candidates(
+            CandidateSearchAction(
+                queries=[RepositoryQuery(query=f"query {index}")],
+                rationale=f"Try strategy {index}.",
+            )
+        )
+        assert result.status == "completed"
+
+    persisted = store.load_run(run.run_id)
+    assert persisted is not None
+    assert persisted.no_gain_action_count == 2
+    assert persisted.search_recovery_required is True
+    assert persisted.search_stopped is False
+    replanned = service.search_repository_candidates(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="query 4")],
+            rationale="Try a materially different strategy after no gain.",
+        )
+    )
+    assert replanned.status == "completed"
 
 
 def test_dynamic_discovery_requires_and_consumes_matching_grant(tmp_path: Path) -> None:
@@ -535,7 +825,7 @@ def test_discovery_requires_atomic_recovery_after_zero_yield_compound_search(tmp
     assert store.load_run(run.run_id).discovery_round_count == 1
 
     premature_selection = service.select_discovery_manifest(1, "No files were found.")
-    assert premature_selection["blockers"] == ["search_recovery_required"]
+    assert premature_selection["blockers"] == ["selected_manifest_has_no_files"]
 
     recovered = service.search_repository_datasets(["human", "DDA"])
 
@@ -701,7 +991,11 @@ def test_openai_agents_function_tools_expose_strict_bounded_schemas() -> None:
     assert state_tool.name == "get_discovery_state"
     assert state_tool.params_json_schema["properties"] == {}
     assert selection_tool.name == "select_discovery_manifest"
-    assert selection_tool.params_json_schema["required"] == ["round_index", "rationale"]
+    assert selection_tool.params_json_schema["required"] == [
+        "round_index",
+        "project_accessions",
+        "rationale",
+    ]
     assert selection_tool.params_json_schema["additionalProperties"] is False
 
 
@@ -774,6 +1068,7 @@ def test_openai_agents_runner_executes_real_function_tool_loop(tmp_path: Path) -
                         arguments=json.dumps(
                             {
                                 "round_index": 0,
+                                "project_accessions": [],
                                 "rationale": "The merged pool contains a valid file-level candidate.",
                             }
                         ),
@@ -948,7 +1243,11 @@ def test_openai_agents_runner_executes_multi_agent_budget_loop(monkeypatch, tmp_
             ),
             (
                 "select_discovery_manifest",
-                {"round_index": 0, "rationale": "The pool contains valid candidates."},
+                {
+                    "round_index": 0,
+                    "project_accessions": [],
+                    "rationale": "The pool contains valid candidates.",
+                },
             ),
             ("final", "Selected the merged candidate pool."),
         ]
@@ -1025,6 +1324,115 @@ def test_openai_agents_runner_executes_multi_agent_budget_loop(monkeypatch, tmp_
     assert payload["mode"] == "multi_agent_dynamic"
     assert payload["approved_queries"] == 1
     assert payload["search_batches"] == 1
+
+
+def test_openai_agents_runner_uses_quality_first_search_environment(tmp_path: Path) -> None:
+    from agents.items import ModelResponse
+    from agents.models.interface import Model
+    from agents.usage import Usage
+    from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputText
+
+    from agent.control_plane.openai_agents import run_openai_agents_discovery
+
+    class FakeQualityFirstModel(Model):
+        def __init__(self) -> None:
+            self.actions = [
+                (
+                    "search_repository_candidates",
+                    {
+                        "action": {
+                            "queries": [
+                                {
+                                    "query": "sensory neuron",
+                                    "depth": 40,
+                                    "intent_dimension": "cell model",
+                                    "expected_gain": "Relevant cell-model projects",
+                                }
+                            ],
+                            "candidate_limit": 20,
+                            "rationale": "Search the most distinctive intent dimension.",
+                        }
+                    },
+                ),
+                (
+                    "inspect_repository_candidates",
+                    {
+                        "action": {
+                            "search_id": "search_0001",
+                            "accessions": ["PXD000001"],
+                            "rationale": "The preview matches the requested cell model.",
+                        }
+                    },
+                ),
+                (
+                    "select_discovery_manifest",
+                    {
+                        "round_index": 0,
+                        "project_accessions": ["PXD000001"],
+                        "rationale": "The inspected candidate is relevant and valid.",
+                    },
+                ),
+                ("final", "Selected an evidence-backed sensory-neuron dataset."),
+            ]
+            self.calls = 0
+
+        async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+            action, payload = self.actions[self.calls]
+            self.calls += 1
+            if action == "final":
+                output = [
+                    ResponseOutputMessage(
+                        id=f"message_{self.calls}",
+                        content=[
+                            ResponseOutputText(annotations=[], text=str(payload), type="output_text")
+                        ],
+                        role="assistant",
+                        status="completed",
+                        type="message",
+                    )
+                ]
+            else:
+                output = [
+                    ResponseFunctionToolCall(
+                        arguments=json.dumps(payload),
+                        call_id=f"call_{self.calls}",
+                        name=action,
+                        type="function_call",
+                        status="completed",
+                    )
+                ]
+            return ModelResponse(output=output, usage=Usage(requests=1), response_id=None)
+
+        async def stream_response(self, *args: Any, **kwargs: Any):
+            if False:
+                yield None
+
+    request = DatasetRequest(repository="pride", max_projects=2, max_files=10)
+    state_db = tmp_path / "agent_control.sqlite"
+    environment = _FakeSearchEnvironment(request)
+    result = run_openai_agents_discovery(
+        prompt="Find human sensory-neuron DDA data",
+        request=request,
+        output_dir=tmp_path / "output",
+        state_db=state_db,
+        run_id="quality_first_agent_run",
+        mode="single_agent",
+        dynamic_limits=DynamicBudgetLimits(),
+        budget=AgentBudget(max_turns=10, max_tool_calls=20),
+        search_environment=environment,
+        model=FakeQualityFirstModel(),
+        stream_events=False,
+    )
+
+    run = AgentRunStore(state_db).load_run(result.run_id)
+    assert result.status == "completed"
+    assert result.selected_round_index == 0
+    assert run is not None
+    assert run.candidate_search_count == 1
+    assert run.candidate_inspection_count == 1
+    assert run.latest_candidate_search_id == "search_0001"
+    assert environment.search_actions[0].queries[0].depth == 40
+    assert environment.inspection_actions[0].accessions == ["PXD000001"]
 
 
 def test_openai_agents_setup_failure_is_persisted(monkeypatch, tmp_path: Path) -> None:

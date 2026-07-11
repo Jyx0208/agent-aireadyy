@@ -1,5 +1,7 @@
 # Discovery Agent 与 Workflow 对比基准
 
+> 本文记录 v1 固定两轮基准，结论为质量持平、未证明替代价值。新的质量优先架构与替代门槛见 `docs/discovery-agent-v2-quality-first.md`；v1 结果保留作为设计变更前基线。
+
 ## 目的
 
 本基准用于回答一个可证伪的问题：在相同需求、数据源、候选上限、两轮发现上限且关闭历史记忆时，OpenAI Agents SDK 运行时是否比 LLM Workflow 产生更高质量的 Discovery 结果。

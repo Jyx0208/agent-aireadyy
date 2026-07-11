@@ -89,7 +89,7 @@ class BudgetGovernor:
             self._mark_search_stopped("budget_agent_stop")
             return BudgetReviewResult(outcome="stopped", decision=decision, reason="budget_agent_stop")
         approved = [proposal.queries[index] for index in decision.approved_query_indexes]
-        denial_reason = self._grant_denial_reason(approved)
+        denial_reason = self._grant_denial_reason(approved, proposal)
         if denial_reason:
             self.store.append_event(
                 self.run_id,
@@ -170,7 +170,11 @@ class BudgetGovernor:
         if decision.decision == "shrink" and set(approved) == set(range(len(proposal.queries))):
             raise ValueError("shrink_requires_true_subset")
 
-    def _grant_denial_reason(self, approved: list[str]) -> str | None:
+    def _grant_denial_reason(
+        self,
+        approved: list[str],
+        proposal: SearchProposalRecord,
+    ) -> str | None:
         run = self._require_run()
         if run.active_grant_id:
             return "active_search_grant_exists"
@@ -178,9 +182,45 @@ class BudgetGovernor:
             return "hard_elapsed_time_limit"
         if run.dynamic_usage.query_units + len(approved) > run.dynamic_limits.max_query_units:
             return "hard_query_unit_limit"
+        projected_query_units = run.dynamic_usage.query_units + len(approved)
+        initial_limit = min(
+            run.dynamic_limits.initial_query_units,
+            run.dynamic_limits.max_query_units,
+        )
+        expanded_limit = min(
+            max(initial_limit, run.dynamic_limits.expanded_query_units),
+            run.dynamic_limits.max_query_units,
+        )
+        if projected_query_units > initial_limit:
+            metrics = run.latest_metrics
+            if metrics is None:
+                return "quality_budget_expansion_requires_measured_gap"
+            quality_gap = max(
+                metrics.quality_gap,
+                metrics.semantic_coverage_gap,
+                metrics.hard_constraint_evidence_gap,
+                metrics.metadata_gap,
+            )
+            expected_dimensions = {
+                str(value).strip()
+                for value in proposal.expected_gain_dimensions
+                if str(value).strip()
+            }
+            if not expected_dimensions:
+                return "quality_budget_expansion_requires_expected_gain_dimension"
+            if metrics.no_gain_streak >= 2 and not proposal.alternatives_considered:
+                return "no_gain_recovery_requires_alternative_strategy"
+            if projected_query_units <= expanded_limit:
+                if quality_gap < 0.15 and metrics.high_relevance_gain <= 0.0:
+                    return "quality_budget_expansion_requires_measured_gap"
+            elif quality_gap < 0.30 or (
+                metrics.strategy_novelty < 0.20 and metrics.high_relevance_gain <= 0.0
+            ):
+                return "maximum_quality_budget_requires_strong_gap_and_novel_strategy"
         repository = str(run.request.get("repository") or "pride")
         if (
             run.search_recovery_required
+            and run.candidate_search_count == 0
             and repository in {"pride", "auto"}
             and classify_pride_query_strategy(approved) != "atomic_seed"
         ):
@@ -207,3 +247,23 @@ class BudgetGovernor:
             )
         )
         self.store.append_event(self.run_id, "dynamic_search_stopped", {"reason": reason})
+
+
+def quality_budget_tier(run: AgentRunRecord) -> str:
+    limits = run.dynamic_limits
+    usage = run.dynamic_usage
+    initial_query = min(limits.initial_query_units, limits.max_query_units)
+    expanded_query = min(max(initial_query, limits.expanded_query_units), limits.max_query_units)
+    initial_requests = min(
+        limits.initial_repository_requests,
+        limits.max_repository_requests,
+    )
+    expanded_requests = min(
+        max(initial_requests, limits.expanded_repository_requests),
+        limits.max_repository_requests,
+    )
+    if usage.query_units <= initial_query and usage.repository_requests <= initial_requests:
+        return "initial"
+    if usage.query_units <= expanded_query and usage.repository_requests <= expanded_requests:
+        return "expanded"
+    return "maximum_quality"

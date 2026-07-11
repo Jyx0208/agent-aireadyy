@@ -80,7 +80,7 @@ async def run_budget_agent_review(
         tools=[tool],
         model_settings=sdk["ModelSettings"](parallel_tool_calls=False),
     )
-    await sdk["Runner"].run(
+    result = await sdk["Runner"].run(
         starting_agent=agent,
         input=_budget_input(proposal, metrics),
         context=context,
@@ -90,6 +90,15 @@ async def run_budget_agent_review(
             tracing_disabled=True,
         ),
     )
+    usage = getattr(getattr(result, "context_wrapper", None), "usage", None)
+    if usage is not None:
+        governor.store.increment_model_usage(
+            governor.run_id,
+            requests=int(getattr(usage, "requests", 0) or 0),
+            input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+            output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+            total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
+        )
     if context.result is None:
         reason = "budget_decision_invalid" if context.invalid_attempts else "budget_agent_did_not_submit_decision"
         raise ValueError(reason)
@@ -98,12 +107,15 @@ async def run_budget_agent_review(
 
 def _budget_instructions() -> str:
     return (
-        "You are the Discovery Budget Agent. Review only the supplied SearchProposal and "
-        "deterministic RoundMetrics. You may approve all proposal indexes, approve a true "
-        "subset, request replanning, or stop. Never invent, rewrite, or execute queries. "
-        "Never change species, acquisition mode, task type, PTM scope, or repository policy. "
-        "Submit one final valid decision with a concise public reasoning_summary; if the tool "
-        "returns budget_decision_invalid, correct it once. "
+        "Objective: allocate additional Discovery search budget when it has credible expected "
+        "scientific value. Quality takes priority over saving requests within the hard limits. "
+        "Review only the supplied SearchProposal and deterministic RoundMetrics. Grant all queries, "
+        "grant a true subset, request replanning, or stop. Favor proposals that target unresolved "
+        "semantic coverage, hard-constraint evidence, or metadata gaps with materially novel queries. "
+        "Repeated queries, high duplicate rate, consecutive no-gain actions, or proposals without a "
+        "specific expected quality gain should be replanned or stopped. Never invent, rewrite, or "
+        "execute queries and never change species, acquisition mode, labeling, task type, PTM scope, "
+        "or repository policy. Submit one valid decision with a concise public reasoning_summary. "
         "A stop decision must include unresolved_gaps, unexplored_strategies, and why_not_continue."
     )
 

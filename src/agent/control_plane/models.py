@@ -39,9 +39,13 @@ class AgentBudget(JsonModel):
 
 
 class DynamicBudgetLimits(JsonModel):
-    max_query_units: int = Field(default=30, ge=1, le=500)
-    max_repository_requests: int = Field(default=200, ge=1, le=5000)
-    max_elapsed_seconds: int = Field(default=1200, ge=30, le=86400)
+    initial_query_units: int = Field(default=12, ge=1, le=500)
+    expanded_query_units: int = Field(default=30, ge=1, le=500)
+    max_query_units: int = Field(default=60, ge=1, le=500)
+    initial_repository_requests: int = Field(default=80, ge=1, le=5000)
+    expanded_repository_requests: int = Field(default=160, ge=1, le=5000)
+    max_repository_requests: int = Field(default=300, ge=1, le=5000)
+    max_elapsed_seconds: int = Field(default=1800, ge=30, le=86400)
     budget_agent_max_turns: int = Field(default=3, ge=2, le=10)
 
 
@@ -128,6 +132,12 @@ class RoundMetrics(JsonModel):
     last_round_yield: float = Field(ge=0.0, le=1.0)
     query_repetition: float = Field(ge=0.0, le=1.0)
     budget_pressure: float = Field(ge=0.0, le=1.0)
+    semantic_coverage_gap: float = Field(default=1.0, ge=0.0, le=1.0)
+    hard_constraint_evidence_gap: float = Field(default=1.0, ge=0.0, le=1.0)
+    duplicate_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    high_relevance_gain: float = Field(default=0.0, ge=0.0, le=1.0)
+    inspection_yield: float = Field(default=0.0, ge=0.0, le=1.0)
+    no_gain_streak: int = Field(default=0, ge=0)
     counts: dict[str, int] = Field(default_factory=dict)
     deltas: dict[str, int] = Field(default_factory=dict)
 
@@ -201,6 +211,16 @@ class AgentRunRecord(JsonModel):
     budget: AgentBudget = Field(default_factory=AgentBudget)
     tool_call_count: int = 0
     discovery_round_count: int = 0
+    candidate_search_count: int = 0
+    candidate_inspection_count: int = 0
+    no_gain_action_count: int = 0
+    latest_candidate_search_id: str | None = None
+    latest_high_relevance_candidate_count: int = 0
+    latest_semantic_coverage: float = Field(default=0.0, ge=0.0, le=1.0)
+    model_requests: int = 0
+    model_input_tokens: int = 0
+    model_output_tokens: int = 0
+    model_total_tokens: int = 0
     expensive_action_count: int = 0
     current_manifest_path: str | None = None
     candidate_pool_manifest_path: str | None = None
@@ -243,6 +263,8 @@ class DiscoveryRoundObservation(JsonModel):
     evidence_level_distribution: dict[str, int] = Field(default_factory=dict)
     instrument_family_distribution: dict[str, int] = Field(default_factory=dict)
     unknown_counts: dict[str, int] = Field(default_factory=dict)
+    candidate_search: dict[str, Any] | None = None
+    project_assessments: list[dict[str, Any]] = Field(default_factory=list)
     recommended_action: str = "review_manifest"
     warnings: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)

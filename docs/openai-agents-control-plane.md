@@ -2,10 +2,10 @@
 
 ## Status
 
-This is an experimental control plane for bounded ReAct-style proteomics
-dataset discovery. It is additive: the legacy deterministic and agentic
-discovery commands remain available and unchanged. Multi-Agent discovery is an
-opt-in rollout; `single_agent` remains the deployment default.
+This is the quality-first v2 control plane for bounded ReAct-style proteomics
+dataset discovery. `multi_agent` is now the deployment default. The Workflow
+path remains temporarily available as a benchmark baseline; it must not be
+removed until the replacement gate has passed on real paired PRIDE runs.
 
 The runtime is pinned and tested with `openai-agents==0.18.1`; this avoids
 silent interface or serialized-state drift while the SDK is still on 0.x.
@@ -16,14 +16,16 @@ silent interface or serialized-state drift while the SDK is still on 0.x.
 CLI / Web
   -> OpenAI Agents SDK Discovery Manager
   -> OpenAI Agents SDK Budget Agent (nested review)
-  -> typed function tools and query-bound grants
+  -> typed candidate-search and candidate-inspection tools
+  -> query-bound grants and staged quality budget
   -> deterministic governor and hard ceilings
-  -> existing deterministic discovery modules
+  -> deterministic PRIDE adapters, validity rules, and manifest builders
   -> dataset manifests and audit artifacts
 ```
 
-The Discovery Manager proposes materially different searches, executes only
-approved searches, evaluates observations, and selects the final manifest. The
+The Discovery Manager proposes materially different searches, chooses depth
+per query, browses a persistent candidate pool, chooses accessions for detailed
+inspection, evaluates observations, and selects the final manifest. The
 Budget Agent independently reviews marginal value and returns `grant`,
 `shrink`, `replan`, or `stop`; it cannot invent or execute queries. The
 deterministic governor validates every decision, enforces hard ceilings, and
@@ -38,13 +40,15 @@ before HTTP dispatch, so retries and pagination consume the hard request limit.
 
 ```text
 single_agent:
-  search_repository_datasets
+  search_repository_candidates
+  inspect_repository_candidates
   get_discovery_state
   select_discovery_manifest
 
 multi_agent:
   request_search_budget
-  search_repository_datasets_with_grant
+  search_repository_candidates_with_grant
+  inspect_repository_candidates
   get_discovery_state
   select_discovery_manifest
 
@@ -59,7 +63,8 @@ SearchProposal
   -> Budget Agent review
   -> deterministic validation and hard-limit check
   -> query-bound, one-use SearchGrant
-  -> repository search and metered observation
+  -> candidate search and metered observation
+  -> targeted candidate inspection
   -> next proposal or final manifest selection
 ```
 
@@ -125,21 +130,24 @@ for evaluation, but no second provider key is required for normal operation.
 Server deployment values are configured in `.env` and passed through Compose:
 
 ```text
-AGENT_DISCOVERY_MODE=single_agent
+AGENT_DISCOVERY_MODE=multi_agent
 AGENT_MAX_MODEL_TURNS=50
 AGENT_MAX_TOOL_CALLS=100
-AGENT_MAX_QUERY_UNITS=30
-AGENT_MAX_REPOSITORY_REQUESTS=200
-AGENT_MAX_ELAPSED_SECONDS=1200
+AGENT_INITIAL_QUERY_UNITS=12
+AGENT_EXPANDED_QUERY_UNITS=30
+AGENT_MAX_QUERY_UNITS=60
+AGENT_INITIAL_REPOSITORY_REQUESTS=80
+AGENT_EXPANDED_REPOSITORY_REQUESTS=160
+AGENT_MAX_REPOSITORY_REQUESTS=300
+AGENT_MAX_ELAPSED_SECONDS=1800
 AGENT_BUDGET_AGENT_MAX_TURNS=3
 ```
 
 Model turns and tool calls are safety ceilings. In `multi_agent` mode, the
-Discovery Manager and Budget Agent decide search batches and query count during
-the run, while query units, actual repository requests, elapsed time, and
-Budget Agent turns remain non-negotiable hard limits. Start with
-`single_agent`, run shadow comparisons, then opt in with
-`AGENT_DISCOVERY_MODE=multi_agent`.
+Discovery Manager and Budget Agent decide query count, query depth, candidate
+inspection, and whether measured quality gaps justify moving from initial to
+expanded or maximum-quality capacity. Query units, actual repository requests,
+elapsed time, and Budget Agent turns remain non-negotiable hard limits.
 
 ## Safety Policy
 
@@ -162,9 +170,9 @@ python -m agent.cli agents-discover-dataset `
   --repository pride `
   --task-type rt_prediction `
   --discovery-mode multi_agent `
-  --max-query-units 30 `
-  --max-repository-requests 200 `
-  --max-elapsed-seconds 1200 `
+  --max-query-units 60 `
+  --max-repository-requests 300 `
+  --max-elapsed-seconds 1800 `
   --budget-agent-max-turns 3 `
   --output-dir runs/discovery/agents_sdk_smoke
 ```
@@ -174,7 +182,24 @@ Legacy scripts may continue using `--max-rounds`, `--max-turns`, and
 ignored by dynamic search allocation in `multi_agent`; model-turn and tool-call
 values remain safety ceilings in both modes.
 
-## Replay Evaluation Gate
+## Replacement Evaluation Gate
+
+The v1 equal-two-round comparison produced 0 wins, 3 ties, and 0 losses. It
+proved lower resource use but no quality improvement. That result motivated v2:
+the Agent now controls candidate search depth and inspection instead of only
+supplying query text to the same fixed selection pipeline.
+
+The v2 benchmark is implemented by
+`scripts/run_discovery_replacement_benchmark.py` and
+`benchmarks/discovery_replacement_scenarios.v2.json`. It compares Workflow with
+Agent 1x, 2x, and max-quality tiers across structured, clear, vague, and
+ambiguous variants. The primary gate uses graded relevance, nDCG@5,
+high-relevance recall, task readiness, evidence completeness, hard-constraint
+violations, and false early stops. Cost is a hard ceiling and secondary metric,
+not a reason to accept lower quality. See
+`docs/discovery-agent-v2-quality-first.md`.
+
+## Legacy Replay Budget Gate
 
 The release gate is implemented by
 `scripts/evaluate_dynamic_discovery_budget.py`. It pairs single-Agent and
@@ -199,8 +224,8 @@ inputs were missing or malformed.
 Local core verification on 2026-07-11 completed with `749 passed in 138.28s`.
 The release-gate command currently exits `2` because the repository does not
 yet contain the required eight paired baseline and dynamic replay directories.
-Accordingly, `single_agent` remains the documented and Compose default; this is
-an evidence gap, not a synthetic gate pass.
+This legacy gate measures budget efficiency only and does not establish
+Workflow replacement quality.
 
 Install the optional runtime outside Docker with:
 
@@ -231,10 +256,11 @@ starting the Web process.
 
 ## Next Stages
 
-1. Run shadow comparisons against legacy one- and two-round discovery.
-2. Add recovery tools with explicit approval for expensive actions.
-3. Persist and resume Agents SDK `RunState` for approval interruptions.
-4. Add model-gap analysis while keeping split, leakage, and exporters
+1. Complete real paired PRIDE runs and pooled relevance review for v2.
+2. Tune search strategy from failure clusters without weakening hard limits.
+3. Remove the Workflow product path only after the replacement gate passes.
+4. Persist and resume Agents SDK `RunState` for approval interruptions.
+5. Add model-gap analysis while keeping split, leakage, and exporters
    deterministic.
 
 Official SDK references:

@@ -23,6 +23,12 @@ from agent.discovery.memory import DiscoveryMemory
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
 from agent.discovery.repository_discovery import discover_repository_dataset
 from agent.discovery.query_builder import classify_pride_query_strategy
+from agent.discovery.search_environment import (
+    CandidateInspectionAction,
+    CandidateSearchAction,
+    CandidateSearchObservation,
+    DiscoverySearchEnvironment,
+)
 from agent.discovery.task_readiness import annotate_manifest_task_readiness
 from agent.repositories.metering import meter_repository_requests
 
@@ -43,6 +49,7 @@ class DiscoveryToolService:
         discovery_func: DiscoveryFunction = discover_repository_dataset,
         dynamic_budget: bool = False,
         budget_governor: BudgetGovernor | None = None,
+        search_environment: DiscoverySearchEnvironment | None = None,
     ) -> None:
         self.run_id = run_id
         self.request = request
@@ -53,7 +60,493 @@ class DiscoveryToolService:
         self.discovery_func = discovery_func
         self.dynamic_budget = dynamic_budget
         self.budget_governor = budget_governor
+        self.search_environment = search_environment
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def search_repository_candidates(
+        self,
+        action: CandidateSearchAction,
+        grant_id: str | None = None,
+    ) -> CandidateSearchObservation:
+        if self.search_environment is None:
+            return self._blocked_candidate_search("candidate_search_environment_unavailable")
+        run = self._require_run()
+        if run.search_stopped:
+            return self._blocked_candidate_search("dynamic_search_stopped")
+        if run.selected_round_index is not None:
+            return self._blocked_candidate_search("manifest_already_selected")
+        policy = evaluate_tool_policy("search_repository_candidates", run)
+        if policy.outcome != "allow":
+            return self._blocked_candidate_search(policy.reason)
+        queries = [item.query for item in action.queries]
+        if self.dynamic_budget:
+            if self.budget_governor is None:
+                raise RuntimeError("dynamic_budget_governor_required")
+            if not grant_id:
+                return self._blocked_candidate_search("search_grant_required")
+            try:
+                self.budget_governor.consume_grant(grant_id, queries)
+            except ValueError as exc:
+                return self._blocked_candidate_search(str(exc))
+
+        arguments = {
+            "action": action.model_dump(mode="json"),
+            "grant_id": grant_id,
+            "request": self.request.model_dump(mode="json"),
+        }
+        tool_call, claimed = self.store.claim_tool_call(
+            run_id=self.run_id,
+            tool_name="search_repository_candidates",
+            arguments=arguments,
+        )
+        if not claimed and tool_call.output:
+            return CandidateSearchObservation.model_validate(tool_call.output)
+        if not claimed:
+            return self._blocked_candidate_search("identical_tool_call_already_in_progress")
+
+        run = self.store.increment_tool_call_count(self.run_id)
+        if not self.dynamic_budget:
+            run = self.store.increment_dynamic_usage(
+                self.run_id,
+                query_units=len(queries),
+                search_batches=1,
+            )
+        self.store.append_event(
+            self.run_id,
+            "candidate_search_started",
+            {
+                "queries": queries,
+                "action": action.model_dump(mode="json"),
+                "idempotency_key": tool_call.idempotency_key,
+            },
+        )
+
+        try:
+            request_callback = self._repository_request_callback()
+            with meter_repository_requests(request_callback):
+                observation = self.search_environment.search(action)
+            metered_run = self._require_run()
+            previous_high = metered_run.latest_high_relevance_candidate_count
+            high_gain_count = max(
+                0,
+                observation.high_relevance_candidate_count - previous_high,
+            )
+            coverage_gain = max(
+                0.0,
+                observation.semantic_coverage - metered_run.latest_semantic_coverage,
+            )
+            no_gain = high_gain_count <= 0 and coverage_gain <= 0.001
+            no_gain_streak = metered_run.no_gain_action_count + 1 if no_gain else 0
+            recommended_action = (
+                "replan_with_a_materially_different_strategy_or_inspect"
+                if no_gain_streak >= 2
+                else "inspect_high_relevance_candidates"
+                if observation.high_relevance_candidate_count > 0
+                else "search_unresolved_intent_with_new_strategy"
+            )
+            observation = observation.model_copy(
+                update={
+                    "new_high_relevance_candidate_count": high_gain_count,
+                    "semantic_coverage_gain": coverage_gain,
+                    "recommended_action": recommended_action,
+                }
+            )
+            base_metrics = self.current_metrics()
+            preview_count = len(observation.previews)
+            review_count = sum(item.needs_review for item in observation.previews)
+            metrics = base_metrics.model_copy(
+                update={
+                    "candidate_shortfall": max(
+                        0.0,
+                        1.0 - min(observation.candidate_count, 10) / 10.0,
+                    ),
+                    "quality_gap": 1.0 - observation.semantic_coverage,
+                    "semantic_coverage_gap": 1.0 - observation.semantic_coverage,
+                    "hard_constraint_evidence_gap": review_count / max(1, preview_count),
+                    "duplicate_rate": observation.duplicate_rate,
+                    "high_relevance_gain": high_gain_count
+                    / max(1, observation.high_relevance_candidate_count),
+                    "last_round_yield": min(
+                        1.0,
+                        observation.new_candidate_count / max(1, len(queries) * 5),
+                    ),
+                    "no_gain_streak": no_gain_streak,
+                    "counts": {
+                        **base_metrics.counts,
+                        "candidate_projects": observation.candidate_count,
+                        "high_relevance_candidates": observation.high_relevance_candidate_count,
+                    },
+                }
+            )
+            run = metered_run.model_copy(
+                update={
+                    "candidate_search_count": metered_run.candidate_search_count + 1,
+                    "latest_candidate_search_id": observation.search_id,
+                    "latest_high_relevance_candidate_count": observation.high_relevance_candidate_count,
+                    "latest_semantic_coverage": observation.semantic_coverage,
+                    "no_gain_action_count": no_gain_streak,
+                    "search_recovery_required": no_gain_streak >= 2,
+                    "latest_metrics": metrics,
+                }
+            )
+            self.store.save_run(run)
+            self.store.complete_tool_call(
+                tool_call.idempotency_key,
+                observation.model_dump(mode="json"),
+            )
+            self.store.append_event(
+                self.run_id,
+                "candidate_search_completed",
+                {
+                    "queries": queries,
+                    "observation": observation.model_dump(mode="json"),
+                    "metrics": metrics.model_dump(mode="json"),
+                },
+            )
+            return observation
+        except Exception as exc:
+            failed = CandidateSearchObservation(
+                status="failed",
+                search_id=run.latest_candidate_search_id or "search_failed",
+                raw_result_count=0,
+                candidate_count=0,
+                new_candidate_count=0,
+                duplicate_count=0,
+                duplicate_rate=0.0,
+                failures=[str(exc)],
+                rationale=action.rationale,
+            )
+            self.store.complete_tool_call(
+                tool_call.idempotency_key,
+                failed.model_dump(mode="json"),
+                status="failed",
+                error=str(exc),
+            )
+            self.store.append_event(
+                self.run_id,
+                "candidate_search_failed",
+                {"queries": queries, "error": str(exc)},
+            )
+            return failed
+
+    def inspect_repository_candidates(
+        self,
+        action: CandidateInspectionAction,
+    ) -> DiscoveryRoundObservation:
+        if self.search_environment is None:
+            return self._blocked_environment_inspection(
+                action,
+                "candidate_search_environment_unavailable",
+            )
+        run = self._require_run()
+        if run.selected_round_index is not None:
+            return self._blocked_environment_inspection(action, "manifest_already_selected")
+        policy = evaluate_tool_policy("inspect_repository_candidates", run)
+        if policy.outcome != "allow":
+            return self._blocked_environment_inspection(action, policy.reason)
+        if action.search_id != run.latest_candidate_search_id:
+            return self._blocked_environment_inspection(action, "candidate_search_id_mismatch")
+
+        arguments = {
+            "action": action.model_dump(mode="json"),
+            "request": self.request.model_dump(mode="json"),
+            "task_type": self.task_type,
+        }
+        tool_call, claimed = self.store.claim_tool_call(
+            run_id=self.run_id,
+            tool_name="inspect_repository_candidates",
+            arguments=arguments,
+        )
+        if not claimed and tool_call.output:
+            return DiscoveryRoundObservation.model_validate(tool_call.output)
+        if not claimed:
+            return self._blocked_environment_inspection(
+                action,
+                "identical_tool_call_already_in_progress",
+            )
+
+        previous_pool = (
+            _load_manifest(Path(run.candidate_pool_manifest_path))
+            if run.candidate_pool_manifest_path
+            and Path(run.candidate_pool_manifest_path).exists()
+            else None
+        )
+        round_index = run.discovery_round_count + 1
+        run = self.store.increment_tool_call_count(self.run_id)
+        run = self.store.save_run(
+            run.model_copy(
+                update={
+                    "status": "running",
+                    "discovery_round_count": round_index,
+                    "candidate_inspection_count": run.candidate_inspection_count + 1,
+                }
+            )
+        )
+        self.store.append_event(
+            self.run_id,
+            "candidate_inspection_started",
+            {
+                "round_index": round_index,
+                "action": action.model_dump(mode="json"),
+                "idempotency_key": tool_call.idempotency_key,
+            },
+        )
+        try:
+            request_callback = self._repository_request_callback()
+            with meter_repository_requests(request_callback):
+                result = self.search_environment.inspect(action)
+            return self._persist_environment_inspection(
+                run=run,
+                round_index=round_index,
+                action=action,
+                result_manifest=result.manifest,
+                usable_files=result.usable_files,
+                previous_pool=previous_pool,
+                tool_call_id=tool_call.idempotency_key,
+            )
+        except Exception as exc:
+            observation = DiscoveryRoundObservation(
+                status="failed",
+                round_index=round_index,
+                recommended_action="inspect_other_candidates_or_search",
+                blockers=[str(exc)],
+                candidate_search={"search_id": action.search_id},
+            )
+            self.store.complete_tool_call(
+                tool_call.idempotency_key,
+                observation.model_dump(mode="json"),
+                status="failed",
+                error=str(exc),
+            )
+            self.store.append_event(
+                self.run_id,
+                "candidate_inspection_failed",
+                {"round_index": round_index, "error": str(exc)},
+            )
+            return observation
+
+    def _persist_environment_inspection(
+        self,
+        *,
+        run: AgentRunRecord,
+        round_index: int,
+        action: CandidateInspectionAction,
+        result_manifest: DatasetManifest,
+        usable_files: int,
+        previous_pool: DatasetManifest | None,
+        tool_call_id: str,
+    ) -> DiscoveryRoundObservation:
+        manifest = result_manifest
+        if self.task_type:
+            manifest = annotate_manifest_task_readiness(manifest, self.task_type)
+        summary = dict(manifest.summary)
+        summary["openai_agents_control_plane"] = {
+            "run_id": self.run_id,
+            "round_index": round_index,
+            "runtime": "openai_agents",
+            "search_id": action.search_id,
+        }
+        manifest = manifest.model_copy(update={"run_id": self.run_id, "summary": summary})
+        round_dir = self.output_dir / f"round_{round_index:02d}"
+        paths = write_dataset_manifest(manifest, round_dir)
+        events = self.store.list_events(self.run_id)
+        search_event = next(
+            (
+                event
+                for event in reversed(events)
+                if event.event_type == "candidate_search_completed"
+                and (event.payload.get("observation") or {}).get("search_id") == action.search_id
+            ),
+            None,
+        )
+        candidate_search = (
+            dict(search_event.payload.get("observation") or {})
+            if search_event is not None
+            else {"search_id": action.search_id}
+        )
+        queries = [str(value) for value in (search_event.payload.get("queries") or [])] if search_event else []
+        observation = _observation_from_manifest(
+            manifest,
+            round_index=round_index,
+            queries=queries,
+            paths=paths,
+        ).model_copy(update={"candidate_search": candidate_search})
+        diagnosis = self._diagnose_search_result(
+            run=run,
+            proposed_queries=queries or ["candidate_pool_inspection"],
+            summary=manifest.summary,
+        )
+        artifacts = dict(run.artifacts)
+        artifacts[f"discovery_round_{round_index:02d}"] = ArtifactReference(
+            path=str(paths["dataset_manifest_json"]),
+            artifact_type="dataset_manifest",
+            schema_version="dataset-manifest/v1",
+        )
+        round_manifests = [
+            _load_manifest(Path(reference.path))
+            for name, reference in sorted(artifacts.items())
+            if name.startswith("discovery_round_") and Path(reference.path).exists()
+        ]
+        pool_manifest = _merge_discovery_manifests(
+            round_manifests,
+            request=self.request,
+            run_id=self.run_id,
+        )
+        pool_paths = write_dataset_manifest(pool_manifest, self.output_dir / "candidate_pool")
+        pool_observation = _observation_from_manifest(
+            pool_manifest,
+            round_index=round_index,
+            queries=queries,
+            paths=pool_paths,
+        )
+        metered_run = self._require_run()
+        prior_queries = [
+            str(query)
+            for event in events
+            if event.event_type == "candidate_search_completed"
+            and event is not search_event
+            for query in event.payload.get("queries", [])
+        ]
+        metrics = evaluate_round_metrics(
+            pool_manifest,
+            previous_pool,
+            request=self.request,
+            queries=queries,
+            prior_queries=prior_queries,
+            usage=metered_run.dynamic_usage,
+            limits=metered_run.dynamic_limits,
+            round_index=round_index,
+        )
+        rich_metrics = metered_run.latest_metrics
+        selected_count = max(1, len(manifest.files))
+        needs_review = sum(file.needs_review for file in manifest.files)
+        metrics = metrics.model_copy(
+            update={
+                "semantic_coverage_gap": (
+                    rich_metrics.semantic_coverage_gap if rich_metrics else 1.0
+                ),
+                "hard_constraint_evidence_gap": needs_review / selected_count,
+                "duplicate_rate": rich_metrics.duplicate_rate if rich_metrics else 0.0,
+                "high_relevance_gain": (
+                    rich_metrics.high_relevance_gain if rich_metrics else 0.0
+                ),
+                "inspection_yield": min(1.0, usable_files / selected_count),
+                "no_gain_streak": metered_run.no_gain_action_count,
+            }
+        )
+        artifacts["candidate_pool"] = ArtifactReference(
+            path=str(pool_paths["dataset_manifest_json"]),
+            artifact_type="dataset_manifest",
+            schema_version="dataset-manifest/v1",
+        )
+        unresolved = candidate_search.get("unresolved_intent_terms") or []
+        if unresolved and usable_files > 0:
+            recommendation = "search_unresolved_intent_or_finalize_with_explicit_gaps"
+        else:
+            recommendation = observation.recommended_action
+        observation = observation.model_copy(
+            update={
+                "candidate_pool_manifest_path": str(pool_paths["dataset_manifest_json"]),
+                "pooled_selected_projects": pool_observation.selected_projects,
+                "pooled_selected_files": pool_observation.selected_files,
+                "metrics": metrics,
+                "diagnosis": diagnosis,
+                "project_assessments": _project_assessments(
+                    manifest,
+                    candidate_search,
+                ),
+                "recommended_action": recommendation,
+            }
+        )
+        self.store.complete_tool_call(tool_call_id, observation.model_dump(mode="json"))
+        run = metered_run.model_copy(
+            update={
+                "artifacts": artifacts,
+                "candidate_pool_manifest_path": str(pool_paths["dataset_manifest_json"]),
+                "current_manifest_path": (
+                    str(pool_paths["dataset_manifest_json"])
+                    if pool_observation.selected_files > 0
+                    else str(paths["dataset_manifest_json"])
+                ),
+                "warnings": pool_observation.warnings,
+                "blockers": pool_observation.blockers,
+                "latest_metrics": metrics,
+                "consecutive_zero_yield": diagnosis.consecutive_zero_yield,
+                "search_recovery_required": diagnosis.recovery_required,
+                "last_search_strategy": diagnosis.strategy,
+            }
+        )
+        self.store.save_run(run)
+        self.store.append_event(
+            self.run_id,
+            "candidate_inspection_completed",
+            {
+                "round_index": round_index,
+                "action": action.model_dump(mode="json"),
+                "observation": observation.model_dump(mode="json"),
+            },
+        )
+        self.store.append_event(
+            self.run_id,
+            "round_value_evaluated",
+            metrics.model_dump(mode="json"),
+        )
+        return observation
+
+    def _repository_request_callback(self) -> Callable[[str, str], None]:
+        if self.dynamic_budget:
+            if self.budget_governor is None:
+                raise RuntimeError("dynamic_budget_governor_required")
+            return self.budget_governor.record_repository_request
+
+        def callback(_repository: str, _operation: str) -> None:
+            self.store.increment_dynamic_usage(
+                self.run_id,
+                repository_requests=1,
+            )
+
+        return callback
+
+    def _blocked_candidate_search(self, reason: str) -> CandidateSearchObservation:
+        run = self._require_run()
+        self.store.append_event(
+            self.run_id,
+            "tool_denied",
+            {"tool": "search_repository_candidates", "reason": reason},
+        )
+        return CandidateSearchObservation(
+            status="blocked",
+            search_id=run.latest_candidate_search_id or "search_blocked",
+            raw_result_count=0,
+            candidate_count=0,
+            new_candidate_count=0,
+            duplicate_count=0,
+            duplicate_rate=0.0,
+            failures=[reason],
+        )
+
+    def _blocked_environment_inspection(
+        self,
+        action: CandidateInspectionAction,
+        reason: str,
+    ) -> DiscoveryRoundObservation:
+        run = self._require_run()
+        self.store.append_event(
+            self.run_id,
+            "tool_denied",
+            {
+                "tool": "inspect_repository_candidates",
+                "reason": reason,
+                "search_id": action.search_id,
+            },
+        )
+        return DiscoveryRoundObservation(
+            status="blocked",
+            round_index=run.discovery_round_count + 1,
+            recommended_action="revise_inspection_or_search",
+            blockers=[reason],
+            candidate_search={"search_id": action.search_id},
+        )
 
     def search_repository_datasets(
         self,
@@ -408,10 +901,13 @@ class DiscoveryToolService:
             )
             return observation
 
-    def select_discovery_manifest(self, round_index: int, rationale: str) -> dict[str, Any]:
+    def select_discovery_manifest(
+        self,
+        round_index: int,
+        rationale: str,
+        project_accessions: list[str] | None = None,
+    ) -> dict[str, Any]:
         run = self._require_run()
-        if run.search_recovery_required:
-            return self._selection_rejected(round_index, "search_recovery_required")
         policy = evaluate_tool_policy("select_discovery_manifest", run)
         if policy.outcome != "allow":
             payload = {"status": "blocked", "round_index": round_index, "blockers": [policy.reason]}
@@ -431,11 +927,27 @@ class DiscoveryToolService:
         if len(rationale) > 2000:
             return self._selection_rejected(round_index, "selection_rationale_too_long")
 
+        selected_accessions = _normalize_accessions(project_accessions or [])
+
         manifest_path = self._manifest_path_for_selection(run, round_index)
         if manifest_path is None or not manifest_path.exists():
             return self._selection_rejected(round_index, "manifest_round_not_found")
 
-        arguments = {"round_index": round_index, "rationale": rationale}
+        manifest = _load_manifest(manifest_path)
+        if selected_accessions:
+            available = {project.project_accession.upper() for project in manifest.projects}
+            missing = [accession for accession in selected_accessions if accession not in available]
+            if missing:
+                return self._selection_rejected(
+                    round_index,
+                    "selection_project_not_in_manifest:" + ",".join(missing),
+                )
+
+        arguments = {
+            "round_index": round_index,
+            "project_accessions": selected_accessions,
+            "rationale": rationale,
+        }
         tool_call, claimed = self.store.claim_tool_call(
             run_id=self.run_id,
             tool_name="select_discovery_manifest",
@@ -447,7 +959,27 @@ class DiscoveryToolService:
             return self._selection_rejected(round_index, "identical_tool_call_already_in_progress")
 
         run = self.store.save_run(run.model_copy(update={"tool_call_count": run.tool_call_count + 1}))
-        manifest = _load_manifest(manifest_path)
+        if selected_accessions:
+            selected_set = set(selected_accessions)
+            filtered = manifest.model_copy(
+                update={
+                    "projects": [
+                        project
+                        for project in manifest.projects
+                        if project.project_accession.upper() in selected_set
+                    ],
+                    "files": [
+                        file
+                        for file in manifest.files
+                        if file.project_accession.upper() in selected_set
+                    ],
+                }
+            )
+            manifest = _merge_discovery_manifests(
+                [filtered],
+                request=self.request,
+                run_id=self.run_id,
+            )
         selected_files = _selected_file_count(manifest)
         if selected_files <= 0:
             payload = {
@@ -460,6 +992,10 @@ class DiscoveryToolService:
             self.store.complete_tool_call(tool_call.idempotency_key, payload)
             self.store.append_event(self.run_id, "manifest_selection_rejected", payload)
             return payload
+
+        if selected_accessions:
+            paths = write_dataset_manifest(manifest, self.output_dir / "final_selection")
+            manifest_path = paths["dataset_manifest_json"]
 
         _, warnings = _recommend_next_action(manifest.summary, selected_files)
         run = self.store.save_run(
@@ -479,6 +1015,9 @@ class DiscoveryToolService:
             "manifest_path": str(manifest_path),
             "selected_projects": int(manifest.summary.get("selected_projects") or len(manifest.projects)),
             "selected_files": selected_files,
+            "selected_project_accessions": [
+                project.project_accession for project in manifest.projects
+            ],
             "rationale": rationale,
         }
         self.store.complete_tool_call(tool_call.idempotency_key, payload)
@@ -567,6 +1106,18 @@ class DiscoveryToolService:
             "status": run.status,
             "tool_call_count": run.tool_call_count,
             "discovery_round_count": run.discovery_round_count,
+            "candidate_search_count": run.candidate_search_count,
+            "candidate_inspection_count": run.candidate_inspection_count,
+            "no_gain_action_count": run.no_gain_action_count,
+            "latest_candidate_search_id": run.latest_candidate_search_id,
+            "latest_high_relevance_candidate_count": run.latest_high_relevance_candidate_count,
+            "latest_semantic_coverage": run.latest_semantic_coverage,
+            "model_usage": {
+                "requests": run.model_requests,
+                "input_tokens": run.model_input_tokens,
+                "output_tokens": run.model_output_tokens,
+                "total_tokens": run.model_total_tokens,
+            },
             "max_discovery_rounds": run.budget.max_discovery_rounds,
             "current_manifest_path": run.current_manifest_path,
             "candidate_pool_manifest_path": run.candidate_pool_manifest_path,
@@ -842,6 +1393,59 @@ def _merge_discovery_manifests(
         files=selected_files,
         summary=summary,
     )
+
+
+def _project_assessments(
+    manifest: DatasetManifest,
+    candidate_search: dict[str, Any],
+) -> list[dict[str, Any]]:
+    previews = {
+        str(item.get("project_accession") or "").upper(): item
+        for item in candidate_search.get("previews") or []
+        if isinstance(item, dict)
+    }
+    assessments: list[dict[str, Any]] = []
+    for project in manifest.projects:
+        project_files = [
+            file
+            for file in manifest.files
+            if file.project_accession.casefold() == project.project_accession.casefold()
+        ]
+        preview = previews.get(project.project_accession.upper(), {})
+        assessments.append(
+            {
+                "project_accession": project.project_accession,
+                "project_title": project.project_title or "",
+                "selected_file_count": len(project_files),
+                "species": project.species,
+                "acquisition_mode": project.acquisition_mode,
+                "labeling_strategy": project.labeling_strategy,
+                "validity_status": project.validity_status,
+                "validity_status_counts": dict(
+                    Counter(file.validity_status for file in project_files)
+                ),
+                "evidence_level_counts": dict(
+                    Counter(str(file.evidence_level or "unknown") for file in project_files)
+                ),
+                "task_readiness_status_counts": dict(
+                    Counter(str(file.task_readiness_status or "not_set") for file in project_files)
+                ),
+                "matched_intent_terms": list(preview.get("matched_intent_terms") or []),
+                "query_hits": list(preview.get("query_hits") or []),
+                "needs_review": project.needs_review,
+            }
+        )
+    return assessments
+
+
+def _normalize_accessions(values: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for value in values:
+        accession = str(value or "").strip().upper()
+        if not accession or accession in normalized:
+            continue
+        normalized.append(accession)
+    return normalized
 
 
 def _normalize_queries(queries: list[str]) -> list[str]:
