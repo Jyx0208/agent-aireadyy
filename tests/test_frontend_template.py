@@ -54,6 +54,35 @@ def test_frontend_template_has_reusable_ui_components_and_button_loading_state()
     assert "aria-busy" in html
     assert "aria-pressed" in html
     assert "aria-checked" in html
+    assert "function formatEventTime(value)" in html
+    assert "toLocaleTimeString" in html
+    assert ".split('T').pop().slice(0,8)" not in html
+
+
+def test_frontend_template_saves_config_discovers_models_and_clears_transient_key():
+    html = _html()
+
+    assert 'id="saveApiConfigBtn"' in html
+    assert 'id="deleteApiConfigBtn"' in html
+    assert 'id="refreshModelsBtn"' in html
+    assert 'id="cfgApiKeyState"' in html
+    assert 'id="cfgApiKeyRequirement"' in html
+    assert '<select id="cfgModel"' in html
+    assert 'datalist id="modelOptions"' not in html
+    assert "/api/llm/config" in html
+    assert "/api/llm/models" in html
+    assert "async function saveLLMConfig()" in html
+    assert "async function deleteLLMConfig()" in html
+    assert "async function loadLLMModels(" in html
+    assert "function clearTransientApiKey()" in html
+    assert "function renderApiKeyState()" in html
+    assert "configStatus.textContent=serverLlmConfigured?'Saved':'';" in html
+    assert "requirement.hidden=serverLlmConfigured;" in html
+    assert "clearTransientApiKey();" in html
+    assert "const previousSelection=select.value;" in html
+    assert "models.includes(previousSelection)" in html
+    assert "parseDiscoveryGoalFallback(false);" not in html
+    assert "status.textContent=e.message||String(e);" in html
 
 
 def test_frontend_template_exposes_batch_excel_workflow():
@@ -136,13 +165,38 @@ def test_frontend_template_exposes_discovery_workflow():
 
     assert 'id="discoveryStartBtn"' in html
     assert 'id="discoveryCancelBtn"' in html
-    assert 'id="discoveryLogBox"' in html
+    assert 'id="discoveryLogActivity"' in html
+    assert 'id="discoveryLogTools"' in html
+    assert 'id="discoveryLogRaw"' in html
     assert 'for="discoverySpecies"' in html
     assert 'for="discoveryMaxProjects"' in html
     assert 'id="discoveryUseMemory"' in html
     assert 'id="discoveryTaskType"' in html
     assert 'id="discoveryAgentic" checked' in html
     assert 'id="discoveryAgenticRounds"' in html
+    assert 'id="discoveryRuntime" value="openai_agents"' in html
+    assert 'id="discoveryRuntimeWorkflow"' in html
+    assert 'id="discoveryRuntimeAgent"' in html
+    assert "setDiscoveryRuntime('openai_agents')" in html
+    assert 'id="discoveryAgentControls"' in html
+    assert 'id="discoveryAgentBudgetAutonomous"' in html
+    assert 'id="discoveryAgentCredentialStatus"' in html
+    assert "discoveryAgentServerKeyReady" in html
+    assert "discoveryAgentServerKeyNeeded" in html
+    assert "discoveryAgentWebKeyReady" in html
+    assert "runtime:currentDiscoveryRuntime" in html
+    assert "agent_budget_mode:" not in html
+    assert "agent_max_rounds:" not in html
+    assert "agent_max_turns:" not in html
+    assert "agent_max_tool_calls:" not in html
+    assert "state==='completed_with_review'?'needs_review'" in html
+    assert "llm_config:collectConfig()" in html
+    assert 'id="discoveryAgentResult"' in html
+    assert "renderDiscoveryAgentResult(data)" in html
+    assert "agents_discovery_report_md" in html
+    assert "agents_discovery_events_json" in html
+    assert "agents_discovery_summary_json" in html
+    assert "agents_discovery_budget_json" in html
     assert 'id="discoveryPrompt"' in html
     assert 'id="discoveryResults"' in html
     assert "startDiscovery()" in html
@@ -150,6 +204,10 @@ def test_frontend_template_exposes_discovery_workflow():
     assert "cancelDiscoveryJob()" in html
     assert "renderDiscoveryJobLogs" in html
     assert "safeRenderDiscoveryJobLogs" in html
+    assert "appendDiscoveryLogRows" in html
+    assert "discoveryLogSequences" in html
+    assert "lastDiscoveryLogsFingerprint" not in html
+    assert "const shouldFollow=box.scrollHeight-box.scrollTop-box.clientHeight<=16;" in html
     assert "discoverySubmitting" in html
     assert "正在提交 Discovery 请求" in html
     assert "safeRenderDiscoveryJobLogs([{ts:new Date().toISOString(),level:'info',message:t('discoverySubmitting')}])" in html
@@ -196,6 +254,21 @@ def test_frontend_template_exposes_discovery_workflow():
     assert "discoveryGroup_weak_keep" in html
     assert "discoveryGroup_needs_review" in html
     assert "discoveryGroup_exclude" in html
+    assert "function setDiscoveryGroupSelection(group,selected)" in html
+    assert "discoveryFilesByValidity(files)[group]" in html
+    assert "setDiscoveryGroupSelection(\\'" in html
+    render_files_body = html.split("function renderDiscoveryFiles(files,options={}){", 1)[1].split(
+        "function renderDiscovery(data)", 1
+    )[0]
+    assert "syncDiscoverySelectionFromDom();" not in render_files_body
+    assert "function goDiscoveryValidityPage(group,page){\n  syncDiscoverySelectionFromDom();" in html
+    assert "function setDiscoveryGroupSelection(group,selected){\n  syncDiscoverySelectionFromDom();" in html
+    assert "function goDiscoveryValidityPage(group,page)" in html
+    assert "function goDiscoveryFilePage(page)" in html
+    assert 'class="discovery-page-input"' in html
+    assert 'aria-label="First page"' in html
+    assert 'aria-label="Last page"' in html
+    assert 'aria-label="Go to page"' in html
     assert "discoverySetSelect('aiReadyTaskType',discoveryTaskType)" in html
     assert "batchRunMode&&fullWorkflowEnabled" in html
     assert "batchRunMode.value='full'" in html
@@ -235,7 +308,7 @@ def test_frontend_template_has_clean_chinese_i18n_override():
     html = _html()
 
     assert "const CLEAN_ZH_I18N" in html
-    assert "蛋白质组 AI 数据工作台" in html
+    assert "蛋白质组 / 数据作业台" in html
     assert "数据发现" in html
     assert "AI-ready 构建" in html
     assert "运行 Discovery" in html
@@ -457,16 +530,36 @@ def test_frontend_template_uses_unclipped_semicircle_gauges():
 def test_frontend_template_uses_light_operational_app_shell():
     html = _html()
 
-    assert "--bg:#f1f5f9" in html
+    assert "--bg:#edf0f2" in html
     assert "--surface:#ffffff" in html
-    assert "--primary:#6366f1" in html
-    assert "--success:#10b981" in html
+    assert "--primary:#087f8c" in html
+    assert "--success:#14804a" in html
     assert 'class="container app-shell"' in html
     assert 'class="surface workbench-card"' in html
     assert 'class="right-rail operations-rail"' in html
     assert 'class="surface api-config-card"' in html
     assert 'class="surface history-card"' in html
     assert "system-summary" in html
+    assert "gradient(" not in html
+
+
+def test_frontend_template_uses_product_workspace_with_agent_first_defaults():
+    html = _html()
+
+    assert 'class="grid product-grid" id="productGrid"' in html
+    assert 'class="workspace-nav"' in html
+    assert 'class="workspace-content"' in html
+    assert 'id="operationsRail"' in html
+    assert 'id="contextToggle"' in html
+    assert 'class="system-drawer"' in html
+    assert 'class="discovery-constraints"' in html
+    assert 'class="workflow-progress"' in html
+    assert 'id="discoveryTaskTab" type="button" role="tab" aria-selected="true"' in html
+    assert 'id="singleTaskPanel" role="tabpanel" aria-labelledby="singleTaskTab" hidden' in html
+    assert "setWorkflowTab(localStorage.getItem('workflowTab')||'discovery',false);" in html
+    assert "setDiscoveryRuntime(localStorage.getItem('discoveryRuntime')||'openai_agents');" in html
+    assert "function setDiscoveryProgress(stage,tone='active')" in html
+    assert "const visibleResults=historyExpanded?results:results.slice(0,8);" in html
 
 
 def test_frontend_template_uses_inline_error_alerts_not_browser_alerts():

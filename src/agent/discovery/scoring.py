@@ -263,7 +263,11 @@ def score_project(project: dict[str, Any], request: DatasetRequest) -> ProjectSc
     populated_fields = sum(1 for _, text in fields if text.strip())
     score += min(10.0, populated_fields * 1.5)
 
-    excluded = request.acquisition_mode == "dda" and bool(negative_evidence)
+    excluded = (
+        request.is_hard_constraint("acquisition_mode")
+        and request.acquisition_mode == "dda"
+        and bool(negative_evidence)
+    )
     labeling_missing = requested_labeling in {"TMT", "iTRAQ"} and not labeling_evidence
     species_required = request.species_policy == "include_only"
     ptm_required = not general_goal and not requested_immunopeptidomics and requested_ptm != "unknown_ptm"
@@ -272,7 +276,11 @@ def score_project(project: dict[str, Any], request: DatasetRequest) -> ProjectSc
         (ptm_required and not ptm_evidence)
         or immuno_missing
         or (species_required and not species)
-        or (request.acquisition_mode == "dda" and not dda_evidence)
+        or (
+            request.is_hard_constraint("acquisition_mode")
+            and request.acquisition_mode == "dda"
+            and not dda_evidence
+        )
         or bool(mixed_acquisition_evidence)
         or labeling_missing
     )
@@ -603,7 +611,11 @@ def score_file(
     requested_labeling = normalize_labeling_strategy(request.labeling_strategy)
     labeling_evidence = _keyword_evidence(fields, labeling_aliases(requested_labeling), "labeling", 4)
     detected_labeling = labeling_from_text(" ".join(text for _, text in fields))
-    if request.acquisition_mode == "dda" and negative_evidence:
+    if (
+        request.is_hard_constraint("acquisition_mode")
+        and request.acquisition_mode == "dda"
+        and negative_evidence
+    ):
         return None
 
     score = 40.0

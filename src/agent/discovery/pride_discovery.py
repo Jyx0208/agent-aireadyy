@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timezone
+from math import ceil
 from typing import Any, Callable
 
 from agent.discovery.diversity import diversity_summary, select_diverse_items, validity_summary
@@ -13,7 +14,7 @@ from agent.discovery.memory import (
     memory_prior_for_project,
 )
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
-from agent.discovery.query_builder import build_pride_queries
+from agent.discovery.query_builder import build_pride_queries, prepare_pride_search_queries
 from agent.discovery.scoring import build_discovered_project, score_file, score_project
 from agent.metadata.context import detect_sdrf_file, load_sdrf_rows, select_sdrf_rows_for_file
 from agent.pride.client import PrideClient
@@ -35,6 +36,23 @@ def _dedupe_projects(projects: list[dict[str, Any]], limit: int) -> list[dict[st
         if len(deduped) >= limit:
             break
     return deduped
+
+
+def _rank_candidate_projects(
+    projects: list[dict[str, Any]], request: DatasetRequest, limit: int
+) -> list[dict[str, Any]]:
+    deduped = _dedupe_projects(projects, len(projects))
+    scored = [(score_project(project, request), project) for project in deduped]
+    ranked = sorted(
+        scored,
+        key=lambda item: (
+            item[0].excluded,
+            item[0].needs_review,
+            -item[0].project_score,
+            _project_accession(item[1]),
+        ),
+    )
+    return [project for _score, project in ranked[:limit]]
 
 
 def _sort_projects(items: list[tuple[DiscoveredProject, list[DiscoveredFile]]]) -> list[tuple[DiscoveredProject, list[DiscoveredFile]]]:
@@ -68,14 +86,21 @@ def discover_pride_dataset(
     client: PrideClient | None = None,
     memory: DiscoveryMemory | None = None,
     queries: list[str] | None = None,
+    candidate_records: list[dict[str, Any]] | None = None,
     report: Callable[[str], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
     early_stop_on_limits: bool = False,
 ) -> DatasetManifest:
     owns_client = client is None
     pride = client or PrideClient()
-    queries = queries or build_pride_queries(request)
-    searched_records: list[dict[str, Any]] = []
+    if candidate_records is None:
+        proposed_queries = queries or build_pride_queries(request)
+        queries = prepare_pride_search_queries(proposed_queries) or proposed_queries
+        searched_records: list[dict[str, Any]] = []
+    else:
+        proposed_queries = list(queries or [])
+        queries = list(queries or [])
+        searched_records = list(candidate_records)
     failures: list[dict[str, str]] = []
     review_decisions = memory.load_review_decisions() if memory is not None else []
 
@@ -88,19 +113,31 @@ def discover_pride_dataset(
             raise InterruptedError("Discovery cancelled.")
 
     try:
-        for query in queries:
-            _check_cancel()
-            _report(f"Searching PRIDE projects: {query}")
-            try:
-                searched_records.extend(pride.search_projects(query, page_size=100))
-                _report(f"Project search returned {len(searched_records)} raw records so far.")
-            except Exception as exc:  # pragma: no cover - defensive network boundary
-                failures.append({"stage": "search_projects", "query": query, "error": str(exc)})
-                _report(f"Project search failed for query '{query}': {exc}")
-            if len(_dedupe_projects(searched_records, request.max_candidate_projects)) >= request.max_candidate_projects:
-                break
+        if candidate_records is None and queries != proposed_queries:
+            _report(
+                f"Adapted {len(proposed_queries)} semantic query term(s) into "
+                f"{len(queries)} high-recall PRIDE keyword seed(s): {'; '.join(queries)}"
+            )
+        # A shallow per-query page systematically hides older but highly relevant projects.
+        # Fetch enough metadata to rank candidates globally; project/file inspection remains bounded.
+        if candidate_records is None:
+            search_page_size = max(
+                20,
+                min(100, ceil(request.max_candidate_projects / max(1, len(queries)))),
+            )
+            for query in queries:
+                _check_cancel()
+                _report(f"Searching PRIDE projects: {query}")
+                try:
+                    searched_records.extend(pride.search_projects(query, page_size=search_page_size))
+                    _report(f"Project search returned {len(searched_records)} raw records so far.")
+                except Exception as exc:  # pragma: no cover - defensive network boundary
+                    failures.append({"stage": "search_projects", "query": query, "error": str(exc)})
+                    _report(f"Project search failed for query '{query}': {exc}")
 
-        candidates = _dedupe_projects(searched_records, request.max_candidate_projects)
+        candidates = _rank_candidate_projects(
+            searched_records, request, request.max_candidate_projects
+        )
         _report(f"Deduped to {len(candidates)} candidate project(s).")
         scored_items: list[tuple[DiscoveredProject, list[DiscoveredFile]]] = []
         excluded_projects = 0

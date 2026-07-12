@@ -22,7 +22,7 @@ COPY src/ src/
 COPY profiles/ profiles/
 COPY scripts/ scripts/
 
-RUN pip install --no-cache-dir -e ".[dev,web]" fastapi "uvicorn[standard]" python-dotenv
+RUN pip install --no-cache-dir -e ".[agents-sdk,dev,web]" fastapi "uvicorn[standard]" python-dotenv
 
 RUN mkdir -p /app/data /app/runs /app/.agent_cache
 

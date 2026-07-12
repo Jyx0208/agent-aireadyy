@@ -364,7 +364,7 @@ class OpenAICompatibleReasoner:
     def __init__(
         self,
         api_key: str,
-        model: str = "deepseek-v4-flash",
+        model: str = "deepseek-v4-pro",
         base_url: str = "https://api.deepseek.com",
         timeout: float = 300.0,
     ) -> None:
@@ -513,7 +513,7 @@ def default_llm_reasoner() -> LLMReasoner | None:
     api_key = os.getenv("AGENT_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
-    model = os.getenv("AGENT_LLM_MODEL", "deepseek-v4-flash")
+    model = os.getenv("AGENT_LLM_MODEL", "deepseek-v4-pro")
     base_url = os.getenv("AGENT_LLM_BASE_URL", "https://api.deepseek.com")
     timeout = _llm_timeout_from_env()
     return OpenAICompatibleReasoner(api_key=api_key, model=model, base_url=base_url, timeout=timeout)
@@ -553,7 +553,7 @@ def confirm_no_sdrf_parameters(
             "示例配置：\n"
             "  AGENT_LLM_API_KEY=your_deepseek_api_key\n"
             "  AGENT_LLM_BASE_URL=https://api.deepseek.com\n"
-            "  AGENT_LLM_MODEL=deepseek-v4-flash"
+            "  AGENT_LLM_MODEL=deepseek-v4-pro"
         )
 
     if report is not None:
@@ -636,7 +636,7 @@ def confirm_sdrf_parameters(
             "示例配置：\n"
             "  AGENT_LLM_API_KEY=your_deepseek_api_key\n"
             "  AGENT_LLM_BASE_URL=https://api.deepseek.com\n"
-            "  AGENT_LLM_MODEL=deepseek-v4-flash"
+            "  AGENT_LLM_MODEL=deepseek-v4-pro"
         )
 
     if report is not None:

@@ -13,6 +13,8 @@ This folder is organized for final handoff. Start with the handoff and reproduct
 ## Current Technical References
 
 - `module-architecture.md` - current architecture overview.
+- `openai-agents-control-plane.md` - experimental OpenAI Agents SDK control plane, safety policy, and state model.
+- `discovery-agent-v2-quality-first.md` - quality-first candidate search, dynamic budget, and Workflow replacement gate.
 - `docker_reproducibility.md` - Docker setup and reproducibility notes.
 - `repository-adapters.md` - PRIDE / MassIVE / iProX adapter contract.
 - `model-adapter-metrics.md` - model-loop adapter metric schema.
@@ -26,4 +28,3 @@ These files describe earlier implementation stages. They are retained because th
 - `frontend_component_architecture.md` - single-page UI structure.
 - `one-click-deploy.md` - older deployment helper notes.
 - `project-report.md` - project summary updated to current task-aware positioning.
-

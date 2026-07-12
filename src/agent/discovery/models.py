@@ -52,6 +52,22 @@ class DatasetRequest(JsonModel):
     max_files: int = Field(default=2000, ge=1)
     max_candidate_projects: int = Field(default=300, ge=1)
     max_files_per_project: int = Field(default=50, ge=1)
+    hard_constraint_fields: list[str] = Field(
+        default_factory=lambda: [
+            "repository",
+            "goal",
+            "ptm_type",
+            "ptm_types",
+            "species",
+            "species_policy",
+            "acquisition_mode",
+            "labeling_strategy",
+        ]
+    )
+    constraint_provenance: dict[str, str] = Field(default_factory=dict)
+
+    def is_hard_constraint(self, field_name: str) -> bool:
+        return str(field_name) in set(self.hard_constraint_fields)
 
 
 class DiscoveredProject(JsonModel):

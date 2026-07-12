@@ -7,6 +7,8 @@ from typing import Any
 
 import httpx
 
+from agent.repositories.metering import record_repository_request
+
 
 class PrideClient:
     def __init__(
@@ -31,11 +33,13 @@ class PrideClient:
         self.close()
 
     def search_projects(self, keyword: str, page_size: int = 100) -> list[dict[str, Any]]:
+        record_repository_request("pride", "search_projects")
         response = self._client.get("/search/projects", params={"keyword": keyword, "pageSize": page_size})
         response.raise_for_status()
         return response.json()
 
     def get_project(self, accession: str) -> dict[str, Any]:
+        record_repository_request("pride", "get_project")
         response = self._client.get(f"/projects/{accession}")
         response.raise_for_status()
         return response.json()
@@ -59,6 +63,7 @@ class PrideClient:
         while True:
             page_params = dict(params)
             page_params["page"] = page
+            record_repository_request("pride", "list_project_files")
             response = self._client.get(f"/projects/{accession}/files", params=page_params)
             response.raise_for_status()
             batch = response.json()

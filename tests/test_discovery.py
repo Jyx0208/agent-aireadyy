@@ -13,7 +13,7 @@ from agent.discovery.manifest import MANIFEST_COLUMNS, write_dataset_manifest
 from agent.discovery.memory import DiscoveryMemory, DiscoveryReviewDecision, now_utc_iso
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
 from agent.discovery.pride_discovery import discover_pride_dataset
-from agent.discovery.query_builder import build_pride_queries
+from agent.discovery.query_builder import build_pride_queries, prepare_pride_search_queries
 from agent.discovery.scoring import (
     build_discovered_project,
     classify_file_role,
@@ -91,6 +91,102 @@ def test_query_builder_general_request_uses_free_text_terms():
     assert "drug treatment DDA" in queries
     assert "kinase inhibitor data dependent" in queries
     assert any("Homo sapiens drug treatment" in query for query in queries)
+
+
+def test_pride_query_adapter_turns_compound_agent_queries_into_distinct_seeds():
+    queries = prepare_pride_search_queries(
+        [
+            "human DDA Orbitrap label-free",
+            "HeLa DDA Orbitrap",
+            "HEK293 DDA Orbitrap label-free",
+            "human DDA Orbitrap gradient length",
+            "human label-free DDA Q Exactive",
+            "human DDA Orbitrap Fusion Lumos",
+        ]
+    )
+
+    assert queries == ["human", "HeLa", "HEK293", "DDA", "label-free", "Orbitrap"]
+
+
+def test_discovery_executes_high_recall_queries_with_balanced_page_sizes():
+    class SearchRecordingClient:
+        def __init__(self):
+            self.calls: list[tuple[str, int]] = []
+
+        def search_projects(self, keyword: str, page_size: int = 100):
+            self.calls.append((keyword, page_size))
+            return []
+
+        def close(self):
+            return None
+
+    client = SearchRecordingClient()
+    request = DatasetRequest(max_candidate_projects=25, max_projects=5, max_files=10)
+
+    discover_pride_dataset(
+        request,
+        client=client,
+        queries=[
+            "human DDA Orbitrap label-free",
+            "HeLa DDA Orbitrap",
+            "HEK293 DDA Orbitrap label-free",
+            "human DDA Orbitrap gradient length",
+            "human label-free DDA Q Exactive",
+            "human DDA Orbitrap Fusion Lumos",
+        ],
+    )
+
+    assert client.calls == [
+        ("human", 20),
+        ("HeLa", 20),
+        ("HEK293", 20),
+        ("DDA", 20),
+        ("label-free", 20),
+        ("Orbitrap", 20),
+    ]
+
+
+def test_discovery_ranks_relevant_older_candidates_before_inspection():
+    target = _project(
+        "PXD000900",
+        title="Confetti: A Multi-protease Map of the HeLa Proteome",
+    )
+    distractors = [
+        _project(f"PXD9{index:05d}", title=f"Unrelated recent project {index}")
+        for index in range(19)
+    ]
+
+    class RankedSearchClient:
+        def __init__(self):
+            self.inspected: list[str] = []
+
+        def search_projects(self, keyword: str, page_size: int = 100):
+            return [*distractors, target][:page_size]
+
+        def get_project(self, accession: str):
+            self.inspected.append(accession)
+            return target if accession == "PXD000900" else distractors[0]
+
+        def list_project_files(self, accession: str, **_kwargs):
+            return []
+
+        def close(self):
+            return None
+
+    client = RankedSearchClient()
+    request = DatasetRequest(
+        goal="general",
+        query_terms=["HeLa", "multi-protease"],
+        species=["Homo sapiens"],
+        species_policy="include_only",
+        max_candidate_projects=1,
+        max_projects=1,
+        max_files=1,
+    )
+
+    discover_pride_dataset(request, client=client, queries=["multi-protease"])
+
+    assert client.inspected == ["PXD000900"]
 
 
 def test_scoring_prefers_phospho_project_metadata():

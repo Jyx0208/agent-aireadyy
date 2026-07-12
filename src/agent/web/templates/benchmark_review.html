@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Discovery Benchmark 盲评</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17202a;
+      --muted: #5d6875;
+      --line: #d8dde3;
+      --surface: #ffffff;
+      --canvas: #f4f6f8;
+      --accent: #087f8c;
+      --accent-soft: #e4f3f4;
+      --danger: #b42318;
+      --warning: #9a6700;
+      --success: #16794b;
+      --blue: #2867b2;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--canvas);
+      color: var(--ink);
+      font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
+      letter-spacing: 0;
+    }
+    button, input, select, textarea { font: inherit; letter-spacing: 0; }
+    button, .file-button {
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--ink);
+      padding: 7px 12px;
+      cursor: pointer;
+    }
+    button:hover, .file-button:hover { border-color: var(--accent); }
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, .file-button:focus-visible {
+      outline: 3px solid rgba(8, 127, 140, .24);
+      outline-offset: 1px;
+    }
+    button:disabled { cursor: not-allowed; opacity: .45; }
+    header {
+      background: #202a33;
+      color: #fff;
+      border-bottom: 3px solid var(--accent);
+    }
+    .header-inner, main { width: min(1120px, calc(100% - 32px)); margin: 0 auto; }
+    .header-inner { min-height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    h1 { margin: 0; font-size: 20px; font-weight: 650; }
+    .progress-text { color: #d9e3e8; font-variant-numeric: tabular-nums; }
+    .toolbar {
+      display: grid;
+      grid-template-columns: auto minmax(150px, 1fr) minmax(190px, 1.3fr) auto;
+      gap: 10px;
+      align-items: end;
+      padding: 18px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .field { display: grid; gap: 5px; }
+    label { color: var(--muted); font-size: 13px; }
+    input[type="text"], select, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--ink);
+      padding: 8px 10px;
+    }
+    input[type="file"] { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
+    .file-button { display: inline-flex; align-items: center; white-space: nowrap; }
+    .primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .review-shell { padding: 18px 0 32px; }
+    .empty {
+      min-height: 300px;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      text-align: center;
+    }
+    .review { display: none; }
+    .task-band {
+      border-left: 4px solid var(--accent);
+      background: var(--accent-soft);
+      padding: 12px 14px;
+      margin-bottom: 16px;
+    }
+    .task-band strong { display: block; margin-bottom: 5px; font-size: 14px; }
+    .task-prompt { line-height: 1.55; }
+    .candidate {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 18px;
+    }
+    .candidate-head { display: flex; justify-content: space-between; align-items: start; gap: 14px; }
+    h2 { margin: 0; font-size: 20px; line-height: 1.35; }
+    .candidate-index { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .description { margin: 14px 0; color: #35404b; line-height: 1.55; white-space: pre-wrap; }
+    .metadata {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      margin: 16px 0;
+    }
+    .meta { padding: 10px 12px 10px 0; min-width: 0; }
+    .meta dt { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+    .meta dd { margin: 0; overflow-wrap: anywhere; }
+    .grade-label { color: var(--ink); font-size: 14px; font-weight: 650; margin-bottom: 8px; }
+    .grades { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    .grade { min-height: 48px; text-align: left; }
+    .grade[data-grade="0"] { border-left: 4px solid var(--danger); }
+    .grade[data-grade="1"] { border-left: 4px solid var(--blue); }
+    .grade[data-grade="2"] { border-left: 4px solid var(--warning); }
+    .grade[data-grade="3"] { border-left: 4px solid var(--success); }
+    .grade.selected { background: #202a33; border-color: #202a33; color: #fff; }
+    .notes { margin-top: 16px; }
+    textarea { min-height: 86px; resize: vertical; }
+    .navigation { display: flex; justify-content: space-between; gap: 12px; margin-top: 14px; }
+    .navigation-group { display: flex; gap: 8px; }
+    .status { min-height: 22px; color: var(--muted); padding-top: 8px; }
+    @media (max-width: 760px) {
+      .header-inner { align-items: flex-start; flex-direction: column; padding: 13px 0; }
+      .toolbar { grid-template-columns: 1fr 1fr; }
+      .metadata { grid-template-columns: 1fr 1fr; }
+      .grades { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 480px) {
+      .header-inner, main { width: min(100% - 20px, 1120px); }
+      .toolbar, .metadata, .grades { grid-template-columns: 1fr; }
+      .candidate-head, .navigation { flex-direction: column; }
+      .navigation-group { width: 100%; }
+      .navigation-group button { flex: 1; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <h1>Discovery Benchmark 盲评</h1>
+      <div class="progress-text" id="progressText" aria-live="polite">尚未载入评审池</div>
+    </div>
+  </header>
+  <main>
+    <section class="toolbar" aria-label="评审工具栏">
+      <div>
+        <input id="poolFile" type="file" accept="application/json,.json">
+        <label class="file-button" for="poolFile" tabindex="0">打开盲评池</label>
+      </div>
+      <div class="field">
+        <label for="reviewerId">评审人编号</label>
+        <input id="reviewerId" type="text" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="taskFilter">问题</label>
+        <select id="taskFilter" disabled><option value="all">全部问题</option></select>
+      </div>
+      <button class="primary" id="exportButton" type="button" disabled>导出评分</button>
+    </section>
+
+    <section class="review-shell">
+      <div class="empty" id="emptyState">请选择 judgment_pool.blinded.json</div>
+      <div class="review" id="reviewArea">
+        <div class="task-band">
+          <strong id="taskName"></strong>
+          <div class="task-prompt" id="taskPrompt"></div>
+        </div>
+        <article class="candidate">
+          <div class="candidate-head">
+            <h2 id="projectTitle"></h2>
+            <div class="candidate-index" id="candidateIndex"></div>
+          </div>
+          <div class="description" id="projectDescription"></div>
+          <dl class="metadata" id="metadata"></dl>
+          <div class="grade-label">相关性评分</div>
+          <div class="grades" role="group" aria-label="相关性评分">
+            <button class="grade" type="button" data-grade="0">0 不相关或冲突</button>
+            <button class="grade" type="button" data-grade="1">1 相关但不适用</button>
+            <button class="grade" type="button" data-grade="2">2 高度相关</button>
+            <button class="grade" type="button" data-grade="3">3 直接满足</button>
+          </div>
+          <div class="field notes">
+            <label for="reviewNotes">评分理由</label>
+            <textarea id="reviewNotes"></textarea>
+          </div>
+        </article>
+        <nav class="navigation" aria-label="候选导航">
+          <div class="navigation-group">
+            <button id="previousButton" type="button" title="上一个候选" aria-label="上一个候选">&#8592;</button>
+            <button id="nextButton" type="button" title="下一个候选" aria-label="下一个候选">&#8594;</button>
+          </div>
+          <div class="navigation-group">
+            <button id="nextUngradedButton" type="button">下一个未评分</button>
+            <button id="clearButton" type="button">清空本地评分</button>
+          </div>
+        </nav>
+        <div class="status" id="statusText" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const storageKey = "discovery-blind-review/v1";
+    let pool = null;
+    let visible = [];
+    let currentIndex = 0;
+
+    const byId = (id) => document.getElementById(id);
+    const poolFile = byId("poolFile");
+    const reviewerId = byId("reviewerId");
+    const taskFilter = byId("taskFilter");
+    const exportButton = byId("exportButton");
+    const gradeButtons = [...document.querySelectorAll(".grade")];
+
+    function text(value) {
+      if (Array.isArray(value)) return value.length ? value.join(", ") : "未记录";
+      if (value === null || value === undefined || value === "") return "未记录";
+      return String(value);
+    }
+
+    function reviewState() {
+      try { return JSON.parse(localStorage.getItem(storageKey) || "{}"); }
+      catch { return {}; }
+    }
+
+    function saveState() {
+      if (!pool) return;
+      const reviews = {};
+      for (const candidate of pool.candidates) {
+        if (candidate.grade !== null || candidate.review_notes) {
+          reviews[candidate.candidate_id] = {
+            grade: candidate.grade,
+            review_notes: candidate.review_notes || "",
+            reviewer_id: candidate.reviewer_id || reviewerId.value.trim()
+          };
+        }
+      }
+      localStorage.setItem(storageKey, JSON.stringify({ reviewer_id: reviewerId.value.trim(), reviews }));
+    }
+
+    function restoreState() {
+      const saved = reviewState();
+      reviewerId.value = saved.reviewer_id || "";
+      for (const candidate of pool.candidates) {
+        const review = (saved.reviews || {})[candidate.candidate_id];
+        if (!review) continue;
+        candidate.grade = review.grade;
+        candidate.review_notes = review.review_notes || "";
+        candidate.reviewer_id = review.reviewer_id || "";
+      }
+    }
+
+    function taskKey(candidate) { return `${candidate.scenario_id}:${candidate.variant_id}`; }
+
+    function rebuildFilter() {
+      const keys = [...new Set(pool.candidates.map(taskKey))].sort();
+      taskFilter.innerHTML = '<option value="all">全部问题</option>';
+      for (const key of keys) {
+        const option = document.createElement("option");
+        option.value = key;
+        option.textContent = key;
+        taskFilter.appendChild(option);
+      }
+      taskFilter.disabled = false;
+    }
+
+    function applyFilter() {
+      visible = pool.candidates.filter((candidate) => taskFilter.value === "all" || taskKey(candidate) === taskFilter.value);
+      currentIndex = Math.min(currentIndex, Math.max(0, visible.length - 1));
+      render();
+    }
+
+    function meta(label, value) {
+      const wrapper = document.createElement("div");
+      wrapper.className = "meta";
+      const dt = document.createElement("dt");
+      const dd = document.createElement("dd");
+      dt.textContent = label;
+      dd.textContent = text(value);
+      wrapper.append(dt, dd);
+      return wrapper;
+    }
+
+    function render() {
+      if (!pool || !visible.length) return;
+      const candidate = visible[currentIndex];
+      const key = taskKey(candidate);
+      const task = (pool.tasks || {})[key] || {};
+      byId("taskName").textContent = key;
+      byId("taskPrompt").textContent = task.visible_prompt || candidate.visible_prompt || "";
+      byId("projectTitle").textContent = candidate.project_title || "未命名项目";
+      byId("projectDescription").textContent = candidate.project_description || "没有项目描述";
+      byId("candidateIndex").textContent = `${currentIndex + 1} / ${visible.length}`;
+      const metadata = byId("metadata");
+      metadata.replaceChildren(
+        meta("物种", candidate.species),
+        meta("采集模式", candidate.acquisition_mode),
+        meta("标记方式", candidate.labeling_strategy),
+        meta("仪器", candidate.instrument_families),
+        meta("HLA 类别", candidate.hla_class),
+        meta("富集方法", candidate.immunopeptide_enrichment_methods),
+        meta("免疫肽范围", candidate.immunopeptide_scope),
+        meta("证据完整度", candidate.evidence_completeness),
+        meta("选中文件数", candidate.selected_file_count)
+      );
+      for (const button of gradeButtons) {
+        const selected = Number(button.dataset.grade) === candidate.grade;
+        button.classList.toggle("selected", selected);
+        button.setAttribute("aria-pressed", String(selected));
+      }
+      byId("reviewNotes").value = candidate.review_notes || "";
+      byId("previousButton").disabled = currentIndex === 0;
+      byId("nextButton").disabled = currentIndex >= visible.length - 1;
+      const graded = pool.candidates.filter((item) => Number.isInteger(item.grade)).length;
+      byId("progressText").textContent = `已评分 ${graded} / ${pool.candidates.length}`;
+      byId("statusText").textContent = Number.isInteger(candidate.grade) ? `当前评分：${candidate.grade}` : "当前候选未评分";
+    }
+
+    poolFile.addEventListener("change", async () => {
+      const file = poolFile.files[0];
+      if (!file) return;
+      try {
+        const parsed = JSON.parse(await file.text());
+        if (!Array.isArray(parsed.candidates) || !parsed.candidates.length) throw new Error("评审池没有候选项目");
+        pool = parsed;
+        restoreState();
+        rebuildFilter();
+        visible = [...pool.candidates];
+        currentIndex = 0;
+        byId("emptyState").style.display = "none";
+        byId("reviewArea").style.display = "block";
+        exportButton.disabled = false;
+        render();
+      } catch (error) {
+        byId("emptyState").textContent = `无法读取评审池：${error.message}`;
+      }
+    });
+
+    gradeButtons.forEach((button) => button.addEventListener("click", () => {
+      const candidate = visible[currentIndex];
+      candidate.grade = Number(button.dataset.grade);
+      candidate.reviewer_id = reviewerId.value.trim();
+      saveState();
+      render();
+    }));
+
+    byId("reviewNotes").addEventListener("input", (event) => {
+      visible[currentIndex].review_notes = event.target.value;
+      visible[currentIndex].reviewer_id = reviewerId.value.trim();
+      saveState();
+    });
+    reviewerId.addEventListener("input", saveState);
+    taskFilter.addEventListener("change", applyFilter);
+    byId("previousButton").addEventListener("click", () => { currentIndex--; render(); });
+    byId("nextButton").addEventListener("click", () => { currentIndex++; render(); });
+    byId("nextUngradedButton").addEventListener("click", () => {
+      const next = visible.findIndex((candidate, index) => index > currentIndex && !Number.isInteger(candidate.grade));
+      const wrapped = visible.findIndex((candidate) => !Number.isInteger(candidate.grade));
+      const target = next >= 0 ? next : wrapped;
+      if (target >= 0) { currentIndex = target; render(); }
+      else byId("statusText").textContent = "当前范围已全部评分";
+    });
+    byId("clearButton").addEventListener("click", () => {
+      if (!pool || !confirm("清空当前浏览器中的全部评分？")) return;
+      localStorage.removeItem(storageKey);
+      for (const candidate of pool.candidates) {
+        candidate.grade = null;
+        candidate.review_notes = "";
+        candidate.reviewer_id = "";
+      }
+      render();
+    });
+    exportButton.addEventListener("click", () => {
+      for (const candidate of pool.candidates) candidate.reviewer_id = candidate.reviewer_id || reviewerId.value.trim();
+      const output = { ...pool, reviewed_at: new Date().toISOString(), reviewer_id: reviewerId.value.trim() };
+      const blob = new Blob([JSON.stringify(output, null, 2) + "\n"], { type: "application/json" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = "judgment_pool.reviewed.json";
+      link.click();
+      URL.revokeObjectURL(link.href);
+    });
+  </script>
+</body>
+</html>

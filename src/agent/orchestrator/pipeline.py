@@ -110,7 +110,7 @@ class AgentService:
                 "示例配置：\n"
                 "  AGENT_LLM_API_KEY=your_deepseek_api_key\n"
                 "  AGENT_LLM_BASE_URL=https://api.deepseek.com\n"
-                "  AGENT_LLM_MODEL=deepseek-v4-flash"
+                "  AGENT_LLM_MODEL=deepseek-v4-pro"
             )
 
     def _report(self, message: str) -> None:

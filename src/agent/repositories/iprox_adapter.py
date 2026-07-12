@@ -25,6 +25,7 @@ from agent.repositories.matching import (
     match_canonical_file,
     score_file_match,
 )
+from agent.repositories.metering import record_repository_request
 
 
 _IPROX_INDEX_ENV = "AGENT_IPROX_INDEX_XLSX"
@@ -370,6 +371,7 @@ def _fetch_text(url: str, timeout: int = 45) -> str:
 
 def _project_ids_for_year(year: int, *, base_url: str = _IPROX_PUBLIC_BASE) -> list[str]:
     url = f"{base_url.rstrip('/')}/projectFileList/getProjectDataFileByYear.jsonp?date={int(year)}"
+    record_repository_request("iprox", "search_projects")
     payload = _read_json_payload(_fetch_text(url))
     data = payload.get("data") or []
     return [str(item).strip().upper() for item in data if str(item).strip()]
@@ -488,6 +490,7 @@ def refresh_public_iprox_index(
             "xml_url": xml_url,
         }
         try:
+            record_repository_request("iprox", "get_project_metadata")
             xml_text = _fetch_text(xml_url)
             (xml_dir / f"{project_id}.xml").write_text(xml_text, encoding="utf-8")
             metadata = parse_iprox_project_xml(xml_text)
@@ -1030,6 +1033,7 @@ class IproxAdapter:
             for candidate_url in candidate_urls:
                 try:
                     cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    record_repository_request("iprox", "get_project_metadata")
                     with urllib.request.urlopen(_quote_download_url(candidate_url), timeout=30) as response:
                         cache_path.write_bytes(response.read())
                     break

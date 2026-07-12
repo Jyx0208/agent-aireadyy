@@ -92,6 +92,57 @@ CLI inside Docker:
 docker compose exec web python -m agent.cli check-runtime
 ```
 
+## OpenAI Agents SDK Discovery (Experimental)
+
+The project includes a quality-first OpenAI Agents SDK control plane for
+bounded ReAct-style repository discovery. `multi_agent` is the default: a
+Discovery Manager controls query depth and candidate inspection, while a
+separate Budget Agent expands search only when measured quality gaps justify
+more work. Workflow remains temporarily available as a replacement benchmark
+baseline.
+
+```powershell
+docker compose exec web python -m agent.cli agents-discover-dataset `
+  --prompt "Find human phosphoproteomics DDA data for RT prediction" `
+  --repository pride `
+  --task-type rt_prediction `
+  --discovery-mode multi_agent `
+  --max-query-units 60 `
+  --max-repository-requests 300 `
+  --max-elapsed-seconds 1800 `
+  --output-dir runs/discovery/agents_sdk_smoke
+```
+
+In multi-Agent mode, each proposed search expansion is reviewed by the Budget
+Agent. Its `grant`, `shrink`, `replan`, or `stop` decision is validated by the
+deterministic governor. An issued grant is query-bound and single-use. Search
+and inspection observations report semantic coverage, high-relevance gain,
+duplicates, evidence gaps, and usable-file yield. The runtime still cannot
+download files, run shell commands, start a full search workflow, train a
+model, or change biological constraints.
+
+Each run writes a SQLite run ledger, public structured events, per-round
+manifests, the selected compatibility manifest, and
+`agents_discovery_budget.json`. The visible activity log contains concise
+evidence summaries and tool outcomes, not raw hidden model chain-of-thought.
+See `docs/openai-agents-control-plane.md` and
+`docs/discovery-agent-v2-quality-first.md`.
+
+The same runtime is available in the Web UI under `Dataset discovery` by
+switching `Execution` from `Workflow` to `OpenAI Agent`. The page can use the
+API key entered for that run, or fall back to server environment variables.
+Browser-supplied keys are kept only for the active request and are not written
+to discovery results, logs, or downloads. Search allocation is autonomous in
+the Web UI; operators configure only hard ceilings through server environment
+variables. The activity, tools, and raw-event tabs expose the public audit
+stream without displaying hidden chain-of-thought.
+
+For a trusted local deployment, the API Configuration panel can validate and
+save the provider key in `.agent_secrets/llm_config.json`, which is excluded
+from Git and never returned to the browser. The panel can fetch the provider's
+available models from `/models`; `deepseek-v4-pro` is the default. Use the
+delete action before sharing or moving a working copy.
+
 ## Reproduce the Protected Benchmark
 
 See the full reproduction guide:

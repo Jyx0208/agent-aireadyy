@@ -158,6 +158,9 @@ def _safe_task_spec(
     default_task_type = task_profile.task_type if task_profile else ("general_discovery" if request.goal == "general" and request_ptm_is_unknown else "ptm_discovery")
     target_ptm = None if request.goal == "general" and request_ptm_is_unknown else request.ptm_type
     modification_scope = None if request.goal == "general" and request_ptm_is_unknown else (request.modification_scope or request.ptm_type)
+    resolved_target_ptm = target_ptm or str(raw.get("target_ptm") or "") or None
+    resolved_modification_scope = modification_scope or str(raw.get("modification_scope") or "") or None
+    resolved_species = list(request.species) or _safe_string_list(raw.get("species_include"), [])
     spec = DiscoveryTaskSpec(
         task_type=str(raw.get("task_type") or default_task_type),
         target_ptm=str(raw.get("target_ptm") or target_ptm) if (raw.get("target_ptm") or target_ptm) else None,
@@ -185,11 +188,11 @@ def _safe_task_spec(
     return spec.model_copy(
         update={
             "task_type": task_profile.task_type if task_profile else spec.task_type,
-            "target_ptm": target_ptm,
-            "species_include": list(request.species),
+            "target_ptm": resolved_target_ptm,
+            "species_include": resolved_species,
             "acquisition_mode": request.acquisition_mode,
             "labeling_strategy": request.labeling_strategy,
-            "modification_scope": modification_scope,
+            "modification_scope": resolved_modification_scope,
             "immunopeptide_scope": request.immunopeptide_scope,
             "hla_class": request.hla_class,
             "hla_alleles": request.hla_alleles,
@@ -303,9 +306,13 @@ class AgenticDiscoveryPlanner:
             system_prompt=_planner_system_prompt(),
             user_prompt=_planner_user_prompt(prompt, request, task_profile=task_profile),
         )
+        task_spec = _safe_task_spec(payload, request, task_profile=task_profile)
         query_notes = _safe_query_notes(payload)
         llm_queries = [item.query for item in query_notes]
-        deterministic_queries = build_pride_queries(request)
+        baseline_request = request
+        if task_spec.target_ptm and str(request.ptm_type or "").casefold() in {"", "unknown_ptm", "unknown", "any"}:
+            baseline_request = request.model_copy(update={"goal": "ptm", "ptm_type": task_spec.target_ptm})
+        deterministic_queries = build_pride_queries(baseline_request)
         queries = _dedupe([*llm_queries, *deterministic_queries])[: max(8, min(40, request.max_candidate_projects))]
         warnings = [str(item) for item in payload.get("warnings", []) if str(item).strip()] if isinstance(payload.get("warnings", []), list) else []
         trace = _safe_trace(payload)
@@ -319,7 +326,7 @@ class AgenticDiscoveryPlanner:
             ]
         return AgenticDiscoveryPlan(
             request=request,
-            task_spec=_safe_task_spec(payload, request, task_profile=task_profile),
+            task_spec=task_spec,
             queries=queries,
             query_notes=query_notes,
             trace=trace,
@@ -347,7 +354,7 @@ def build_agentic_self_check(plan: AgenticDiscoveryPlan, manifest: DatasetManife
     unknown_counts = summary.get("unknown_counts") if isinstance(summary.get("unknown_counts"), dict) else {}
     if int(unknown_counts.get("fragmentation_method") or 0) > selected_files / 2:
         warnings.append("fragmentation_diversity_or_metadata_weak")
-        if plan.request.goal == "general":
+        if plan.task_spec.target_ptm != "phospho":
             bases = plan.request.query_terms[:3] or ["proteomics"]
             suggested_queries.extend([f"{base} HCD" for base in bases])
             suggested_queries.extend([f"{base} CID" for base in bases[:2]])
@@ -358,7 +365,7 @@ def build_agentic_self_check(plan: AgenticDiscoveryPlan, manifest: DatasetManife
     project_level_count = int(evidence_distribution.get("project") or 0)
     if selected_files and project_level_count > selected_files / 3:
         warnings.append("project_level_evidence_overrepresented")
-        if plan.request.goal == "general":
+        if plan.task_spec.target_ptm != "phospho":
             bases = plan.request.query_terms[:3] or ["proteomics"]
             suggested_queries.extend([f"{species} {base} raw" for species in plan.request.species for base in bases[:2]])
         else:
@@ -367,7 +374,7 @@ def build_agentic_self_check(plan: AgenticDiscoveryPlan, manifest: DatasetManife
     instrument_distribution = summary.get("instrument_family_distribution") if isinstance(summary.get("instrument_family_distribution"), dict) else {}
     if len(instrument_distribution) <= 1 and selected_files >= 10:
         warnings.append("instrument_diversity_low")
-        if plan.request.goal == "general":
+        if plan.task_spec.target_ptm != "phospho":
             base = (plan.request.query_terms or ["proteomics"])[0]
             suggested_queries.extend([f"{base} timsTOF", f"{base} Q Exactive", f"{base} Orbitrap Fusion"])
         else:

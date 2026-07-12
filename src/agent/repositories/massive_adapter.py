@@ -22,6 +22,7 @@ from agent.repositories.matching import (
     canonical_files_to_project_file_records,
     match_canonical_file,
 )
+from agent.repositories.metering import record_repository_request
 
 
 def _first_text(*values: Any) -> str | None:
@@ -162,6 +163,7 @@ class MassiveClient:
         self._client = httpx.Client(timeout=httpx.Timeout(timeout, read=max(timeout, 120.0)), follow_redirects=True)
 
     def get_dataset(self, accession: str) -> dict[str, Any]:
+        record_repository_request("massive", "get_project_metadata")
         response = self._client.get(f"{self.base_url}/proxi/v0.1/datasets/{accession}")
         response.raise_for_status()
         payload = response.json()
@@ -169,6 +171,7 @@ class MassiveClient:
 
     def query_datasets(self, accession: str) -> dict[str, Any]:
         query = quote(f'{{"title_input":"{accession}"}}')
+        record_repository_request("massive", "get_project_metadata")
         response = self._client.get(f"{self.base_url}/QueryDatasets?pageSize=30&offset=0&query={query}")
         response.raise_for_status()
         payload = response.json()
@@ -182,6 +185,7 @@ class MassiveClient:
 
     def search_datasets(self, query_text: str, page_size: int = 30) -> list[dict[str, Any]]:
         query = quote(f'{{"title_input":"{query_text}"}}')
+        record_repository_request("massive", "search_projects")
         response = self._client.get(f"{self.base_url}/QueryDatasets?pageSize={int(page_size)}&offset=0&query={query}")
         response.raise_for_status()
         payload = response.json()
@@ -199,6 +203,7 @@ class MassiveClient:
         # This hook supports deployments that point at a precomputed MassIVE file index CSV.
         if not csv_url:
             return []
+        record_repository_request("massive", "list_project_files")
         response = self._client.get(csv_url)
         response.raise_for_status()
         rows = csv.DictReader(io.StringIO(response.text))
@@ -213,6 +218,7 @@ class MassiveClient:
     def _datasetcache_csv(self, sql: str, timeout: float | None = None) -> list[dict[str, Any]]:
         url = "https://datasetcache.gnps2.org/datasette/database.csv?sql=" + quote(sql)
         request_timeout = httpx.Timeout(timeout, read=timeout) if timeout else None
+        record_repository_request("massive", "get_file_metadata")
         response = self._client.get(url, timeout=request_timeout)
         response.raise_for_status()
         text = response.text.lstrip("\ufeff\r\n")

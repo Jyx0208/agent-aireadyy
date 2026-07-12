@@ -42,7 +42,9 @@ from agent.ai_ready.model_informed_discovery import (
 from agent.ai_ready.model_loop import run_dataset_model_loop
 from agent.ai_ready.real_smoke import run_ai_ready_real_smoke
 from agent.ai_ready.validation import validate_ai_ready_build
-from agent.discovery.agentic import OpenAICompatibleDiscoveryLLM, default_agentic_discovery_planner, default_discovery_llm_client
+from agent.control_plane.models import AgentBudget, AgentEvent, DynamicBudgetLimits
+from agent.control_plane.openai_agents import run_openai_agents_discovery
+from agent.discovery.agentic import AgenticDiscoveryPlanner, OpenAICompatibleDiscoveryLLM, default_agentic_discovery_planner, default_discovery_llm_client
 from agent.discovery.agentic_runner import run_agentic_discovery
 from agent.discovery.features import extract_file_features, extract_project_features
 from agent.discovery.manifest import write_dataset_manifest
@@ -67,6 +69,7 @@ from agent.discovery.ontology import (
     species_from_text,
 )
 from agent.discovery.pride_discovery import discover_pride_dataset
+from agent.discovery.search_environment import PrideDiscoverySearchEnvironment
 from agent.discovery.repository_discovery import discover_repository_dataset
 from agent.discovery.scoring import build_discovered_project, classify_file_role, score_file, score_project
 from agent.discovery.task_readiness import annotate_manifest_task_readiness, normalize_task_type
@@ -85,6 +88,7 @@ from agent.repositories.registry import RepositoryRegistry
 from agent.runtime.system_metrics import collect_system_metrics
 from agent.utils import write_json
 from agent.web.history import history_timestamp, merge_project_history_records, with_history_identity
+from agent.web.llm_config_store import LLMConfigStore
 
 
 @asynccontextmanager
@@ -152,6 +156,10 @@ _DISCOVERY_DOWNLOAD_FILES = {
     "data_value_strategy_eval_md": ("data_value_strategy_eval.md", "text/markdown"),
     "agentic_plan": ("agentic_plan.json", "application/json"),
     "agentic_rounds": ("agentic_rounds.json", "application/json"),
+    "agents_discovery_summary_json": ("agents_discovery_summary.json", "application/json"),
+    "agents_discovery_events_json": ("agents_discovery_events.json", "application/json"),
+    "agents_discovery_report_md": ("agents_discovery_report.md", "text/markdown"),
+    "agents_discovery_budget_json": ("agents_discovery_budget.json", "application/json"),
 }
 _AI_READY_DOWNLOAD_FILES = {
     "input_profile_json": ("ai_ready_input_profile.json", "application/json"),
@@ -277,7 +285,7 @@ _UI_LANGUAGES = {"en", "zh"}
 # 默认配置（不从 .env 加载，由用户在页面填写）
 _DEFAULT_CONFIG = {
     "base_url": "https://api.deepseek.com",
-    "model": "deepseek-v4-flash",
+    "model": "deepseek-v4-pro",
     "timeout": "1200",
 }
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\[\d{1,3}(?:;\d{1,3})*m")
@@ -1121,6 +1129,46 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int
     return max(minimum, min(parsed, maximum))
 
 
+def _agent_discovery_configuration(
+    body: dict[str, Any],
+) -> tuple[str, AgentBudget, DynamicBudgetLimits]:
+    mode = _clean_text(os.getenv("AGENT_DISCOVERY_MODE") or "multi_agent").lower()
+    if mode not in {"single_agent", "multi_agent"}:
+        mode = "single_agent"
+    budget = AgentBudget(
+        max_turns=_bounded_int(os.getenv("AGENT_MAX_MODEL_TURNS"), default=50, minimum=1, maximum=50),
+        max_tool_calls=_bounded_int(os.getenv("AGENT_MAX_TOOL_CALLS"), default=100, minimum=1, maximum=100),
+        max_discovery_rounds=_bounded_int(
+            os.getenv("AGENT_MAX_DISCOVERY_ROUNDS"), default=3, minimum=1, maximum=3
+        ),
+    )
+    limits = DynamicBudgetLimits(
+        initial_query_units=_bounded_int(
+            os.getenv("AGENT_INITIAL_QUERY_UNITS"), default=12, minimum=1, maximum=500
+        ),
+        expanded_query_units=_bounded_int(
+            os.getenv("AGENT_EXPANDED_QUERY_UNITS"), default=30, minimum=1, maximum=500
+        ),
+        max_query_units=_bounded_int(os.getenv("AGENT_MAX_QUERY_UNITS"), default=60, minimum=1, maximum=500),
+        initial_repository_requests=_bounded_int(
+            os.getenv("AGENT_INITIAL_REPOSITORY_REQUESTS"), default=80, minimum=1, maximum=5000
+        ),
+        expanded_repository_requests=_bounded_int(
+            os.getenv("AGENT_EXPANDED_REPOSITORY_REQUESTS"), default=160, minimum=1, maximum=5000
+        ),
+        max_repository_requests=_bounded_int(
+            os.getenv("AGENT_MAX_REPOSITORY_REQUESTS"), default=300, minimum=1, maximum=5000
+        ),
+        max_elapsed_seconds=_bounded_int(
+            os.getenv("AGENT_MAX_ELAPSED_SECONDS"), default=1800, minimum=30, maximum=86400
+        ),
+        budget_agent_max_turns=_bounded_int(
+            os.getenv("AGENT_BUDGET_AGENT_MAX_TURNS"), default=3, minimum=2, maximum=10
+        ),
+    )
+    return mode, budget, limits
+
+
 def _clean_discovery_species(value: Any, *, default: list[str] | None = None) -> list[str]:
     if isinstance(value, list):
         values = [_clean_text(item) for item in value]
@@ -1144,8 +1192,19 @@ def _clean_discovery_ptm_types(value: Any, *, default: list[str] | None = None) 
 
 
 def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
-    acquisition = _clean_text(body.get("acquisition_mode") or body.get("acquisition") or "dda").lower()
+    acquisition_supplied = any(
+        key in body and bool(_clean_text(body.get(key)))
+        for key in ("acquisition_mode", "acquisition")
+    )
+    labeling_supplied = any(
+        key in body and bool(_clean_text(body.get(key)))
+        for key in ("labeling_strategy", "labeling")
+    )
+    acquisition = _clean_text(
+        body.get("acquisition_mode") or body.get("acquisition") or "unknown"
+    ).lower()
     repository = _clean_repository(body.get("repository") or "pride")
+    goal_supplied = "goal" in body and bool(_clean_text(body.get("goal")))
     goal = _clean_text(body.get("goal") or "general").lower()
     if goal not in {"general", "ptm"} and is_immunopeptidomics_goal(goal):
         goal = "immunopeptidomics"
@@ -1167,11 +1226,32 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
         query_terms = [*query_terms, *general_query_terms_from_text(_clean_text(body.get("prompt")))]
     raw_species = body.get("species")
     species = _clean_discovery_species(raw_species, default=[])
+    species_supplied = "species" in body and bool(species)
     species_policy = _clean_text(body.get("species_policy") or "open").lower()
     if species_policy not in {"open", "include_only", "exclude"}:
         species_policy = "open"
     canonical_species, taxon_ids = normalize_species_values(species)
     immunopeptide = interpret_immunopeptide_metadata(" ".join([goal, _clean_text(body.get("prompt")), _clean_text(body.get("immunopeptide_context"))]))
+    hard_constraint_fields = ["repository"]
+    constraint_provenance = {
+        "repository": "user" if "repository" in body else "default"
+    }
+    if goal_supplied:
+        hard_constraint_fields.append("goal")
+        constraint_provenance["goal"] = "user_or_parsed"
+    if species_supplied:
+        hard_constraint_fields.extend(["species", "species_policy"])
+        constraint_provenance["species"] = "user_or_parsed"
+        constraint_provenance["species_policy"] = "user_or_parsed"
+    if acquisition_supplied:
+        hard_constraint_fields.append("acquisition_mode")
+        constraint_provenance["acquisition_mode"] = "user_or_parsed"
+    if labeling_supplied:
+        hard_constraint_fields.append("labeling_strategy")
+        constraint_provenance["labeling_strategy"] = "user_or_parsed"
+    if goal != "general" and any(key in body for key in ("ptm", "ptm_type", "ptm_types")):
+        hard_constraint_fields.extend(["ptm_type", "ptm_types"])
+        constraint_provenance["ptm_type"] = "user_or_parsed"
     return DatasetRequest(
         repository=repository,
         goal=goal,
@@ -1189,12 +1269,16 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
         immunopeptide_evidence_terms=list(immunopeptide.evidence_terms),
         immunopeptide_enrichment_methods=list(immunopeptide.enrichment_methods),
         immunopeptide_metadata_confidence=immunopeptide.confidence,
-        labeling_strategy=normalize_labeling_strategy(body.get("labeling_strategy") or body.get("labeling") or "label_free"),
+        labeling_strategy=normalize_labeling_strategy(
+            body.get("labeling_strategy") or body.get("labeling") or "unknown"
+        ),
         acquisition_mode=acquisition,
         max_projects=_bounded_int(body.get("max_projects"), default=5, minimum=1, maximum=100),
         max_files=_bounded_int(body.get("max_files"), default=50, minimum=1, maximum=2000),
         max_candidate_projects=_bounded_int(body.get("max_candidate_projects"), default=50, minimum=1, maximum=300),
         max_files_per_project=_bounded_int(body.get("max_files_per_project"), default=20, minimum=1, maximum=100),
+        hard_constraint_fields=list(dict.fromkeys(hard_constraint_fields)),
+        constraint_provenance=constraint_provenance,
     )
 
 
@@ -1463,19 +1547,8 @@ def _run_discovery_goal_parse(body: dict[str, Any]) -> dict[str, Any]:
     prompt = _clean_text(body.get("prompt"))
     if not prompt:
         raise ValueError("Please enter a discovery request.")
-    llm_config = body.get("llm_config")
-    if isinstance(llm_config, dict) and _clean_text(llm_config.get("api_key")):
-        config, config_error = _build_llm_config(llm_config)
-        if config_error or config is None:
-            raise ValueError(config_error or "Invalid LLM configuration.")
-        client = OpenAICompatibleDiscoveryLLM(
-            api_key=config["api_key"],
-            base_url=config["base_url"],
-            model=config["model"],
-            timeout=_positive_float(config["timeout"], 120.0),
-        )
-    else:
-        client = default_discovery_llm_client()
+    llm_config = body.get("llm_config") if isinstance(body.get("llm_config"), dict) else {}
+    client = _discovery_llm_client(llm_config)
     if client is None:
         raise ValueError("No discovery LLM API key found. Fill API Configuration or set DEEPSEEK_API_KEY.")
     current = body.get("current") if isinstance(body.get("current"), dict) else {}
@@ -1530,7 +1603,16 @@ def _public_discovery_record(
     manifest: DatasetManifest,
     paths: dict[str, Path] | None = None,
     memory_saved: bool = False,
+    status: str = "completed",
+    runtime: str = "workflow",
+    agent: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    persisted_agent = manifest.summary.get("agent_runtime")
+    if agent is None and isinstance(persisted_agent, dict):
+        agent = dict(persisted_agent)
+    if agent is not None:
+        runtime = "openai_agents"
+        status = _clean_text(agent.get("status")) or status
     download_files = paths or {
         key: output_dir / filename
         for key, (filename, _media_type) in _DISCOVERY_DOWNLOAD_FILES.items()
@@ -1550,7 +1632,9 @@ def _public_discovery_record(
     return {
         "discovery_id": discovery_id,
         "run_id": manifest.run_id,
-        "status": "completed",
+        "status": status,
+        "runtime": runtime,
+        "agent": agent,
         "request": manifest.request.model_dump(mode="json"),
         "summary": {
             **manifest.summary,
@@ -2093,6 +2177,7 @@ def _run_web_discovery(
     body: dict[str, Any],
     report: Callable[[str], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    agent_event_callback: Callable[[AgentEvent], None] | None = None,
 ) -> dict[str, Any]:
     def _report(message: str) -> None:
         if report is not None:
@@ -2169,11 +2254,170 @@ def _run_web_discovery(
         finally:
             pride_client.close()
 
+    runtime = _clean_text(body.get("runtime") or body.get("discovery_runtime") or "workflow").lower()
+    if runtime in {"agent", "agents", "openai-agent", "openai_agents_sdk"}:
+        runtime = "openai_agents"
+    if runtime not in {"workflow", "openai_agents"}:
+        raise ValueError(f"Unsupported discovery runtime: {runtime}")
+
+    if runtime == "openai_agents":
+        _check_cancel()
+        prompt = _clean_text(body.get("prompt"))
+        if not prompt:
+            raise ValueError("Discovery request is required for OpenAI Agents mode.")
+        web_llm_config = body.get("llm_config") if isinstance(body.get("llm_config"), dict) else {}
+        agent_llm_config, config_error = _build_llm_config(web_llm_config)
+        if config_error or agent_llm_config is None:
+            raise ValueError(config_error or "Invalid LLM configuration.")
+        discovery_id = safe_output_stem(
+            f"agents_{datetime.now(_APP_TZ).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        )
+        output_dir = _discovery_root_dir() / discovery_id
+        normalized_task_type = normalize_task_type(task_type) if task_type else None
+        discovery_mode, budget, dynamic_limits = _agent_discovery_configuration(body)
+
+        def _agent_discovery_func(
+            discovery_request: DatasetRequest,
+            memory: DiscoveryMemory | None = None,
+            queries: list[str] | None = None,
+        ) -> DatasetManifest:
+            _check_cancel()
+            query_list = list(queries or [])
+            preview = "; ".join(query_list[:4])
+            _report(f"Act: repository search with {len(query_list)} query term(s){': ' + preview if preview else ''}")
+            observed = _discover_for_web(discovery_request, memory=memory, queries=query_list)
+            _report(
+                "Observe: "
+                f"{int(observed.summary.get('selected_projects') or len(observed.projects))} project(s), "
+                f"{int(observed.summary.get('selected_files') or len(observed.files))} file(s)."
+            )
+            return observed
+
+        _report(
+            "Reason: OpenAI Agents SDK is planning quality-first candidate search and inspection within server safety ceilings."
+        )
+        quality_client: PrideClient | None = None
+        search_environment: PrideDiscoverySearchEnvironment | None = None
+        if request.repository == "pride":
+            quality_client = PrideClient(timeout=15.0, read_timeout=15.0)
+            search_environment = PrideDiscoverySearchEnvironment(
+                request=request,
+                prompt=prompt,
+                state_path=output_dir / "candidate_search_state.json",
+                client=quality_client,
+                memory=prior_memory,
+                report=_report,
+                should_cancel=should_cancel,
+            )
+        try:
+            result = run_openai_agents_discovery(
+                prompt=prompt,
+                request=request,
+                output_dir=output_dir,
+                task_type=normalized_task_type,
+                state_db=output_dir / "agent_control.sqlite",
+                memory=prior_memory,
+                budget=budget,
+                mode=discovery_mode,
+                dynamic_limits=dynamic_limits,
+                run_id=discovery_id,
+                discovery_func=_agent_discovery_func,
+                search_environment=search_environment,
+                llm_config=agent_llm_config,
+                event_callback=agent_event_callback,
+                stream_events=True,
+            )
+        finally:
+            if quality_client is not None:
+                quality_client.close()
+        _check_cancel()
+        if result.status == "failed":
+            detail = "; ".join(result.blockers or result.warnings) or "OpenAI Agents discovery failed."
+            raise RuntimeError(detail)
+        manifest_path = Path(
+            result.selected_manifest_path
+            or result.files.get("dataset_manifest_json")
+            or output_dir / "dataset_manifest.json"
+        )
+        if not manifest_path.exists():
+            raise RuntimeError("OpenAI Agents discovery finished without a persisted dataset manifest.")
+        manifest = DatasetManifest.model_validate(json.loads(manifest_path.read_text(encoding="utf-8")))
+        control_summary = _read_json_if_exists(output_dir / "agents_discovery_summary.json")
+        dynamic_usage = control_summary.get("dynamic_usage") or {}
+        budget_audit = control_summary.get("budget_audit") or {}
+        save_memory = body.get("save_memory", True) is not False
+        agent_summary = {
+            "runtime": "openai_agents",
+            "status": result.status,
+            "run_id": result.run_id,
+            "discovery_rounds": result.discovery_round_count,
+            "candidate_searches": int(control_summary.get("candidate_search_count") or 0),
+            "candidate_inspections": int(control_summary.get("candidate_inspection_count") or 0),
+            "no_gain_actions": int(control_summary.get("no_gain_action_count") or 0),
+            "latest_metrics": control_summary.get("latest_metrics") or {},
+            "model_usage": control_summary.get("model_usage") or {},
+            "quality_budget_tier": _clean_text(budget_audit.get("quality_budget_tier")),
+            "tool_calls": int(control_summary.get("tool_call_count") or 0),
+            "stop_reason": _clean_text(control_summary.get("stop_reason")),
+            "final_output": result.final_output,
+            "warnings": list(result.warnings),
+            "blockers": list(result.blockers),
+            "selected_round_index": result.selected_round_index,
+            "selection_rationale": result.selection_rationale,
+            "mode": discovery_mode,
+            "budget": budget.model_dump(mode="json"),
+            "dynamic_limits": dynamic_limits.model_dump(mode="json"),
+            "query_units": int(dynamic_usage.get("query_units") or 0),
+            "repository_requests": int(dynamic_usage.get("repository_requests") or 0),
+            "search_batches": int(dynamic_usage.get("search_batches") or 0),
+            "budget_reviews": int(dynamic_usage.get("budget_reviews") or 0),
+            "pooled_selected_files": int(manifest.summary.get("selected_files") or len(manifest.files)),
+            "hard_limits_reached": bool(budget_audit.get("hard_limits_reached")),
+        }
+        summary = {
+            **manifest.summary,
+            "run_id": result.run_id,
+            "memory_used": use_memory,
+            "memory_saved": save_memory,
+            "agent_runtime": agent_summary,
+        }
+        manifest = manifest.model_copy(update={"run_id": result.run_id, "summary": summary})
+        paths = write_dataset_manifest(manifest, output_dir)
+        for key, raw_path in result.files.items():
+            path = Path(raw_path)
+            if key in _DISCOVERY_DOWNLOAD_FILES and path.exists():
+                paths[key] = path
+        if save_memory:
+            memory = DiscoveryMemory(_discovery_memory_dir())
+            memory.append_run(
+                build_run_record(
+                    run_id=result.run_id,
+                    manifest=manifest,
+                    output_dir=output_dir,
+                    manifest_path=paths["dataset_manifest_json"],
+                )
+            )
+        _report(
+            f"Final: Agent discovery {result.status}; "
+            f"{len(manifest.projects)} project(s), {len(manifest.files)} file(s)."
+        )
+        return _public_discovery_record(
+            discovery_id=discovery_id,
+            output_dir=output_dir,
+            manifest=manifest,
+            paths=paths,
+            memory_saved=save_memory,
+            status=result.status,
+            runtime="openai_agents",
+            agent=agent_summary,
+        )
+
     if agentic_enabled:
         _check_cancel()
         _report("Starting LLM agentic discovery planning.")
         try:
-            planner = default_agentic_discovery_planner()
+            web_llm_config = body.get("llm_config") if isinstance(body.get("llm_config"), dict) else {}
+            planner = _agentic_discovery_planner(web_llm_config)
         except Exception as exc:
             planner = None
             agentic_fallback = {
@@ -3575,10 +3819,18 @@ def _list_project_history_records_fast() -> list[dict[str, Any]]:
         item["can_download"] = bool(item.get("can_download"))
         records.append(_decorate_history_item(item))
 
-    for batch in _list_parameter_batch_history_records(include_file_stats=False):
+    for batch in _list_parameter_batch_history_records(include_file_stats=True):
         if batch.get("status") in _ACTIVE_STATUSES:
             continue
         records.append(_decorate_history_item(batch))
+
+    for result in _list_public_results():
+        task_updated_at = result.get("task_updated_at") or result.get("finished_at") or result.get("started_at") or result.get("created_at")
+        if task_updated_at:
+            result["updated_at"] = task_updated_at
+        if result.get("status") in _ACTIVE_STATUSES and not _history_item_is_active(result, active_task_ids, active_history_ids):
+            result = _mark_interrupted_history_item(result)
+        records.append(_decorate_history_item(result))
 
     with _tasks_lock:
         for task_id, task in _tasks.items():
@@ -3908,14 +4160,50 @@ def _start_ready_queued_tasks() -> list[str]:
     return started
 
 
+def _llm_config_store() -> LLMConfigStore:
+    return LLMConfigStore(os.getenv("AGENT_LLM_CONFIG_PATH") or ".agent_secrets/llm_config.json")
+
+
+def _server_llm_config() -> tuple[dict[str, str] | None, str]:
+    saved = _llm_config_store().load()
+    if saved is not None:
+        return saved, "saved"
+    api_key = _clean_text(
+        os.getenv("AGENT_LLM_API_KEY")
+        or os.getenv("DEEPSEEK_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+    )
+    if not api_key:
+        return None, "default"
+    return {
+        "api_key": api_key,
+        "base_url": _clean_text(os.getenv("AGENT_LLM_BASE_URL")) or _DEFAULT_CONFIG["base_url"],
+        "model": _clean_text(os.getenv("AGENT_LLM_MODEL")) or _DEFAULT_CONFIG["model"],
+        "timeout": _clean_text(os.getenv("AGENT_LLM_TIMEOUT")) or _DEFAULT_CONFIG["timeout"],
+    }, "environment"
+
+
+def _public_llm_config() -> dict[str, Any]:
+    config, source = _server_llm_config()
+    return {
+        "api_key_set": config is not None,
+        "base_url": (config or {}).get("base_url") or _DEFAULT_CONFIG["base_url"],
+        "model": (config or {}).get("model") or _DEFAULT_CONFIG["model"],
+        "timeout": (config or {}).get("timeout") or _DEFAULT_CONFIG["timeout"],
+        "source": source,
+    }
+
+
 def _build_llm_config(llm_config: dict[str, Any]) -> tuple[dict[str, str] | None, str | None]:
-    api_key = _clean_text(llm_config.get("api_key"))
+    server_config, _ = _server_llm_config()
+    fallback = server_config or {}
+    api_key = _clean_text(llm_config.get("api_key")) or fallback.get("api_key", "")
     if not api_key:
         return None, "请先填写本次任务使用的 API Key"
 
-    base_url = _clean_text(llm_config.get("base_url")) or os.getenv("AGENT_LLM_BASE_URL") or _DEFAULT_CONFIG["base_url"]
-    model = _clean_text(llm_config.get("model")) or os.getenv("AGENT_LLM_MODEL") or _DEFAULT_CONFIG["model"]
-    timeout = _clean_text(llm_config.get("timeout")) or os.getenv("AGENT_LLM_TIMEOUT") or _DEFAULT_CONFIG["timeout"]
+    base_url = _clean_text(llm_config.get("base_url")) or fallback.get("base_url") or _DEFAULT_CONFIG["base_url"]
+    model = _clean_text(llm_config.get("model")) or fallback.get("model") or _DEFAULT_CONFIG["model"]
+    timeout = _clean_text(llm_config.get("timeout")) or fallback.get("timeout") or _DEFAULT_CONFIG["timeout"]
     try:
         if float(timeout) <= 0:
             return None, "大模型超时时间必须大于 0"
@@ -3923,6 +4211,36 @@ def _build_llm_config(llm_config: dict[str, Any]) -> tuple[dict[str, str] | None
         return None, "大模型超时时间必须是数字"
 
     return {"api_key": api_key, "base_url": base_url.rstrip("/"), "model": model, "timeout": timeout}, None
+
+
+def _discovery_llm_client(llm_config: dict[str, Any]):
+    config, config_error = _build_llm_config(llm_config)
+    if config is not None:
+        return OpenAICompatibleDiscoveryLLM(
+            api_key=config["api_key"],
+            base_url=config["base_url"],
+            model=config["model"],
+            timeout=_positive_float(config["timeout"], 120.0),
+        )
+    if llm_config:
+        raise ValueError(config_error or "Invalid LLM configuration.")
+    return default_discovery_llm_client()
+
+
+def _agentic_discovery_planner(llm_config: dict[str, Any]) -> AgenticDiscoveryPlanner | None:
+    config, config_error = _build_llm_config(llm_config)
+    if config is not None:
+        return AgenticDiscoveryPlanner(
+            OpenAICompatibleDiscoveryLLM(
+                api_key=config["api_key"],
+                base_url=config["base_url"],
+                model=config["model"],
+                timeout=_positive_float(config["timeout"], 120.0),
+            )
+        )
+    if llm_config:
+        raise ValueError(config_error or "Invalid LLM configuration.")
+    return default_agentic_discovery_planner()
 
 
 def _task_llm_reasoner(config: dict[str, str]):
@@ -4200,6 +4518,30 @@ async def _run_llm_check(config: dict[str, str]) -> tuple[bool, str]:
     return await _check_llm_api(config)
 
 
+async def _fetch_llm_models(config: dict[str, str]) -> list[str]:
+    timeout = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.get(
+            f"{config['base_url']}/models",
+            headers={"Authorization": f"Bearer {config['api_key']}"},
+        )
+        response.raise_for_status()
+    payload = response.json()
+    records = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        raise ValueError("Model API response has no data list")
+    models = [
+        _clean_text(record.get("id"))
+        for record in records
+        if isinstance(record, dict) and _clean_text(record.get("id"))
+    ]
+    return list(dict.fromkeys(models))
+
+
+def _ordered_models(models: list[str], selected: str) -> list[str]:
+    return [model for model in dict.fromkeys([selected, *models]) if model]
+
+
 # ── 页面 ──────────────────────────────────────────────────────────
 def _start_result_cleanup_worker() -> None:
     global _cleanup_thread_started
@@ -4214,6 +4556,11 @@ async def index():
     return (_templates_dir / "index.html").read_text(encoding="utf-8")
 
 
+@app.get("/benchmark-review", response_class=HTMLResponse)
+async def benchmark_review():
+    return (_templates_dir / "benchmark_review.html").read_text(encoding="utf-8")
+
+
 # ── 健康检查 ──────────────────────────────────────────────────────
 @app.get("/api/health")
 async def health():
@@ -4221,7 +4568,7 @@ async def health():
         queue_state = _queue_state_locked()
     return {
         "status": "ok",
-        "llm_configured": False,
+        "llm_configured": _server_llm_config()[0] is not None,
         "per_task_api_keys": True,
         "result_retention_seconds": _result_retention_seconds(),
         "max_result_projects": _max_result_projects(),
@@ -4238,15 +4585,60 @@ async def get_config():
         queue_state = _queue_state_locked()
     return {
         "api_key_masked": "",
-        "api_key_set": False,
+        **_public_llm_config(),
         "per_task_api_keys": True,
-        "base_url": os.getenv("AGENT_LLM_BASE_URL") or _DEFAULT_CONFIG["base_url"],
-        "model": os.getenv("AGENT_LLM_MODEL") or _DEFAULT_CONFIG["model"],
-        "timeout": os.getenv("AGENT_LLM_TIMEOUT") or _DEFAULT_CONFIG["timeout"],
         "result_retention_seconds": _result_retention_seconds(),
         "max_result_projects": _max_result_projects(),
         "full_workflow_enabled": _full_workflow_enabled(),
         **queue_state,
+    }
+
+
+@app.get("/api/llm/config")
+async def get_llm_config():
+    return _public_llm_config()
+
+
+@app.put("/api/llm/config")
+async def save_llm_config(body: dict[str, Any]):
+    payload = body.get("llm_config", body)
+    if not isinstance(payload, dict):
+        payload = {}
+    existing = _llm_config_store().load() or {}
+    api_key = _clean_text(payload.get("api_key")) or existing.get("api_key", "")
+    if not api_key:
+        return {"ok": False, "error": "API Key is required before saving configuration."}
+    config, error = _build_llm_config({**existing, **payload, "api_key": api_key})
+    if error or config is None:
+        return {"ok": False, "error": error}
+    ok, message = await _run_llm_check(config)
+    if not ok:
+        return {"ok": False, "error": message}
+    _llm_config_store().save(config)
+    return {"ok": True, **_public_llm_config(), "message": message}
+
+
+@app.delete("/api/llm/config")
+async def delete_llm_config():
+    return {"ok": True, "deleted": _llm_config_store().delete()}
+
+
+@app.post("/api/llm/models")
+async def list_llm_models(body: dict[str, Any]):
+    payload = body.get("llm_config", body)
+    if not isinstance(payload, dict):
+        payload = {}
+    config, error = _build_llm_config(payload)
+    if error or config is None:
+        return {"ok": False, "error": error, "models": []}
+    try:
+        models = await _fetch_llm_models(config)
+    except Exception as exc:
+        return {"ok": False, "error": _llm_check_error(exc), "models": []}
+    return {
+        "ok": True,
+        "models": _ordered_models(models, config["model"]),
+        "selected": config["model"],
     }
 
 
@@ -4278,13 +4670,15 @@ async def list_public_results():
 @app.get("/api/history")
 async def list_project_history(fast: bool = True, refresh: bool = False):
     if fast and not refresh:
+        if not _read_history_index():
+            _sync_history_index_from_disk()
         with _tasks_lock:
             active_tasks = [
                 _public_task_record_locked(task_id, task)
                 for task_id, task in _tasks.items()
                 if task.get("status") in _ACTIVE_STATUSES
             ]
-        active_tasks.extend(batch for batch in _list_parameter_batch_history_records(include_file_stats=False) if batch.get("status") in _ACTIVE_STATUSES)
+        active_tasks.extend(batch for batch in _list_parameter_batch_history_records(include_file_stats=True) if batch.get("status") in _ACTIVE_STATUSES)
         active_tasks.sort(key=lambda item: str(item.get("created_at") or ""))
         active_task_ids = {str(item.get("task_id") or "") for item in active_tasks}
         active_history_ids = {str(item.get("history_id") or "") for item in active_tasks}
@@ -5341,7 +5735,131 @@ def _append_discovery_job_log(job_id: str, level: str, message: str) -> None:
         if not job:
             return
         logs = job.setdefault("logs", [])
-        logs.append({"ts": _now_app_iso(), "level": level, "message": _redact_secrets(str(message))})
+        sequence = max((int(item.get("sequence") or 0) for item in logs if isinstance(item, dict)), default=0) + 1
+        logs.append(
+            {
+                "sequence": sequence,
+                "ts": _now_app_iso(),
+                "level": level,
+                "actor": "Discovery Agent",
+                "type": "job_message",
+                "message": _redact_secrets(str(message)),
+                "reasoning_summary": "",
+                "evidence_refs": [],
+                "metrics": {},
+                "payload": {},
+            }
+        )
+        if len(logs) > _MAX_PERSISTED_LOGS:
+            del logs[: len(logs) - _MAX_PERSISTED_LOGS]
+        _persist_discovery_job(job)
+
+
+def _event_actor(event_type: str) -> str:
+    if event_type.startswith("budget_"):
+        return "Budget Agent"
+    if "grant" in event_type or event_type == "dynamic_search_stopped":
+        return "BudgetGovernor"
+    if event_type.startswith("sdk_"):
+        return "OpenAI Agents SDK"
+    if event_type.startswith("candidate_search_"):
+        return "Repository Search"
+    if event_type.startswith("candidate_inspection_"):
+        return "Candidate Inspector"
+    if event_type.startswith("tool_") or event_type == "repository_request_started":
+        return "Repository tool"
+    return "Discovery Agent"
+
+
+def _event_level(event_type: str) -> str:
+    if "invalid" in event_type or "rejected" in event_type or "failed" in event_type:
+        return "warning"
+    return "info"
+
+
+def _event_message(event: AgentEvent) -> str:
+    payload = event.payload
+    observation = payload.get("observation") or {}
+    action = payload.get("action") or {}
+    if event.event_type == "candidate_search_started":
+        queries = payload.get("queries") or []
+        return _redact_secrets(
+            f"Searching repository with {len(queries)} query plan(s): "
+            + "; ".join(str(query) for query in queries[:4])
+        )
+    if event.event_type == "candidate_search_completed":
+        return (
+            "Search observed "
+            f"{int(observation.get('candidate_count') or 0)} candidate project(s), "
+            f"{int(observation.get('new_candidate_count') or 0)} new and "
+            f"{int(observation.get('high_relevance_candidate_count') or 0)} high-relevance; "
+            f"semantic coverage {float(observation.get('semantic_coverage') or 0):.0%}."
+        )
+    if event.event_type == "candidate_inspection_started":
+        accessions = action.get("accessions") or []
+        return _redact_secrets(
+            f"Inspecting {len(accessions)} candidate project(s): "
+            + ", ".join(str(accession) for accession in accessions[:8])
+        )
+    if event.event_type == "candidate_inspection_completed":
+        return (
+            "Inspection produced "
+            f"{int(observation.get('selected_projects') or 0)} selected project(s) and "
+            f"{int(observation.get('selected_files') or 0)} selected file(s); "
+            f"next action: {observation.get('recommended_action') or 'reassess evidence'}."
+        )
+    return _redact_secrets(
+        str(
+            payload.get("reasoning_summary")
+            or payload.get("reason")
+            or payload.get("message")
+            or event.event_type.replace("_", " ")
+        )
+    )
+
+
+def _sanitize_log_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize_log_payload(item)
+            for key, item in value.items()
+            if str(key).casefold() not in {"api_key", "authorization", "sdk_state_json"}
+        }
+    if isinstance(value, list):
+        return [_sanitize_log_payload(item) for item in value]
+    if isinstance(value, str):
+        return _redact_secrets(value)
+    return _json_safe(value)
+
+
+def _append_discovery_job_event(job_id: str, event: AgentEvent) -> None:
+    event_metrics: Any = event.payload.get("metrics") or {}
+    if event.event_type == "round_value_evaluated":
+        event_metrics = event.payload
+    elif event.event_type == "candidate_inspection_completed":
+        event_metrics = (event.payload.get("observation") or {}).get("metrics") or {}
+    entry = {
+        "source_sequence": event.sequence,
+        "ts": event.created_at,
+        "level": _event_level(event.event_type),
+        "actor": _event_actor(event.event_type),
+        "type": event.event_type,
+        "message": _event_message(event),
+        "reasoning_summary": _redact_secrets(str(event.payload.get("reasoning_summary") or "")),
+        "evidence_refs": _sanitize_log_payload(event.payload.get("evidence_refs") or []),
+        "metrics": _sanitize_log_payload(event_metrics),
+        "payload": _sanitize_log_payload(event.payload),
+    }
+    with _discovery_jobs_lock:
+        job = _discovery_jobs.get(job_id)
+        if not job:
+            return
+        logs = job.setdefault("logs", [])
+        entry["sequence"] = max(
+            (int(item.get("sequence") or 0) for item in logs if isinstance(item, dict)),
+            default=0,
+        ) + 1
+        logs.append(entry)
         if len(logs) > _MAX_PERSISTED_LOGS:
             del logs[: len(logs) - _MAX_PERSISTED_LOGS]
         _persist_discovery_job(job)
@@ -5361,6 +5879,8 @@ def _run_discovery_job(job_id: str) -> None:
         job["status"] = "running"
         job["started_at"] = _now_app_iso()
         body = dict(job.get("body") or {})
+        # Keep the request credential only in this worker's local copy.
+        job["body"].pop("llm_config", None)
         _persist_discovery_job(job)
     _append_discovery_job_log(job_id, "info", "Discovery job started.")
 
@@ -5373,7 +5893,12 @@ def _run_discovery_job(job_id: str) -> None:
     try:
         if should_cancel():
             raise InterruptedError("Discovery cancelled.")
-        record = _run_web_discovery(body, report=report, should_cancel=should_cancel)
+        record = _run_web_discovery(
+            body,
+            report=report,
+            should_cancel=should_cancel,
+            agent_event_callback=lambda event: _append_discovery_job_event(job_id, event),
+        )
         with _discovery_jobs_lock:
             job = _discovery_jobs.get(job_id)
             if not job:

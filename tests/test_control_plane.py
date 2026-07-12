@@ -1,0 +1,1637 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+from typer.testing import CliRunner
+
+from agent.cli import app
+from agent.control_plane.budget_governor import BudgetGovernor
+from agent.control_plane.discovery import DiscoveryToolService
+from agent.control_plane.models import (
+    AgentBudget,
+    AgentEvent,
+    AgentRunRecord,
+    BudgetDecision,
+    DynamicBudgetLimits,
+    OpenAIAgentsDiscoveryResult,
+    SearchProposalInput,
+)
+from agent.control_plane.policy import evaluate_tool_policy
+from agent.control_plane.store import AgentRunStore, tool_idempotency_key
+from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
+from agent.discovery.search_environment import (
+    CandidateInspectionAction,
+    CandidateInspectionResult,
+    CandidateSearchAction,
+    CandidateSearchObservation,
+    QueryYield,
+    RepositoryQuery,
+)
+
+
+def _run(run_id: str = "run_001") -> AgentRunRecord:
+    return AgentRunRecord(
+        run_id=run_id,
+        workflow="discovery",
+        budget=AgentBudget(
+            max_turns=8,
+            max_tool_calls=5,
+            max_discovery_rounds=3,
+            max_expensive_actions=1,
+        ),
+    )
+
+
+def test_model_usage_is_persisted_and_accumulated(tmp_path: Path):
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    store.save_run(_run("model_usage"))
+
+    store.increment_model_usage(
+        "model_usage",
+        requests=1,
+        input_tokens=120,
+        output_tokens=30,
+        total_tokens=150,
+    )
+    updated = store.increment_model_usage(
+        "model_usage",
+        requests=2,
+        input_tokens=80,
+        output_tokens=20,
+        total_tokens=100,
+    )
+
+    assert updated.model_requests == 3
+    assert updated.model_input_tokens == 200
+    assert updated.model_output_tokens == 50
+    assert updated.model_total_tokens == 250
+    persisted = store.load_run("model_usage")
+    assert persisted is not None
+    assert persisted.model_total_tokens == 250
+
+
+def _dynamic_discovery_service(
+    tmp_path: Path,
+    *,
+    with_valid_candidate: bool = False,
+) -> tuple[DiscoveryToolService, BudgetGovernor, list[list[str]]]:
+    request = DatasetRequest(repository="pride", max_projects=2, max_files=10)
+    calls: list[list[str]] = []
+
+    def fake_discovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
+        calls.append(list(queries or []))
+        project = DiscoveredProject(project_accession="PXD_DYNAMIC", project_title="Dynamic fixture")
+        file = DiscoveredFile(
+            project_accession=project.project_accession,
+            project_title=project.project_title,
+            file_name="dynamic.raw",
+            file_type=".raw",
+            validity_status="valid",
+            evidence_level="file",
+        )
+        return DatasetManifest(
+            request=request,
+            projects=[project],
+            files=[file],
+            summary={"selected_projects": 1, "selected_files": 1},
+        )
+
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("dynamic_service").model_copy(
+            update={
+                "status": "running",
+                "dynamic_budget_enabled": True,
+                "dynamic_limits": DynamicBudgetLimits(),
+            }
+        )
+    )
+    governor = BudgetGovernor(store, run.run_id)
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        discovery_func=fake_discovery,
+        dynamic_budget=True,
+        budget_governor=governor,
+    )
+    if with_valid_candidate:
+        proposal = governor.register_proposal(
+            SearchProposalInput(
+                objective="Create a persisted candidate pool",
+                reasoning_summary="The pool is empty.",
+                queries=["seed query"],
+                expected_gain="One valid candidate",
+                stop_condition="A valid candidate is found",
+            )
+        )
+        review = governor.apply_decision(
+            BudgetDecision(
+                proposal_id=proposal.proposal_id,
+                decision="grant",
+                approved_query_indexes=[0],
+                reasoning_summary="The seed query is required.",
+            )
+        )
+        assert review.grant is not None
+        service.search_repository_datasets(["seed query"], grant_id=review.grant.grant_id)
+    return service, governor, calls
+
+
+class _FakeSearchEnvironment:
+    def __init__(self, request: DatasetRequest) -> None:
+        self.request = request
+        self.search_actions: list[CandidateSearchAction] = []
+        self.inspection_actions: list[CandidateInspectionAction] = []
+
+    def search(self, action: CandidateSearchAction) -> CandidateSearchObservation:
+        self.search_actions.append(action)
+        return CandidateSearchObservation(
+            search_id="search_0001",
+            query_yields=[
+                QueryYield(
+                    query=action.queries[0].query,
+                    executed_query=action.queries[0].query,
+                    intent_dimension=action.queries[0].intent_dimension,
+                    requested_depth=action.queries[0].depth,
+                    raw_result_count=3,
+                    new_candidate_count=2,
+                    duplicate_count=1,
+                )
+            ],
+            raw_result_count=3,
+            candidate_count=2,
+            new_candidate_count=2,
+            duplicate_count=1,
+            duplicate_rate=1 / 3,
+            intent_terms=["sensory", "neuropathy"],
+            covered_intent_terms=["sensory"],
+            unresolved_intent_terms=["neuropathy"],
+            semantic_coverage=0.5,
+            high_relevance_candidate_count=1,
+            rationale=action.rationale,
+        )
+
+    def inspect(self, action: CandidateInspectionAction) -> CandidateInspectionResult:
+        self.inspection_actions.append(action)
+        projects = [
+            DiscoveredProject(project_accession=accession, project_title=f"Selected {accession}")
+            for accession in action.accessions
+        ]
+        files = [
+            DiscoveredFile(
+                project_accession=project.project_accession,
+                project_title=project.project_title,
+                file_name=f"{project.project_accession}.raw",
+                file_type=".raw",
+                validity_status="valid",
+                evidence_level="file",
+            )
+            for project in projects
+        ]
+        manifest = DatasetManifest(
+            request=self.request,
+            projects=projects,
+            files=files,
+            summary={"selected_projects": len(projects), "selected_files": len(files)},
+        )
+        return CandidateInspectionResult(
+            search_id=action.search_id,
+            inspected_accessions=action.accessions,
+            manifest=manifest,
+            usable_files=len(files),
+            valid_files=len(files),
+            rationale=action.rationale,
+        )
+
+    def close(self) -> None:
+        return None
+
+
+def test_quality_first_search_and_inspection_are_separate_control_plane_actions(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride", max_projects=2, max_files=10)
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("quality_first").model_copy(
+            update={"status": "running", "dynamic_limits": DynamicBudgetLimits()}
+        )
+    )
+    environment = _FakeSearchEnvironment(request)
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=environment,
+    )
+    search_action = CandidateSearchAction(
+        queries=[RepositoryQuery(query="sensory neuron", depth=40, intent_dimension="cell model")],
+        rationale="Find candidates before expensive inspection.",
+    )
+
+    search = service.search_repository_candidates(search_action)
+    inspection = service.inspect_repository_candidates(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD000001"],
+            rationale="The preview covers the cell model.",
+        )
+    )
+
+    persisted = store.load_run(run.run_id)
+    assert persisted is not None
+    assert search.semantic_coverage == 0.5
+    assert persisted.candidate_search_count == 1
+    assert persisted.candidate_inspection_count == 1
+    assert persisted.latest_metrics is not None
+    assert persisted.latest_metrics.semantic_coverage_gap == 0.5
+    assert inspection.status == "completed"
+    assert inspection.pooled_selected_files == 1
+    assert inspection.candidate_search is not None
+    assert inspection.candidate_search["search_id"] == "search_0001"
+    assert environment.search_actions == [search_action]
+    assert environment.inspection_actions[0].accessions == ["PXD000001"]
+
+
+def test_agent_can_filter_inspected_projects_during_final_selection(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride", max_projects=5, max_files=10)
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("filtered_selection").model_copy(
+            update={"status": "running", "dynamic_limits": DynamicBudgetLimits()}
+        )
+    )
+    environment = _FakeSearchEnvironment(request)
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=environment,
+    )
+    search = service.search_repository_candidates(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="human neuron")],
+            rationale="Create a candidate pool.",
+        )
+    )
+    inspection = service.inspect_repository_candidates(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD_GOOD", "PXD_OFFTOPIC"],
+            rationale="Inspect both candidates before retaining only relevant evidence.",
+        )
+    )
+
+    selection = service.select_discovery_manifest(
+        1,
+        "PXD_GOOD is the only candidate aligned to the requested task.",
+        ["PXD_GOOD"],
+    )
+    selected_manifest = DatasetManifest.model_validate_json(
+        Path(selection["manifest_path"]).read_text(encoding="utf-8")
+    )
+
+    assert len(inspection.project_assessments) == 2
+    assert selection["selected_project_accessions"] == ["PXD_GOOD"]
+    assert [project.project_accession for project in selected_manifest.projects] == ["PXD_GOOD"]
+    assert {file.project_accession for file in selected_manifest.files} == {"PXD_GOOD"}
+
+
+def test_candidate_pool_preserves_agent_choices_until_final_selection(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride", max_projects=1, max_files=10)
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("agent_owned_selection").model_copy(
+            update={"status": "running", "dynamic_limits": DynamicBudgetLimits()}
+        )
+    )
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=_FakeSearchEnvironment(request),
+    )
+    search = service.search_repository_candidates(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="human immunopeptidomics")],
+            rationale="Find candidates for Agent selection.",
+        )
+    )
+    first_inspection = service.inspect_repository_candidates(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD_HIGH_SCORE", "PXD_AGENT_CHOICE"],
+            rationale="Inspect both candidates before deciding.",
+        )
+    )
+
+    assert first_inspection.inspected_candidate_count == 2
+    assert first_inspection.minimum_high_relevance_inspections == 1
+    assert first_inspection.selection_ready is True
+
+    persisted_run = store.load_run(run.run_id)
+    assert persisted_run is not None
+    pool_path = Path(persisted_run.candidate_pool_manifest_path or "")
+    pool = DatasetManifest.model_validate_json(pool_path.read_text(encoding="utf-8"))
+    premature = service.select_discovery_manifest(0, "Let deterministic ranking decide.", [])
+    selected = service.select_discovery_manifest(
+        0,
+        "The second project is more relevant to the visible request.",
+        ["PXD_AGENT_CHOICE"],
+    )
+
+    assert {project.project_accession for project in pool.projects} == {
+        "PXD_HIGH_SCORE",
+        "PXD_AGENT_CHOICE",
+    }
+    assert premature["status"] == "blocked"
+    assert premature["blockers"] == [
+        "explicit_project_selection_required_for_candidate_pool"
+    ]
+    assert selected["selected_project_accessions"] == ["PXD_AGENT_CHOICE"]
+
+
+def test_selection_waits_for_minimum_high_relevance_inspection_coverage(tmp_path: Path) -> None:
+    class HighRelevanceEnvironment(_FakeSearchEnvironment):
+        def search(self, action: CandidateSearchAction) -> CandidateSearchObservation:
+            return super().search(action).model_copy(
+                update={"high_relevance_candidate_count": 4}
+            )
+
+    request = DatasetRequest(repository="pride", max_projects=2, max_files=10)
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("inspection_coverage").model_copy(
+            update={"status": "running", "dynamic_limits": DynamicBudgetLimits()}
+        )
+    )
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=HighRelevanceEnvironment(request),
+    )
+    search = service.search_repository_candidates(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="human immunopeptidomics")],
+            rationale="Find high-relevance candidates.",
+        )
+    )
+    first_inspection = service.inspect_repository_candidates(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD_FIRST", "PXD_SECOND"],
+            rationale="Inspect the first promising batch.",
+        )
+    )
+    assert first_inspection.inspected_candidate_count == 2
+    assert first_inspection.minimum_high_relevance_inspections == 4
+    assert first_inspection.selection_ready is False
+    assert first_inspection.recommended_action == "inspect_more_high_relevance_candidates"
+
+    premature = service.select_discovery_manifest(
+        0,
+        "The first batch is usable, although other high-relevance candidates remain.",
+        ["PXD_FIRST", "PXD_SECOND"],
+    )
+
+    assert premature["status"] == "blocked"
+    assert premature["blockers"] == ["high_relevance_candidates_require_more_inspection"]
+
+    second_inspection = service.inspect_repository_candidates(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD_THIRD", "PXD_FOURTH"],
+            rationale="Inspect the remaining high-relevance candidates.",
+        )
+    )
+    assert second_inspection.inspected_candidate_count == 4
+    assert second_inspection.selection_ready is True
+    selected = service.select_discovery_manifest(
+        0,
+        "All high-relevance candidates were inspected before final selection.",
+        ["PXD_FIRST", "PXD_SECOND"],
+    )
+
+    assert selected["status"] == "completed"
+
+
+def test_quality_first_search_honors_dynamic_budget_grant(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride")
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("quality_budget").model_copy(
+            update={
+                "status": "running",
+                "dynamic_budget_enabled": True,
+                "dynamic_limits": DynamicBudgetLimits(),
+            }
+        )
+    )
+    governor = BudgetGovernor(store, run.run_id)
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        dynamic_budget=True,
+        budget_governor=governor,
+        search_environment=_FakeSearchEnvironment(request),
+    )
+    action = CandidateSearchAction(
+        queries=[RepositoryQuery(query="sensory neuron")],
+        rationale="Search a missing intent dimension.",
+    )
+    proposal = governor.register_proposal(
+        SearchProposalInput(
+            objective="Find sensory-neuron candidates",
+            reasoning_summary="The candidate pool is empty.",
+            queries=["sensory neuron"],
+            expected_gain="Relevant candidates",
+            stop_condition="At least one relevant candidate is found",
+        )
+    )
+    review = governor.apply_decision(
+        BudgetDecision(
+            proposal_id=proposal.proposal_id,
+            decision="grant",
+            approved_query_indexes=[0],
+            reasoning_summary="The query covers an unresolved concept.",
+        )
+    )
+    assert review.grant is not None
+
+    denied = service.search_repository_candidates(action)
+    allowed = service.search_repository_candidates(action, grant_id=review.grant.grant_id)
+
+    assert denied.status == "blocked"
+    assert denied.failures == ["search_grant_required"]
+    assert allowed.status == "completed"
+
+
+def test_new_but_semantically_redundant_candidates_require_replan_without_hard_stop(
+    tmp_path: Path,
+) -> None:
+    request = DatasetRequest(repository="pride")
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("quality_no_gain").model_copy(
+            update={"status": "running", "dynamic_limits": DynamicBudgetLimits()}
+        )
+    )
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=_FakeSearchEnvironment(request),
+    )
+
+    for index in range(3):
+        result = service.search_repository_candidates(
+            CandidateSearchAction(
+                queries=[RepositoryQuery(query=f"query {index}")],
+                rationale=f"Try strategy {index}.",
+            )
+        )
+        assert result.status == "completed"
+
+    persisted = store.load_run(run.run_id)
+    assert persisted is not None
+    assert persisted.no_gain_action_count == 2
+    assert persisted.search_recovery_required is True
+    assert persisted.search_stopped is False
+    replanned = service.search_repository_candidates(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="query 4")],
+            rationale="Try a materially different strategy after no gain.",
+        )
+    )
+    assert replanned.status == "completed"
+
+
+def test_dynamic_discovery_requires_and_consumes_matching_grant(tmp_path: Path) -> None:
+    service, governor, calls = _dynamic_discovery_service(tmp_path)
+    denied = service.search_repository_datasets(["human plasma SDRF"])
+    assert denied.blockers == ["search_grant_required"]
+    proposal = governor.register_proposal(
+        SearchProposalInput(
+            objective="Improve metadata coverage",
+            reasoning_summary="The metadata gap is high.",
+            queries=["human plasma SDRF"],
+            expected_gain="More usable metadata",
+            stop_condition="No new usable files",
+        )
+    )
+    review = governor.apply_decision(
+        BudgetDecision(
+            proposal_id=proposal.proposal_id,
+            decision="grant",
+            approved_query_indexes=[0],
+            reasoning_summary="The query targets the gap.",
+        )
+    )
+    assert review.grant is not None
+    observation = service.search_repository_datasets(
+        ["human plasma SDRF"],
+        grant_id=review.grant.grant_id,
+    )
+    assert observation.status == "completed"
+    assert observation.metrics is not None
+    assert calls == [["human plasma SDRF"]]
+    replay = service.search_repository_datasets(
+        ["human plasma SDRF"],
+        grant_id=review.grant.grant_id,
+    )
+    assert replay.blockers == ["grant_already_consumed"]
+
+
+def test_dynamic_stop_blocks_search_but_allows_final_manifest_selection(tmp_path: Path) -> None:
+    service, _, _ = _dynamic_discovery_service(tmp_path, with_valid_candidate=True)
+    run = service.store.load_run(service.run_id)
+    assert run is not None
+    service.store.save_run(
+        run.model_copy(update={"search_stopped": True, "search_stop_reason": "budget_agent_stop"})
+    )
+    blocked = service.search_repository_datasets(["another query"], grant_id="grant_unused")
+    assert blocked.blockers == ["dynamic_search_stopped"]
+    selected = service.select_discovery_manifest(
+        0,
+        "The persisted candidate pool is the strongest available manifest.",
+    )
+    assert selected["status"] == "completed"
+    assert selected["round_index"] == 0
+
+
+def test_agent_run_store_round_trips_events_and_idempotent_tool_calls(tmp_path: Path) -> None:
+    store = AgentRunStore(tmp_path / "agent_control.sqlite")
+    run = store.save_run(_run())
+    store.append_event(run.run_id, "run_started", {"workflow": "discovery"})
+
+    arguments = {"queries": ["human phosphoproteomics"]}
+    first, claimed = store.claim_tool_call(
+        run_id=run.run_id,
+        tool_name="search_repository_datasets",
+        arguments=arguments,
+    )
+    assert claimed is True
+    assert first.idempotency_key == tool_idempotency_key(
+        run.run_id,
+        "search_repository_datasets",
+        arguments,
+    )
+    store.complete_tool_call(first.idempotency_key, {"selected_files": 2})
+
+    cached, claimed_again = store.claim_tool_call(
+        run_id=run.run_id,
+        tool_name="search_repository_datasets",
+        arguments=arguments,
+    )
+    assert claimed_again is False
+    assert cached.status == "completed"
+    assert cached.output == {"selected_files": 2}
+    assert store.load_run(run.run_id) is not None
+    assert [event.event_type for event in store.list_events(run.run_id)] == ["run_started"]
+
+
+def test_agent_store_listener_receives_committed_events(tmp_path: Path) -> None:
+    received: list[AgentEvent] = []
+    store = AgentRunStore(tmp_path / "state.sqlite", event_listener=received.append)
+    store.save_run(_run("listener_1"))
+    event = store.append_event("listener_1", "search_plan_proposed", {"reasoning_summary": "Plan"})
+    assert received == [event]
+
+
+def test_streamed_runner_persists_public_lifecycle_not_raw_deltas(tmp_path: Path) -> None:
+    from agent.control_plane.openai_agents import _run_streamed_to_completion
+
+    class AgentUpdatedStreamEvent:
+        new_agent = SimpleNamespace(name="Proteomics Discovery Agent")
+
+    class RawResponsesStreamEvent:
+        data = {"reasoning": "must not persist"}
+
+    class FakeStreamedResult:
+        async def stream_events(self):
+            yield AgentUpdatedStreamEvent()
+            yield RawResponsesStreamEvent()
+
+    class FakeRunner:
+        @staticmethod
+        def run_streamed(**kwargs: Any) -> FakeStreamedResult:
+            return FakeStreamedResult()
+
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    store.save_run(_run("stream_1"))
+    context = SimpleNamespace(service=SimpleNamespace(run_id="stream_1"))
+    asyncio.run(
+        _run_streamed_to_completion(
+            sdk={"Runner": FakeRunner},
+            store=store,
+            starting_agent=object(),
+            input="test",
+            context=context,
+        )
+    )
+    events = store.list_events("stream_1")
+    assert [event.event_type for event in events] == ["sdk_agent_updated"]
+    assert "reasoning" not in json.dumps(events[0].model_dump(mode="json"))
+
+
+def test_control_plane_policy_separates_safe_expensive_biological_and_forbidden_tools() -> None:
+    run = _run()
+
+    assert evaluate_tool_policy("search_repository_datasets", run).outcome == "allow"
+    assert evaluate_tool_policy("select_discovery_manifest", run).outcome == "allow"
+    assert evaluate_tool_policy("run_full_workflow", run).outcome == "approval_required"
+    assert evaluate_tool_policy("change_species", run).outcome == "approval_required"
+    assert evaluate_tool_policy("run_shell_command", run).outcome == "deny"
+    assert evaluate_tool_policy("invented_tool", run).outcome == "deny"
+
+
+def test_discovery_tool_service_reuses_identical_query_result(tmp_path: Path) -> None:
+    request = DatasetRequest(
+        repository="pride",
+        species=["human"],
+        max_projects=2,
+        max_files=4,
+        max_candidate_projects=10,
+    )
+    calls: list[list[str]] = []
+
+    def fake_discovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
+        calls.append(list(queries or []))
+        project = DiscoveredProject(
+            project_accession="PXDTEST001",
+            project_title="Human phosphoproteomics",
+        )
+        file = DiscoveredFile(
+            project_accession=project.project_accession,
+            project_title=project.project_title,
+            file_name="sample.raw",
+            file_type=".raw",
+            file_role="raw_acquisition",
+            acquisition_mode="dda",
+            species=["human"],
+            validity_status="valid",
+            evidence_level="mixed",
+        )
+        return DatasetManifest(
+            request=request,
+            projects=[project],
+            files=[file],
+            summary={
+                "selected_projects": 1,
+                "selected_files": 1,
+                "candidate_projects_seen": 1,
+                "validity_status_counts": {"valid": 1},
+                "evidence_level_distribution": {"mixed": 1},
+                "instrument_family_distribution": {"orbitrap": 1},
+                "unknown_counts": {},
+            },
+        )
+
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(_run("discovery_001").model_copy(update={"status": "running"}))
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        task_type="rt_prediction",
+        discovery_func=fake_discovery,
+    )
+
+    first = service.search_repository_datasets(["human phosphoproteomics", "human phosphoproteomics"])
+    second = service.search_repository_datasets(["human   phosphoproteomics"])
+
+    assert first.status == "completed"
+    assert first.selected_files == 1
+    assert second == first
+    assert calls == [["human phosphoproteomics"]]
+    stored = store.load_run(run.run_id)
+    assert stored is not None
+    assert stored.discovery_round_count == 1
+    assert stored.tool_call_count == 1
+    assert Path(stored.current_manifest_path or "").exists()
+    assert "tool_result_reused" in [event.event_type for event in store.list_events(run.run_id)]
+    selected = service.auto_select_best_manifest()
+    assert selected.selected_round_index == 0
+    assert "manifest_auto_selected" in [event.event_type for event in store.list_events(run.run_id)]
+
+
+def test_discovery_tool_service_retains_nonempty_manifest_after_empty_followup(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride", max_projects=2, max_files=4)
+    calls = 0
+
+    def discovery_with_empty_followup(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            return DatasetManifest(request=request, summary={"selected_projects": 0, "selected_files": 0})
+        project = DiscoveredProject(project_accession="PXD_RETAIN", project_title="usable project")
+        file = DiscoveredFile(
+            project_accession=project.project_accession,
+            project_title=project.project_title,
+            file_name="retain.raw",
+            file_type=".raw",
+            file_role="raw_acquisition",
+            acquisition_mode="dda",
+            species=["human"],
+            validity_status="valid",
+            evidence_level="file",
+        )
+        return DatasetManifest(
+            request=request,
+            projects=[project],
+            files=[file],
+            summary={"selected_projects": 1, "selected_files": 1},
+        )
+
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(_run("retain_001").model_copy(update={"status": "running"}))
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        discovery_func=discovery_with_empty_followup,
+    )
+
+    first = service.search_repository_datasets(["human dda"])
+    second = service.search_repository_datasets(["human dda HCD"])
+
+    assert first.selected_files == 1
+    assert first.pooled_selected_files == 1
+    assert second.selected_files == 0
+    assert second.pooled_selected_files == 1
+
+    stored = store.load_run(run.run_id)
+    assert stored is not None
+    assert stored.blockers == []
+    assert stored.current_manifest_path is not None
+    selected_manifest = DatasetManifest.model_validate(
+        json.loads(Path(stored.current_manifest_path).read_text(encoding="utf-8"))
+    )
+    assert selected_manifest.summary["selected_files"] == 1
+    events = store.list_events(run.run_id)
+    assert events[-1].payload["selected_manifest_retained"] is True
+
+    selection = service.select_discovery_manifest(0, "The merged pool retains the valid first-round file.")
+    assert selection["status"] == "completed"
+    assert selection["round_index"] == 0
+    stored = store.load_run(run.run_id)
+    assert stored is not None
+    assert stored.selected_round_index == 0
+    assert stored.selection_rationale == "The merged pool retains the valid first-round file."
+    blocked = service.search_repository_datasets(["another query"])
+    assert blocked.blockers == ["manifest_already_selected"]
+
+
+def test_discovery_tool_service_merges_distinct_round_candidates(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride", max_projects=2, max_files=4)
+    calls = 0
+
+    def discovery_by_round(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
+        nonlocal calls
+        calls += 1
+        accession = f"PXD_POOL_{calls}"
+        project = DiscoveredProject(project_accession=accession, project_title=f"Pool round {calls}")
+        file = DiscoveredFile(
+            project_accession=accession,
+            project_title=project.project_title,
+            file_name=f"round_{calls}.raw",
+            file_type=".raw",
+            file_role="raw_acquisition",
+            acquisition_mode="dda",
+            species=["human"],
+            validity_status="valid" if calls == 1 else "weak_keep",
+            evidence_level="file",
+            trust_score=0.9 - calls * 0.1,
+        )
+        return DatasetManifest(
+            request=request,
+            projects=[project],
+            files=[file],
+            summary={"selected_projects": 1, "selected_files": 1},
+        )
+
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(_run("pool_001").model_copy(update={"status": "running"}))
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        discovery_func=discovery_by_round,
+    )
+
+    assert service.search_repository_datasets(["round one"]).pooled_selected_files == 1
+    second = service.search_repository_datasets(["round two"])
+    assert second.selected_files == 1
+    assert second.pooled_selected_projects == 2
+    assert second.pooled_selected_files == 2
+    stored = store.load_run(run.run_id)
+    assert stored is not None
+    assert stored.candidate_pool_manifest_path is not None
+    pool = DatasetManifest.model_validate_json(
+        Path(stored.candidate_pool_manifest_path).read_text(encoding="utf-8")
+    )
+    assert {file.file_name for file in pool.files} == {"round_1.raw", "round_2.raw"}
+    assert pool.summary["candidate_pool"]["merged_rounds"] == 2
+
+
+def test_discovery_tool_service_enforces_round_budget(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride")
+    calls = 0
+
+    def empty_discovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
+        nonlocal calls
+        calls += 1
+        return DatasetManifest(request=request, summary={"selected_projects": 0, "selected_files": 0})
+
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = AgentRunRecord(
+        run_id="budget_001",
+        workflow="discovery",
+        status="running",
+        budget=AgentBudget(max_turns=4, max_tool_calls=3, max_discovery_rounds=1),
+    )
+    store.save_run(run)
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        discovery_func=empty_discovery,
+    )
+
+    assert service.search_repository_datasets(["proteomics"]).status == "blocked"
+    blocked = service.search_repository_datasets(["proteomics HCD"])
+
+    assert blocked.status == "blocked"
+    assert blocked.blockers == ["discovery_round_budget_exhausted"]
+    assert calls == 1
+    stored = store.load_run(run.run_id)
+    assert stored is not None
+    assert stored.blockers == ["no_selected_files"]
+
+
+def test_discovery_requires_atomic_recovery_after_zero_yield_compound_search(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride", max_projects=1, max_files=1)
+    calls: list[list[str]] = []
+
+    def discovery_with_recovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
+        calls.append(list(queries or []))
+        if queries == ["human", "DDA"]:
+            project = DiscoveredProject(project_accession="PXD_RECOVERED", project_title="Recovered")
+            file = DiscoveredFile(
+                project_accession=project.project_accession,
+                file_name="recovered.raw",
+                file_type=".raw",
+                validity_status="valid",
+                evidence_level="file",
+            )
+            return DatasetManifest(
+                request=request,
+                projects=[project],
+                files=[file],
+                summary={
+                    "queries": ["human", "DDA"],
+                    "candidate_projects_seen": 1,
+                    "selected_projects": 1,
+                    "selected_files": 1,
+                },
+            )
+        return DatasetManifest(
+            request=request,
+            summary={
+                "queries": list(queries or []),
+                "candidate_projects_seen": 0,
+                "selected_projects": 0,
+                "selected_files": 0,
+                "failures": [],
+            },
+        )
+
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(_run("recovery_001").model_copy(update={"status": "running"}))
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        discovery_func=discovery_with_recovery,
+    )
+
+    first = service.search_repository_datasets(["human DDA Orbitrap"])
+    repeated = service.search_repository_datasets(["human DDA label-free"])
+
+    assert first.diagnosis is not None
+    assert first.diagnosis.health == "selectivity_suspected"
+    assert first.diagnosis.recovery_required is True
+    assert first.recommended_action == "retry_with_atomic_repository_seeds"
+    assert repeated.status == "blocked"
+    assert repeated.blockers == ["search_recovery_requires_atomic_queries"]
+    assert repeated.recommended_action == "retry_with_atomic_repository_seeds"
+    assert calls == [["human DDA Orbitrap"]]
+    assert store.load_run(run.run_id).discovery_round_count == 1
+
+    premature_selection = service.select_discovery_manifest(1, "No files were found.")
+    assert premature_selection["blockers"] == ["selected_manifest_has_no_files"]
+
+    recovered = service.search_repository_datasets(["human", "DDA"])
+
+    assert recovered.status == "completed"
+    assert recovered.diagnosis is not None
+    assert recovered.diagnosis.health == "healthy_yield"
+    assert recovered.diagnosis.recovery_attempted is True
+    stored = store.load_run(run.run_id)
+    assert stored is not None
+    assert stored.search_recovery_required is False
+    assert stored.search_recovery_attempts == 1
+    event_types = [event.event_type for event in store.list_events(run.run_id)]
+    assert "search_diagnosis_recorded" in event_types
+    assert "search_strategy_rejected" in event_types
+    assert "search_recovery_succeeded" in event_types
+
+
+def test_discovery_classifies_repository_failure_separately_from_zero_match(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride")
+
+    def unavailable_discovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
+        raise RuntimeError("PRIDE upstream unavailable")
+
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(_run("repository_failure_001").model_copy(update={"status": "running"}))
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        discovery_func=unavailable_discovery,
+    )
+
+    observation = service.search_repository_datasets(["human"])
+
+    assert observation.status == "failed"
+    assert observation.diagnosis is not None
+    assert observation.diagnosis.health == "repository_unavailable"
+    assert observation.diagnosis.recovery_required is False
+    assert observation.recommended_action == "retry_repository_or_stop"
+
+
+def test_discovery_classifies_invalid_repository_response(tmp_path: Path) -> None:
+    request = DatasetRequest(repository="pride")
+
+    def invalid_response_discovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
+        raise ValueError("invalid repository response schema")
+
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(_run("invalid_response_001").model_copy(update={"status": "running"}))
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        discovery_func=invalid_response_discovery,
+    )
+
+    observation = service.search_repository_datasets(["human"])
+
+    assert observation.diagnosis is not None
+    assert observation.diagnosis.health == "response_invalid"
+    assert observation.recommended_action == "retry_repository_or_stop"
+
+
+def test_budget_governor_denies_compound_queries_when_atomic_recovery_is_required(tmp_path: Path) -> None:
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = AgentRunRecord(
+        run_id="recovery_budget_001",
+        workflow="discovery",
+        status="running",
+        request={"repository": "pride"},
+        dynamic_budget_enabled=True,
+        search_recovery_required=True,
+    )
+    store.save_run(run)
+    governor = BudgetGovernor(store, run.run_id)
+
+    proposal = governor.register_proposal(
+        SearchProposalInput(
+            objective="Recover from zero-yield PRIDE search",
+            reasoning_summary="The previous compound strategy returned no candidates.",
+            queries=["human DDA Orbitrap"],
+            expected_gain="Test whether another compound query changes yield.",
+            stop_condition="candidate found",
+        )
+    )
+    denied = governor.apply_decision(
+        BudgetDecision(
+            proposal_id=proposal.proposal_id,
+            decision="grant",
+            approved_query_indexes=[0],
+            reasoning_summary="Retry the same strategy.",
+        )
+    )
+
+    assert denied.outcome == "denied"
+    assert denied.reason == "search_recovery_requires_atomic_queries"
+
+    atomic_proposal = governor.register_proposal(
+        SearchProposalInput(
+            objective="Run atomic PRIDE recovery",
+            reasoning_summary="Atomic seeds separate query selectivity from a genuine no-match.",
+            queries=["human", "DDA"],
+            expected_gain="Identify whether the repository contains broad matching candidates.",
+            stop_condition="candidate found or atomic seeds exhausted",
+        )
+    )
+    granted = governor.apply_decision(
+        BudgetDecision(
+            proposal_id=atomic_proposal.proposal_id,
+            decision="grant",
+            approved_query_indexes=[0, 1],
+            reasoning_summary="Use a materially different atomic strategy.",
+        )
+    )
+
+    assert granted.outcome == "granted"
+    assert granted.grant is not None
+
+
+def test_discovery_state_tool_is_budgeted_and_audited(tmp_path: Path) -> None:
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = AgentRunRecord(
+        run_id="state_budget_001",
+        workflow="discovery",
+        status="running",
+        budget=AgentBudget(max_turns=3, max_tool_calls=1, max_discovery_rounds=1),
+    )
+    store.save_run(run)
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=DatasetRequest(repository="pride"),
+        output_dir=tmp_path / "output",
+        store=store,
+    )
+
+    first = service.get_discovery_state()
+    second = service.get_discovery_state()
+
+    assert first["tool_call_count"] == 1
+    assert first["policy"]["outcome"] == "allow"
+    assert second["tool_call_count"] == 1
+    assert second["policy"]["outcome"] == "deny"
+    assert second["policy"]["reason"] == "tool_call_budget_exhausted"
+    assert [event.event_type for event in store.list_events(run.run_id)] == [
+        "tool_completed",
+        "tool_denied",
+    ]
+
+
+def test_openai_agents_function_tools_expose_strict_bounded_schemas() -> None:
+    from agent.control_plane import openai_agents
+
+    sdk = openai_agents._load_agents_sdk()
+    search_tool = sdk["function_tool"](openai_agents.search_repository_datasets)
+    state_tool = sdk["function_tool"](openai_agents.get_discovery_state)
+    selection_tool = sdk["function_tool"](openai_agents.select_discovery_manifest)
+
+    assert search_tool.name == "search_repository_datasets"
+    assert search_tool.params_json_schema["required"] == ["queries"]
+    assert search_tool.params_json_schema["additionalProperties"] is False
+    assert state_tool.name == "get_discovery_state"
+    assert state_tool.params_json_schema["properties"] == {}
+    assert selection_tool.name == "select_discovery_manifest"
+    assert selection_tool.params_json_schema["required"] == [
+        "round_index",
+        "project_accessions",
+        "rationale",
+    ]
+    assert selection_tool.params_json_schema["additionalProperties"] is False
+
+
+def test_openai_agents_model_configuration_accepts_transient_web_config(monkeypatch) -> None:
+    from agent.control_plane import openai_agents
+
+    monkeypatch.delenv("AGENT_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    assert openai_agents._model_configuration(
+        {
+            "api_key": "temporary-web-key",
+            "base_url": "https://example.test/v1",
+            "model": "test-model",
+        }
+    ) == ("temporary-web-key", "https://example.test/v1", "test-model")
+
+
+def test_openai_agents_marks_candidate_only_manifests_for_review(tmp_path: Path) -> None:
+    from agent.control_plane import openai_agents
+
+    manifest = DatasetManifest(
+        request=DatasetRequest(repository="pride"),
+        projects=[DiscoveredProject(project_accession="PXD_REVIEW")],
+        files=[
+            DiscoveredFile(
+                project_accession="PXD_REVIEW",
+                file_name="review.raw",
+                file_type=".raw",
+                validity_status="needs_review",
+                needs_review=True,
+            )
+        ],
+        summary={"selected_projects": 1, "selected_files": 1},
+    )
+    path = tmp_path / "dataset_manifest.json"
+    path.write_text(manifest.model_dump_json(), encoding="utf-8")
+
+    assert openai_agents._manifest_completion_status(str(path)) == "completed_with_review"
+
+
+def test_openai_agents_runner_executes_real_function_tool_loop(tmp_path: Path) -> None:
+    from agents.items import ModelResponse
+    from agents.models.interface import Model
+    from agents.usage import Usage
+    from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputText
+
+    from agent.control_plane.openai_agents import run_openai_agents_discovery
+
+    class FakeToolCallingModel(Model):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_response(self, *args, **kwargs) -> ModelResponse:
+            self.calls += 1
+            if self.calls == 1:
+                output = [
+                    ResponseFunctionToolCall(
+                        arguments=json.dumps({"queries": ["human phosphoproteomics DDA"]}),
+                        call_id="call_discovery_001",
+                        name="search_repository_datasets",
+                        type="function_call",
+                        status="completed",
+                    )
+                ]
+            elif self.calls == 2:
+                output = [
+                    ResponseFunctionToolCall(
+                        arguments=json.dumps(
+                            {
+                                "round_index": 0,
+                                "project_accessions": [],
+                                "rationale": "The merged pool contains a valid file-level candidate.",
+                            }
+                        ),
+                        call_id="call_selection_001",
+                        name="select_discovery_manifest",
+                        type="function_call",
+                        status="completed",
+                    )
+                ]
+            else:
+                output = [
+                    ResponseOutputMessage(
+                        id="message_001",
+                        content=[
+                            ResponseOutputText(
+                                annotations=[],
+                                text="Accept the current manifest because it contains a valid file-level candidate.",
+                                type="output_text",
+                            )
+                        ],
+                        role="assistant",
+                        status="completed",
+                        type="message",
+                    )
+                ]
+            return ModelResponse(output=output, usage=Usage(requests=1), response_id=None)
+
+        async def stream_response(self, *args, **kwargs):
+            if False:
+                yield None
+
+    request = DatasetRequest(repository="pride", species=["human"], max_projects=2, max_files=4)
+
+    def fake_discovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
+        project = DiscoveredProject(project_accession="PXDAGENT001", project_title="Agent test")
+        file = DiscoveredFile(
+            project_accession=project.project_accession,
+            project_title=project.project_title,
+            file_name="agent_test.raw",
+            file_type=".raw",
+            file_role="raw_acquisition",
+            acquisition_mode="dda",
+            species=["human"],
+            validity_status="valid",
+            evidence_level="file",
+        )
+        return DatasetManifest(
+            request=request,
+            projects=[project],
+            files=[file],
+            summary={
+                "selected_projects": 1,
+                "selected_files": 1,
+                "candidate_projects_seen": 1,
+                "validity_status_counts": {"valid": 1},
+                "evidence_level_distribution": {"file": 1},
+                "instrument_family_distribution": {"orbitrap": 1},
+                "unknown_counts": {},
+            },
+        )
+
+    model = FakeToolCallingModel()
+    result = run_openai_agents_discovery(
+        prompt="Find human phosphoproteomics DDA data",
+        request=request,
+        output_dir=tmp_path / "agents_discovery",
+        state_db=tmp_path / "agent_control.sqlite",
+        budget=AgentBudget(max_turns=4, max_tool_calls=4, max_discovery_rounds=2),
+        run_id="agents_runner_001",
+        discovery_func=fake_discovery,
+        model=model,
+    )
+
+    assert result.status == "completed"
+    assert result.discovery_round_count == 1
+    assert model.calls == 3
+    assert result.selected_round_index == 0
+    assert result.selection_rationale == "The merged pool contains a valid file-level candidate."
+    assert Path(result.files["dataset_manifest_json"]).exists()
+    assert Path(result.files["agents_discovery_events_json"]).exists()
+    assert "Accept the current manifest" in result.final_output
+    events = json.loads(Path(result.files["agents_discovery_events_json"]).read_text(encoding="utf-8"))
+    assert "manifest_selected" in [event["event_type"] for event in events]
+
+
+def test_openai_chat_completions_model_buffers_streamed_tool_calls() -> None:
+    from agent.control_plane.openai_agents import _build_model
+
+    captured: dict[str, Any] = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["client"] = kwargs
+
+    class FakeChatCompletionsModel:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["model"] = kwargs
+
+    _build_model(
+        {
+            "AsyncOpenAI": FakeClient,
+            "OpenAIChatCompletionsModel": FakeChatCompletionsModel,
+        },
+        api_key="test-key",
+        base_url="https://api.deepseek.com",
+        model_name="deepseek-v4-pro",
+    )
+
+    assert captured["model"]["buffer_streamed_tool_calls"] is True
+
+
+def test_openai_agents_runner_executes_multi_agent_budget_loop(monkeypatch, tmp_path: Path) -> None:
+    from agents.items import ModelResponse
+    from agents.models.interface import Model
+    from agents.usage import Usage
+    from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputText
+
+    from agent.control_plane.openai_agents import run_openai_agents_discovery
+
+    class FakeScriptedToolModel(Model):
+        def __init__(self, actions: list[tuple[str, dict[str, Any] | str]]) -> None:
+            self.actions = actions
+            self.calls = 0
+
+        async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+            action, payload = self.actions[self.calls]
+            self.calls += 1
+            if action == "final":
+                output = [
+                    ResponseOutputMessage(
+                        id=f"message_{self.calls}",
+                        content=[
+                            ResponseOutputText(annotations=[], text=str(payload), type="output_text")
+                        ],
+                        role="assistant",
+                        status="completed",
+                        type="message",
+                    )
+                ]
+            else:
+                output = [
+                    ResponseFunctionToolCall(
+                        arguments=json.dumps(payload),
+                        call_id=f"call_{self.calls}",
+                        name=action,
+                        type="function_call",
+                        status="completed",
+                    )
+                ]
+            return ModelResponse(output=output, usage=Usage(requests=1), response_id=None)
+
+        async def stream_response(self, *args: Any, **kwargs: Any):
+            if False:
+                yield None
+
+    proposal = {
+        "objective": "Improve metadata coverage",
+        "reasoning_summary": "The current pool lacks sample-level metadata.",
+        "evidence_refs": ["metadata_gap:0.7"],
+        "queries": ["human plasma SDRF"],
+        "expected_gain_dimensions": ["metadata_completeness"],
+        "expected_gain": "More sample metadata",
+        "alternatives_considered": ["generic broad search"],
+        "stop_condition": "No new usable files",
+    }
+    discovery_model = FakeScriptedToolModel(
+        [
+            ("request_search_budget", {"proposal": proposal}),
+            (
+                "search_repository_datasets_with_grant",
+                {"grant_id": "grant_" + "1" * 32, "queries": ["human plasma SDRF"]},
+            ),
+            (
+                "select_discovery_manifest",
+                {
+                    "round_index": 0,
+                    "project_accessions": [],
+                    "rationale": "The pool contains valid candidates.",
+                },
+            ),
+            ("final", "Selected the merged candidate pool."),
+        ]
+    )
+    budget_model = FakeScriptedToolModel(
+        [
+            (
+                "submit_budget_decision",
+                {
+                    "decision": {
+                        "proposal_id": "proposal_" + "1" * 32,
+                        "decision": "grant",
+                        "approved_query_indexes": [0],
+                        "reasoning_summary": "The query targets the measured metadata gap.",
+                    }
+                },
+            ),
+            ("final", "Budget decision submitted."),
+        ]
+    )
+    request = DatasetRequest(repository="pride", max_projects=2, max_files=10)
+
+    def fake_discovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
+        project = DiscoveredProject(project_accession="PXD_MULTI", project_title="Multi-agent fixture")
+        file = DiscoveredFile(
+            project_accession=project.project_accession,
+            project_title=project.project_title,
+            file_name="multi.raw",
+            file_type=".raw",
+            validity_status="valid",
+            evidence_level="file",
+        )
+        return DatasetManifest(
+            request=request,
+            projects=[project],
+            files=[file],
+            summary={"selected_projects": 1, "selected_files": 1},
+        )
+
+    monkeypatch.setattr(
+        "agent.control_plane.budget_governor.uuid.uuid4",
+        lambda: SimpleNamespace(hex="1" * 32),
+    )
+    state_db = tmp_path / "agent_control.sqlite"
+    result = run_openai_agents_discovery(
+        prompt="Find human plasma DDA data",
+        request=request,
+        output_dir=tmp_path / "output",
+        state_db=state_db,
+        run_id="multi_agent_run",
+        mode="multi_agent",
+        dynamic_limits=DynamicBudgetLimits(),
+        budget=AgentBudget(max_turns=12, max_tool_calls=20),
+        discovery_func=fake_discovery,
+        model=discovery_model,
+        budget_model=budget_model,
+        stream_events=False,
+    )
+    store = AgentRunStore(state_db)
+    assert result.status == "completed"
+    assert result.selected_round_index == 0
+    run = store.load_run(result.run_id)
+    assert run is not None
+    assert run.dynamic_usage.budget_reviews == 1
+    assert run.dynamic_usage.search_batches == 1
+    assert run.dynamic_usage.query_units == 1
+    assert store.list_search_grants(run.run_id)[0].status == "consumed"
+    event_types = [event.event_type for event in store.list_events(run.run_id)]
+    assert "budget_decision_recorded" in event_types
+    assert "search_grant_consumed" in event_types
+    assert "manifest_selected" in event_types
+    budget_path = Path(result.files["agents_discovery_budget_json"])
+    payload = json.loads(budget_path.read_text(encoding="utf-8"))
+    assert payload["mode"] == "multi_agent_dynamic"
+    assert payload["approved_queries"] == 1
+    assert payload["search_batches"] == 1
+
+
+def test_openai_agents_runner_uses_quality_first_search_environment(tmp_path: Path) -> None:
+    from agents.items import ModelResponse
+    from agents.models.interface import Model
+    from agents.usage import Usage
+    from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputText
+
+    from agent.control_plane.openai_agents import run_openai_agents_discovery
+
+    class FakeQualityFirstModel(Model):
+        def __init__(self) -> None:
+            self.actions = [
+                (
+                    "search_repository_candidates",
+                    {
+                        "action": {
+                            "queries": [
+                                {
+                                    "query": "sensory neuron",
+                                    "depth": 40,
+                                    "intent_dimension": "cell model",
+                                    "expected_gain": "Relevant cell-model projects",
+                                }
+                            ],
+                            "candidate_limit": 20,
+                            "rationale": "Search the most distinctive intent dimension.",
+                        }
+                    },
+                ),
+                (
+                    "inspect_repository_candidates",
+                    {
+                        "action": {
+                            "search_id": "search_0001",
+                            "accessions": ["PXD000001"],
+                            "rationale": "The preview matches the requested cell model.",
+                        }
+                    },
+                ),
+                (
+                    "select_discovery_manifest",
+                    {
+                        "round_index": 0,
+                        "project_accessions": ["PXD000001"],
+                        "rationale": "The inspected candidate is relevant and valid.",
+                    },
+                ),
+                ("final", "Selected an evidence-backed sensory-neuron dataset."),
+            ]
+            self.calls = 0
+
+        async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+            action, payload = self.actions[self.calls]
+            self.calls += 1
+            if action == "final":
+                output = [
+                    ResponseOutputMessage(
+                        id=f"message_{self.calls}",
+                        content=[
+                            ResponseOutputText(annotations=[], text=str(payload), type="output_text")
+                        ],
+                        role="assistant",
+                        status="completed",
+                        type="message",
+                    )
+                ]
+            else:
+                output = [
+                    ResponseFunctionToolCall(
+                        arguments=json.dumps(payload),
+                        call_id=f"call_{self.calls}",
+                        name=action,
+                        type="function_call",
+                        status="completed",
+                    )
+                ]
+            return ModelResponse(output=output, usage=Usage(requests=1), response_id=None)
+
+        async def stream_response(self, *args: Any, **kwargs: Any):
+            if False:
+                yield None
+
+    request = DatasetRequest(repository="pride", max_projects=2, max_files=10)
+    state_db = tmp_path / "agent_control.sqlite"
+    environment = _FakeSearchEnvironment(request)
+    result = run_openai_agents_discovery(
+        prompt="Find human sensory-neuron DDA data",
+        request=request,
+        output_dir=tmp_path / "output",
+        state_db=state_db,
+        run_id="quality_first_agent_run",
+        mode="single_agent",
+        dynamic_limits=DynamicBudgetLimits(),
+        budget=AgentBudget(max_turns=10, max_tool_calls=20),
+        search_environment=environment,
+        model=FakeQualityFirstModel(),
+        stream_events=False,
+    )
+
+    run = AgentRunStore(state_db).load_run(result.run_id)
+    assert result.status == "completed"
+    assert result.selected_round_index == 0
+    assert run is not None
+    assert run.candidate_search_count == 1
+    assert run.candidate_inspection_count == 1
+    assert run.latest_candidate_search_id == "search_0001"
+    assert environment.search_actions[0].queries[0].depth == 40
+    assert environment.inspection_actions[0].accessions == ["PXD000001"]
+
+
+def test_openai_agents_setup_failure_is_persisted(monkeypatch, tmp_path: Path) -> None:
+    from agent.control_plane import openai_agents
+
+    def fail_to_build_tool(_function):
+        raise RuntimeError("tool schema setup failed")
+
+    monkeypatch.setattr(
+        openai_agents,
+        "_load_agents_sdk",
+        lambda: {"function_tool": fail_to_build_tool},
+    )
+    state_db = tmp_path / "state.sqlite"
+
+    result = openai_agents.run_openai_agents_discovery(
+        prompt="Find proteomics data",
+        request=DatasetRequest(repository="pride"),
+        output_dir=tmp_path / "output",
+        state_db=state_db,
+        run_id="setup_failure_001",
+        model=object(),
+    )
+
+    assert result.status == "failed"
+    assert result.blockers == ["tool schema setup failed"]
+    stored = AgentRunStore(state_db).load_run(result.run_id)
+    assert stored is not None
+    assert stored.status == "failed"
+    assert Path(result.files["agents_discovery_summary_json"]).exists()
+    assert [event.event_type for event in AgentRunStore(state_db).list_events(result.run_id)] == [
+        "run_started",
+        "run_failed",
+    ]
+
+
+def test_agents_discover_dataset_cli_keeps_new_runtime_opt_in(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(**kwargs) -> OpenAIAgentsDiscoveryResult:
+        captured.update(kwargs)
+        return OpenAIAgentsDiscoveryResult(
+            status="completed",
+            run_id="cli_agents_001",
+            output_dir=str(kwargs["output_dir"]),
+            state_db=str(tmp_path / "state.sqlite"),
+            selected_manifest_path=str(tmp_path / "dataset_manifest.json"),
+            discovery_round_count=1,
+            final_output="label‑free",
+        )
+
+    monkeypatch.setattr("agent.cli.run_openai_agents_discovery", fake_run)
+    output_dir = tmp_path / "cli_output"
+    result = CliRunner().invoke(
+        app,
+        [
+            "agents-discover-dataset",
+            "--prompt",
+            "Find human DDA data for RT prediction",
+            "--output-dir",
+            str(output_dir),
+            "--species",
+            "human",
+            "--task-type",
+            "rt_prediction",
+            "--max-rounds",
+            "2",
+            "--no-use-memory",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["task_type"] == "rt_prediction"
+    assert captured["memory"] is None
+    request = captured["request"]
+    assert isinstance(request, DatasetRequest)
+    assert request.species == ["human"]
+    assert request.goal == "general"
+    assert captured["budget"].max_discovery_rounds == 2
+    assert "label‑free" not in result.output
+    assert "label\\u2011free" in result.output
