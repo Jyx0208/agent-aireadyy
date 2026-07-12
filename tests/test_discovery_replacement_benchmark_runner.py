@@ -160,3 +160,45 @@ def test_blinded_pool_scores_same_project_separately_for_each_prompt(tmp_path: P
     assert len(blinded["candidates"]) == 2
     assert {item["variant_id"] for item in blinded["candidates"]} == {"clear", "vague"}
     assert len({item["candidate_id"] for item in key_payload["candidates"]}) == 2
+
+
+def test_blinded_pool_includes_neutral_candidates_without_leaking_source(tmp_path: Path) -> None:
+    runner = _runner_module()
+    scenario = _scenario()
+    (tmp_path / "neutral_pool.json").write_text(
+        json.dumps(
+            {
+                "candidates": [
+                    {
+                        "scenario_id": "human_neuron",
+                        "variant_id": "clear",
+                        "project_accession": "PXD_NEUTRAL",
+                        "matched_queries": ["neuron"],
+                        "project_title": "Independent candidate",
+                        "species": ["Homo sapiens"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    runner._write_blinded_judgment_pool(tmp_path, [scenario])
+
+    blinded_text = (tmp_path / "judgment_pool.blinded.json").read_text(encoding="utf-8")
+    key_payload = json.loads((tmp_path / "judgment_pool.key.json").read_text(encoding="utf-8"))
+    assert "PXD_NEUTRAL" not in blinded_text
+    assert "neutral_high_recall_pool" not in blinded_text
+    assert key_payload["candidates"][0]["project_accession"] == "PXD_NEUTRAL"
+    assert key_payload["candidates"][0]["observed_in"][0]["source"] == "neutral_high_recall_pool"
+
+
+def test_benchmark_output_is_protected_from_web_result_cleanup(tmp_path: Path) -> None:
+    runner = _runner_module()
+    output_root = tmp_path / "runs" / "benchmarks" / "pilot"
+    output_root.mkdir(parents=True)
+
+    runner._protect_benchmark_output(output_root)
+
+    assert (output_root / ".agent_keep").is_file()
+    assert (tmp_path / "runs" / "benchmarks" / ".agent_keep").is_file()

@@ -1,0 +1,105 @@
+[
+  {
+    "id": "holdout_rt_mouse_tissue_gradient",
+    "hidden_request": {
+      "repository": "pride", "goal": "general",
+      "query_terms": ["mouse tissue", "DDA", "retention time", "LC gradient diversity"],
+      "species": ["Mus musculus"], "species_policy": "include_only",
+      "acquisition_mode": "dda", "labeling_strategy": "label_free",
+      "max_projects": 5, "max_files": 20, "max_candidate_projects": 50, "max_files_per_project": 10,
+      "hard_constraint_fields": ["species", "species_policy", "acquisition_mode", "labeling_strategy"]
+    },
+    "task_type": "rt_prediction",
+    "prompt_variants": [
+      {"id": "explicit", "ambiguity_level": "clear", "mode": "raw_prompt", "hard_constraint_fields": ["species", "species_policy", "acquisition_mode", "labeling_strategy"], "prompt": "寻找小鼠组织的 label-free DDA 蛋白质组数据，用于验证保留时间预测模型。需要原始文件和肽段鉴定，优先覆盖不同组织、LC 梯度长度或实验平台。"},
+      {"id": "ordinary", "ambiguity_level": "vague", "mode": "raw_prompt", "hard_constraint_fields": ["species", "species_policy"], "prompt": "我想用几种小鼠组织测试肽段保留时间模型，请找实验条件有差异且鉴定信息完整的公开数据。"},
+      {"id": "vague", "ambiguity_level": "ambiguous", "mode": "raw_prompt", "hard_constraint_fields": [], "prompt": "我的保留时间模型只在一批样本上准，想找数据看看它换组织后怎么样。", "simulated_clarification": "先测试小鼠不同组织，需要原始 LC-MS/MS 数据、肽段鉴定和可追踪的保留时间。"}
+    ],
+    "relevance_judgments": {}, "notes": "Frozen holdout task; no target accession is predefined."
+  },
+  {
+    "id": "holdout_fragment_synthetic_hcd_energy",
+    "hidden_request": {
+      "repository": "pride", "goal": "general",
+      "query_terms": ["synthetic peptide library", "HCD", "normalized collision energy", "fragment intensity"],
+      "species_policy": "open", "acquisition_mode": "dda", "labeling_strategy": "unknown",
+      "max_projects": 5, "max_files": 20, "max_candidate_projects": 50, "max_files_per_project": 10,
+      "hard_constraint_fields": ["acquisition_mode"]
+    },
+    "task_type": "fragment_intensity_prediction",
+    "prompt_variants": [
+      {"id": "explicit", "ambiguity_level": "clear", "mode": "raw_prompt", "hard_constraint_fields": ["acquisition_mode"], "prompt": "Find public DDA measurements of synthetic peptide libraries acquired with HCD at multiple normalized collision energies. I need raw spectra and confident peptide identities to evaluate fragment-intensity prediction across energy settings."},
+      {"id": "ordinary", "ambiguity_level": "vague", "mode": "raw_prompt", "hard_constraint_fields": [], "prompt": "Find synthetic-peptide mass-spectrometry datasets suitable for testing whether a fragment-intensity model transfers across collision energies."},
+      {"id": "vague", "ambiguity_level": "ambiguous", "mode": "raw_prompt", "hard_constraint_fields": [], "prompt": "I need clean spectra to see whether my spectral predictor understands collision energy.", "simulated_clarification": "Synthetic peptides are preferred; I need HCD spectra at more than one energy and known peptide sequences."}
+    ],
+    "relevance_judgments": {}, "notes": "Frozen holdout task; no target accession is predefined."
+  },
+  {
+    "id": "holdout_psm_metaproteome_decoy",
+    "hidden_request": {
+      "repository": "pride", "goal": "general",
+      "query_terms": ["metaproteomics", "microbiome", "target decoy", "search results", "raw spectra"],
+      "species_policy": "open", "acquisition_mode": "unknown", "labeling_strategy": "unknown",
+      "max_projects": 5, "max_files": 20, "max_candidate_projects": 50, "max_files_per_project": 10,
+      "hard_constraint_fields": []
+    },
+    "task_type": "psm_scoring",
+    "prompt_variants": [
+      {"id": "explicit", "ambiguity_level": "clear", "mode": "raw_prompt", "hard_constraint_fields": [], "prompt": "寻找适合训练复杂微生物群 PSM 重打分模型的 metaproteomics 数据。需要原始谱图、数据库搜索结果以及可恢复的 target-decoy 或错误率信息。"},
+      {"id": "ordinary", "ambiguity_level": "vague", "mode": "raw_prompt", "hard_constraint_fields": [], "prompt": "我想在微生物群蛋白质组上训练 PSM 评分，请找同时提供原始数据和较完整搜索结果的公开项目。"},
+      {"id": "vague", "ambiguity_level": "ambiguous", "mode": "raw_prompt", "hard_constraint_fields": [], "prompt": "微生物群数据库很大，谱图匹配假阳性很多，我需要训练数据。", "simulated_clarification": "目标是 PSM 可信度建模，需要原始谱图、候选匹配或搜索结果以及错误标签来源。"}
+    ],
+    "relevance_judgments": {}, "notes": "Frozen holdout task; no target accession is predefined."
+  },
+  {
+    "id": "holdout_ptm_plant_phospho_stress",
+    "hidden_request": {
+      "repository": "pride", "goal": "ptm", "ptm_type": "phospho", "ptm_types": ["phospho"],
+      "query_terms": ["plant phosphoproteomics", "stress", "phosphopeptide enrichment", "site localization"],
+      "species_policy": "open", "acquisition_mode": "dda", "labeling_strategy": "unknown", "modification_scope": "phospho",
+      "max_projects": 5, "max_files": 20, "max_candidate_projects": 50, "max_files_per_project": 10,
+      "hard_constraint_fields": ["goal", "ptm_type", "ptm_types", "acquisition_mode"]
+    },
+    "task_type": "ptm_denovo",
+    "prompt_variants": [
+      {"id": "explicit", "ambiguity_level": "clear", "mode": "raw_prompt", "hard_constraint_fields": ["goal", "ptm_type", "ptm_types", "acquisition_mode"], "prompt": "寻找植物胁迫响应的磷酸化蛋白质组 DDA 数据，用于测试修饰肽 de novo 模型。需要磷酸肽富集、原始谱图和位点定位结果，并尽量覆盖不同植物或胁迫条件。"},
+      {"id": "ordinary", "ambiguity_level": "vague", "mode": "raw_prompt", "hard_constraint_fields": ["goal", "ptm_type", "ptm_types"], "prompt": "请找植物胁迫相关的磷酸化质谱数据，我想验证模型能否读出修饰肽序列和位点。"},
+      {"id": "vague", "ambiguity_level": "ambiguous", "mode": "raw_prompt", "hard_constraint_fields": ["goal", "ptm_type", "ptm_types"], "prompt": "我想看看模型能不能识别植物受胁迫后变化的磷酸化肽，需要公开数据。", "simulated_clarification": "需要富集后的高分辨率 MS/MS、可靠肽段序列和磷酸化位点结果。"}
+    ],
+    "relevance_judgments": {}, "notes": "Frozen holdout task; no target accession is predefined."
+  },
+  {
+    "id": "holdout_chimeric_plasma_wide_window",
+    "hidden_request": {
+      "repository": "pride", "goal": "general",
+      "query_terms": ["plasma proteomics", "DDA", "wide isolation window", "chimeric spectra"],
+      "species": ["Homo sapiens"], "species_policy": "include_only", "acquisition_mode": "dda", "labeling_strategy": "unknown",
+      "max_projects": 5, "max_files": 20, "max_candidate_projects": 50, "max_files_per_project": 10,
+      "hard_constraint_fields": ["species", "species_policy", "acquisition_mode"]
+    },
+    "task_type": "chimeric_interpretation",
+    "prompt_variants": [
+      {"id": "explicit", "ambiguity_level": "clear", "mode": "raw_prompt", "hard_constraint_fields": ["species", "species_policy", "acquisition_mode"], "prompt": "Find human plasma DDA datasets for evaluating chimeric-spectrum interpretation. Require raw high-resolution MS/MS and identification results; prefer experiments with wide precursor isolation windows or other evidence of frequent co-isolation."},
+      {"id": "ordinary", "ambiguity_level": "vague", "mode": "raw_prompt", "hard_constraint_fields": ["species", "species_policy"], "prompt": "Find public human plasma proteomics where precursor interference is likely and raw spectra plus identifications are available."},
+      {"id": "vague", "ambiguity_level": "ambiguous", "mode": "raw_prompt", "hard_constraint_fields": [], "prompt": "I need a difficult biological dataset with lots of mixed MS2 spectra to stress-test my model.", "simulated_clarification": "Use human plasma and DDA if possible; I need raw spectra, identifications, and evidence that precursor co-isolation is common."}
+    ],
+    "relevance_judgments": {}, "notes": "Frozen holdout task; no target accession is predefined."
+  },
+  {
+    "id": "holdout_denovo_environmental_metaproteome",
+    "hidden_request": {
+      "repository": "pride", "goal": "general",
+      "query_terms": ["environmental metaproteomics", "reference incomplete", "high resolution MS/MS", "peptide identification"],
+      "species_policy": "open", "acquisition_mode": "unknown", "labeling_strategy": "unknown",
+      "max_projects": 5, "max_files": 20, "max_candidate_projects": 50, "max_files_per_project": 10,
+      "hard_constraint_fields": []
+    },
+    "task_type": "denovo",
+    "prompt_variants": [
+      {"id": "explicit", "ambiguity_level": "clear", "mode": "raw_prompt", "hard_constraint_fields": [], "prompt": "寻找环境样本 metaproteomics 数据测试无数据库 de novo 肽段测序。需要高分辨率原始 MS/MS 和一部分可靠肽段鉴定作为验证，优先参考数据库明显不完整的群落。"},
+      {"id": "ordinary", "ambiguity_level": "vague", "mode": "raw_prompt", "hard_constraint_fields": [], "prompt": "请找环境微生物群的公开质谱数据，用来测试不依赖完整序列数据库的肽段测序。"},
+      {"id": "vague", "ambiguity_level": "ambiguous", "mode": "raw_prompt", "hard_constraint_fields": [], "prompt": "环境样本里很多蛋白数据库没有，我想直接从谱图找新肽段，需要数据。", "simulated_clarification": "用于 de novo 模型评估，需要原始高质量 MS/MS 和可作为部分真值的鉴定结果。"}
+    ],
+    "relevance_judgments": {}, "notes": "Frozen holdout task; no target accession is predefined."
+  }
+]

@@ -1,0 +1,265 @@
+[
+  {
+    "id": "rt_prediction_cross_lab",
+    "hidden_request": {
+      "repository": "pride",
+      "goal": "general",
+      "query_terms": ["retention time prediction", "DDA", "LC gradient", "cross-laboratory"],
+      "species_policy": "open",
+      "acquisition_mode": "dda",
+      "labeling_strategy": "unknown",
+      "max_projects": 5,
+      "max_files": 20,
+      "max_candidate_projects": 50,
+      "max_files_per_project": 10,
+      "hard_constraint_fields": ["acquisition_mode"]
+    },
+    "task_type": "rt_prediction",
+    "prompt_variants": [
+      {
+        "id": "explicit",
+        "ambiguity_level": "clear",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["acquisition_mode"],
+        "prompt": "我想训练一个能跨实验室泛化的肽段保留时间预测模型。请找公开的 DDA 蛋白质组数据，需要原始质谱文件和肽段鉴定结果，优先选择 LC 梯度信息完整、仪器与样本来源有差异的数据；物种不限。"
+      },
+      {
+        "id": "ordinary",
+        "ambiguity_level": "vague",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": [],
+        "prompt": "请帮我找几批适合训练通用肽段保留时间预测模型的公开蛋白质组数据，最好来自不同实验室，实验和鉴定信息比较完整。"
+      },
+      {
+        "id": "vague",
+        "ambiguity_level": "ambiguous",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": [],
+        "prompt": "我想让肽段保留时间模型换一批实验数据也能用，帮我找训练数据。",
+        "simulated_clarification": "优先使用常规 LC-MS/MS 数据；物种不限制，但需要能得到肽段序列与保留时间。"
+      }
+    ],
+    "relevance_judgments": {},
+    "notes": "Development task written before repository search; no target accession is predefined."
+  },
+  {
+    "id": "fragment_intensity_human_hcd",
+    "hidden_request": {
+      "repository": "pride",
+      "goal": "general",
+      "query_terms": ["human", "fragment intensity prediction", "Orbitrap", "HCD", "collision energy"],
+      "species": ["Homo sapiens"],
+      "species_policy": "include_only",
+      "acquisition_mode": "dda",
+      "labeling_strategy": "unknown",
+      "max_projects": 5,
+      "max_files": 20,
+      "max_candidate_projects": 50,
+      "max_files_per_project": 10,
+      "hard_constraint_fields": ["species", "species_policy", "acquisition_mode"]
+    },
+    "task_type": "fragment_intensity_prediction",
+    "prompt_variants": [
+      {
+        "id": "explicit",
+        "ambiguity_level": "clear",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["species", "species_policy", "acquisition_mode"],
+        "prompt": "寻找适合训练碎片离子强度预测模型的人类 DDA 蛋白质组数据。需要高分辨率 Orbitrap HCD 谱图和鉴定结果，优先覆盖不同碰撞能量或仪器设置。"
+      },
+      {
+        "id": "ordinary",
+        "ambiguity_level": "vague",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["species", "species_policy"],
+        "prompt": "我需要公开的人类蛋白质组数据训练碎片强度模型，希望谱图质量高，并且实验设置不要过于单一。"
+      },
+      {
+        "id": "vague",
+        "ambiguity_level": "ambiguous",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": [],
+        "prompt": "帮我找能训练肽段碎片谱预测的数据。",
+        "simulated_clarification": "先做人类肽段，主要关注 HCD 碎片离子强度，需要谱图和可靠鉴定。"
+      }
+    ],
+    "relevance_judgments": {},
+    "notes": "Development task written before repository search; no target accession is predefined."
+  },
+  {
+    "id": "psm_scoring_human_disease_cohort",
+    "hidden_request": {
+      "repository": "pride",
+      "goal": "general",
+      "query_terms": ["human disease cohort", "case control", "raw spectra", "search results", "PSM"],
+      "species": ["Homo sapiens"],
+      "species_policy": "include_only",
+      "acquisition_mode": "unknown",
+      "labeling_strategy": "unknown",
+      "max_projects": 5,
+      "max_files": 20,
+      "max_candidate_projects": 50,
+      "max_files_per_project": 10,
+      "hard_constraint_fields": ["species", "species_policy"]
+    },
+    "task_type": "psm_scoring",
+    "prompt_variants": [
+      {
+        "id": "explicit",
+        "ambiguity_level": "clear",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["species", "species_policy"],
+        "prompt": "我需要公开的人类疾病队列质谱数据训练 PSM 质量评分模型。必须同时有原始谱图和搜索鉴定结果，并包含病例与对照；疾病类型不限。"
+      },
+      {
+        "id": "ordinary",
+        "ambiguity_level": "vague",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["species", "species_policy"],
+        "prompt": "找一些带完整鉴定结果的人类疾病蛋白质组数据，我想用真实队列里的谱图训练 PSM 评分。"
+      },
+      {
+        "id": "vague",
+        "ambiguity_level": "ambiguous",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": [],
+        "prompt": "我想改进谱图匹配结果的可信度判断，能帮我找训练数据吗？",
+        "simulated_clarification": "希望用有原始谱图和搜索结果的人类病例-对照队列，疾病不限。"
+      }
+    ],
+    "relevance_judgments": {},
+    "notes": "Development task written before repository search; no target accession is predefined."
+  },
+  {
+    "id": "phospho_ptm_denovo",
+    "hidden_request": {
+      "repository": "pride",
+      "goal": "ptm",
+      "ptm_type": "phospho",
+      "ptm_types": ["phospho"],
+      "query_terms": ["phosphopeptide enrichment", "site localization", "DDA", "high resolution"],
+      "species_policy": "open",
+      "acquisition_mode": "dda",
+      "labeling_strategy": "unknown",
+      "modification_scope": "phospho",
+      "max_projects": 5,
+      "max_files": 20,
+      "max_candidate_projects": 50,
+      "max_files_per_project": 10,
+      "hard_constraint_fields": ["goal", "ptm_type", "ptm_types", "acquisition_mode"]
+    },
+    "task_type": "ptm_denovo",
+    "prompt_variants": [
+      {
+        "id": "explicit",
+        "ambiguity_level": "clear",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["goal", "ptm_type", "ptm_types", "acquisition_mode"],
+        "prompt": "寻找适合训练磷酸化肽 de novo 测序模型的公开数据。需要磷酸肽富集、高分辨率 DDA 原始谱图，并尽量有位点定位或鉴定结果作为标签。"
+      },
+      {
+        "id": "ordinary",
+        "ambiguity_level": "vague",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["goal", "ptm_type", "ptm_types"],
+        "prompt": "我想训练能识别磷酸化肽序列的模型，请找有富集实验、原始谱图和可靠位点鉴定的公开数据。"
+      },
+      {
+        "id": "vague",
+        "ambiguity_level": "ambiguous",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["goal", "ptm_type", "ptm_types"],
+        "prompt": "普通 de novo 模型遇到磷酸化肽效果不好，我需要一些数据。",
+        "simulated_clarification": "用于重新训练模型，需要磷酸肽富集后的高分辨率谱图和可以验证序列、修饰位点的结果。"
+      }
+    ],
+    "relevance_judgments": {},
+    "notes": "Development task written before repository search; no target accession is predefined."
+  },
+  {
+    "id": "chimeric_ms2_complex_samples",
+    "hidden_request": {
+      "repository": "pride",
+      "goal": "general",
+      "query_terms": ["chimeric MS2", "cofragmentation", "co-isolation", "isolation window", "complex sample"],
+      "species_policy": "open",
+      "acquisition_mode": "dda",
+      "labeling_strategy": "unknown",
+      "max_projects": 5,
+      "max_files": 20,
+      "max_candidate_projects": 50,
+      "max_files_per_project": 10,
+      "hard_constraint_fields": ["acquisition_mode"]
+    },
+    "task_type": "chimeric_interpretation",
+    "prompt_variants": [
+      {
+        "id": "explicit",
+        "ambiguity_level": "clear",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": ["acquisition_mode"],
+        "prompt": "寻找适合训练嵌合 MS2 解析模型的高分辨率 DDA 数据。样本应具有较高复杂度，优先选择较宽隔离窗口或明确记录前体共隔离信息，并需要原始谱图和鉴定结果。"
+      },
+      {
+        "id": "ordinary",
+        "ambiguity_level": "vague",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": [],
+        "prompt": "我想训练模型处理一个 MS2 谱里混有多个肽段的情况，请找复杂样本的公开原始数据和鉴定结果。"
+      },
+      {
+        "id": "vague",
+        "ambiguity_level": "ambiguous",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": [],
+        "prompt": "很多谱图看起来不止一个前体，我想做个模型，帮我找数据。",
+        "simulated_clarification": "目标是解析共隔离、共碎裂产生的嵌合 MS2，需要复杂样本的原始谱图和可用于验证的鉴定。"
+      }
+    ],
+    "relevance_judgments": {},
+    "notes": "Development task written before repository search; no target accession is predefined."
+  },
+  {
+    "id": "denovo_non_model_organism",
+    "hidden_request": {
+      "repository": "pride",
+      "goal": "general",
+      "query_terms": ["non-model organism", "de novo peptide sequencing", "high resolution spectra", "identification results"],
+      "species_policy": "open",
+      "acquisition_mode": "unknown",
+      "labeling_strategy": "unknown",
+      "max_projects": 5,
+      "max_files": 20,
+      "max_candidate_projects": 50,
+      "max_files_per_project": 10,
+      "hard_constraint_fields": []
+    },
+    "task_type": "denovo",
+    "prompt_variants": [
+      {
+        "id": "explicit",
+        "ambiguity_level": "clear",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": [],
+        "prompt": "寻找适合评估无数据库 de novo 测序的数据。优先非模式生物或参考蛋白组不完整的样本，需要高分辨率原始 MS/MS 谱图和可用于验证肽段序列的鉴定结果。"
+      },
+      {
+        "id": "ordinary",
+        "ambiguity_level": "vague",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": [],
+        "prompt": "请找一些非模式生物的公开质谱数据，我想训练不依赖完整蛋白数据库的肽段测序模型。"
+      },
+      {
+        "id": "vague",
+        "ambiguity_level": "ambiguous",
+        "mode": "raw_prompt",
+        "hard_constraint_fields": [],
+        "prompt": "没有靠谱参考蛋白组时我也想从谱图读出肽段序列，哪里有训练数据？",
+        "simulated_clarification": "优先非模式生物，需要高质量 MS/MS 原始数据以及一部分可靠鉴定用于验证。"
+      }
+    ],
+    "relevance_judgments": {},
+    "notes": "Development task written before repository search; no target accession is predefined."
+  }
+]

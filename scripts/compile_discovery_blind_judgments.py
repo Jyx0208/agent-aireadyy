@@ -14,6 +14,13 @@ def compile_blind_judgments(
     *,
     allow_partial: bool = False,
 ) -> dict[str, Any]:
+    judgment_source = str(reviewed_pool.get("judgment_source") or "human_verified")
+    if judgment_source not in {
+        "provisional_same_family",
+        "provisional_independent_model",
+        "human_verified",
+    }:
+        raise ValueError("reviewed pool has an unsupported judgment source")
     key_by_id = {
         str(item.get("candidate_id") or ""): item
         for item in key_payload.get("candidates") or []
@@ -62,6 +69,7 @@ def compile_blind_judgments(
         raise ValueError("reviewed pool contains no graded candidates")
     return {
         "schema_version": "discovery-replacement-judgments/v1",
+        "judgment_source": judgment_source,
         "variant_relevance_judgments": judgments,
         "review_evidence": evidence,
         "review_summary": {

@@ -18,6 +18,12 @@ AmbiguityLevel = Literal["structured", "clear", "vague", "ambiguous"]
 VariantMode = Literal["parsed_spec", "raw_prompt"]
 ReplacementRuntime = Literal["workflow", "openai_agents"]
 BudgetTier = Literal["baseline", "1x", "2x", "max_quality"]
+JudgmentSource = Literal[
+    "seed",
+    "provisional_same_family",
+    "provisional_independent_model",
+    "human_verified",
+]
 
 
 class PromptVariant(JsonModel):
@@ -33,8 +39,9 @@ class ReplacementBenchmarkScenario(JsonModel):
     id: str = Field(min_length=1)
     hidden_request: DatasetRequest
     prompt_variants: list[PromptVariant] = Field(min_length=1)
-    relevance_judgments: dict[str, int] = Field(min_length=1)
+    relevance_judgments: dict[str, int] = Field(default_factory=dict)
     variant_relevance_judgments: dict[str, dict[str, int]] = Field(default_factory=dict)
+    variant_judgment_sources: dict[str, JudgmentSource] = Field(default_factory=dict)
     task_type: str | None = None
     notes: str = ""
 
@@ -53,6 +60,9 @@ class ReplacementBenchmarkScenario(JsonModel):
         unknown_variants = set(self.variant_relevance_judgments) - set(variant_ids)
         if unknown_variants:
             raise ValueError("variant relevance judgments reference unknown prompt variants")
+        unknown_source_variants = set(self.variant_judgment_sources) - set(variant_ids)
+        if unknown_source_variants:
+            raise ValueError("variant judgment sources reference unknown prompt variants")
         invalid_variant = {
             f"{variant_id}:{accession}": grade
             for variant_id, judgments in self.variant_relevance_judgments.items()
@@ -77,6 +87,12 @@ class ReplacementRun(JsonModel):
     ineligible_reason: str | None = None
     selected_project_accessions: list[str] = Field(default_factory=list)
     hard_constraint_violations: int = Field(default=0, ge=0)
+    selected_file_count: int = Field(default=0, ge=0)
+    raw_spectra_count: int = Field(default=0, ge=0)
+    search_result_count: int = Field(default=0, ge=0)
+    metadata_file_count: int = Field(default=0, ge=0)
+    task_ready_file_count: int = Field(default=0, ge=0)
+    file_bundle_completeness: float = Field(default=0.0, ge=0.0, le=1.0)
     task_ready_precision: float = Field(default=0.0, ge=0.0, le=1.0)
     evidence_completeness: float = Field(default=0.0, ge=0.0, le=1.0)
     repository_requests: int = Field(default=0, ge=0)
@@ -107,6 +123,7 @@ class ReplacementPair(JsonModel):
     variant_id: str
     repeat: int
     ambiguity_level: AmbiguityLevel
+    judgment_source: JudgmentSource | Literal["missing"] = "missing"
     eligible: bool = True
     ineligible_reason: str | None = None
     workflow: ScoredReplacementRun
@@ -114,6 +131,7 @@ class ReplacementPair(JsonModel):
     quality_delta: float
     outcome: Literal["agent_win", "tie", "workflow_win"]
     added_hard_constraint_violations: int = Field(ge=0)
+    file_bundle_delta: float
 
 
 class ReplacementTierReport(JsonModel):
@@ -131,6 +149,7 @@ class ReplacementTierReport(JsonModel):
     repository_request_ratio: float
     elapsed_time_ratio: float
     added_hard_constraint_violations: int = Field(ge=0)
+    average_file_bundle_delta: float
     replacement_ready: bool
     gate_reasons: list[str] = Field(default_factory=list)
 
@@ -143,6 +162,7 @@ class ReplacementBenchmarkReport(JsonModel):
 
 class ReplacementJudgmentOverlay(JsonModel):
     schema_version: str = "discovery-replacement-judgments/v1"
+    judgment_source: JudgmentSource = "human_verified"
     variant_relevance_judgments: dict[str, dict[str, dict[str, int]]]
 
     @model_validator(mode="after")
@@ -204,7 +224,16 @@ def apply_replacement_judgment_overlay(
                 for variant_id, judgments in updates.items()
             }
         )
-        result.append(scenario.model_copy(update={"variant_relevance_judgments": merged}))
+        merged_sources = dict(scenario.variant_judgment_sources)
+        merged_sources.update({variant_id: overlay.judgment_source for variant_id in updates})
+        result.append(
+            scenario.model_copy(
+                update={
+                    "variant_relevance_judgments": merged,
+                    "variant_judgment_sources": merged_sources,
+                }
+            )
+        )
     return result
 
 
@@ -228,10 +257,7 @@ def score_replacement_run(
         raise ValueError("replacement run scenario does not match")
     if run.variant_id not in {variant.id for variant in scenario.prompt_variants}:
         raise ValueError("replacement run variant does not match scenario")
-    source_judgments = scenario.variant_relevance_judgments.get(
-        run.variant_id,
-        scenario.relevance_judgments,
-    )
+    source_judgments = _relevance_judgments_for_variant(scenario, run.variant_id)
     judgments = {key.upper(): grade for key, grade in source_judgments.items()}
     accessions = [accession.strip().upper() for accession in run.selected_project_accessions if accession.strip()]
     grades = [judgments.get(accession, 0) for accession in accessions[:5]]
@@ -242,7 +268,8 @@ def score_replacement_run(
     quality = (
         0.55 * ndcg
         + 0.25 * recall
-        + 0.10 * run.task_ready_precision
+        + 0.05 * run.task_ready_precision
+        + 0.05 * run.file_bundle_completeness
         + 0.10 * run.evidence_completeness
     )
     return ScoredReplacementRun(
@@ -282,6 +309,9 @@ def replacement_run_from_record(
         max(0.0, min(1.0, float(item.get("evidence_completeness") or 0.0)))
         for item in files
     ]
+    role_counts = _file_role_counts(files)
+    ready_file_count = sum(score >= 0.6 for score in task_ready_scores)
+    bundle_completeness = _file_bundle_completeness(files, role_counts)
     eligible = True
     ineligible_reason = None
     if runtime == "workflow":
@@ -311,6 +341,12 @@ def replacement_run_from_record(
                 else variant.hard_constraint_fields
             ),
         ),
+        selected_file_count=len(files),
+        raw_spectra_count=role_counts["raw_spectra"],
+        search_result_count=role_counts["search_result"],
+        metadata_file_count=role_counts["metadata"],
+        task_ready_file_count=ready_file_count,
+        file_bundle_completeness=bundle_completeness,
         task_ready_precision=sum(task_ready_scores) / max(1, len(task_ready_scores)),
         evidence_completeness=sum(evidence_values) / max(1, len(evidence_values)),
         repository_requests=max(
@@ -334,6 +370,27 @@ def _task_readiness_value(item: dict[str, object]) -> float:
         return max(0.0, min(1.0, float(score)))
     status = str(item.get("task_readiness_status") or "")
     return 1.0 if status == "ready" else 0.6 if status == "weak_ready" else 0.0
+
+
+def _file_role_counts(files: Sequence[dict[str, object]]) -> dict[str, int]:
+    roles = [str(item.get("file_role") or "unknown") for item in files]
+    return {
+        "raw_spectra": sum(role in {"raw_acquisition", "converted_peaklist"} for role in roles),
+        "search_result": sum(role == "search_result" for role in roles),
+        "metadata": sum(role in {"metadata", "report_table"} for role in roles),
+    }
+
+
+def _file_bundle_completeness(
+    files: Sequence[dict[str, object]],
+    role_counts: dict[str, int],
+) -> float:
+    if not files:
+        return 0.0
+    spectra = 0.5 if role_counts["raw_spectra"] else 0.0
+    labels = 0.3 if role_counts["search_result"] else 0.0
+    metadata = 0.2 if role_counts["metadata"] else 0.0
+    return spectra + labels + metadata
 
 
 def evaluate_replacement(
@@ -393,19 +450,40 @@ def _score_pair(
     if scenario is None:
         raise ValueError(f"unknown replacement scenario: {workflow.scenario_id}")
     variant = next(item for item in scenario.prompt_variants if item.id == workflow.variant_id)
+    judgments_available = bool(
+        _relevance_judgments_for_variant(scenario, workflow.variant_id)
+    )
+    judgment_source = _judgment_source_for_variant(scenario, workflow.variant_id)
     scored_workflow = score_replacement_run(scenario, workflow)
     scored_agent = score_replacement_run(scenario, agent)
     delta = scored_agent.quality_score - scored_workflow.quality_score
-    outcome = "agent_win" if delta >= 0.03 else "workflow_win" if delta <= -0.03 else "tie"
+    violation_delta = agent.hard_constraint_violations - workflow.hard_constraint_violations
+    bundle_delta = agent.file_bundle_completeness - workflow.file_bundle_completeness
+    if violation_delta > 0:
+        outcome = "workflow_win"
+    elif violation_delta < 0:
+        outcome = "agent_win"
+    elif bundle_delta >= 0.5:
+        outcome = "agent_win"
+    elif bundle_delta <= -0.5:
+        outcome = "workflow_win"
+    else:
+        outcome = "agent_win" if delta >= 0.03 else "workflow_win" if delta <= -0.03 else "tie"
     return ReplacementPair(
         scenario_id=workflow.scenario_id,
         variant_id=workflow.variant_id,
         repeat=workflow.repeat,
         ambiguity_level=variant.ambiguity_level,
-        eligible=workflow.eligible_for_comparison and agent.eligible_for_comparison,
+        judgment_source=judgment_source,
+        eligible=(
+            workflow.eligible_for_comparison
+            and agent.eligible_for_comparison
+            and judgments_available
+        ),
         ineligible_reason=(
-            workflow.ineligible_reason
-            or agent.ineligible_reason
+            "missing_relevance_judgments"
+            if not judgments_available
+            else workflow.ineligible_reason or agent.ineligible_reason
             if not (workflow.eligible_for_comparison and agent.eligible_for_comparison)
             else None
         ),
@@ -417,6 +495,7 @@ def _score_pair(
             0,
             agent.hard_constraint_violations - workflow.hard_constraint_violations,
         ),
+        file_bundle_delta=bundle_delta,
     )
 
 
@@ -442,9 +521,16 @@ def _evaluate_tier(
     workflow_elapsed = sum(pair.workflow.elapsed_seconds for pair in eligible_pairs)
     agent_elapsed = sum(pair.agent.elapsed_seconds for pair in eligible_pairs)
     added_violations = sum(pair.added_hard_constraint_violations for pair in eligible_pairs)
+    average_bundle_delta = sum(pair.file_bundle_delta for pair in eligible_pairs) / max(1, count)
     reasons: list[str] = []
     if count != len(pairs):
         reasons.append("ineligible paired runs present")
+    if any(
+        pair.eligible
+        and pair.judgment_source not in {"provisional_independent_model", "human_verified"}
+        for pair in pairs
+    ):
+        reasons.append("non-independent relevance judgments present")
     if count < gate.min_pairs:
         reasons.append("insufficient paired runs")
     if average_delta < gate.min_average_quality_delta:
@@ -457,6 +543,8 @@ def _evaluate_tier(
         reasons.append("vague-prompt quality delta below gate")
     if added_violations:
         reasons.append("agent added hard-constraint violations")
+    if average_bundle_delta < -0.01:
+        reasons.append("agent file-manifest readiness regressed")
     request_ratio = agent_requests / max(1, workflow_requests)
     if request_ratio > gate.max_repository_request_ratio:
         reasons.append("repository request ratio exceeds hard gate")
@@ -475,6 +563,7 @@ def _evaluate_tier(
         repository_request_ratio=request_ratio,
         elapsed_time_ratio=agent_elapsed / max(0.001, workflow_elapsed),
         added_hard_constraint_violations=added_violations,
+        average_file_bundle_delta=average_bundle_delta,
         replacement_ready=not reasons,
         gate_reasons=reasons,
     )
@@ -499,6 +588,25 @@ def _index_runs(
     if not indexed:
         raise ValueError("at least one replacement run is required")
     return indexed
+
+
+def _relevance_judgments_for_variant(
+    scenario: ReplacementBenchmarkScenario,
+    variant_id: str,
+) -> dict[str, int]:
+    return scenario.variant_relevance_judgments.get(
+        variant_id,
+        scenario.relevance_judgments,
+    )
+
+
+def _judgment_source_for_variant(
+    scenario: ReplacementBenchmarkScenario,
+    variant_id: str,
+) -> JudgmentSource | Literal["missing"]:
+    if not _relevance_judgments_for_variant(scenario, variant_id):
+        return "missing"
+    return scenario.variant_judgment_sources.get(variant_id, "seed")
 
 
 def _ndcg_at_5(selected_grades: Sequence[int], all_grades: Sequence[int]) -> float:

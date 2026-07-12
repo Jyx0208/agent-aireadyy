@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Task-aware AI-ready Data Agent</title>
 <style>
-:root{--bg:#f1f5f9;--surface:#ffffff;--panel:#f8fafc;--panel2:#eef2f7;--line:#e2e8f0;--line-strong:#cbd5e1;--text:#0f172a;--muted:#475569;--soft:#94a3b8;--primary:#6366f1;--primary-soft:#eef2ff;--primary-glow:rgba(99,102,241,.12);--accent:#6366f1;--accent2:#0ea5e9;--success:#10b981;--green:#10b981;--red:#ef4444;--amber:#f59e0b;--danger-soft:#fef2f2;--warning-soft:#fffbeb;--shadow-sm:0 1px 2px rgba(15,23,42,.04);--shadow:0 4px 16px rgba(15,23,42,.06),0 1px 3px rgba(15,23,42,.04);--shadow-lg:0 12px 32px rgba(15,23,42,.08),0 2px 6px rgba(15,23,42,.04);--radius:10px;--radius-sm:6px;--radius-lg:14px}
+:root{--bg:#edf0f2;--surface:#ffffff;--panel:#f4f6f7;--panel2:#e8ecef;--line:#cbd2d8;--line-strong:#9da8b1;--text:#182026;--muted:#52606a;--soft:#7b8790;--primary:#087f8c;--primary-soft:#e9f6f7;--primary-glow:rgba(8,127,140,.14);--accent:#155eef;--accent2:#087f8c;--success:#14804a;--green:#14804a;--red:#c4320a;--amber:#b54708;--danger-soft:#fff1ed;--warning-soft:#fff8e8;--shadow-sm:none;--shadow:none;--shadow-lg:none;--radius:4px;--radius-sm:3px;--radius-lg:5px}
 *{box-sizing:border-box;margin:0;padding:0}
 body{min-height:100vh;background:var(--bg);color:var(--text);font-family:"Plus Jakarta Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;line-height:1.55;-webkit-font-smoothing:antialiased}
 button,input,select{font:inherit}
@@ -17,9 +17,9 @@ button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{ou
 .container{max-width:1440px;margin:0 auto;padding:24px}
 .app-shell{display:grid;gap:18px}
 header{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;padding:18px 22px;border:1px solid var(--line);border-radius:var(--radius-lg);background:var(--surface);box-shadow:var(--shadow-sm);position:relative;overflow:hidden}
-header::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--primary),var(--accent2),#8b5cf6)}
+header::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:#242b31}
 .brand-stack{display:grid;gap:4px}
-.product-kicker{font-size:.7rem;font-weight:800;letter-spacing:.1em;text-transform:uppercase;background:linear-gradient(135deg,var(--primary),#8b5cf6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.product-kicker{font-size:.7rem;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:var(--primary)}
 h1{font-size:1.4rem;letter-spacing:-.01em;font-weight:800}
 .subtitle{font-size:.84rem;color:var(--muted);margin-top:1px;max-width:760px}
 .header-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:flex-end}
@@ -43,12 +43,12 @@ h1{font-size:1.4rem;letter-spacing:-.01em;font-weight:800}
 .main-input input:focus,.form-row input:focus,.form-row select:focus,.review-actions select:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-glow)}
 .btn{border:0;border-radius:var(--radius-sm);padding:11px 18px;font-size:.84rem;font-weight:650;cursor:pointer;transition:.15s all;display:inline-flex;align-items:center;gap:6px}
 .btn:disabled{opacity:.45;cursor:not-allowed;pointer-events:none}
-.btn-primary{background:linear-gradient(135deg,var(--primary),#4f46e5);color:#fff;box-shadow:0 2px 8px rgba(99,102,241,.25)}
-.btn-primary:hover:not(:disabled){background:linear-gradient(135deg,#4f46e5,#4338ca);box-shadow:0 4px 14px rgba(99,102,241,.35);transform:translateY(-1px)}
+.btn-primary{background:var(--primary);color:#fff;box-shadow:none}
+.btn-primary:hover:not(:disabled){background:#056873;box-shadow:none;transform:none}
 .btn-primary:active:not(:disabled){transform:translateY(0)}
 .btn-secondary{background:var(--surface);color:var(--text);border:1.5px solid var(--line)}
 .btn-secondary:hover:not(:disabled){border-color:var(--primary);color:var(--primary);background:var(--primary-soft)}
-.btn-green{background:linear-gradient(135deg,var(--success),#059669);color:#fff;box-shadow:0 2px 8px rgba(16,185,129,.25)}
+.btn-green{background:var(--success);color:#fff;box-shadow:none}
 .btn-green:hover:not(:disabled){box-shadow:0 4px 14px rgba(16,185,129,.35);transform:translateY(-1px)}
 .btn-small{padding:6px 12px;font-size:.76rem}
 .form-row{display:grid;grid-template-columns:104px minmax(0,1fr);gap:10px;align-items:center;margin-bottom:10px}
@@ -218,7 +218,7 @@ h1{font-size:1.4rem;letter-spacing:-.01em;font-weight:800}
 .discovery-compact-muted{font-size:.68rem;color:var(--muted);margin-top:3px}
 .config-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px;padding-top:14px;border-top:1px solid var(--line)}
 .config-toggle{background:transparent;border:0;color:var(--primary);cursor:pointer;font-size:.82rem;font-weight:700;transition:.15s color;padding:0}
-.config-toggle:hover{color:#4338ca}
+.config-toggle:hover{color:#1247b8}
 .config-body{display:none;margin-top:12px;animation:fadeIn .2s ease}
 .config-body.open{display:block}
 @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
@@ -280,7 +280,7 @@ h1{font-size:1.4rem;letter-spacing:-.01em;font-weight:800}
 .log-filters button{padding:3px 10px;border:1px solid var(--line);border-radius:999px;background:transparent;color:var(--muted);font-size:.7rem;cursor:pointer;transition:.15s all}
 .log-filters button.active{background:var(--primary);border-color:var(--primary);color:#fff}
 .log-filters button:hover:not(.active){border-color:var(--primary);color:var(--primary)}
-.log-box{height:500px;overflow-y:auto;background:linear-gradient(180deg,#0f172a 0%,#1e293b 100%);border:1px solid #334155;border-radius:var(--radius-sm);padding:14px;font-family:"Cascadia Code","JetBrains Mono",Consolas,monospace;font-size:.74rem;line-height:1.65}
+.log-box{height:500px;overflow-y:auto;background:#171d22;border:1px solid #39434b;border-radius:var(--radius-sm);padding:14px;font-family:"Cascadia Code","JetBrains Mono",Consolas,monospace;font-size:.74rem;line-height:1.65}
 .log-box::-webkit-scrollbar{width:5px}
 .log-box::-webkit-scrollbar-track{background:transparent}
 .log-box::-webkit-scrollbar-thumb{background:#475569;border-radius:999px}
@@ -318,8 +318,8 @@ h1{font-size:1.4rem;letter-spacing:-.01em;font-weight:800}
 /* Agent Reasoning Tree - redesigned */
 .agent-reasoning-panel{flex:1 1 360px;min-height:280px;min-width:0;display:flex;flex-direction:column;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--surface);overflow:hidden;box-shadow:var(--shadow-sm);transition:box-shadow .3s}
 .agent-reasoning-panel:has(.agent-reasoning-body.open){box-shadow:var(--shadow-lg)}
-.agent-reasoning-header{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 16px;background:linear-gradient(135deg,var(--primary-soft),#f5f3ff);border-bottom:1px solid var(--line);cursor:pointer;user-select:none;transition:.15s background}
-.agent-reasoning-header:hover{background:linear-gradient(135deg,#e0e7ff,#ede9fe)}
+.agent-reasoning-header{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 16px;background:var(--primary-soft);border-bottom:1px solid var(--line);cursor:pointer;user-select:none;transition:.15s background}
+.agent-reasoning-header:hover{background:#dff1f2}
 .agent-reasoning-header h3{font-size:.84rem;margin:0;font-weight:750;color:var(--primary);display:flex;align-items:center;gap:8px}
 .agent-reasoning-header h3::before{content:"🧠";font-size:.9rem}
 .agent-reasoning-toggle{font-size:.7rem;color:var(--primary);transition:transform .25s ease;width:22px;height:22px;display:flex;align-items:center;justify-content:center;background:var(--surface);border-radius:50%;border:1px solid var(--line)}
@@ -342,7 +342,7 @@ h1{font-size:1.4rem;letter-spacing:-.01em;font-weight:800}
 .agent-tree-section>.agent-tree-label{position:relative}
 .agent-tree-section>.agent-tree-label::before{content:"";position:absolute;left:-22px;top:50%;transform:translateY(-50%);width:10px;height:10px;border-radius:50%;background:var(--primary);border:2px solid var(--surface);box-shadow:0 0 0 2.5px var(--primary);z-index:1}
 .agent-tree-section:nth-child(2)>.agent-tree-label::before{background:var(--accent2);box-shadow:0 0 0 2.5px var(--accent2)}
-.agent-tree-section:nth-child(3)>.agent-tree-label::before{background:#8b5cf6;box-shadow:0 0 0 2.5px #8b5cf6}
+.agent-tree-section:nth-child(3)>.agent-tree-label::before{background:#b54708;box-shadow:0 0 0 2.5px #b54708}
 .agent-tree-section:nth-child(4)>.agent-tree-label::before{background:var(--amber);box-shadow:0 0 0 2.5px var(--amber)}
 /* Section label */
 .agent-tree-label{font-size:.72rem;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--primary);margin-bottom:8px;display:flex;align-items:center;gap:8px}
@@ -417,7 +417,7 @@ h1{font-size:1.4rem;letter-spacing:-.01em;font-weight:800}
 .workflow-tab{display:grid;gap:4px;text-align:left;border:1.5px solid var(--line);border-radius:var(--radius-sm);background:var(--panel);color:var(--text);padding:12px 14px;cursor:pointer;min-height:76px;transition:.15s all}
 .workflow-tab strong{font-size:.84rem;font-weight:750}
 .workflow-tab span{font-size:.7rem;color:var(--muted)}
-.workflow-tab[aria-selected="true"]{border-color:var(--primary);background:linear-gradient(135deg,var(--primary-soft),#f5f3ff);box-shadow:0 0 0 3px var(--primary-glow)}
+.workflow-tab[aria-selected="true"]{border-color:var(--primary);background:var(--primary-soft);box-shadow:0 0 0 3px var(--primary-glow)}
 .workflow-tab:hover:not([aria-selected="true"]){border-color:var(--line-strong);background:var(--surface)}
 .task-pane[hidden]{display:none}
 .pane-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}
@@ -434,18 +434,178 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
 @media(max-width:1180px){.run-grid{grid-template-columns:1fr}.side-panels{position:static;height:auto;max-height:none;overflow:visible}.review-panel{max-height:300px}.agent-reasoning-panel{min-height:300px}.agent-reasoning-body.open{max-height:520px}}
 @media(max-width:1100px){.grid{grid-template-columns:1fr}.operations-rail,.review-panel{position:static}.status-cards{grid-template-columns:1fr 1fr}.workflow-tabs{grid-template-columns:1fr}.history-card{max-height:60vh}.history-card .result-list{max-height:calc(60vh - 90px)}header{align-items:flex-start;flex-direction:column}.header-actions{justify-content:flex-start}.main-input{flex-direction:column}.steps{grid-template-columns:1fr 1fr}.form-row,.mode-row{grid-template-columns:1fr}.form-row label,.mode-label{text-align:left}.config-actions,.option-row,.examples{margin-left:0}.batch-toolbar{align-items:stretch}.batch-toolbar label,.batch-toolbar .btn{width:100%;justify-content:center}.batch-toolbar input{flex:1}.ai-ready-source-options{grid-template-columns:1fr}.ai-ready-stage-head{display:grid}}
 @media(max-width:720px){.container{padding:14px}.surface{padding:14px}.status-cards{grid-template-columns:1fr}.pane-title{display:grid}.workflow-tab{min-height:58px}.server-status{white-space:normal}.log-box{height:380px}.agent-budget-mode,.agent-budget-grid{grid-template-columns:1fr}.agent-budget-mode-help{padding-bottom:0}.discovery-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.agent-result-head{align-items:flex-start;flex-direction:column}}
+
+/* Product workspace */
+body{background:#edf1f5}
+.container{max-width:1680px;padding:18px 22px 30px}
+.app-shell{gap:14px}
+header{align-items:center;flex-direction:row;padding:12px 16px;border-radius:8px;position:sticky;top:0;z-index:30;box-shadow:0 8px 24px rgba(15,23,42,.08)}
+header::before{height:2px;background:#242b31}
+.brand-lockup{display:flex;align-items:center;gap:11px;min-width:0}
+.brand-mark{display:grid;place-items:center;width:38px;height:38px;flex:0 0 38px;border-radius:7px;background:#102a43;color:#fff;font-size:.76rem;font-weight:850;letter-spacing:0;box-shadow:inset 0 0 0 1px rgba(255,255,255,.12)}
+.brand-stack{gap:1px;min-width:0}
+.product-kicker{font-size:.62rem;letter-spacing:.08em;color:#0f766e;background:none;-webkit-text-fill-color:currentColor}
+h1{font-size:1.08rem;letter-spacing:0}
+.subtitle{font-size:.72rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:700px}
+.header-actions{gap:8px;flex-wrap:nowrap}
+.context-toggle{min-height:34px;padding:7px 10px;background:var(--surface)}
+.context-toggle-symbol{font-size:1rem;line-height:1}
+.system-drawer{border:1px solid var(--line);border-radius:7px;background:var(--surface);box-shadow:var(--shadow-sm)}
+.system-drawer>summary{display:flex;align-items:center;justify-content:space-between;gap:12px;list-style:none;padding:8px 12px;cursor:pointer;font-size:.72rem;color:var(--muted);font-weight:700}
+.system-drawer>summary::-webkit-details-marker{display:none}
+.system-drawer>summary::after{content:"+";font-size:1rem;color:var(--soft)}
+.system-drawer[open]>summary::after{content:"-"}
+.system-drawer .status-cards{padding:0 12px 12px;grid-template-columns:repeat(7,minmax(120px,1fr));gap:8px}
+.system-drawer .metric-card{min-height:70px;padding:10px;box-shadow:none}
+.system-drawer .gauge-dial{display:none}
+.system-drawer .gauge-card{display:block}
+.system-drawer .gauge-head{display:flex}
+.product-grid{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:14px;align-items:start}
+.product-grid.context-collapsed{grid-template-columns:minmax(0,1fr)}
+.product-grid.context-collapsed .operations-rail{display:none}
+.workbench-card{display:grid;grid-template-columns:224px minmax(0,1fr);gap:0;padding:0;overflow:hidden;min-height:680px;border-radius:8px}
+.workspace-nav{display:flex;flex-direction:column;min-height:100%;padding:18px 12px 14px;background:#102a43;color:#d9e2ec;border-right:1px solid #243b53}
+.workspace-nav .section-heading{display:block;padding:0 8px 14px;margin:0;border-bottom:1px solid rgba(255,255,255,.12)}
+.workspace-nav .section-eyebrow{color:#7dd3c7;font-size:.61rem;letter-spacing:.08em}
+.workspace-nav h2{color:#fff;font-size:.9rem;margin:3px 0 0}
+.workflow-tabs{display:grid;grid-template-columns:1fr;gap:4px;margin:14px 0 0}
+.workflow-tab{grid-template-columns:34px minmax(0,1fr);align-items:center;gap:0 9px;min-height:58px;padding:8px;border:0;border-radius:6px;background:transparent;color:#d9e2ec}
+.workflow-tab .workflow-index{grid-row:1 / span 2;display:grid;place-items:center;width:30px;height:30px;border:1px solid rgba(255,255,255,.2);border-radius:6px;color:#9fb3c8;font-size:.68rem;font-weight:800}
+.workflow-tab strong{font-size:.76rem;color:#f0f4f8;line-height:1.3}
+.workflow-tab span:not(.workflow-index){font-size:.64rem;color:#9fb3c8;line-height:1.35}
+.workflow-tab[aria-selected="true"]{border:0;background:#fff;color:#102a43;box-shadow:0 5px 14px rgba(0,0,0,.18)}
+.workflow-tab[aria-selected="true"] strong{color:#102a43}
+.workflow-tab[aria-selected="true"] span:not(.workflow-index){color:#486581}
+.workflow-tab[aria-selected="true"] .workflow-index{border-color:#0f766e;background:#e6fffa;color:#0f766e}
+.workflow-tab:hover:not([aria-selected="true"]){border:0;background:rgba(255,255,255,.08)}
+.workspace-nav-foot{margin-top:auto;padding:14px 8px 2px;border-top:1px solid rgba(255,255,255,.12);display:grid;gap:7px}
+.workspace-nav-link{color:#bcccdc;font-size:.7rem;text-decoration:none;padding:6px 8px;border-radius:5px}
+.workspace-nav-link:hover{color:#fff;background:rgba(255,255,255,.08)}
+.workspace-content{min-width:0;padding:24px 28px 30px;background:var(--surface)}
+.workspace-content>.form-alert{margin-bottom:14px}
+.pane-title{padding-bottom:14px;margin-bottom:16px;border-bottom:1px solid var(--line)}
+.pane-title h3{font-size:1rem}
+.pane-title p{max-width:760px;margin-top:3px}
+.workflow-progress{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0;margin:0 0 18px;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:var(--panel)}
+.workflow-progress span{position:relative;padding:8px 10px 8px 27px;border-right:1px solid var(--line);font-size:.68rem;color:var(--muted);font-weight:700}
+.workflow-progress span:last-child{border-right:0}
+.workflow-progress span::before{content:attr(data-step);position:absolute;left:9px;top:8px;color:#0f766e;font-weight:850}
+.workflow-progress span.active{background:#e6fffa;color:#115e59}
+.workflow-progress span.complete{background:#f0fdf9;color:#0f766e}
+.workflow-progress span.error{background:#fef2f2;color:#b91c1c}
+.discovery-goal-box{margin:0 0 12px;padding:16px;border-color:#b8d7d2;background:#f4fbfa}
+.discovery-goal-box label{color:#115e59}
+.discovery-goal-input{min-height:104px;background:#fff;font-size:.86rem}
+.discovery-constraints{margin:10px 0 14px;border:1px solid var(--line);border-radius:6px;background:var(--panel)}
+.discovery-constraints>summary{display:flex;align-items:center;justify-content:space-between;gap:10px;list-style:none;padding:11px 13px;cursor:pointer;color:var(--text);font-size:.76rem;font-weight:800}
+.discovery-constraints>summary::-webkit-details-marker{display:none}
+.discovery-constraints>summary::after{content:"+";color:var(--soft);font-size:1rem}
+.discovery-constraints[open]>summary::after{content:"-"}
+.discovery-constraints-body{padding:13px 14px 4px;border-top:1px solid var(--line);background:#fff}
+.discovery-toolbar{padding:12px 0 0;border-top:1px solid var(--line)}
+.discovery-toolbar .btn-primary{min-width:132px;justify-content:center;background:#0f766e;box-shadow:0 2px 8px rgba(15,118,110,.22)}
+.discovery-toolbar .btn-primary:hover:not(:disabled){background:#115e59;box-shadow:0 4px 12px rgba(15,118,110,.28)}
+.discovery-panel #discoveryRuntimeAgent.active{background:#0f766e;box-shadow:0 2px 8px rgba(15,118,110,.24)}
+.result-package-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+.result-package-head h4{font-size:.9rem;margin-top:2px}
+.history-more{width:100%;justify-content:center;margin-top:2px}
+.operations-rail{top:76px;gap:12px}
+.rail-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:3px 2px 0}
+.rail-heading strong{display:block;font-size:.76rem}
+.rail-heading span{display:block;font-size:.66rem;color:var(--muted);margin-top:1px}
+.operations-rail .surface{padding:14px;border-radius:7px;box-shadow:var(--shadow-sm)}
+.api-config-card .warn{font-size:.68rem}
+.history-card{max-height:470px}
+.run-card{border-radius:8px}
+footer{border:0;padding:2px 0}
+@media(max-width:1260px){.product-grid{grid-template-columns:minmax(0,1fr)}.operations-rail{position:static;grid-template-columns:1fr 1fr}.context-toggle{display:none}.workbench-card{grid-template-columns:204px minmax(0,1fr)}}
+@media(max-width:860px){.container{padding:10px}.subtitle{display:none}.server-status{display:none}.product-kicker{display:none}.workbench-card{display:block;min-height:0}.workspace-nav{min-height:0;padding:10px}.workspace-nav .section-heading,.workspace-nav-foot{display:none}.workflow-tabs{grid-template-columns:repeat(4,minmax(132px,1fr));overflow-x:auto;margin:0;padding-bottom:2px}.workflow-tab{min-height:52px}.workspace-content{padding:18px}.operations-rail{grid-template-columns:1fr}.system-drawer .status-cards{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){header{padding:10px}.brand-mark{width:34px;height:34px;flex-basis:34px}h1{font-size:.88rem}.language-switch button{padding:7px 9px;white-space:nowrap}.context-toggle{display:none}.system-drawer>summary span:last-child{display:none}.workspace-content{padding:15px 12px}.workflow-tabs{grid-template-columns:repeat(2,minmax(0,1fr));overflow:visible}.workflow-tab{grid-template-columns:28px minmax(0,1fr);min-height:48px}.workflow-tab .workflow-index{width:26px;height:26px}.workflow-tab span:not(.workflow-index){display:none}.workflow-progress{grid-template-columns:1fr}.workflow-progress span{border-right:0;border-bottom:1px solid var(--line)}.workflow-progress span:last-child{border-bottom:0}.discovery-goal-input{min-height:150px}.discovery-summary{grid-template-columns:1fr}.discovery-goal-actions{align-items:stretch;flex-direction:column}.discovery-goal-actions .btn{justify-content:center}.header-actions{gap:5px}}
+
+/* Proteomics instrument-console identity */
+:root{--bg:#edf0f2;--surface:#ffffff;--panel:#f4f6f7;--panel2:#e8ecef;--line:#cbd2d8;--line-strong:#9da8b1;--text:#182026;--muted:#52606a;--soft:#7b8790;--primary:#087f8c;--primary-soft:#e9f6f7;--primary-glow:rgba(8,127,140,.14);--accent:#155eef;--accent2:#087f8c;--success:#14804a;--green:#14804a;--red:#c4320a;--amber:#b54708;--danger-soft:#fff1ed;--warning-soft:#fff8e8;--shadow-sm:none;--shadow:none;--shadow-lg:none;--radius:4px;--radius-sm:3px;--radius-lg:5px}
+body{background:var(--bg);font-family:"Segoe UI","Noto Sans SC",Arial,sans-serif}
+.surface,.system-drawer,header{box-shadow:none}
+header{border:1px solid var(--line);border-top:4px solid #242b31;border-radius:3px;background:#fff}
+header::before{display:none}
+.brand-mark{position:relative;border-radius:2px;background:#f4b41a;color:#20272d;box-shadow:none;font-family:"Cascadia Mono",Consolas,monospace;font-weight:900}
+.product-kicker{color:#087f8c;font-family:"Cascadia Mono",Consolas,monospace;font-weight:800;letter-spacing:.08em}
+h1{font-weight:760}
+.server-status{border-radius:2px;background:#f4f6f7}
+.server-status::before{border-radius:1px;background:#14804a}
+.language-switch,.segmented{border-radius:3px;background:#f4f6f7}
+.segmented button,.language-switch button{border-radius:0}
+.segmented button.active,.language-switch button.active{background:#242b31;color:#fff;box-shadow:none}
+.segmented button:hover:not(.active),.language-switch button:hover:not(.active){color:#087f8c;background:#e9f6f7}
+.btn{border-radius:3px;font-weight:700;box-shadow:none;transform:none}
+.btn-primary{background:#087f8c;color:#fff;box-shadow:none}
+.btn-primary:hover:not(:disabled){background:#056873;box-shadow:none;transform:none}
+.btn-green{background:#14804a;color:#fff;box-shadow:none}
+.btn-green:hover:not(:disabled){background:#116b3f;box-shadow:none;transform:none}
+.btn-secondary{background:#fff;border-color:#aeb8c0}
+.btn-secondary:hover:not(:disabled){border-color:#087f8c;color:#056873;background:#f0faf9}
+input,select,textarea,.main-input input,.form-row input,.form-row select{border-radius:3px;background:#fff}
+.system-drawer{border-radius:3px;border-left:4px solid #6b7680}
+.system-drawer>summary{font-family:"Cascadia Mono",Consolas,monospace;text-transform:uppercase;letter-spacing:.02em}
+.metric-card{border-radius:3px;box-shadow:none}
+.workbench-card{border-radius:3px}
+.workspace-nav{background:#242b31;border-right:0;color:#d8dde1}
+.workspace-nav .section-heading{border-bottom-color:#485159}
+.workspace-nav .section-eyebrow{color:#79d1d8;font-family:"Cascadia Mono",Consolas,monospace}
+.workflow-tab{position:relative;border-radius:2px;color:#d8dde1}
+.workflow-tab .workflow-index{border-radius:2px;border-color:#59636b;color:#aeb7bd;font-family:"Cascadia Mono",Consolas,monospace}
+.workflow-tab[aria-selected="true"]{border-left:4px solid #f4b41a;border-radius:1px;background:#fff;box-shadow:none}
+.workflow-tab[aria-selected="true"] .workflow-index{border-color:#087f8c;background:#e9f6f7;color:#056873}
+.workflow-tab:hover:not([aria-selected="true"]){background:#303940}
+.workspace-nav-link{border-radius:2px;font-family:"Cascadia Mono",Consolas,monospace}
+.workspace-content{background:#fff}
+.pane-title{border-bottom:2px solid #242b31}
+.pane-title h3{font-weight:760}
+.status-pill{border-radius:2px;background:#fff}
+.status-pill::before{border-radius:1px}
+.workflow-progress{border-radius:2px;background:#f4f6f7}
+.workflow-progress span{font-family:"Cascadia Mono",Consolas,monospace;letter-spacing:0}
+.workflow-progress span.active{background:#dff4f3;color:#055f67;box-shadow:inset 0 -3px 0 #087f8c}
+.workflow-progress span.complete{background:#edf8f1;color:#116b3f;box-shadow:inset 0 -3px 0 #14804a}
+.workflow-progress span.error{background:#fff1ed;color:#a62b12;box-shadow:inset 0 -3px 0 #c4320a}
+.discovery-goal-box{border-radius:3px;border:1px solid #8bbfc2;border-left:4px solid #087f8c;background:#f4fbfb}
+.discovery-goal-input{border-radius:2px;font-family:"Cascadia Code",Consolas,monospace}
+.discovery-constraints,.discovery-table-wrap,.discovery-file-group,.batch-log-panel,.ai-ready-advanced{border-radius:3px}
+.discovery-panel #discoveryRuntimeAgent.active{background:#087f8c;box-shadow:none}
+.discovery-panel #discoveryRuntimeWorkflow.active{background:#242b31;box-shadow:none}
+.discovery-toolbar .btn-primary{background:#087f8c;box-shadow:none}
+.discovery-toolbar .btn-primary:hover:not(:disabled){background:#056873;box-shadow:none}
+.batch-log-box,.agent-result-output,.log-box{border-radius:2px;background:#171d22;color:#d5dde3}
+.discovery-next-step{border-radius:3px;border-left:4px solid #155eef;background:#eef4ff}
+.discovery-selection-toolbar{border-radius:3px;border-left:4px solid #14804a}
+.discovery-review-actions{border-radius:3px;border-left:4px solid #b54708;background:#fff8e8}
+.discovery-stat{border-radius:3px;background:#f7f8f9}
+.right-rail .surface{border-radius:3px}
+.config-toggle{color:#155eef}
+.config-toggle:hover{color:#1247b8}
+.history-card{border-top:3px solid #6b7680}
+.api-config-card{border-top:3px solid #155eef}
+.result-row{border-radius:2px}
+.result-package-head{border-bottom:2px solid #242b31}
+.section-eyebrow{color:#087f8c;font-family:"Cascadia Mono",Consolas,monospace}
+.monitor-card{border-top:4px solid #242b31}
+footer{font-family:"Cascadia Mono",Consolas,monospace}
 </style>
 </head>
 <body>
 <a class="skip-link" href="#mainContent">Skip to main content</a>
 <main class="container app-shell" id="mainContent" tabindex="-1">
   <header>
-    <div class="brand-stack">
-      <div class="product-kicker" data-i18n="productKicker">Proteomics AI data workbench</div>
-      <h1>Task-aware AI-ready Data Agent</h1>
-      <div class="subtitle" data-i18n="subtitle">Discover task-fit proteomics data, run or reuse search workflows, and build validated AI-ready training datasets.</div>
+    <div class="brand-lockup">
+      <div class="brand-mark" aria-hidden="true">AR</div>
+      <div class="brand-stack">
+        <div class="product-kicker" data-i18n="productKicker">Proteomics AI data workbench</div>
+        <h1>Task-aware AI-ready Data Agent</h1>
+        <div class="subtitle" data-i18n="subtitle">Discover task-fit proteomics data, run or reuse search workflows, and build validated AI-ready training datasets.</div>
+      </div>
     </div>
     <div class="header-actions">
+      <button class="btn btn-secondary btn-small context-toggle" id="contextToggle" type="button" aria-controls="operationsRail" aria-expanded="true" onclick="toggleContextRail()"><span class="context-toggle-symbol" aria-hidden="true">&#9638;</span><span data-i18n="workspaceContext">Context</span></button>
       <div class="language-switch" role="group" aria-label="Language">
         <button type="button" data-lang-btn="en" aria-pressed="true" onclick="setLanguage('en')">EN</button>
         <button type="button" data-lang-btn="zh" aria-pressed="false" onclick="setLanguage('zh')">中文</button>
@@ -454,44 +614,53 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
     </div>
   </header>
 
-  <section class="status-cards system-summary" aria-label="System summary">
-    <div class="metric-card" id="metricRunning"></div>
-    <div class="metric-card" id="metricQueued"></div>
-    <div class="metric-card" id="metricCpu"></div>
-    <div class="metric-card" id="metricMemory"></div>
-    <div class="metric-card" id="metricDisk"></div>
-    <div class="metric-card" id="metricHistory"></div>
-    <div class="metric-card" id="metricStorage"></div>
-  </section>
+  <details class="system-drawer">
+    <summary><span data-i18n="systemOverview">System and resource overview</span><span data-i18n="systemOverviewHint">Queue, storage, CPU and memory</span></summary>
+    <section class="status-cards system-summary" aria-label="System summary">
+      <div class="metric-card" id="metricRunning"></div>
+      <div class="metric-card" id="metricQueued"></div>
+      <div class="metric-card" id="metricCpu"></div>
+      <div class="metric-card" id="metricMemory"></div>
+      <div class="metric-card" id="metricDisk"></div>
+      <div class="metric-card" id="metricHistory"></div>
+      <div class="metric-card" id="metricStorage"></div>
+    </section>
+  </details>
 
-  <div class="grid">
+  <div class="grid product-grid" id="productGrid">
     <section class="surface workbench-card">
-      <div class="section-heading">
-        <div>
-          <div class="section-eyebrow" data-i18n="taskEyebrow">Workflow control</div>
-          <h2 data-i18n="createTask">Create Task</h2>
+      <aside class="workspace-nav" aria-label="Data workflow">
+        <div class="section-heading">
+          <div>
+            <div class="section-eyebrow" data-i18n="taskEyebrow">Workflow control</div>
+            <h2 data-i18n="createTask">Create Task</h2>
+          </div>
         </div>
-      </div>
+        <div class="workflow-tabs" role="tablist" aria-label="Workflow type">
+          <button class="workflow-tab" id="discoveryTaskTab" type="button" role="tab" aria-selected="true" aria-controls="discoveryTaskPanel" data-workflow-tab="discovery" onclick="setWorkflowTab('discovery')">
+            <span class="workflow-index" aria-hidden="true">D1</span><strong data-i18n="discoveryTabTitle">Dataset discovery</strong>
+            <span data-i18n="discoveryTabDesc">Find candidate files for model-building datasets.</span>
+          </button>
+          <button class="workflow-tab" id="singleTaskTab" type="button" role="tab" aria-selected="false" aria-controls="singleTaskPanel" data-workflow-tab="single" onclick="setWorkflowTab('single')">
+            <span class="workflow-index" aria-hidden="true">P2</span><strong data-i18n="singleTabTitle">Single file</strong>
+            <span data-i18n="singleTabDesc">Run one PRIDE file through planning or the full workflow.</span>
+          </button>
+          <button class="workflow-tab" id="batchTaskTab" type="button" role="tab" aria-selected="false" aria-controls="batchTaskPanel" data-workflow-tab="batch" onclick="setWorkflowTab('batch')">
+            <span class="workflow-index" aria-hidden="true">B3</span><strong data-i18n="batchTabTitle">Batch Excel</strong>
+            <span data-i18n="batchTabDesc">Plan many files and export a benchmark spreadsheet.</span>
+          </button>
+          <button class="workflow-tab" id="aiReadyTaskTab" type="button" role="tab" aria-selected="false" aria-controls="aiReadyTaskPanel" data-workflow-tab="ai_ready" onclick="setWorkflowTab('ai_ready')">
+            <span class="workflow-index" aria-hidden="true">A4</span><strong data-i18n="aiReadyTabTitle">AI-ready Build</strong>
+            <span data-i18n="aiReadyTabDesc">Convert completed runs or search outputs into task tables.</span>
+          </button>
+        </div>
+        <div class="workspace-nav-foot">
+          <a class="workspace-nav-link" href="/benchmark-review" data-i18n="benchmarkReviewLink">Benchmark review</a>
+        </div>
+      </aside>
+      <div class="workspace-content">
       <div class="form-alert" id="formAlert" role="alert" aria-live="assertive" aria-atomic="true" hidden></div>
-      <div class="workflow-tabs" role="tablist" aria-label="Workflow type">
-        <button class="workflow-tab" id="discoveryTaskTab" type="button" role="tab" aria-selected="false" aria-controls="discoveryTaskPanel" data-workflow-tab="discovery" onclick="setWorkflowTab('discovery')">
-          <strong data-i18n="discoveryTabTitle">Dataset discovery</strong>
-          <span data-i18n="discoveryTabDesc">Find candidate files for model-building datasets.</span>
-        </button>
-        <button class="workflow-tab" id="singleTaskTab" type="button" role="tab" aria-selected="true" aria-controls="singleTaskPanel" data-workflow-tab="single" onclick="setWorkflowTab('single')">
-          <strong data-i18n="singleTabTitle">Single file</strong>
-          <span data-i18n="singleTabDesc">Run one PRIDE file through planning or the full workflow.</span>
-        </button>
-        <button class="workflow-tab" id="batchTaskTab" type="button" role="tab" aria-selected="false" aria-controls="batchTaskPanel" data-workflow-tab="batch" onclick="setWorkflowTab('batch')">
-          <strong data-i18n="batchTabTitle">Batch Excel</strong>
-          <span data-i18n="batchTabDesc">Plan many files and export a benchmark spreadsheet.</span>
-        </button>
-        <button class="workflow-tab" id="aiReadyTaskTab" type="button" role="tab" aria-selected="false" aria-controls="aiReadyTaskPanel" data-workflow-tab="ai_ready" onclick="setWorkflowTab('ai_ready')">
-          <strong data-i18n="aiReadyTabTitle">AI-ready Build</strong>
-          <span data-i18n="aiReadyTabDesc">Convert completed runs or search outputs into task tables.</span>
-        </button>
-      </div>
-      <div class="task-pane" id="singleTaskPanel" role="tabpanel" aria-labelledby="singleTaskTab">
+      <div class="task-pane" id="singleTaskPanel" role="tabpanel" aria-labelledby="singleTaskTab" hidden>
         <div class="pane-title">
           <div>
             <h3 data-i18n="singleSetupTitle">Single task setup</h3>
@@ -611,13 +780,18 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
           <div class="batch-log-box" id="batchLogBox" role="log" aria-live="polite"></div>
         </div>
       </div>
-      <div class="discovery-panel task-pane" id="discoveryTaskPanel" role="tabpanel" aria-labelledby="discoveryTaskTab" hidden>
+      <div class="discovery-panel task-pane" id="discoveryTaskPanel" role="tabpanel" aria-labelledby="discoveryTaskTab">
         <div class="pane-title">
           <div>
             <h3 data-i18n="discoveryTitle">Dataset Discovery</h3>
             <p class="batch-help" data-i18n="discoveryHelp">Search repository metadata for candidate projects/files and export quality-scored manifests. No RAW download or workflow execution.</p>
           </div>
           <span class="status-pill queued" data-i18n="workflowReady">Ready</span>
+        </div>
+        <div class="workflow-progress" aria-label="Discovery workflow">
+          <span class="active" data-step="1" data-i18n="discoveryStageRequest">Request</span>
+          <span data-step="2" data-i18n="discoveryStageSearch">Agent search</span>
+          <span data-step="3" data-i18n="discoveryStagePackage">Review package</span>
         </div>
         <div class="form-row">
           <label for="discoverySource" data-i18n="discoverySource">Discovery source</label>
@@ -634,22 +808,25 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
         <div class="mode-row" id="discoveryRuntimeRow">
           <div class="mode-label" data-i18n="discoveryRuntime">Execution</div>
           <div class="mode-control">
-            <input type="hidden" id="discoveryRuntime" value="workflow">
+            <input type="hidden" id="discoveryRuntime" value="openai_agents">
             <div class="segmented" role="radiogroup" aria-label="Discovery execution mode" aria-describedby="discoveryRuntimeHelp">
-              <button class="active" id="discoveryRuntimeWorkflow" type="button" role="radio" aria-checked="true" onclick="setDiscoveryRuntime('workflow')" data-i18n="discoveryRuntimeWorkflow">Workflow</button>
-              <button id="discoveryRuntimeAgent" type="button" role="radio" aria-checked="false" onclick="setDiscoveryRuntime('openai_agents')" data-i18n="discoveryRuntimeAgent">OpenAI Agent</button>
+              <button id="discoveryRuntimeAgent" class="active" type="button" role="radio" aria-checked="true" onclick="setDiscoveryRuntime('openai_agents')" data-i18n="discoveryRuntimeAgent">OpenAI Agent</button>
+              <button id="discoveryRuntimeWorkflow" type="button" role="radio" aria-checked="false" onclick="setDiscoveryRuntime('workflow')" data-i18n="discoveryRuntimeWorkflow">Workflow</button>
             </div>
-            <div class="mode-help" id="discoveryRuntimeHelp" data-i18n="discoveryRuntimeWorkflowHelp">Deterministic discovery with optional legacy LLM query planning.</div>
+            <div class="mode-help" id="discoveryRuntimeHelp" data-i18n="discoveryRuntimeAgentHelp">The Agent chooses search queries, observes results, and adapts within server safety limits.</div>
           </div>
         </div>
         <div class="discovery-goal-box">
           <label for="discoveryPrompt" data-i18n="discoveryGoalPrompt">Discovery request</label>
           <textarea class="discovery-goal-input" id="discoveryPrompt" autocomplete="off" data-i18n-placeholder="discoveryGoalPlaceholder" placeholder="Find small DDA proteomics datasets for HLA ligandome, drug treatment, or another future modeling use case. Prioritize diversity."></textarea>
           <div class="discovery-goal-actions">
-            <button class="btn btn-secondary btn-small" id="discoveryParseBtn" type="button" onclick="parseDiscoveryGoal()" data-i18n="parseDiscoveryGoal">Parse goal</button>
+            <button class="btn btn-secondary btn-small" id="discoveryParseBtn" type="button" onclick="parseDiscoveryGoal()" data-i18n="parseDiscoveryGoal">Fill constraints (optional)</button>
             <span class="discovery-helper" id="discoveryParseStatus" data-i18n="discoveryParseHelp">Natural language fills the fields below; the fields are the final constraints.</span>
           </div>
         </div>
+        <details class="discovery-constraints">
+          <summary data-i18n="discoveryConstraints">Search constraints and limits</summary>
+          <div class="discovery-constraints-body">
         <div class="form-row">
           <label for="discoveryRepository" data-i18n="repository">Repository</label>
           <select id="discoveryRepository">
@@ -760,7 +937,9 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
             </select>
           </div>
         </div>
-        <div class="discovery-runtime-panel" id="discoveryAgentControls" hidden>
+          </div>
+        </details>
+        <div class="discovery-runtime-panel" id="discoveryAgentControls">
           <div class="agent-budget-head">
             <div>
               <div class="agent-budget-title" data-i18n="discoveryAgentBudgetTitle">Agent budget</div>
@@ -796,6 +975,10 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
           <div class="batch-log-box discovery-log-box" id="discoveryLogRaw" role="log" aria-live="polite" hidden></div>
         </div>
         <div class="discovery-results" id="discoveryResults" hidden>
+          <div class="result-package-head">
+            <div><div class="section-eyebrow" data-i18n="discoveryPackageEyebrow">Discovery package</div><h4 data-i18n="discoveryPackageTitle">Candidate data package</h4></div>
+            <span class="status-pill completed" id="discoveryPackageStatus" data-i18n="discoveryPackageReady">Ready for review</span>
+          </div>
           <div class="discovery-summary" id="discoverySummary"></div>
           <div class="discovery-next-step" id="discoveryNextStep" role="status" aria-live="polite" hidden></div>
           <section class="agent-result" id="discoveryAgentResult" aria-live="polite" hidden>
@@ -1066,9 +1249,13 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
           <div class="discovery-actions" id="aiReadyDownloads"></div>
         </div>
       </div>
+      </div>
     </section>
 
-    <div class="right-rail operations-rail">
+    <div class="right-rail operations-rail" id="operationsRail">
+      <div class="rail-heading">
+        <div><strong data-i18n="workspaceContext">Workspace context</strong><span data-i18n="workspaceContextHint">Connection and recent activity</span></div>
+      </div>
       <section class="surface api-config-card" aria-label="API Configuration">
         <div class="config-head">
           <button class="config-toggle" id="configToggle" aria-controls="configBody" aria-expanded="false" onclick="toggleConfig()"><span data-i18n="apiConfig">API Configuration</span> <span id="configStatus"></span></button>
@@ -1157,18 +1344,19 @@ footer{padding:6px 0;color:var(--soft);font-size:.72rem;text-align:center;border
 
 <script>
 let taskId=null,ws=null,currentFilter='all',allLogs=[],startTime=null,timerInterval=null,renderScheduled=false;
-let currentLanguage='en';
+let currentLanguage='zh';
 let currentRunMode='prepare';
 let fullWorkflowEnabled=false;
 let serverLlmConfigured=false;
 let lastReviewSummary=null;
 let currentBatchId=null,batchPollTimer=null,currentBatchRecord=null;
-let currentWorkflowTab='single';
+let currentWorkflowTab='discovery';
+let historyExpanded=false;
 let currentDiscoveryId=null;
 let currentDiscoveryRecord=null;
 let currentDiscoveryJobId=null,discoveryPollTimer=null,activeDiscoveryLogTab='activity';
 let discoveryLogSequences={jobId:null,activity:0,tools:0,raw:0};
-let currentDiscoveryRuntime='workflow';
+let currentDiscoveryRuntime='openai_agents';
 let currentBatchInputRecords=[];
 let currentModelDiscoveryRequests=[];
 let currentDiscoveryFilePage=1;
@@ -1181,11 +1369,25 @@ let healthPollActive=false;
 
 const I18N={
   en:{
-    productKicker:'Proteomics AI data workbench',
+    productKicker:'PROTEOMICS / DATA OPERATIONS',
     subtitle:'Discover task-fit proteomics data, run or reuse search workflows, and build validated AI-ready training datasets.',
     serverReading:'Reading server status...',
-    taskEyebrow:'Workflow control',
-    createTask:'Create Task',
+    workspaceContext:'Context',
+    workspaceContextHint:'Connection and recent activity',
+    systemOverview:'System and resource overview',
+    systemOverviewHint:'Queue, storage, CPU and memory',
+    benchmarkReviewLink:'Benchmark review',
+    discoveryStageRequest:'Request',
+    discoveryStageSearch:'Agent search',
+    discoveryStagePackage:'Review package',
+    discoveryConstraints:'Search constraints and limits',
+    discoveryPackageEyebrow:'Discovery package',
+    discoveryPackageTitle:'Candidate data package',
+    discoveryPackageReady:'Ready for review',
+    showMoreHistory:'Show all history',
+    showLessHistory:'Show recent only',
+    taskEyebrow:'ACTIVE WORKSPACE',
+    createTask:'Data operations',
     singleTabTitle:'Single file',
     singleTabDesc:'Plan one PRIDE file or run it end to end.',
     batchTabTitle:'Batch Excel',
@@ -1281,7 +1483,7 @@ const I18N={
     downloadAgentBudget:'Budget audit',
     discoveryGoalPrompt:'Discovery request',
     discoveryGoalPlaceholder:'Find small DDA proteomics datasets for HLA ligandome, drug treatment, or another future modeling use case. Prioritize diversity.',
-    parseDiscoveryGoal:'Parse request',
+    parseDiscoveryGoal:'Fill constraints (optional)',
     discoveryParsingGoal:'Parsing with LLM...',
     discoveryParseHelp:'Natural language fills the fields below; the fields are the final constraints.',
     discoveryParseEmpty:'Enter a discovery request first.',
@@ -1807,11 +2009,25 @@ Object.assign(I18N.zh,{
 });
 
 const CLEAN_ZH_I18N={
-  productKicker:'蛋白质组 AI 数据工作台',
+  productKicker:'蛋白质组 / 数据作业台',
   subtitle:'按建模任务发现可用数据，复用或运行搜库流程，并生成可验证的 AI-ready 训练集。',
   serverReading:'正在读取服务状态...',
-  taskEyebrow:'流程控制',
-  createTask:'创建任务',
+  workspaceContext:'上下文',
+  workspaceContextHint:'连接配置与最近任务',
+  systemOverview:'系统与资源概览',
+  systemOverviewHint:'队列、存储、CPU 与内存',
+  benchmarkReviewLink:'Benchmark 评价',
+  discoveryStageRequest:'描述需求',
+  discoveryStageSearch:'Agent 搜索',
+  discoveryStagePackage:'检查文件包',
+  discoveryConstraints:'搜索约束与数量上限',
+  discoveryPackageEyebrow:'Discovery 文件包',
+  discoveryPackageTitle:'候选数据文件包',
+  discoveryPackageReady:'等待检查',
+  showMoreHistory:'查看全部历史',
+  showLessHistory:'只看最近记录',
+  taskEyebrow:'当前工作区',
+  createTask:'数据作业',
   singleTabTitle:'单文件',
   singleTabDesc:'规划单个文件，或在确认资源后执行完整流程。',
   batchTabTitle:'批量任务',
@@ -1884,7 +2100,7 @@ const CLEAN_ZH_I18N={
   discoveryLocalDirRequired:'请填写本地 raw/mzML 目录。',
   discoveryGoalPrompt:'发现需求',
   discoveryGoalPlaceholder:'例如：寻找小型 DDA 蛋白质组数据，用于 HLA 免疫肽、药物处理或其他未来建模任务，并优先覆盖多样性。',
-  parseDiscoveryGoal:'解析需求',
+  parseDiscoveryGoal:'填充约束（可选）',
   discoveryParsingGoal:'正在用 LLM 解析...',
   discoveryParseHelp:'自然语言会更新下方字段；真正执行时以下方字段为准。',
   discoveryParseEmpty:'请先输入发现需求。',
@@ -2181,10 +2397,10 @@ const CLEAN_ZH_I18N={
 Object.assign(I18N.zh,CLEAN_ZH_I18N);
 Object.assign(I18N.zh,{
   discoveryRuntime:'执行方式',
-  discoveryRuntimeWorkflow:'Workflow',
-  discoveryRuntimeAgent:'OpenAI Agent',
-  discoveryRuntimeWorkflowHelp:'确定性数据发现，可选用原有 LLM 查询规划。',
-  discoveryRuntimeAgentHelp:'通过 OpenAI Agents SDK 执行受预算约束的 ReAct 数据发现；仓库工具保持只读。',
+  discoveryRuntimeWorkflow:'Workflow 基线',
+  discoveryRuntimeAgent:'自主 Agent',
+  discoveryRuntimeWorkflowHelp:'使用固定流程执行数据发现，作为可重复的基线。',
+  discoveryRuntimeAgentHelp:'Agent 会自主提出查询、观察结果并调整搜索；服务器只提供安全上限。',
   discoveryAgentBudgetTitle:'Agent 预算',
   discoveryAgentBudgetHelp:'本次运行优先使用本页填写的 API key，否则使用服务器密钥；密钥不会写入结果文件。',
   discoveryAgentReadOnly:'只读工具',
@@ -2372,6 +2588,20 @@ function toggleConfig(){
   toggle.setAttribute('aria-expanded',open?'true':'false');
 }
 
+function setContextRail(expanded,persist=true){
+  const grid=document.getElementById('productGrid');
+  const toggle=document.getElementById('contextToggle');
+  if(!grid||!toggle)return;
+  grid.classList.toggle('context-collapsed',!expanded);
+  toggle.setAttribute('aria-expanded',expanded?'true':'false');
+  if(persist)localStorage.setItem('contextRail',expanded?'open':'closed');
+}
+
+function toggleContextRail(){
+  const grid=document.getElementById('productGrid');
+  setContextRail(!!grid?.classList.contains('context-collapsed'));
+}
+
 function applyStepLabels(){
   const key=currentRunMode==='parameters'?'stepParams':(currentRunMode==='prepare'?'stepPrepare':'stepFull');
   const labels=t(key)||I18N.en[key]||I18N.en.stepFull;
@@ -2454,6 +2684,8 @@ function setWorkflowTab(tab,persist=true){
   document.getElementById('batchTaskPanel').hidden=currentWorkflowTab!=='batch';
   document.getElementById('discoveryTaskPanel').hidden=currentWorkflowTab!=='discovery';
   document.getElementById('aiReadyTaskPanel').hidden=currentWorkflowTab!=='ai_ready';
+  const grid=document.getElementById('productGrid');
+  if(grid)grid.dataset.activeWorkflow=currentWorkflowTab;
 }
 
 function formatEventTime(value){
@@ -2475,8 +2707,8 @@ async function loadConfig(){
     document.getElementById('cfgTimeout').value=d.timeout||'';
     serverLlmConfigured=!!d.api_key_set;
     renderApiKeyState();
-    document.getElementById('configBody').classList.add('open');
-    document.getElementById('configToggle').setAttribute('aria-expanded','true');
+    document.getElementById('configBody').classList.toggle('open',!serverLlmConfigured);
+    document.getElementById('configToggle').setAttribute('aria-expanded',serverLlmConfigured?'false':'true');
     document.getElementById('resultRetention').textContent=tf('retention',retentionMinutes(d),d.max_result_projects||4);
     updateFullWorkflowAvailability(!!d.full_workflow_enabled);
     setRunMode(localStorage.getItem('runMode')||(fullWorkflowEnabled?'full':'prepare'),false);
@@ -2564,7 +2796,8 @@ async function loadResults(refresh=false){
       const actions=UI.actionButton(label,handler,label+' '+(item.display_name||item.input_value||item.task_id||item.batch_id||''));
       return UI.taskRow(item,{meta:metaLine(item)+esc(pos),actions});
     }).join('');
-    const resultHtml=results.map(item=>{
+    const visibleResults=historyExpanded?results:results.slice(0,8);
+    const resultHtml=visibleResults.map(item=>{
       const fileInfo=(item.file_count||0)>0?(tf('fileCount',item.file_count)+' · '+formatSize(item.size_bytes)):t('filesCleaned');
       const viewId=item.kind==='batch'?(item.batch_id||item.result_id||''):(item.task_id||item.result_id||item.name);
       const viewLabel=item.kind==='batch'?batchActionText(item.primary_action):actionText(item.primary_action);
@@ -2574,7 +2807,8 @@ async function loadResults(refresh=false){
       const actionHtml=(viewBtn+downloadBtn)||'<span class="public-meta">'+esc(t('noDownload'))+'</span>';
       return UI.taskRow(item,{meta:metaLine(item)+' · '+esc(fileInfo),actions:actionHtml});
     }).join('');
-    box.innerHTML=activeHtml+resultHtml;
+    const historyToggle=results.length>8?'<button class="btn btn-secondary btn-small history-more" type="button" onclick="toggleHistoryExpanded()">'+esc(t(historyExpanded?'showLessHistory':'showMoreHistory'))+' ('+results.length+')</button>':'';
+    box.innerHTML=activeHtml+resultHtml+historyToggle;
   }catch(e){
     box.innerHTML=UI.emptyState(t('historyReading'));
   }
@@ -2607,6 +2841,11 @@ function renderBatchEvents(batch){
   meta.textContent=rows.length?rows.length+' events/log lines':t('batchLogEmpty');
   box.innerHTML=rows.length?rows.map(event=>UI.batchEvent(event)).join(''):UI.emptyState(t('batchLogEmpty'));
   box.scrollTop=box.scrollHeight;
+}
+
+function toggleHistoryExpanded(){
+  historyExpanded=!historyExpanded;
+  loadResults();
 }
 
 function batchItemHasAiReadyUsableRun(item){
@@ -2880,6 +3119,7 @@ function setDiscoveryRuntime(runtime){
   const source=document.getElementById('discoverySource')?.value||'remote';
   const next=runtime==='openai_agents'&&source!=='local'?'openai_agents':'workflow';
   currentDiscoveryRuntime=next;
+  localStorage.setItem('discoveryRuntime',next);
   const input=document.getElementById('discoveryRuntime');
   if(input)input.value=next;
   const workflowButton=document.getElementById('discoveryRuntimeWorkflow');
@@ -3674,6 +3914,18 @@ function renderDiscoveryFiles(files,options={}){
   updateDiscoverySelectionMeta();
 }
 
+function setDiscoveryProgress(stage,tone='active'){
+  const current=Math.max(1,Math.min(3,Number(stage)||1));
+  document.querySelectorAll('.workflow-progress [data-step]').forEach(item=>{
+    const value=Number(item.dataset.step||0);
+    item.classList.toggle('complete',value<current);
+    item.classList.toggle('active',value===current&&tone!=='error');
+    item.classList.toggle('error',value===current&&tone==='error');
+    if(value===current)item.setAttribute('aria-current','step');
+    else item.removeAttribute('aria-current');
+  });
+}
+
 function renderDiscovery(data){
   currentDiscoveryId=data.discovery_id||null;
   currentDiscoveryRecord=data||null;
@@ -3682,6 +3934,7 @@ function renderDiscovery(data){
   renderDiscoveryProjects(data.projects||[]);
   renderDiscoveryFiles(data.files||[]);
   document.getElementById('discoveryResults').hidden=false;
+  setDiscoveryProgress(3);
 }
 
 function discoveryLogCategory(item){
@@ -3762,20 +4015,25 @@ async function pollDiscoveryJob(){
       setButtonBusy(startBtn,false,t('startDiscovery'));
       cancelBtn.disabled=true;
       currentDiscoveryJobId=null;
+      setDiscoveryProgress(2,'error');
       return;
     }
     safeRenderDiscoveryJobLogs(data.logs||[]);
     const jobStatus=String(data.status||'');
     if(jobStatus==='queued'){
+      setDiscoveryProgress(2);
       status.textContent=t('discoveryQueued');
       status.className='discovery-status';
     }else if(jobStatus==='running'){
+      setDiscoveryProgress(2);
       status.textContent=t('discoveryRunning');
       status.className='discovery-status';
     }else if(jobStatus==='cancelled'){
+      setDiscoveryProgress(2,'error');
       status.textContent=t('discoveryCancelled');
       status.className='discovery-status error';
     }else if(jobStatus==='failed'){
+      setDiscoveryProgress(2,'error');
       status.textContent=tf('discoveryFailed',data.error||'unknown');
       status.className='discovery-status error';
     }else if(jobStatus==='completed'){
@@ -3821,6 +4079,7 @@ async function pollDiscoveryJob(){
     setButtonBusy(startBtn,false,t('startDiscovery'));
     cancelBtn.disabled=true;
     currentDiscoveryJobId=null;
+    setDiscoveryProgress(2,'error');
   }
 }
 
@@ -3879,6 +4138,7 @@ async function startDiscovery(){
   cancelBtn.disabled=true;
   status.textContent=t('discoveryQueued');
   status.className='discovery-status';
+  setDiscoveryProgress(2);
   try{
     const request=fetch('/api/discovery/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     clearTransientApiKey();
@@ -3888,6 +4148,7 @@ async function startDiscovery(){
       status.textContent=tf('discoveryFailed',data.error);
       status.className='discovery-status error';
       setButtonBusy(btn,false,t('startDiscovery'));
+      setDiscoveryProgress(2,'error');
       return;
     }
     currentDiscoveryJobId=data.job_id||null;
@@ -3899,6 +4160,7 @@ async function startDiscovery(){
     status.className='discovery-status error';
     setButtonBusy(btn,false,t('startDiscovery'));
     cancelBtn.disabled=true;
+    setDiscoveryProgress(2,'error');
   }
 }
 
@@ -5268,10 +5530,11 @@ async function loadAgentAudit(){
 }
 
 setRunMode(localStorage.getItem('runMode')||'prepare');
-setWorkflowTab(localStorage.getItem('workflowTab')||'single',false);
-setLanguage(localStorage.getItem('uiLanguage')||'en');
+setWorkflowTab(localStorage.getItem('workflowTab')||'discovery',false);
+setLanguage(localStorage.getItem('uiLanguage')||'zh');
+setContextRail(localStorage.getItem('contextRail')!=='closed',false);
 toggleDiscoverySourceControls();
-setDiscoveryRuntime('workflow');
+setDiscoveryRuntime(localStorage.getItem('discoveryRuntime')||'openai_agents');
 toggleDiscoveryGoalControls();
 toggleAiReadySource();
 loadConfig();

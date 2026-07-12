@@ -174,11 +174,11 @@ def test_frontend_template_exposes_discovery_workflow():
     assert 'id="discoveryTaskType"' in html
     assert 'id="discoveryAgentic" checked' in html
     assert 'id="discoveryAgenticRounds"' in html
-    assert 'id="discoveryRuntime" value="workflow"' in html
+    assert 'id="discoveryRuntime" value="openai_agents"' in html
     assert 'id="discoveryRuntimeWorkflow"' in html
     assert 'id="discoveryRuntimeAgent"' in html
     assert "setDiscoveryRuntime('openai_agents')" in html
-    assert 'id="discoveryAgentControls" hidden' in html
+    assert 'id="discoveryAgentControls"' in html
     assert 'id="discoveryAgentBudgetAutonomous"' in html
     assert 'id="discoveryAgentCredentialStatus"' in html
     assert "discoveryAgentServerKeyReady" in html
@@ -308,7 +308,7 @@ def test_frontend_template_has_clean_chinese_i18n_override():
     html = _html()
 
     assert "const CLEAN_ZH_I18N" in html
-    assert "蛋白质组 AI 数据工作台" in html
+    assert "蛋白质组 / 数据作业台" in html
     assert "数据发现" in html
     assert "AI-ready 构建" in html
     assert "运行 Discovery" in html
@@ -530,16 +530,36 @@ def test_frontend_template_uses_unclipped_semicircle_gauges():
 def test_frontend_template_uses_light_operational_app_shell():
     html = _html()
 
-    assert "--bg:#f1f5f9" in html
+    assert "--bg:#edf0f2" in html
     assert "--surface:#ffffff" in html
-    assert "--primary:#6366f1" in html
-    assert "--success:#10b981" in html
+    assert "--primary:#087f8c" in html
+    assert "--success:#14804a" in html
     assert 'class="container app-shell"' in html
     assert 'class="surface workbench-card"' in html
     assert 'class="right-rail operations-rail"' in html
     assert 'class="surface api-config-card"' in html
     assert 'class="surface history-card"' in html
     assert "system-summary" in html
+    assert "gradient(" not in html
+
+
+def test_frontend_template_uses_product_workspace_with_agent_first_defaults():
+    html = _html()
+
+    assert 'class="grid product-grid" id="productGrid"' in html
+    assert 'class="workspace-nav"' in html
+    assert 'class="workspace-content"' in html
+    assert 'id="operationsRail"' in html
+    assert 'id="contextToggle"' in html
+    assert 'class="system-drawer"' in html
+    assert 'class="discovery-constraints"' in html
+    assert 'class="workflow-progress"' in html
+    assert 'id="discoveryTaskTab" type="button" role="tab" aria-selected="true"' in html
+    assert 'id="singleTaskPanel" role="tabpanel" aria-labelledby="singleTaskTab" hidden' in html
+    assert "setWorkflowTab(localStorage.getItem('workflowTab')||'discovery',false);" in html
+    assert "setDiscoveryRuntime(localStorage.getItem('discoveryRuntime')||'openai_agents');" in html
+    assert "function setDiscoveryProgress(stage,tone='active')" in html
+    assert "const visibleResults=historyExpanded?results:results.slice(0,8);" in html
 
 
 def test_frontend_template_uses_inline_error_alerts_not_browser_alerts():

@@ -57,6 +57,7 @@ def test_compiler_maps_blind_candidate_ids_to_variant_accessions() -> None:
         }
     }
     assert compiled["review_summary"]["complete"] is True
+    assert compiled["judgment_source"] == "human_verified"
 
 
 def test_compiler_rejects_ungraded_candidates_by_default() -> None:
@@ -79,3 +80,25 @@ def test_compiler_rejects_ungraded_candidates_by_default() -> None:
         assert "not graded" in str(exc)
     else:
         raise AssertionError("expected incomplete review to fail")
+
+
+def test_compiler_preserves_machine_judgment_source() -> None:
+    compiler = _compiler_module()
+    reviewed = {
+        "judgment_source": "provisional_same_family",
+        "candidates": [{"candidate_id": "candidate_a", "grade": 2}],
+    }
+    key = {
+        "candidates": [
+            {
+                "candidate_id": "candidate_a",
+                "scenario_id": "scenario",
+                "variant_id": "vague",
+                "project_accession": "PXD000001",
+            }
+        ]
+    }
+
+    compiled = compiler.compile_blind_judgments(reviewed, key)
+
+    assert compiled["judgment_source"] == "provisional_same_family"

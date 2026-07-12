@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -22,6 +23,8 @@ from agent.discovery.replacement_evaluation import (
     load_replacement_judgment_overlay,
     replacement_run_from_record,
 )
+from agent.discovery.neutral_pool import collect_neutral_pool
+from agent.pride.client import PrideClient
 from agent.repositories.metering import meter_repository_requests
 from agent.web import app as web_app
 
@@ -69,8 +72,10 @@ def run_replacement_benchmark(
     tiers: Sequence[str],
     repeats: int,
     resume: bool = False,
+    include_neutral_pool: bool = True,
 ) -> ReplacementBenchmarkReport:
     output_root.mkdir(parents=True, exist_ok=True)
+    _protect_benchmark_output(output_root)
     web_app._runs_dir = output_root / "runs"
     workflow_runs: list[ReplacementRun] = []
     agent_runs: list[ReplacementRun] = []
@@ -119,6 +124,13 @@ def run_replacement_benchmark(
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+    if include_neutral_pool:
+        with PrideClient(timeout=30.0, read_timeout=60.0) as client:
+            neutral = collect_neutral_pool(scenarios, client)
+        (output_root / "neutral_pool.json").write_text(
+            json.dumps(neutral.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     report = evaluate_replacement(
         scenarios=scenarios,
         workflow=workflow_runs,
@@ -127,6 +139,14 @@ def run_replacement_benchmark(
     _write_report(output_root, report, workflow_runs, agent_runs)
     _write_blinded_judgment_pool(output_root, scenarios)
     return report
+
+
+def _protect_benchmark_output(output_root: Path) -> None:
+    (output_root / ".agent_keep").touch(exist_ok=True)
+    for ancestor in output_root.parents:
+        if ancestor.parent.name.casefold() == "runs":
+            (ancestor / ".agent_keep").touch(exist_ok=True)
+            break
 
 
 def _run_or_resume(
@@ -297,6 +317,12 @@ def _write_blinded_judgment_pool(
         if variant is None:
             continue
         projects = [item for item in record.get("projects") or [] if isinstance(item, dict)]
+        files = [item for item in record.get("files") or [] if isinstance(item, dict)]
+        files_by_accession: dict[str, list[dict[str, Any]]] = {}
+        for item in files:
+            file_accession = str(item.get("project_accession") or "").strip().upper()
+            if file_accession:
+                files_by_accession.setdefault(file_accession, []).append(item)
         for project in projects:
             accession = str(project.get("project_accession") or "").strip().upper()
             if not accession:
@@ -325,7 +351,7 @@ def _write_blinded_judgment_pool(
                 ),
                 "validity_status": project.get("validity_status"),
                 "evidence_completeness": project.get("evidence_completeness"),
-                "selected_file_count": project.get("selected_file_count"),
+                **_blind_file_bundle(files_by_accession.get(accession, [])),
                 "grade": None,
                 "review_notes": "",
                 "reviewer_id": "",
@@ -341,6 +367,72 @@ def _write_blinded_judgment_pool(
                     "budget_tier": result.get("budget_tier"),
                     "repeat": result.get("repeat"),
                     "artifact": path.name,
+                }
+            )
+
+    neutral_path = output_root / "neutral_pool.json"
+    if neutral_path.is_file():
+        neutral_payload = json.loads(neutral_path.read_text(encoding="utf-8"))
+        for project in neutral_payload.get("candidates") or []:
+            if not isinstance(project, dict):
+                continue
+            scenario_id = str(project.get("scenario_id") or "")
+            variant_id = str(project.get("variant_id") or "")
+            accession = str(project.get("project_accession") or "").strip().upper()
+            if scenario_id not in scenarios_by_id or not variant_id or not accession:
+                continue
+            key = (scenario_id, variant_id, accession)
+            candidate_id = "candidate_" + hashlib.sha256(
+                f"{scenario_id}:{variant_id}:{accession}".encode("utf-8")
+            ).hexdigest()[:12]
+            metadata = {
+                "candidate_id": candidate_id,
+                "scenario_id": scenario_id,
+                "variant_id": variant_id,
+                "visible_prompt": next(
+                    variant.prompt
+                    for variant in scenarios_by_id[scenario_id].prompt_variants
+                    if variant.id == variant_id
+                ),
+                "visible_hard_constraint_fields": next(
+                    variant.hard_constraint_fields
+                    for variant in scenarios_by_id[scenario_id].prompt_variants
+                    if variant.id == variant_id
+                ),
+                **{
+                    field: project.get(field)
+                    for field in (
+                        "project_title",
+                        "project_description",
+                        "species",
+                        "acquisition_mode",
+                        "labeling_strategy",
+                        "instrument_families",
+                        "fragmentation_methods",
+                        "validity_status",
+                        "evidence_completeness",
+                        "selected_file_count",
+                        "file_role_counts",
+                        "file_type_counts",
+                        "task_readiness_counts",
+                        "missing_task_requirements",
+                        "paired_raw_and_results",
+                    )
+                },
+                "grade": None,
+                "review_notes": "",
+                "reviewer_id": "",
+            }
+            current = pooled.get(key)
+            if current is None or len(json.dumps(metadata, ensure_ascii=False)) > len(
+                json.dumps(current, ensure_ascii=False)
+            ):
+                pooled[key] = metadata
+            provenance.setdefault(key, []).append(
+                {
+                    "source": "neutral_high_recall_pool",
+                    "matched_queries": list(project.get("matched_queries") or []),
+                    "artifact": neutral_path.name,
                 }
             )
 
@@ -390,6 +482,31 @@ def _write_blinded_judgment_pool(
     )
 
 
+def _blind_file_bundle(files: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    role_counts = Counter(str(item.get("file_role") or "unknown") for item in files)
+    type_counts = Counter(str(item.get("file_type") or "unknown") for item in files)
+    readiness_counts = Counter(
+        str(item.get("task_readiness_status") or "unknown") for item in files
+    )
+    missing = sorted(
+        {
+            str(requirement)
+            for item in files
+            for requirement in item.get("missing_task_requirements") or []
+            if str(requirement).strip()
+        }
+    )
+    raw_count = role_counts["raw_acquisition"] + role_counts["converted_peaklist"]
+    return {
+        "selected_file_count": len(files),
+        "file_role_counts": dict(role_counts),
+        "file_type_counts": dict(type_counts),
+        "task_readiness_counts": dict(readiness_counts),
+        "missing_task_requirements": missing,
+        "paired_raw_and_results": bool(raw_count and role_counts["search_result"]),
+    }
+
+
 def _set_agent_tier(tier: str) -> None:
     limits = TIER_LIMITS.get(tier)
     if limits is None:
@@ -419,18 +536,19 @@ def _write_report(
         f"Replacement ready: **{report.replacement_ready}**",
         f"Winning budget tier: `{report.winning_budget_tier or 'none'}`",
         "",
-        "| Tier | Eligible pairs | Wins/Ties/Losses | Quality delta | Vague delta | Request ratio | Ready |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| Tier | Eligible pairs | Wins/Ties/Losses | Quality delta | File bundle delta | Vague delta | Request ratio | Ready |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for tier in report.tiers:
         lines.append(
             f"| {tier.budget_tier} | {tier.pair_count}/{tier.total_pairs} | "
             f"{tier.agent_wins}/{tier.ties}/{tier.workflow_wins} | "
-            f"{tier.average_quality_delta:+.3f} | {tier.vague_quality_delta:+.3f} | "
+            f"{tier.average_quality_delta:+.3f} | {tier.average_file_bundle_delta:+.3f} | "
+            f"{tier.vague_quality_delta:+.3f} | "
             f"{tier.repository_request_ratio:.2f} | {tier.replacement_ready} |"
         )
         if tier.gate_reasons:
-            lines.append(f"|  |  | Gate | {'; '.join(tier.gate_reasons)} |  |  |  |")
+            lines.append(f"|  |  | Gate | {'; '.join(tier.gate_reasons)} |  |  |  |  |")
     (output_root / "replacement_report.md").write_text(
         "\n".join(lines) + "\n",
         encoding="utf-8",
@@ -456,6 +574,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         action="store_true",
         help="Reuse validated per-run JSON artifacts already present in output-root.",
+    )
+    parser.add_argument(
+        "--no-neutral-pool",
+        action="store_true",
+        help="Skip the non-competing high-recall PRIDE candidate collector.",
     )
     return parser
 
@@ -504,6 +627,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             tiers=tiers,
             repeats=args.repeat,
             resume=args.resume,
+            include_neutral_pool=not args.no_neutral_pool,
         )
     except Exception as exc:
         print(f"replacement benchmark error: {exc}", file=sys.stderr)
