@@ -28,6 +28,12 @@ from agent.control_plane.models import (
     minimum_high_relevance_inspections,
 )
 from agent.control_plane.store import AgentRunStore
+from agent.control_plane.sdk_runtime import (
+    PublicRunHooks,
+    configure_local_trace,
+    create_role_session,
+    serialize_run_state,
+)
 from agent.discovery.memory import DiscoveryMemory
 from agent.discovery.models import DatasetManifest, DatasetRequest
 from agent.discovery.query_builder import build_pride_queries
@@ -49,6 +55,11 @@ class DiscoveryAgentContext:
     sdk: dict[str, Any]
     budget_model: Any
     budget_governor: BudgetGovernor | None = None
+    should_cancel: Callable[[], bool] | None = None
+
+    def raise_if_cancelled(self) -> None:
+        if self.should_cancel is not None and self.should_cancel():
+            raise InterruptedError("Discovery cancelled.")
 
 
 def search_repository_datasets(
@@ -60,6 +71,7 @@ def search_repository_datasets(
     Args:
         queries: One or more repository search strings for this discovery round.
     """
+    wrapper.context.raise_if_cancelled()
     observation = wrapper.context.service.search_repository_datasets(queries)
     return observation.model_dump_json()
 
@@ -73,6 +85,7 @@ async def request_search_budget(
     Args:
         proposal: Evidence-backed search proposal containing the exact queries requested.
     """
+    wrapper.context.raise_if_cancelled()
     if wrapper.context.budget_governor is None:
         return json.dumps({"outcome": "denied", "reason": "dynamic_budget_disabled"})
     record = wrapper.context.budget_governor.register_proposal(proposal)
@@ -98,6 +111,7 @@ def search_repository_datasets_with_grant(
         grant_id: Issued one-use grant identifier.
         queries: Exact approved query list in its approved order.
     """
+    wrapper.context.raise_if_cancelled()
     return wrapper.context.service.search_repository_datasets(queries, grant_id=grant_id).model_dump_json()
 
 
@@ -110,6 +124,7 @@ def search_repository_candidates(
     Args:
         action: Query-level search depths, intent dimensions, expected gain, and rationale.
     """
+    wrapper.context.raise_if_cancelled()
     return wrapper.context.service.search_repository_candidates(action).model_dump_json()
 
 
@@ -124,6 +139,7 @@ def search_repository_candidates_with_grant(
         grant_id: Issued one-use grant identifier.
         action: Candidate search action whose query texts exactly match the approved grant.
     """
+    wrapper.context.raise_if_cancelled()
     return wrapper.context.service.search_repository_candidates(
         action,
         grant_id=grant_id,
@@ -139,11 +155,13 @@ def inspect_repository_candidates(
     Args:
         action: Latest search id, candidate accessions, and evidence-based rationale.
     """
+    wrapper.context.raise_if_cancelled()
     return wrapper.context.service.inspect_repository_candidates(action).model_dump_json()
 
 
 def get_discovery_state(wrapper: RunContextWrapper[DiscoveryAgentContext]) -> str:
     """Return the current discovery budget, artifact pointer, warnings, and blockers."""
+    wrapper.context.raise_if_cancelled()
     return json.dumps(wrapper.context.service.get_discovery_state(), ensure_ascii=False)
 
 
@@ -160,6 +178,7 @@ def select_discovery_manifest(
         project_accessions: Exact inspected project accessions to retain. When the pooled candidate count exceeds max_projects, provide a non-empty list within that limit.
         rationale: Concise evidence-based reason for selecting this manifest.
     """
+    wrapper.context.raise_if_cancelled()
     payload = wrapper.context.service.select_discovery_manifest(
         round_index,
         rationale,
@@ -176,6 +195,12 @@ def openai_agents_available() -> bool:
     return True
 
 
+def build_openai_agents_model(llm_config: dict[str, str] | None = None) -> Any:
+    sdk = _load_agents_sdk()
+    api_key, base_url, model_name = _model_configuration(llm_config)
+    return _build_model(sdk, api_key=api_key, base_url=base_url, model_name=model_name)
+
+
 def run_openai_agents_discovery(
     *,
     prompt: str,
@@ -186,6 +211,7 @@ def run_openai_agents_discovery(
     memory: DiscoveryMemory | None = None,
     budget: AgentBudget | None = None,
     run_id: str | None = None,
+    project_id: str | None = None,
     discovery_func=None,
     model: Any | None = None,
     llm_config: dict[str, str] | None = None,
@@ -195,6 +221,8 @@ def run_openai_agents_discovery(
     search_environment: DiscoverySearchEnvironment | None = None,
     event_callback: Callable[[AgentEvent], None] | None = None,
     stream_events: bool = False,
+    session_db: str | Path | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> OpenAIAgentsDiscoveryResult:
     sdk = _load_agents_sdk()
     if model is None:
@@ -206,7 +234,10 @@ def run_openai_agents_discovery(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     state_db = Path(state_db) if state_db is not None else output_dir / "agent_control.sqlite"
+    session_db = Path(session_db) if session_db is not None else output_dir / "agent_sessions.sqlite"
+    trace_path = output_dir / "agents_sdk_trace.jsonl"
     run_id = run_id or _new_run_id()
+    project_id = str(project_id).strip() if project_id else None
     budget = budget or AgentBudget()
     store = AgentRunStore(state_db, event_listener=event_callback)
     if store.load_run(run_id) is not None:
@@ -214,6 +245,7 @@ def run_openai_agents_discovery(
     run = store.save_run(
         AgentRunRecord(
             run_id=run_id,
+            project_id=project_id,
             workflow="discovery",
             status="running",
             prompt=prompt,
@@ -229,6 +261,7 @@ def run_openai_agents_discovery(
         {
             "runtime": "openai_agents",
             "workflow": "discovery",
+            "project_id": project_id,
             "task_type": task_type,
             "budget": budget.model_dump(mode="json"),
             "mode": mode,
@@ -256,7 +289,9 @@ def run_openai_agents_discovery(
             sdk=sdk,
             budget_model=budget_model,
             budget_governor=governor,
+            should_cancel=should_cancel,
         )
+        context.raise_if_cancelled()
         quality_first = search_environment is not None
         if mode == "multi_agent" and quality_first:
             tools = [
@@ -305,10 +340,27 @@ def run_openai_agents_discovery(
             tools=tools,
             model_settings=sdk["ModelSettings"](parallel_tool_calls=False),
         )
+        session = create_role_session(
+            session_db,
+            project_id=project_id or run_id,
+            role="discovery",
+            encryption_key=os.getenv("AGENT_SESSION_ENCRYPTION_KEY") or None,
+        )
+        configure_local_trace(run_id, trace_path)
+        hooks = PublicRunHooks(
+            lambda event_type, payload: store.append_event(run_id, event_type, payload),
+            should_cancel=should_cancel,
+        )
         run_config = sdk["RunConfig"](
             workflow_name="proteomics_ai_ready_discovery_v2",
-            trace_metadata={"run_id": run_id, "workflow": "discovery"},
-            tracing_disabled=not _env_flag("AGENT_OPENAI_AGENTS_TRACING", default=False),
+            trace_metadata={
+                "run_id": run_id,
+                "project_id": project_id,
+                "workflow": "discovery",
+            },
+            group_id=project_id or run_id,
+            tracing_disabled=False,
+            trace_include_sensitive_data=False,
             tool_execution=sdk["ToolExecutionConfig"](
                 max_function_tool_concurrency=1,
                 pre_approval_tool_input_guardrails=True,
@@ -324,13 +376,43 @@ def run_openai_agents_discovery(
             "context": context,
             "max_turns": budget.max_turns,
             "run_config": run_config,
+            "hooks": hooks,
+            "session": session,
         }
-        if stream_events:
+        # Prefer stream mode when cancel is cooperative so we can abort between
+        # SDK events instead of waiting for a full run_sync turn.
+        use_stream = stream_events or should_cancel is not None
+        if use_stream:
             result = asyncio.run(
-                _run_streamed_to_completion(sdk=sdk, store=store, **runner_kwargs)
+                _run_streamed_to_completion(
+                    sdk=sdk,
+                    store=store,
+                    should_cancel=should_cancel,
+                    **runner_kwargs,
+                )
             )
         else:
             result = sdk["Runner"].run_sync(**runner_kwargs)
+    except InterruptedError as exc:
+        run = store.load_run(run_id) or run
+        run = store.save_run(
+            run.model_copy(
+                update={
+                    "status": "cancelled",
+                    "stop_reason": "user_cancelled",
+                    "blockers": _dedupe([*run.blockers, str(exc)]),
+                }
+            )
+        )
+        store.append_event(run_id, "run_cancelled", {"error": str(exc)})
+        _write_run_outputs(
+            store,
+            run,
+            output_dir,
+            session_db=session_db,
+            trace_path=trace_path,
+        )
+        raise
     except Exception as exc:
         run = store.load_run(run_id) or run
         run = store.save_run(
@@ -343,7 +425,13 @@ def run_openai_agents_discovery(
             )
         )
         store.append_event(run_id, "run_failed", {"error": str(exc)})
-        files = _write_run_outputs(store, run, output_dir)
+        files = _write_run_outputs(
+            store,
+            run,
+            output_dir,
+            session_db=session_db,
+            trace_path=trace_path,
+        )
         return OpenAIAgentsDiscoveryResult(
             status="failed",
             run_id=run_id,
@@ -432,7 +520,14 @@ def run_openai_agents_discovery(
 
     selected_files = service.publish_latest_manifest() if run.current_manifest_path else {}
     run = store.load_run(run_id) or run
-    files = _write_run_outputs(store, run, output_dir, selected_files=selected_files)
+    files = _write_run_outputs(
+        store,
+        run,
+        output_dir,
+        selected_files=selected_files,
+        session_db=session_db,
+        trace_path=trace_path,
+    )
     run = store.load_run(run_id) or run
     return OpenAIAgentsDiscoveryResult(
         status=run.status,
@@ -455,10 +550,13 @@ async def _run_streamed_to_completion(
     *,
     sdk: dict[str, Any],
     store: AgentRunStore,
+    should_cancel: Callable[[], bool] | None = None,
     **kwargs: Any,
 ) -> Any:
     streamed = sdk["Runner"].run_streamed(**kwargs)
     async for event in streamed.stream_events():
+        if should_cancel is not None and should_cancel():
+            raise InterruptedError("Discovery cancelled.")
         payload = _public_sdk_event(event)
         if payload is not None:
             store.append_event(
@@ -466,6 +564,8 @@ async def _run_streamed_to_completion(
                 payload["event_type"],
                 payload["payload"],
             )
+        if should_cancel is not None and should_cancel():
+            raise InterruptedError("Discovery cancelled.")
     return streamed
 
 
@@ -556,7 +656,11 @@ def _build_model(
     base_url: str,
     model_name: str,
 ) -> Any:
-    client = sdk["AsyncOpenAI"](api_key=api_key, base_url=base_url)
+    client = sdk["AsyncOpenAI"](
+        api_key=api_key,
+        base_url=base_url,
+        max_retries=3,
+    )
     return sdk["OpenAIChatCompletionsModel"](
         model=model_name,
         openai_client=client,
@@ -696,10 +800,7 @@ def _new_run_id() -> str:
 
 
 def _serialize_sdk_state(state: Any) -> str:
-    payload = state.to_json()
-    if isinstance(payload, str):
-        return payload
-    return json.dumps(payload, ensure_ascii=False)
+    return serialize_run_state(state)
 
 
 def _interruption_payload(item: Any) -> dict[str, Any]:
@@ -729,8 +830,12 @@ def _write_run_outputs(
     output_dir: Path,
     *,
     selected_files: dict[str, str] | None = None,
+    session_db: Path | None = None,
+    trace_path: Path | None = None,
 ) -> dict[str, str]:
     selected_files = selected_files or {}
+    session_db = session_db or output_dir / "agent_sessions.sqlite"
+    trace_path = trace_path or output_dir / "agents_sdk_trace.jsonl"
     summary_path = output_dir / "agents_discovery_summary.json"
     events_path = output_dir / "agents_discovery_events.json"
     report_path = output_dir / "agents_discovery_report.md"
@@ -741,6 +846,8 @@ def _write_run_outputs(
         "agents_discovery_report_md": str(report_path),
         "agents_discovery_budget_json": str(budget_path),
         "agent_control_sqlite": str(store.path),
+        "agent_sessions_sqlite": str(session_db),
+        "agents_sdk_trace_jsonl": str(trace_path),
         **selected_files,
     }
     budget_audit = _budget_audit(store, run)
@@ -748,6 +855,7 @@ def _write_run_outputs(
         "schema_version": "openai-agents-discovery/v2",
         "status": run.status,
         "run_id": run.run_id,
+        "project_id": run.project_id,
         "runtime": run.runtime,
         "workflow": run.workflow,
         "request": run.request,
@@ -887,13 +995,6 @@ def _markdown_report(summary: dict[str, Any]) -> str:
     lines.extend(f"- Blocker: `{item}`" for item in summary.get("blockers") or [])
     lines.extend(["", "## Agent Conclusion", "", str(summary.get("final_output") or "No final output.")])
     return "\n".join(lines) + "\n"
-
-
-def _env_flag(name: str, *, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().casefold() in {"1", "true", "yes", "on"}
 
 
 def _dedupe(values: list[str]) -> list[str]:
