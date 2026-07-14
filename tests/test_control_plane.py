@@ -1257,8 +1257,10 @@ def test_openai_agents_runner_executes_real_function_tool_loop(tmp_path: Path) -
         request=request,
         output_dir=tmp_path / "agents_discovery",
         state_db=tmp_path / "agent_control.sqlite",
+        session_db=tmp_path / "project_sessions.sqlite",
         budget=AgentBudget(max_turns=4, max_tool_calls=4, max_discovery_rounds=2),
         run_id="agents_runner_001",
+        project_id="project_human_dda",
         discovery_func=fake_discovery,
         model=model,
     )
@@ -1270,6 +1272,10 @@ def test_openai_agents_runner_executes_real_function_tool_loop(tmp_path: Path) -
     assert result.selection_rationale == "The merged pool contains a valid file-level candidate."
     assert Path(result.files["dataset_manifest_json"]).exists()
     assert Path(result.files["agents_discovery_events_json"]).exists()
+    summary = json.loads(Path(result.files["agents_discovery_summary_json"]).read_text(encoding="utf-8"))
+    assert summary["project_id"] == "project_human_dda"
+    assert Path(result.files["agent_sessions_sqlite"]) == tmp_path / "project_sessions.sqlite"
+    assert AgentRunStore(tmp_path / "agent_control.sqlite").load_run(result.run_id).project_id == "project_human_dda"  # type: ignore[union-attr]
     assert "Accept the current manifest" in result.final_output
     events = json.loads(Path(result.files["agents_discovery_events_json"]).read_text(encoding="utf-8"))
     assert "manifest_selected" in [event["event_type"] for event in events]
@@ -1299,6 +1305,7 @@ def test_openai_chat_completions_model_buffers_streamed_tool_calls() -> None:
     )
 
     assert captured["model"]["buffer_streamed_tool_calls"] is True
+    assert captured["client"]["max_retries"] == 3
 
 
 def test_openai_agents_runner_executes_multi_agent_budget_loop(monkeypatch, tmp_path: Path) -> None:
@@ -1605,7 +1612,7 @@ def test_agents_discover_dataset_cli_keeps_new_runtime_opt_in(monkeypatch, tmp_p
             final_output="label‑free",
         )
 
-    monkeypatch.setattr("agent.cli.run_openai_agents_discovery", fake_run)
+    monkeypatch.setattr("agent.cli.run_agents_discovery", fake_run)
     output_dir = tmp_path / "cli_output"
     result = CliRunner().invoke(
         app,
@@ -1635,3 +1642,74 @@ def test_agents_discover_dataset_cli_keeps_new_runtime_opt_in(monkeypatch, tmp_p
     assert captured["budget"].max_discovery_rounds == 2
     assert "label‑free" not in result.output
     assert "label\\u2011free" in result.output
+
+
+def test_discovery_context_raise_if_cancelled() -> None:
+    from agent.control_plane.openai_agents import DiscoveryAgentContext
+
+    cancelled = {"value": False}
+    ctx = DiscoveryAgentContext(
+        service=None,  # type: ignore[arg-type]
+        sdk={},
+        budget_model=None,
+        should_cancel=lambda: cancelled["value"],
+    )
+    ctx.raise_if_cancelled()
+    cancelled["value"] = True
+    try:
+        ctx.raise_if_cancelled()
+        raise AssertionError("expected InterruptedError")
+    except InterruptedError:
+        pass
+
+
+def test_openai_agents_cancelled_before_runner_persists_and_raises(monkeypatch, tmp_path: Path) -> None:
+    from agent.control_plane import openai_agents
+    from agent.control_plane.store import AgentRunStore
+
+    monkeypatch.setattr(
+        openai_agents,
+        "_load_agents_sdk",
+        lambda: {
+            "function_tool": lambda fn: fn,
+            "Agent": lambda *a, **k: object(),
+            "ModelSettings": lambda **k: object(),
+            "RunConfig": lambda **k: object(),
+            "Runner": type(
+                "R",
+                (),
+                {
+                    "run_sync": staticmethod(
+                        lambda **k: (_ for _ in ()).throw(RuntimeError("should not run"))
+                    )
+                },
+            ),
+            "ToolExecutionConfig": lambda **k: object(),
+        },
+    )
+    original = openai_agents.DiscoveryAgentContext
+
+    def cancelling_context(*args, **kwargs):
+        kwargs = dict(kwargs)
+        kwargs["should_cancel"] = lambda: True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(openai_agents, "DiscoveryAgentContext", cancelling_context)
+    state_db = tmp_path / "state.sqlite"
+    try:
+        openai_agents.run_openai_agents_discovery(
+            prompt="cancel me",
+            request=DatasetRequest(repository="pride"),
+            output_dir=tmp_path / "output",
+            state_db=state_db,
+            run_id="cancel_early_001",
+            model=object(),
+            should_cancel=lambda: True,
+        )
+        raise AssertionError("expected InterruptedError")
+    except InterruptedError:
+        pass
+    stored = AgentRunStore(state_db).load_run("cancel_early_001")
+    assert stored is not None
+    assert stored.status == "cancelled"
+    assert stored.stop_reason == "user_cancelled"

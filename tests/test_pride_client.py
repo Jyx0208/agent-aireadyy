@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import httpx
+
 from agent.pride.client import PrideClient
 
 
 class _FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, *, text: str = "", content: bytes = b""):
         self._payload = payload
+        self.text = text
+        self.content = content
 
     def raise_for_status(self) -> None:
         return None
@@ -103,3 +107,43 @@ def test_first_download_url_prefers_ftp_or_http_over_aspera():
         PrideClient.first_download_url(file_record)
         == "https://ftp.pride.ebi.ac.uk/pride/data/archive/2022/02/PXD028735/experimental-design.sdrf.tsv"
     )
+
+
+def test_download_text_retries_incomplete_chunked_response(monkeypatch):
+    client = PrideClient(retries=3)
+    calls = 0
+
+    def fake_get(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.RemoteProtocolError(
+                "peer closed connection without sending complete message body"
+            )
+        return _FakeResponse({}, text="source name\tcomment[instrument]\n")
+
+    monkeypatch.setattr(client._client, "get", fake_get)
+    monkeypatch.setattr("agent.pride.client.sleep", lambda *_args: None)
+
+    assert client.download_text("https://ftp.pride.ebi.ac.uk/example.sdrf.tsv").startswith("source name")
+    assert calls == 2
+
+
+def test_search_projects_retries_incomplete_chunked_response(monkeypatch):
+    client = PrideClient(retries=3)
+    calls = 0
+
+    def fake_get(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.RemoteProtocolError(
+                "peer closed connection without sending complete message body"
+            )
+        return _FakeResponse([{"accession": "PXD000001"}])
+
+    monkeypatch.setattr(client._client, "get", fake_get)
+    monkeypatch.setattr("agent.pride.client.sleep", lambda *_args: None)
+
+    assert client.search_projects("human") == [{"accession": "PXD000001"}]
+    assert calls == 2

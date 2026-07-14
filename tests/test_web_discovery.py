@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import agent.web.app as web_app
 from fastapi import BackgroundTasks
@@ -11,6 +12,11 @@ from agent.control_plane.models import AgentEvent, OpenAIAgentsDiscoveryResult
 from agent.discovery.agentic import AgenticDiscoveryPlanner
 from agent.discovery.memory import DiscoveryMemory
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
+from agent.projects import (
+    ProjectBuildExecutionResult,
+    ProjectManagerRunResult,
+    SpecialistExecutionResult,
+)
 
 
 def _manifest(request: DatasetRequest) -> DatasetManifest:
@@ -517,6 +523,34 @@ def test_discovery_job_recovers_completed_state_after_memory_loss(monkeypatch, t
     assert "Discovery job completed." in messages
 
 
+def test_web_worker_notifies_project_execution_coordinator(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr(
+        web_app,
+        "discover_pride_dataset",
+        lambda request, memory=None, **_kwargs: _manifest(request),
+    )
+    observed: list[tuple[str, dict]] = []
+
+    class FakeCoordinator:
+        def observe_discovery_completion(self, job_id, record):
+            observed.append((job_id, record))
+            return None
+
+        def observe_job_failure(self, job_id, error):
+            raise AssertionError((job_id, error))
+
+    monkeypatch.setattr(web_app, "_project_execution_coordinator", lambda: FakeCoordinator())
+
+    created = asyncio.run(web_app.start_discovery_job({"max_projects": 1, "max_files": 1}))
+    final = _wait_discovery_job(created["job_id"])
+
+    assert final["status"] == "completed"
+    assert len(observed) == 1
+    assert observed[0][0] == created["job_id"]
+    assert observed[0][1]["file_count"] == 1
+
+
 def test_discovery_job_can_defer_worker_until_response(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setattr(web_app, "discover_pride_dataset", lambda request, memory=None, **_kwargs: _manifest(request))
@@ -557,9 +591,615 @@ def test_discovery_job_reports_interrupted_state_after_memory_loss(monkeypatch, 
         web_app._discovery_jobs.pop(job_id, None)
 
     recovered = asyncio.run(web_app.get_discovery_job(job_id))
-    assert recovered["status"] == "failed"
+    assert recovered["status"] == "interrupted"
     assert recovered["error"] == "discovery_job_interrupted_by_server_reload"
     assert any("interrupted by a server reload" in item["message"] for item in recovered["logs"])
+
+
+def test_project_api_persists_goal_jobs_and_events(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+
+    created = asyncio.run(
+        web_app.create_project_record(
+            {
+                "name": "Human DDA RT",
+                "objective": "Build a human DDA retention-time dataset",
+                "goal": {"task_type": "rt_prediction"},
+            }
+        )
+    )
+    project_id = created["project_id"]
+
+    listed = asyncio.run(web_app.list_project_records())
+    detail = asyncio.run(web_app.get_project_record(project_id))
+
+    assert [item["project_id"] for item in listed["projects"]] == [project_id]
+    assert detail["goal"]["objective"] == "Build a human DDA retention-time dataset"
+    assert detail["goal"]["task_type"] == "rt_prediction"
+    assert detail["plans"] == []
+    assert detail["stage_runs"] == []
+    assert detail["jobs"] == []
+    assert detail["approvals"] == []
+    assert detail["memory"] == []
+    assert detail["release_candidates"] == []
+    assert detail["dataset_releases"] == []
+    assert [event["event_type"] for event in detail["events"]] == ["project_created"]
+
+
+def test_project_plan_api_uses_saved_llm_config_and_starts_queued_discovery(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    web_app._llm_config_store().save(
+        {
+            "api_key": "saved-manager-key",
+            "base_url": "https://manager.example.test/v1",
+            "model": "manager-model",
+            "timeout": "1200",
+        }
+    )
+    project = asyncio.run(
+        web_app.create_project_record(
+            {"name": "Managed project", "objective": "Find human DDA datasets"}
+        )
+    )
+    captured: dict[str, object] = {}
+    started: list[str] = []
+    monkeypatch.setattr(web_app, "_start_discovery_job_thread", started.append)
+
+    class FakeManagerService:
+        def plan_project(self, project_id, *, llm_config, auto_start):
+            captured.update(
+                project_id=project_id,
+                llm_config=llm_config,
+                auto_start=auto_start,
+            )
+            job = web_app._project_store().enqueue_job(
+                project_id=project_id,
+                job_type="discovery",
+                idempotency_key="manager-api-test",
+                payload={"project_id": project_id, "prompt": "Find human DDA", "runtime": "openai_agents"},
+            )
+            return ProjectManagerRunResult(
+                project_id=project_id,
+                manager_run_id="manager_api_test",
+                status="active",
+                queued_job_ids=[job.job_id],
+            )
+
+    monkeypatch.setattr(web_app, "_project_manager_service", lambda: FakeManagerService())
+
+    response = asyncio.run(web_app.plan_project_record(project["project_id"], {"auto_start": True}))
+
+    assert response["status"] == "active"
+    assert started == response["queued_job_ids"]
+    assert captured["project_id"] == project["project_id"]
+    assert captured["llm_config"]["model"] == "manager-model"  # type: ignore[index]
+    assert "saved-manager-key" not in json.dumps(response)
+
+
+def test_manager_replan_worker_creates_revision_and_starts_new_discovery(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    project = asyncio.run(
+        web_app.create_project_record(
+            {"name": "Replan project", "objective": "Find human DDA datasets"}
+        )
+    )
+    store = web_app._project_store()
+    replan_job = store.enqueue_job(
+        project_id=project["project_id"],
+        job_type="manager_replan",
+        idempotency_key="replan-worker-test",
+        payload={
+            "source_plan_id": "plan_1",
+            "source_plan_revision": 1,
+            "source_stage_run_id": "stage_run_1",
+            "source_stage_id": "discover",
+            "observation": {"issue_codes": ["no_selected_files"]},
+            "evidence_refs": ["artifact_1"],
+            "auto_start": True,
+        },
+    )
+    captured: dict[str, object] = {}
+    started: list[str] = []
+    monkeypatch.setattr(
+        web_app,
+        "_build_llm_config",
+        lambda _config: (
+            {"api_key": "transient", "base_url": "https://example.test", "model": "test"},
+            None,
+        ),
+    )
+    monkeypatch.setattr(web_app, "_start_project_job_thread", started.append)
+
+    class FakeManagerService:
+        def plan_project(self, project_id, **kwargs):
+            captured.update(project_id=project_id, **kwargs)
+            discovery = store.enqueue_job(
+                project_id=project_id,
+                job_type="discovery",
+                idempotency_key="replanned-discovery",
+                payload={"project_id": project_id, "prompt": "Broaden discovery", "runtime": "workflow"},
+            )
+            return ProjectManagerRunResult(
+                project_id=project_id,
+                manager_run_id="manager_revision_test",
+                status="active",
+                queued_job_ids=[discovery.job_id],
+            )
+
+    monkeypatch.setattr(web_app, "_project_manager_service", lambda: FakeManagerService())
+
+    web_app._run_project_manager_job(replan_job.job_id)
+
+    completed = store.get_job(replan_job.job_id)
+    assert completed is not None and completed.status == "completed"
+    assert captured["revision_context"]["observation"]["issue_codes"] == ["no_selected_files"]  # type: ignore[index]
+    started_types = {
+        store.get_job(started_job_id).job_type  # type: ignore[union-attr]
+        for started_job_id in started
+    }
+    assert started_types == {"discovery", "run_reflection"}
+
+
+def test_startup_restarts_all_queued_supported_project_jobs(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    project = asyncio.run(
+        web_app.create_project_record(
+            {"name": "Restart project", "objective": "Resume queued work"}
+        )
+    )
+    store = web_app._project_store()
+    discovery = store.enqueue_job(
+        project_id=project["project_id"],
+        job_type="discovery",
+        idempotency_key="startup-discovery",
+        payload={"project_id": project["project_id"], "prompt": "Find data"},
+    )
+    replan = store.enqueue_job(
+        project_id=project["project_id"],
+        job_type="manager_replan",
+        idempotency_key="startup-replan",
+        payload={"project_id": project["project_id"]},
+    )
+    candidate_review = store.enqueue_job(
+        project_id=project["project_id"],
+        job_type="candidate_review",
+        idempotency_key="startup-candidate-review",
+        payload={"project_id": project["project_id"]},
+    )
+    build = store.enqueue_job(
+        project_id=project["project_id"],
+        job_type="build",
+        idempotency_key="startup-build",
+        payload={"project_id": project["project_id"]},
+    )
+    build_execution = store.enqueue_job(
+        project_id=project["project_id"],
+        job_type="build_execution",
+        idempotency_key="startup-build-execution",
+        payload={"project_id": project["project_id"]},
+    )
+    reflection = store.enqueue_job(
+        project_id=project["project_id"],
+        job_type="reflection",
+        idempotency_key="startup-reflection",
+        payload={"project_id": project["project_id"]},
+    )
+    run_reflection = store.enqueue_job(
+        project_id=project["project_id"],
+        job_type="run_reflection",
+        idempotency_key="startup-run-reflection",
+        payload={"project_id": project["project_id"]},
+    )
+    release_candidate = store.enqueue_job(
+        project_id=project["project_id"],
+        job_type="release_candidate",
+        idempotency_key="startup-release-candidate",
+        payload={"project_id": project["project_id"]},
+    )
+    started: list[str] = []
+    monkeypatch.setattr(web_app, "_start_project_job_thread", started.append)
+
+    result = web_app._start_queued_project_jobs()
+
+    supported = {
+        discovery.job_id,
+        replan.job_id,
+        candidate_review.job_id,
+        build.job_id,
+        build_execution.job_id,
+        reflection.job_id,
+        run_reflection.job_id,
+        release_candidate.job_id,
+    }
+    assert set(result) == supported
+    assert set(started) == supported
+
+
+def test_project_build_execution_worker_runs_batch_and_data_scientist_loop(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    project = asyncio.run(
+        web_app.create_project_record(
+            {"name": "Build execution", "objective": "Build an RT dataset"}
+        )
+    )
+    store = web_app._project_store()
+    job = store.enqueue_job(
+        project_id=project["project_id"],
+        job_type="build_execution",
+        idempotency_key="approved-build-execution",
+        payload={
+            "project_id": project["project_id"],
+            "plan_id": "plan_fixture",
+            "stage_id": "build",
+            "task_type": "rt_prediction",
+            "accepted_files": [
+                {
+                    "file_name": "sample.raw",
+                    "project_accession": "PXD_FIXTURE",
+                    "download_url": "https://example.test/sample.raw",
+                }
+            ],
+        },
+    )
+    stage_run = SimpleNamespace(stage_run_id="stage_run_build_execution")
+    captured: dict[str, object] = {}
+
+    class FakeBuildService:
+        def create_execution_stage_run(self, job_id):
+            captured["created_for_job"] = job_id
+            return stage_run
+
+        def finalize_execution(self, stage_run_id, **kwargs):
+            captured.update(stage_run_id=stage_run_id, finalize=kwargs)
+            return ProjectBuildExecutionResult(
+                stage_run_id=stage_run_id,
+                status="completed",
+                ai_ready_dataset_created=True,
+                output_files=kwargs["output_files"],
+            )
+
+    def fake_batch(batch_id):
+        with web_app._batches_lock:
+            batch = web_app._batches[batch_id]
+            batch["status"] = "completed"
+            for item in batch["items"]:
+                item["status"] = "completed"
+                item_dir = Path(item["output_dir"])
+                item_dir.mkdir(parents=True, exist_ok=True)
+                (item_dir / "sample_ai_ready.parquet").write_bytes(b"PAR1batch")
+            web_app._write_batch_manifest(batch)
+
+    def fake_loop(**kwargs):
+        captured["loop"] = kwargs
+        output_dir = Path(kwargs["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        parquet = output_dir / "rt_train.parquet"
+        parquet.write_bytes(b"PAR1fixture")
+        return SimpleNamespace(
+            status="completed",
+            blockers=[],
+            warnings=[],
+            files={"rt_train_parquet": str(parquet)},
+            recipe_status="completed",
+            model_loop_status="completed",
+            guidance_alignment_status="aligned",
+        )
+
+    monkeypatch.setattr(web_app, "_project_store", lambda: store)
+    monkeypatch.setattr(web_app, "_project_build_service", lambda: FakeBuildService())
+    monkeypatch.setattr(
+        web_app,
+        "_build_llm_config",
+        lambda _config: ({"api_key": "transient", "model": "test"}, None),
+    )
+    monkeypatch.setattr(web_app, "_run_parameter_batch", fake_batch)
+    monkeypatch.setattr(web_app, "run_data_scientist_agent_loop", fake_loop)
+
+    web_app._run_project_build_execution_job(job.job_id)
+
+    completed = store.get_job(job.job_id)
+    assert completed is not None and completed.status == "completed"
+    assert captured["created_for_job"] == job.job_id
+    assert captured["loop"]["split_strategy"] == "project_disjoint"  # type: ignore[index]
+    assert captured["finalize"]["pipeline_status"] == "completed"  # type: ignore[index]
+    assert any(key.startswith("batch_ai_ready_parquet_") for key in captured["finalize"]["output_files"])  # type: ignore[index]
+
+
+def test_project_build_execution_preserves_partial_outputs_before_recovery(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    project = asyncio.run(
+        web_app.create_project_record(
+            {"name": "Partial build", "objective": "Preserve failed build evidence"}
+        )
+    )
+    store = web_app._project_store()
+    job = store.enqueue_job(
+        project_id=project["project_id"],
+        job_type="build_execution",
+        idempotency_key="partial-build-execution",
+        payload={
+            "project_id": project["project_id"],
+            "plan_id": "plan_fixture",
+            "stage_id": "build",
+            "task_type": "rt_prediction",
+            "accepted_files": [
+                {"file_name": "sample.raw", "project_accession": "PXD_FIXTURE"}
+            ],
+        },
+    )
+    stage_run = SimpleNamespace(stage_run_id="stage_run_partial_build")
+    captured: dict[str, object] = {}
+
+    class FakeBuildService:
+        def create_execution_stage_run(self, _job_id):
+            return stage_run
+
+        def finalize_execution(self, stage_run_id, **kwargs):
+            captured.update(stage_run_id=stage_run_id, finalize=kwargs)
+            return ProjectBuildExecutionResult(
+                stage_run_id=stage_run_id,
+                status="blocked",
+                blockers=list(kwargs["blockers"]),
+                output_files=kwargs["output_files"],
+            )
+
+    def fake_batch(batch_id):
+        with web_app._batches_lock:
+            batch = web_app._batches[batch_id]
+            batch["status"] = "completed"
+            audit = Path(batch["output_dir"]) / "partial_audit.json"
+            audit.write_text('{"status":"partial"}', encoding="utf-8")
+            web_app._write_batch_manifest(batch)
+
+    monkeypatch.setattr(web_app, "_project_store", lambda: store)
+    monkeypatch.setattr(web_app, "_project_build_service", lambda: FakeBuildService())
+    monkeypatch.setattr(
+        web_app,
+        "_build_llm_config",
+        lambda _config: ({"api_key": "transient", "model": "test"}, None),
+    )
+    monkeypatch.setattr(web_app, "_run_parameter_batch", fake_batch)
+    monkeypatch.setattr(
+        web_app,
+        "run_data_scientist_agent_loop",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("model loop failed")),
+    )
+
+    web_app._run_project_build_execution_job(job.job_id)
+
+    completed = store.get_job(job.job_id)
+    assert completed is not None and completed.status == "completed"
+    assert captured["finalize"]["pipeline_status"] == "failed"  # type: ignore[index]
+    assert "build_execution_exception" in captured["finalize"]["blockers"]  # type: ignore[index]
+    partial_paths = captured["finalize"]["output_files"].values()  # type: ignore[index]
+    assert any(str(path).endswith("partial_audit.json") for path in partial_paths)
+
+
+def test_project_specialist_worker_completes_candidate_review_job(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    project = asyncio.run(
+        web_app.create_project_record(
+            {"name": "Specialist project", "objective": "Review selected candidates"}
+        )
+    )
+    store = web_app._project_store()
+    job = store.enqueue_job(
+        project_id=project["project_id"],
+        job_type="candidate_review",
+        idempotency_key="candidate-review-worker",
+        payload={"stage_run_id": "stage_run_review"},
+    )
+    monkeypatch.setattr(web_app, "_project_store", lambda: store)
+    monkeypatch.setattr(
+        store,
+        "get_stage_run_by_job",
+        lambda _job_id: SimpleNamespace(stage_run_id="stage_run_review"),
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_build_llm_config",
+        lambda _config: ({"api_key": "transient", "model": "test-model"}, None),
+    )
+    captured: dict[str, object] = {}
+
+    class FakeSpecialistService:
+        def run_candidate_review(self, stage_run_id, *, llm_config):
+            captured.update(stage_run_id=stage_run_id, llm_config=llm_config)
+            return SpecialistExecutionResult(
+                stage_run_id=stage_run_id,
+                status="completed",
+                output={"status": "accepted"},
+            )
+
+    monkeypatch.setattr(web_app, "_project_specialist_service", lambda: FakeSpecialistService())
+
+    web_app._run_project_specialist_job(job.job_id)
+
+    completed = store.get_job(job.job_id)
+    assert completed is not None and completed.status == "completed"
+    assert completed.output["status"] == "completed"
+    assert captured["stage_run_id"] == "stage_run_review"
+    assert captured["llm_config"]["model"] == "test-model"  # type: ignore[index]
+
+
+def test_project_approval_can_be_decided_through_api(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    created = asyncio.run(
+        web_app.create_project_record(
+            {"name": "Approval project", "objective": "Build a release candidate"}
+        )
+    )
+    store = web_app._project_store()
+    job = store.enqueue_job(
+        project_id=created["project_id"],
+        job_type="release",
+        idempotency_key="release:v1",
+    )
+    gate = store.create_approval_gate(
+        project_id=created["project_id"],
+        job_id=job.job_id,
+        action_type="publish_release",
+        summary="Publish release candidate",
+        risk="scientific_signoff",
+    )
+
+    decided = asyncio.run(
+        web_app.decide_project_approval(
+            created["project_id"], gate.gate_id, {"decision": "approve", "reason": "reviewed"}
+        )
+    )
+    detail = asyncio.run(web_app.get_project_record(created["project_id"]))
+
+    assert decided["status"] == "approved"
+    assert "sdk_state_json" not in decided
+    assert "sdk_state_json" not in detail["approvals"][0]
+    assert detail["approvals"][0]["decision_reason"] == "reviewed"
+    assert detail["jobs"][0]["status"] == "queued"
+
+
+def test_project_approval_rejection_is_kept_as_human_decision(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    created = asyncio.run(
+        web_app.create_project_record(
+            {"name": "Rejected build", "objective": "Build a reviewed dataset"}
+        )
+    )
+    store = web_app._project_store()
+    job = store.enqueue_job(
+        project_id=created["project_id"],
+        job_type="build_execution",
+        idempotency_key="rejected-build-execution",
+        payload={"project_id": created["project_id"]},
+    )
+    gate = store.create_approval_gate(
+        project_id=created["project_id"],
+        job_id=job.job_id,
+        action_type="execute_full_dataset_build",
+        summary="Run the Full Docker build",
+        risk="high_cost_external_execution",
+    )
+
+    decided = asyncio.run(
+        web_app.decide_project_approval(
+            created["project_id"],
+            gate.gate_id,
+            {"decision": "reject", "reason": "Storage is not available this week."},
+        )
+    )
+    detail = asyncio.run(web_app.get_project_record(created["project_id"]))
+
+    assert decided["status"] == "rejected"
+    assert detail["jobs"][0]["status"] == "approval_denied"
+    assert len(detail["memory"]) == 1
+    assert detail["memory"][0]["kind"] == "human_decision"
+    assert detail["memory"][0]["statement"] == "Storage is not available this week."
+
+
+def test_project_artifact_download_requires_matching_checksum(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    created = asyncio.run(
+        web_app.create_project_record(
+            {"name": "Artifact project", "objective": "Keep traceable evidence"}
+        )
+    )
+    path = tmp_path / "evidence.json"
+    path.write_text('{"status":"validated"}', encoding="utf-8")
+    store = web_app._project_store()
+    artifact = store.register_artifact(
+        project_id=created["project_id"],
+        artifact_type="test_evidence",
+        path=path,
+        sha256=web_app.sha256_file(path),
+    )
+
+    response = asyncio.run(
+        web_app.download_project_artifact(created["project_id"], artifact.artifact_id)
+    )
+    assert Path(response.path) == path
+
+    path.write_text('{"status":"tampered"}', encoding="utf-8")
+    rejected = asyncio.run(
+        web_app.download_project_artifact(created["project_id"], artifact.artifact_id)
+    )
+    assert rejected == {
+        "error": "Project artifact is missing or failed checksum verification."
+    }
+
+
+def test_project_release_verify_api_returns_replay_result(monkeypatch):
+    release = SimpleNamespace(release_id="release_1", project_id="project_1")
+    store = SimpleNamespace(list_dataset_releases=lambda project_id: [release])
+    monkeypatch.setattr(web_app, "_project_store", lambda: store)
+
+    class FakeReleaseService:
+        def verify_release(self, value):
+            assert value is release
+            return {"status": "passed", "release_id": value.release_id, "artifact_count": 7}
+
+    monkeypatch.setattr(web_app, "_project_release_service", lambda: FakeReleaseService())
+
+    result = asyncio.run(web_app.verify_project_release("project_1", "release_1"))
+
+    assert result == {"status": "passed", "release_id": "release_1", "artifact_count": 7}
+
+
+def test_discovery_job_is_durable_idempotent_and_does_not_persist_api_key(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    started: list[str] = []
+    monkeypatch.setattr(web_app, "_start_discovery_job_thread", started.append)
+    project = asyncio.run(
+        web_app.create_project_record(
+            {"name": "Durable project", "objective": "Find human DDA projects"}
+        )
+    )
+    body = {
+        "project_id": project["project_id"],
+        "idempotency_key": "discovery:plan-revision-1",
+        "prompt": "Find human DDA projects",
+        "max_projects": 2,
+        "llm_config": {
+            "api_key": "must-not-be-persisted",
+            "base_url": "https://example.test/v1",
+            "model": "test-model",
+        },
+    }
+
+    first = asyncio.run(web_app.start_discovery_job(body))
+    duplicate = asyncio.run(web_app.start_discovery_job(body))
+    durable_job = web_app._project_store().get_job(first["job_id"])
+
+    assert duplicate["job_id"] == first["job_id"]
+    assert first["project_id"] == project["project_id"]
+    assert started == [first["job_id"]]
+    assert durable_job is not None
+    assert durable_job.status == "queued"
+    assert durable_job.payload["llm_config"]["model"] == "test-model"
+    assert "must-not-be-persisted" not in json.dumps(durable_job.payload)
+
+
+def test_interrupted_durable_discovery_job_can_be_resumed(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    started: list[str] = []
+    monkeypatch.setattr(web_app, "_start_discovery_job_thread", started.append)
+    created = asyncio.run(
+        web_app.start_discovery_job(
+            {"prompt": "Find human DDA projects", "idempotency_key": "resume-test"}
+        )
+    )
+    job_id = created["job_id"]
+    store = web_app._project_store()
+    store.claim_job(job_id, worker_id="worker_before_restart")
+    store.interrupt_running_jobs(reason="server_restart")
+    with web_app._discovery_jobs_lock:
+        web_app._discovery_jobs.pop(job_id, None)
+
+    recovered = asyncio.run(web_app.get_discovery_job(job_id))
+    resumed = asyncio.run(web_app.resume_discovery_job(job_id))
+
+    assert recovered["status"] == "interrupted"
+    assert resumed["status"] == "queued"
+    assert store.get_job(job_id).status == "queued"  # type: ignore[union-attr]
+    assert started == [job_id, job_id]
 
 
 def test_discovery_job_can_be_cancelled(monkeypatch, tmp_path: Path):
@@ -860,6 +1500,31 @@ def test_web_agent_uses_server_dynamic_limits_not_request_presets(monkeypatch):
     assert limits.max_repository_requests == 120
 
 
+def test_project_plan_hard_ceiling_caps_discovery_runtime(monkeypatch):
+    monkeypatch.setenv("AGENT_MAX_MODEL_TURNS", "50")
+    monkeypatch.setenv("AGENT_MAX_TOOL_CALLS", "100")
+    monkeypatch.setenv("AGENT_MAX_DISCOVERY_ROUNDS", "3")
+    monkeypatch.setenv("AGENT_MAX_ELAPSED_SECONDS", "1800")
+
+    _mode, budget, limits = web_app._agent_discovery_configuration(
+        {
+            "project_plan": {
+                "hard_ceilings": {
+                    "max_model_turns": 24,
+                    "max_tool_calls": 40,
+                    "max_discovery_rounds": 2,
+                    "max_runtime_minutes": 12,
+                }
+            }
+        }
+    )
+
+    assert budget.max_turns == 24
+    assert budget.max_tool_calls == 40
+    assert budget.max_discovery_rounds == 2
+    assert limits.max_elapsed_seconds == 720
+
+
 def test_web_discovery_openai_agents_runtime_reuses_existing_result_contract(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setenv("AGENT_DISCOVERY_MODE", "multi_agent")
@@ -905,7 +1570,7 @@ def test_web_discovery_openai_agents_runtime_reuses_existing_result_contract(mon
             },
         )
 
-    monkeypatch.setattr(web_app, "run_openai_agents_discovery", fake_run_openai_agents_discovery)
+    monkeypatch.setattr(web_app, "run_agents_discovery", fake_run_openai_agents_discovery)
     created = asyncio.run(
         web_app.create_discovery(
             {
@@ -940,6 +1605,7 @@ def test_web_discovery_openai_agents_runtime_reuses_existing_result_contract(mon
     assert "agents_discovery_budget_json" in created["downloads"]
     assert captured["task_type"] == "rt_prediction"
     assert captured["mode"] == "multi_agent"
+    assert captured["stream_events"] is False
     assert captured["budget"].max_turns == 50
     assert captured["budget"].max_tool_calls == 100
     assert captured["dynamic_limits"].initial_query_units == 12
@@ -999,7 +1665,7 @@ def test_web_discovery_openai_agents_blocked_manifest_is_renderable(monkeypatch,
             },
         )
 
-    monkeypatch.setattr(web_app, "run_openai_agents_discovery", fake_blocked_run)
+    monkeypatch.setattr(web_app, "run_agents_discovery", fake_blocked_run)
     created = asyncio.run(
         web_app.create_discovery(
             {
@@ -1090,3 +1756,160 @@ def test_download_discovery_file_rejects_unknown_key(monkeypatch, tmp_path: Path
     result = asyncio.run(web_app.download_discovery_file(created["discovery_id"], file="../secret"))
 
     assert result == {"error": "Discovery file not available."}
+
+
+def test_web_discovery_openai_agents_failed_status_returns_output_dir_and_audits(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    web_app._llm_config_store().save(
+        {
+            "api_key": "saved-failed-agent-key",
+            "base_url": "https://saved.example.test/v1",
+            "model": "saved-agent-model",
+            "timeout": "1200",
+        }
+    )
+    captured: dict[str, object] = {}
+
+    def fake_failed_run(**kwargs) -> OpenAIAgentsDiscoveryResult:
+        captured.update(kwargs)
+        output_dir = Path(kwargs["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = output_dir / "agents_discovery_summary.json"
+        events_path = output_dir / "agents_discovery_events.json"
+        report_path = output_dir / "agents_discovery_report.md"
+        budget_path = output_dir / "agents_discovery_budget.json"
+        summary_path.write_text(
+            '{"status":"failed","stop_reason":"agents_sdk_run_failed","tool_call_count":5,"blockers":["Max turns (4) exceeded"],"dynamic_usage":{"query_units":2,"repository_requests":7,"search_batches":1,"budget_reviews":1},"budget_audit":{"hard_limits_reached":true}}',
+            encoding="utf-8",
+        )
+        events_path.write_text("[]", encoding="utf-8")
+        report_path.write_text("# failed\n", encoding="utf-8")
+        budget_path.write_text('{"mode":"multi_agent_dynamic"}', encoding="utf-8")
+        return OpenAIAgentsDiscoveryResult(
+            status="failed",
+            run_id=str(kwargs["run_id"]),
+            output_dir=str(output_dir),
+            state_db=str(output_dir / "agent_control.sqlite"),
+            discovery_round_count=1,
+            blockers=["Max turns (4) exceeded"],
+            warnings=["project_level_evidence_overrepresented"],
+            files={
+                "agents_discovery_summary_json": str(summary_path),
+                "agents_discovery_events_json": str(events_path),
+                "agents_discovery_report_md": str(report_path),
+                "agents_discovery_budget_json": str(budget_path),
+            },
+        )
+
+    monkeypatch.setattr(web_app, "run_agents_discovery", fake_failed_run)
+    created = asyncio.run(
+        web_app.create_discovery(
+            {
+                "runtime": "openai_agents",
+                "prompt": "Find DDA data under tight ceilings",
+                "max_projects": 1,
+                "max_files": 1,
+            }
+        )
+    )
+
+    assert created["status"] == "failed"
+    assert created["runtime"] == "openai_agents"
+    assert created["project_count"] == 0
+    assert created["file_count"] == 0
+    assert created["output_dir"]
+    assert Path(created["output_dir"]).exists()
+    assert created["agent"]["status"] == "failed"
+    assert "Max turns" in (created["agent"].get("error") or "")
+    assert "agents_discovery_summary_json" in created["downloads"]
+
+
+def test_discovery_job_failed_agents_run_keeps_public_record(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    web_app._llm_config_store().save(
+        {
+            "api_key": "saved-failed-job-key",
+            "base_url": "https://saved.example.test/v1",
+            "model": "saved-agent-model",
+            "timeout": "1200",
+        }
+    )
+
+    def fake_failed_run(**kwargs) -> OpenAIAgentsDiscoveryResult:
+        output_dir = Path(kwargs["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = output_dir / "agents_discovery_summary.json"
+        summary_path.write_text(
+            '{"status":"failed","stop_reason":"agents_sdk_run_failed","tool_call_count":3,"blockers":["Max turns (4) exceeded"]}',
+            encoding="utf-8",
+        )
+        return OpenAIAgentsDiscoveryResult(
+            status="failed",
+            run_id=str(kwargs["run_id"]),
+            output_dir=str(output_dir),
+            state_db=str(output_dir / "agent_control.sqlite"),
+            blockers=["Max turns (4) exceeded"],
+            files={"agents_discovery_summary_json": str(summary_path)},
+        )
+
+    monkeypatch.setattr(web_app, "run_agents_discovery", fake_failed_run)
+    monkeypatch.setattr(web_app, "_start_discovery_job_thread", lambda job_id: web_app._run_discovery_job(job_id))
+    created = asyncio.run(
+        web_app.start_discovery_job(
+            {
+                "runtime": "openai_agents",
+                "prompt": "Tight ceiling discovery",
+                "max_projects": 1,
+                "max_files": 1,
+                "llm_config": {
+                    "api_key": "saved-failed-job-key",
+                    "base_url": "https://saved.example.test/v1",
+                    "model": "saved-agent-model",
+                    "timeout": "1200",
+                },
+            }
+        )
+    )
+    job = asyncio.run(web_app.get_discovery_job(created["job_id"]))
+    assert job["status"] == "failed"
+    assert job["error"]
+    assert job["record"] is not None
+    assert job["record"]["output_dir"]
+    assert job["record"]["status"] == "failed"
+    assert "Max turns" in (job["record"]["agent"].get("error") or job["error"])
+
+
+def test_discovery_tool_wrappers_raise_when_cancel_requested() -> None:
+    from types import SimpleNamespace
+
+    from agent.control_plane import openai_agents
+
+    class _Ctx:
+        def raise_if_cancelled(self) -> None:
+            raise InterruptedError("Discovery cancelled.")
+
+    wrapper = SimpleNamespace(context=_Ctx())
+    try:
+        openai_agents.get_discovery_state(wrapper)  # type: ignore[arg-type]
+        raise AssertionError("expected InterruptedError")
+    except InterruptedError as exc:
+        assert "cancelled" in str(exc).lower()
+
+
+def test_discovery_job_get_defaults_to_slim_record(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr(web_app, "discover_pride_dataset", lambda request, memory=None, **_kwargs: _manifest(request))
+    monkeypatch.setattr(web_app, "_start_discovery_job_thread", lambda job_id: web_app._run_discovery_job(job_id))
+    created = asyncio.run(web_app.start_discovery_job({"max_projects": 1, "max_files": 1}))
+    final = _wait_discovery_job(created["job_id"])
+    assert final["status"] == "completed"
+    slim = asyncio.run(web_app.get_discovery_job(created["job_id"]))
+    assert slim["detail"] == "summary"
+    assert slim["record"]["project_count"] == 1
+    assert slim["record"]["file_count"] == 1
+    assert "projects" not in slim["record"]
+    assert "files" not in slim["record"]
+    full = asyncio.run(web_app.get_discovery_job(created["job_id"], detail=1))
+    assert full["detail"] == "full"
+    assert len(full["record"]["projects"]) == 1
+    assert len(full["record"]["files"]) == 1

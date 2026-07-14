@@ -16,7 +16,9 @@ class PrideClient:
         base_url: str = "https://www.ebi.ac.uk/pride/ws/archive/v2",
         timeout: float = 60.0,
         read_timeout: float | None = None,
+        retries: int = 3,
     ):
+        self._retries = max(1, retries)
         self._client = httpx.Client(
             base_url=base_url,
             timeout=httpx.Timeout(timeout, read=max(timeout, 120.0) if read_timeout is None else read_timeout),
@@ -32,16 +34,36 @@ class PrideClient:
     def __exit__(self, *_: object) -> None:
         self.close()
 
+    def _get(self, path: str, *, operation: str, params: dict[str, Any] | None = None) -> httpx.Response:
+        last_error: Exception | None = None
+        for attempt in range(1, self._retries + 1):
+            try:
+                record_repository_request("pride", operation)
+                response = self._client.get(path, params=params)
+                response.raise_for_status()
+                return response
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                if exc.response.status_code not in {429, 500, 502, 503, 504}:
+                    raise
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+                last_error = exc
+            if attempt < self._retries:
+                sleep(min(2 ** (attempt - 1), 4))
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("PRIDE request failed without a response.")
+
     def search_projects(self, keyword: str, page_size: int = 100) -> list[dict[str, Any]]:
-        record_repository_request("pride", "search_projects")
-        response = self._client.get("/search/projects", params={"keyword": keyword, "pageSize": page_size})
-        response.raise_for_status()
+        response = self._get(
+            "/search/projects",
+            operation="search_projects",
+            params={"keyword": keyword, "pageSize": page_size},
+        )
         return response.json()
 
     def get_project(self, accession: str) -> dict[str, Any]:
-        record_repository_request("pride", "get_project")
-        response = self._client.get(f"/projects/{accession}")
-        response.raise_for_status()
+        response = self._get(f"/projects/{accession}", operation="get_project")
         return response.json()
 
     def list_project_files(
@@ -63,9 +85,11 @@ class PrideClient:
         while True:
             page_params = dict(params)
             page_params["page"] = page
-            record_repository_request("pride", "list_project_files")
-            response = self._client.get(f"/projects/{accession}/files", params=page_params)
-            response.raise_for_status()
+            response = self._get(
+                f"/projects/{accession}/files",
+                operation="list_project_files",
+                params=page_params,
+            )
             batch = response.json()
             if not batch:
                 break
@@ -89,15 +113,11 @@ class PrideClient:
 
     def download_text(self, url: str) -> str:
         url = self._normalize_download_url(url) or url
-        response = self._client.get(url)
-        response.raise_for_status()
-        return response.text
+        return self._get(url, operation="download_text").text
 
     def download_binary(self, url: str) -> bytes:
         url = self._normalize_download_url(url) or url
-        response = self._client.get(url)
-        response.raise_for_status()
-        return response.content
+        return self._get(url, operation="download_binary").content
 
     def download_to_path(self, url: str, target_path: str | Path, report=None, retries: int = 3) -> Path:
         url = self._normalize_download_url(url) or url
