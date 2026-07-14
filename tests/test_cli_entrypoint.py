@@ -35,7 +35,7 @@ def test_agents_discover_cli_passes_dynamic_limits(monkeypatch, tmp_path: Path) 
             state_db=str(tmp_path / "state.sqlite"),
         )
 
-    monkeypatch.setattr("agent.cli.run_openai_agents_discovery", fake_run)
+    monkeypatch.setattr("agent.cli.run_agents_discovery", fake_run)
     result = CliRunner().invoke(
         app,
         [

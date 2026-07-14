@@ -43,8 +43,8 @@ from agent.assets.preparer import AssetPreparationError
 from agent.control_plane.models import AgentBudget, DynamicBudgetLimits
 from agent.control_plane.openai_agents import (
     OpenAIAgentsRuntimeUnavailable,
-    run_openai_agents_discovery,
 )
+from agent.discovery.runner import run_agents_discovery
 from agent.discovery.agentic import (
     AgenticDiscoveryPlanner,
     default_agentic_discovery_planner,
@@ -707,7 +707,7 @@ def agents_discover_dataset_command(
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
     try:
-        result = run_openai_agents_discovery(
+        result = run_agents_discovery(
             prompt=prompt,
             request=request,
             output_dir=output_dir,
@@ -719,7 +719,7 @@ def agents_discover_dataset_command(
                 max_tool_calls=max_tool_calls,
                 max_discovery_rounds=max_rounds,
             ),
-            mode=discovery_mode,
+            mode=discovery_mode,  # type: ignore[arg-type]
             dynamic_limits=DynamicBudgetLimits(
                 max_query_units=max_query_units,
                 max_repository_requests=max_repository_requests,

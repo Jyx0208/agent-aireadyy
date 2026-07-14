@@ -43,7 +43,7 @@ from agent.ai_ready.model_loop import run_dataset_model_loop
 from agent.ai_ready.real_smoke import run_ai_ready_real_smoke
 from agent.ai_ready.validation import validate_ai_ready_build
 from agent.control_plane.models import AgentBudget, AgentEvent, DynamicBudgetLimits
-from agent.control_plane.openai_agents import run_openai_agents_discovery
+from agent.discovery.runner import run_agents_discovery
 from agent.discovery.agentic import AgenticDiscoveryPlanner, OpenAICompatibleDiscoveryLLM, default_agentic_discovery_planner, default_discovery_llm_client
 from agent.discovery.agentic_runner import run_agentic_discovery
 from agent.discovery.features import extract_file_features, extract_project_features
@@ -2310,7 +2310,7 @@ def _run_web_discovery(
                 should_cancel=should_cancel,
             )
         try:
-            result = run_openai_agents_discovery(
+            result = run_agents_discovery(
                 prompt=prompt,
                 request=request,
                 output_dir=output_dir,
@@ -2318,34 +2318,25 @@ def _run_web_discovery(
                 state_db=output_dir / "agent_control.sqlite",
                 memory=prior_memory,
                 budget=budget,
-                mode=discovery_mode,
+                mode=discovery_mode,  # type: ignore[arg-type]
                 dynamic_limits=dynamic_limits,
                 run_id=discovery_id,
                 discovery_func=_agent_discovery_func,
                 search_environment=search_environment,
                 llm_config=agent_llm_config,
                 event_callback=agent_event_callback,
-                stream_events=True,
+                # Prefer cancel-aware streaming inside the control plane when
+                # should_cancel is provided; avoid full run_sync blind spots.
+                stream_events=False,
+                should_cancel=should_cancel,
             )
         finally:
             if quality_client is not None:
                 quality_client.close()
         _check_cancel()
-        if result.status == "failed":
-            detail = "; ".join(result.blockers or result.warnings) or "OpenAI Agents discovery failed."
-            raise RuntimeError(detail)
-        manifest_path = Path(
-            result.selected_manifest_path
-            or result.files.get("dataset_manifest_json")
-            or output_dir / "dataset_manifest.json"
-        )
-        if not manifest_path.exists():
-            raise RuntimeError("OpenAI Agents discovery finished without a persisted dataset manifest.")
-        manifest = DatasetManifest.model_validate(json.loads(manifest_path.read_text(encoding="utf-8")))
         control_summary = _read_json_if_exists(output_dir / "agents_discovery_summary.json")
         dynamic_usage = control_summary.get("dynamic_usage") or {}
         budget_audit = control_summary.get("budget_audit") or {}
-        save_memory = body.get("save_memory", True) is not False
         agent_summary = {
             "runtime": "openai_agents",
             "status": result.status,
@@ -2358,7 +2349,7 @@ def _run_web_discovery(
             "model_usage": control_summary.get("model_usage") or {},
             "quality_budget_tier": _clean_text(budget_audit.get("quality_budget_tier")),
             "tool_calls": int(control_summary.get("tool_call_count") or 0),
-            "stop_reason": _clean_text(control_summary.get("stop_reason")),
+            "stop_reason": _clean_text(control_summary.get("stop_reason") or result.status),
             "final_output": result.final_output,
             "warnings": list(result.warnings),
             "blockers": list(result.blockers),
@@ -2371,9 +2362,56 @@ def _run_web_discovery(
             "repository_requests": int(dynamic_usage.get("repository_requests") or 0),
             "search_batches": int(dynamic_usage.get("search_batches") or 0),
             "budget_reviews": int(dynamic_usage.get("budget_reviews") or 0),
-            "pooled_selected_files": int(manifest.summary.get("selected_files") or len(manifest.files)),
             "hard_limits_reached": bool(budget_audit.get("hard_limits_reached")),
         }
+        if result.status == "failed":
+            detail = "; ".join(result.blockers or result.warnings) or "OpenAI Agents discovery failed."
+            agent_summary["error"] = detail
+            paths = {
+                key: Path(raw_path)
+                for key, raw_path in result.files.items()
+                if key in _DISCOVERY_DOWNLOAD_FILES and Path(raw_path).exists()
+            }
+            for key, (filename, _media) in _DISCOVERY_DOWNLOAD_FILES.items():
+                candidate = output_dir / filename
+                if key not in paths and candidate.exists():
+                    paths[key] = candidate
+            empty_manifest = DatasetManifest(
+                run_id=result.run_id or discovery_id,
+                request=request,
+                projects=[],
+                files=[],
+                summary={
+                    "run_id": result.run_id or discovery_id,
+                    "selected_projects": 0,
+                    "selected_files": 0,
+                    "agent_runtime": agent_summary,
+                    "error": detail,
+                },
+            )
+            _report(f"Final: Agent discovery failed; audits retained under {output_dir}.")
+            return _public_discovery_record(
+                discovery_id=discovery_id,
+                output_dir=output_dir,
+                manifest=empty_manifest,
+                paths=paths,
+                memory_saved=False,
+                status="failed",
+                runtime="openai_agents",
+                agent=agent_summary,
+            )
+        manifest_path = Path(
+            result.selected_manifest_path
+            or result.files.get("dataset_manifest_json")
+            or output_dir / "dataset_manifest.json"
+        )
+        if not manifest_path.exists():
+            raise RuntimeError("OpenAI Agents discovery finished without a persisted dataset manifest.")
+        manifest = DatasetManifest.model_validate(json.loads(manifest_path.read_text(encoding="utf-8")))
+        save_memory = body.get("save_memory", True) is not False
+        agent_summary["pooled_selected_files"] = int(
+            manifest.summary.get("selected_files") or len(manifest.files)
+        )
         summary = {
             **manifest.summary,
             "run_id": result.run_id,
@@ -5674,7 +5712,25 @@ def _now_app_iso() -> str:
     return datetime.now(_APP_TZ).isoformat()
 
 
-def _discovery_job_public(job: dict[str, Any]) -> dict[str, Any]:
+def _slim_discovery_record(record: Any) -> Any:
+    """Drop heavy project/file arrays from job polling payloads (ISS-04)."""
+    if not isinstance(record, dict):
+        return record
+    slim = dict(record)
+    projects = slim.pop("projects", None)
+    files = slim.pop("files", None)
+    if "project_count" not in slim:
+        slim["project_count"] = len(projects) if isinstance(projects, list) else 0
+    if "file_count" not in slim:
+        slim["file_count"] = len(files) if isinstance(files, list) else 0
+    slim["detail"] = "summary"
+    return slim
+
+
+def _discovery_job_public(job: dict[str, Any], *, detail: bool = False) -> dict[str, Any]:
+    record = job.get("record")
+    if record is not None and not detail:
+        record = _slim_discovery_record(record)
     return {
         "job_id": job.get("job_id"),
         "status": job.get("status"),
@@ -5683,8 +5739,9 @@ def _discovery_job_public(job: dict[str, Any]) -> dict[str, Any]:
         "finished_at": job.get("finished_at"),
         "cancel_requested": bool(job.get("cancel_requested")),
         "logs": list(job.get("logs") or []),
-        "record": job.get("record"),
+        "record": record,
         "error": job.get("error"),
+        "detail": "full" if detail else "summary",
     }
 
 
@@ -5698,7 +5755,11 @@ def _discovery_job_path(job_id: str) -> Path:
 
 def _persist_discovery_job(job: dict[str, Any]) -> None:
     try:
-        write_json(_discovery_job_path(str(job.get("job_id") or "")), _discovery_job_public(job))
+        # Persist the full record so restart recovery can rehydrate UI detail views.
+        write_json(
+            _discovery_job_path(str(job.get("job_id") or "")),
+            _discovery_job_public(job, detail=True),
+        )
     except Exception:
         # Job status persistence is best-effort; the in-memory job remains authoritative.
         return
@@ -5899,15 +5960,41 @@ def _run_discovery_job(job_id: str) -> None:
             should_cancel=should_cancel,
             agent_event_callback=lambda event: _append_discovery_job_event(job_id, event),
         )
+        cancelled = should_cancel()
+        record_status = _clean_text((record or {}).get("status")).lower() if isinstance(record, dict) else ""
+        if cancelled or record_status == "cancelled":
+            terminal_status = "cancelled"
+        elif record_status == "failed":
+            terminal_status = "failed"
+        else:
+            terminal_status = "completed"
         with _discovery_jobs_lock:
             job = _discovery_jobs.get(job_id)
             if not job:
                 return
             job["record"] = record
-            job["status"] = "cancelled" if should_cancel() else "completed"
+            job["status"] = terminal_status
+            if terminal_status == "failed" and isinstance(record, dict):
+                job["error"] = _redact_secrets(
+                    _clean_text((record.get("agent") or {}).get("error"))
+                    or _clean_text((record.get("summary") or {}).get("error"))
+                    or "Discovery failed."
+                )
             job["finished_at"] = _now_app_iso()
             _persist_discovery_job(job)
-        _append_discovery_job_log(job_id, "info", "Discovery job completed.")
+        finish_message = {
+            "completed": "Discovery job completed.",
+            "failed": "Discovery job failed with retained audits.",
+            "cancelled": "Discovery job cancelled.",
+        }[terminal_status]
+        finish_level = (
+            "info"
+            if terminal_status == "completed"
+            else "warning"
+            if terminal_status == "cancelled"
+            else "error"
+        )
+        _append_discovery_job_log(job_id, finish_level, finish_message)
     except InterruptedError as exc:
         with _discovery_jobs_lock:
             job = _discovery_jobs.get(job_id)
@@ -5959,7 +6046,8 @@ async def start_discovery_job(body: dict[str, Any], background_tasks: Background
 
 
 @app.get("/api/discovery/jobs/{job_id}")
-async def get_discovery_job(job_id: str):
+async def get_discovery_job(job_id: str, detail: int = 0):
+    include_detail = bool(detail)
     with _discovery_jobs_lock:
         job = _discovery_jobs.get(job_id)
         if not job:
@@ -5969,7 +6057,7 @@ async def get_discovery_job(job_id: str):
             job = _mark_interrupted_discovery_job(job)
             _discovery_jobs[job_id] = job
             _persist_discovery_job(job)
-        return _discovery_job_public(job)
+        return _discovery_job_public(job, detail=include_detail)
 
 
 @app.post("/api/discovery/jobs/{job_id}/cancel")

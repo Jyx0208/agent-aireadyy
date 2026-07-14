@@ -4037,6 +4037,20 @@ async function pollDiscoveryJob(){
       status.textContent=tf('discoveryFailed',data.error||'unknown');
       status.className='discovery-status error';
     }else if(jobStatus==='completed'){
+      let record=data.record||{};
+      // Polling uses slim job payloads; fetch full detail once for the result panel.
+      if(!Array.isArray(record.projects) || !Array.isArray(record.files)){
+        try{
+          const detailResp=await fetch('/api/discovery/jobs/'+encodeURIComponent(currentDiscoveryJobId)+'?detail=1');
+          const detailData=await detailResp.json();
+          if(!detailData.error && detailData.record){
+            record=detailData.record;
+            data.record=record;
+          }
+        }catch(detailError){
+          console.warn('Discovery job detail fetch failed',detailError);
+        }
+      }
       if(data.record){
         try{
           renderDiscovery(data.record);
@@ -4046,7 +4060,7 @@ async function pollDiscoveryJob(){
           status.className='discovery-status error';
         }
       }
-      const record=data.record||{};
+      record=data.record||{};
       if(status.className!=='discovery-status error'){
         const recordStatus=String(record.status||'completed');
         if(recordStatus==='blocked'){
