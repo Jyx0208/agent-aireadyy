@@ -73,6 +73,26 @@
       min-height: 20px;
       padding-bottom: 8px;
     }
+    .queue-bar { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 0 12px; }
+    .queue-bar button[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); }
+    .layout-split { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 14px; align-items: start; }
+    .side-rail, .impact-panel, .jobs-panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 12px;
+    }
+    .side-rail h3, .impact-panel h3, .jobs-panel h3 { margin: 0 0 8px; font-size: 14px; }
+    .side-rail.hidden, .impact-panel.hidden, .jobs-panel.hidden, .dev-only.hidden { display: none !important; }
+    .vote-item { border-top: 1px solid var(--line); padding: 8px 0; font-size: 13px; line-height: 1.45; }
+    .impact-panel { margin-top: 14px; }
+    .impact-panel p { margin: 0 0 8px; line-height: 1.5; }
+    .jobs-panel { margin-top: 14px; }
+    .jobs-panel .job-row { border-top: 1px solid var(--line); padding: 8px 0; font-size: 13px; }
+    .jobs-controls { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; margin-bottom: 10px; }
+    .progress-bar { height: 8px; background: #e8ecef; border-radius: 99px; overflow: hidden; margin: 6px 0; }
+    .progress-bar > span { display: block; height: 100%; background: var(--accent); width: 0; }
+    .log-box { max-height: 140px; overflow: auto; background: #f8fafb; border: 1px solid var(--line); padding: 8px; font-size: 12px; white-space: pre-wrap; }
     .field { display: grid; gap: 5px; }
     label { color: var(--muted); font-size: 13px; }
     input[type="text"], select, textarea {
@@ -138,7 +158,7 @@
     .status { min-height: 22px; color: var(--muted); padding-top: 8px; }
     @media (max-width: 760px) {
       .header-inner { align-items: flex-start; flex-direction: column; padding: 13px 0; }
-      .toolbar, .registry-bar { grid-template-columns: 1fr 1fr; }
+      .toolbar, .registry-bar, .layout-split, .jobs-controls { grid-template-columns: 1fr; }
       .metadata { grid-template-columns: 1fr 1fr; }
       .grades { grid-template-columns: 1fr 1fr; }
     }
@@ -176,6 +196,13 @@
       </div>
     </section>
     <div class="pool-meta" id="poolMeta"></div>
+    <div class="queue-bar" id="queueBar" aria-label="优先级队列">
+      <button type="button" data-queue="all" aria-pressed="true">全部</button>
+      <button type="button" data-queue="ungraded">未评分</button>
+      <button type="button" data-queue="low_confidence" class="dev-only">低置信</button>
+      <button type="button" data-queue="vote_disagreement" class="dev-only">投票分歧</button>
+      <button type="button" data-queue="hard_constraint_conflicts" class="dev-only">硬约束冲突</button>
+    </div>
     <section class="toolbar" aria-label="评审工具栏">
       <div>
         <input id="poolFile" type="file" accept="application/json,.json">
@@ -200,25 +227,32 @@
           <strong id="taskName"></strong>
           <div class="task-prompt" id="taskPrompt"></div>
         </div>
-        <article class="candidate">
-          <div class="candidate-head">
-            <h2 id="projectTitle"></h2>
-            <div class="candidate-index" id="candidateIndex"></div>
-          </div>
-          <div class="description" id="projectDescription"></div>
-          <dl class="metadata" id="metadata"></dl>
-          <div class="grade-label">相关性评分</div>
-          <div class="grades" role="group" aria-label="相关性评分">
-            <button class="grade" type="button" data-grade="0">0 不相关或冲突</button>
-            <button class="grade" type="button" data-grade="1">1 相关但不适用</button>
-            <button class="grade" type="button" data-grade="2">2 高度相关</button>
-            <button class="grade" type="button" data-grade="3">3 直接满足</button>
-          </div>
-          <div class="field notes">
-            <label for="reviewNotes">评分理由</label>
-            <textarea id="reviewNotes"></textarea>
-          </div>
-        </article>
+        <div class="layout-split">
+          <article class="candidate">
+            <div class="candidate-head">
+              <h2 id="projectTitle"></h2>
+              <div class="candidate-index" id="candidateIndex"></div>
+            </div>
+            <div class="description" id="projectDescription"></div>
+            <dl class="metadata" id="metadata"></dl>
+            <div class="grade-label">相关性评分</div>
+            <div class="grades" role="group" aria-label="相关性评分">
+              <button class="grade" type="button" data-grade="0">0 不相关或冲突</button>
+              <button class="grade" type="button" data-grade="1">1 相关但不适用</button>
+              <button class="grade" type="button" data-grade="2">2 高度相关</button>
+              <button class="grade" type="button" data-grade="3">3 直接满足</button>
+            </div>
+            <div class="field notes">
+              <label for="reviewNotes">评分理由</label>
+              <textarea id="reviewNotes"></textarea>
+            </div>
+          </article>
+          <aside class="side-rail hidden" id="machineRail">
+            <h3>机器票（仅开发者）</h3>
+            <div id="machineSummary" class="pool-meta"></div>
+            <div id="machineVotes"></div>
+          </aside>
+        </div>
         <nav class="navigation" aria-label="候选导航">
           <div class="navigation-group">
             <button id="previousButton" type="button" title="上一个候选" aria-label="上一个候选">&#8592;</button>
@@ -230,6 +264,44 @@
           </div>
         </nav>
         <div class="status" id="statusText" role="status" aria-live="polite"></div>
+        <section class="impact-panel hidden" id="impactPanel">
+          <h3>测试模式影响</h3>
+          <div class="field">
+            <label for="impactKeyPath">key 路径（服务端可读，runs/ 下）</label>
+            <input id="impactKeyPath" type="text" placeholder="runs/.../judgment_pool.key.json">
+          </div>
+          <div class="field" style="margin-top:8px">
+            <label for="impactRunPaths">run JSON 路径（逗号分隔）</label>
+            <input id="impactRunPaths" type="text" placeholder="runs/.../agent_run.json,runs/.../workflow_run.json">
+          </div>
+          <div style="margin-top:8px; display:flex; gap:8px;">
+            <button id="bindImpactButton" type="button">绑定影响数据</button>
+          </div>
+          <div id="impactText" style="margin-top:10px"></div>
+        </section>
+        <section class="jobs-panel hidden" id="jobsPanel">
+          <h3>Agent 专家评审 Job</h3>
+          <div class="jobs-controls">
+            <div class="field">
+              <label for="profileSelect">LLM profile</label>
+              <select id="profileSelect"><option value="">加载中…</option></select>
+            </div>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;">
+              <input id="independentModel" type="checkbox"> 独立模型族
+            </label>
+            <button id="startJobButton" type="button" class="primary">启动 Job</button>
+          </div>
+          <div id="jobsList"></div>
+          <div class="field" style="margin-top:8px">
+            <label>选中 Job 日志</label>
+            <div class="log-box" id="jobLog"></div>
+          </div>
+          <div style="display:flex; gap:8px; margin-top:8px;">
+            <button id="refreshJobsButton" type="button">刷新 Jobs</button>
+            <button id="cancelJobButton" type="button">取消选中</button>
+            <button id="retryJobButton" type="button">重试失败</button>
+          </div>
+        </section>
       </div>
     </section>
   </main>
@@ -240,6 +312,9 @@
     let currentIndex = 0;
     let activePoolId = null;
     let registryEnabled = true;
+    let activeQueue = "all";
+    let selectedJobId = null;
+    let jobPollTimer = null;
 
     const byId = (id) => document.getElementById(id);
     const poolFile = byId("poolFile");
@@ -257,7 +332,8 @@
       const mode = (params.get("mode") || "expert").toLowerCase();
       return ["expert", "developer", "test"].includes(mode) ? mode : "expert";
     }
-
+    function currentMode() { return reviewMode.value || queryMode(); }
+    function isDevMode() { return currentMode() !== "expert"; }
     reviewMode.value = queryMode();
 
     function text(value) {
@@ -275,7 +351,7 @@
       if (!pool) return;
       const reviews = {};
       for (const candidate of pool.candidates) {
-        if (candidate.grade !== null || candidate.review_notes) {
+        if ((candidate.grade !== null && candidate.grade !== undefined) || candidate.review_notes) {
           reviews[candidate.candidate_id] = {
             grade: candidate.grade,
             review_notes: candidate.review_notes || "",
@@ -292,13 +368,32 @@
       for (const candidate of pool.candidates) {
         const review = (saved.reviews || {})[candidate.candidate_id];
         if (!review) continue;
-        candidate.grade = review.grade;
-        candidate.review_notes = review.review_notes || "";
-        candidate.reviewer_id = review.reviewer_id || "";
+        if (candidate.grade === null || candidate.grade === undefined) {
+          candidate.grade = review.grade;
+          candidate.review_notes = review.review_notes || "";
+          candidate.reviewer_id = review.reviewer_id || "";
+        }
       }
     }
 
     function taskKey(candidate) { return `${candidate.scenario_id}:${candidate.variant_id}`; }
+    function isGraded(candidate) {
+      return candidate.grade === 0 || candidate.grade === 1 || candidate.grade === 2 || candidate.grade === 3;
+    }
+    function queueOf(candidate) {
+      if (!isGraded(candidate)) return "ungraded";
+      if (!isDevMode()) return "graded";
+      const votes = candidate.machine_reviews || [];
+      const conflicts = [];
+      for (const vote of votes) {
+        for (const item of (vote.constraint_conflicts || [])) if (item) conflicts.push(item);
+      }
+      if (conflicts.length) return "hard_constraint_conflicts";
+      const grades = [...new Set(votes.map(v => Number(v.grade)).filter(Number.isInteger))];
+      if (grades.length >= 2 && (Math.max(...grades) - Math.min(...grades) >= 2)) return "vote_disagreement";
+      if ((candidate.judgment_confidence || candidate.confidence) === "low") return "low_confidence";
+      return "graded";
+    }
 
     function rebuildFilter() {
       const keys = [...new Set(pool.candidates.map(taskKey))].sort();
@@ -313,7 +408,11 @@
     }
 
     function applyFilter() {
-      visible = pool.candidates.filter((candidate) => taskFilter.value === "all" || taskKey(candidate) === taskFilter.value);
+      visible = pool.candidates.filter((candidate) => {
+        const taskOk = taskFilter.value === "all" || taskKey(candidate) === taskFilter.value;
+        const queueOk = activeQueue === "all" || queueOf(candidate) === activeQueue;
+        return taskOk && queueOk;
+      });
       currentIndex = Math.min(currentIndex, Math.max(0, visible.length - 1));
       render();
     }
@@ -329,8 +428,15 @@
       return wrapper;
     }
 
-    function setPoolMeta(message) {
-      byId("poolMeta").textContent = message || "";
+    function setPoolMeta(message) { byId("poolMeta").textContent = message || ""; }
+
+    function updateModeChrome() {
+      const dev = isDevMode();
+      document.querySelectorAll(".dev-only").forEach((el) => el.classList.toggle("hidden", !dev));
+      byId("machineRail").classList.toggle("hidden", !dev);
+      byId("impactPanel").classList.toggle("hidden", currentMode() !== "test");
+      byId("jobsPanel").classList.toggle("hidden", !dev);
+      if (dev) { refreshProfiles(); refreshJobs(); }
     }
 
     function activatePool(parsed, metaMessage) {
@@ -338,18 +444,50 @@
       pool = parsed;
       restoreState();
       rebuildFilter();
-      visible = [...pool.candidates];
-      currentIndex = 0;
       byId("emptyState").style.display = "none";
       byId("reviewArea").style.display = "block";
       exportButton.disabled = false;
       importServerButton.disabled = !registryEnabled;
       setPoolMeta(metaMessage || "");
-      render();
+      updateModeChrome();
+      currentIndex = 0;
+      applyFilter();
+    }
+
+    function renderMachineRail(candidate) {
+      if (!isDevMode()) return;
+      const votes = candidate.machine_reviews || [];
+      byId("machineSummary").textContent = votes.length
+        ? `置信度：${candidate.judgment_confidence || candidate.confidence || "未知"} · ${votes.length} 票 · 模型 ${candidate.review_model || "未知"}`
+        : "当前候选没有机器票";
+      const box = byId("machineVotes");
+      box.replaceChildren();
+      votes.forEach((vote, index) => {
+        const div = document.createElement("div");
+        div.className = "vote-item";
+        const evidence = (vote.supporting_evidence || []).join("；") || "无";
+        const conflicts = (vote.constraint_conflicts || []).join("；") || "无";
+        div.textContent = `#${index + 1} 分 ${vote.grade}｜${vote.reason || ""}｜证据：${evidence}｜冲突：${conflicts}`;
+        box.appendChild(div);
+      });
+    }
+
+    function renderImpact(impact) {
+      const root = byId("impactText");
+      if (!impact) { root.textContent = "尚未计算影响。"; return; }
+      root.replaceChildren();
+      for (const sentence of (impact.sentences || [])) {
+        const p = document.createElement("p");
+        p.textContent = sentence;
+        root.appendChild(p);
+      }
     }
 
     function render() {
-      if (!pool || !visible.length) return;
+      if (!pool || !visible.length) {
+        if (pool && !visible.length) byId("statusText").textContent = "当前队列/筛选下没有候选";
+        return;
+      }
       const candidate = visible[currentIndex];
       const key = taskKey(candidate);
       const task = (pool.tasks || {})[key] || {};
@@ -378,9 +516,36 @@
       byId("reviewNotes").value = candidate.review_notes || "";
       byId("previousButton").disabled = currentIndex === 0;
       byId("nextButton").disabled = currentIndex >= visible.length - 1;
-      const graded = pool.candidates.filter((item) => Number.isInteger(item.grade)).length;
+      const graded = pool.candidates.filter((item) => isGraded(item)).length;
       byId("progressText").textContent = `已评分 ${graded} / ${pool.candidates.length}`;
-      byId("statusText").textContent = Number.isInteger(candidate.grade) ? `当前评分：${candidate.grade}` : "当前候选未评分";
+      byId("statusText").textContent = isGraded(candidate) ? `当前评分：${candidate.grade}` : "当前候选未评分";
+      renderMachineRail(candidate);
+    }
+
+    async function persistGrade(candidate) {
+      saveState();
+      if (!activePoolId) return;
+      try {
+        const payload = await fetch(`/api/expert-review/pools/${encodeURIComponent(activePoolId)}/grades/${encodeURIComponent(candidate.candidate_id)}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            grade: candidate.grade,
+            notes: candidate.review_notes || "",
+            reviewer_id: reviewerId.value.trim(),
+            mode: currentMode(),
+            impact_session_id: activePoolId
+          })
+        }).then(r => r.json());
+        if (payload && payload.ok && payload.candidate) {
+          Object.assign(candidate, payload.candidate);
+          if (payload.impact) renderImpact(payload.impact);
+        } else if (payload && payload.error) {
+          byId("statusText").textContent = `保存失败：${payload.error}`;
+        }
+      } catch (error) {
+        byId("statusText").textContent = `保存失败：${error.message}`;
+      }
     }
 
     async function refreshRegistry() {
@@ -426,7 +591,7 @@
       const poolId = serverPoolSelect.value;
       if (!poolId) return;
       try {
-        const mode = reviewMode.value || "expert";
+        const mode = currentMode();
         const payload = await fetch(`/api/expert-review/pools/${encodeURIComponent(poolId)}/candidates?mode=${encodeURIComponent(mode)}&limit=500`).then((r) => r.json());
         if (!payload || !payload.ok) throw new Error((payload && payload.error) || "打开失败");
         activePoolId = poolId;
@@ -458,6 +623,74 @@
       }
     }
 
+    async function refreshProfiles() {
+      try {
+        const payload = await fetch("/api/llm/profiles").then(r => r.json());
+        const profiles = (payload && payload.profiles) || [];
+        const select = byId("profileSelect");
+        select.innerHTML = "";
+        if (!profiles.length) {
+          select.innerHTML = '<option value="">无已保存 profile（请在设置页添加）</option>';
+          return;
+        }
+        for (const profile of profiles) {
+          const option = document.createElement("option");
+          option.value = profile.id;
+          option.textContent = `${profile.label || profile.id} · ${profile.model}`;
+          if (profile.is_default) option.selected = true;
+          select.appendChild(option);
+        }
+      } catch {
+        byId("profileSelect").innerHTML = '<option value="">无法加载 profiles</option>';
+      }
+    }
+
+    function renderJobs(jobs) {
+      const root = byId("jobsList");
+      root.replaceChildren();
+      if (!jobs.length) {
+        root.textContent = "暂无 job。";
+        return;
+      }
+      for (const job of jobs) {
+        const row = document.createElement("div");
+        row.className = "job-row";
+        const prog = job.progress || {};
+        const done = prog.done || 0;
+        const total = prog.total || 0;
+        const pct = total ? Math.round(100 * done / total) : 0;
+        const title = document.createElement("div");
+        title.innerHTML = `<strong>${job.job_id}</strong> · ${job.status} · ${job.model || ""}`;
+        const bar = document.createElement("div");
+        bar.className = "progress-bar";
+        const span = document.createElement("span");
+        span.style.width = pct + "%";
+        bar.appendChild(span);
+        const counts = document.createElement("div");
+        counts.textContent = `${done}/${total} 完成 · 失败 ${prog.failed || 0}`;
+        row.append(title, bar, counts);
+        row.style.cursor = "pointer";
+        row.onclick = async () => {
+          selectedJobId = job.job_id;
+          const detail = await fetch(`/api/expert-review/jobs/${encodeURIComponent(job.job_id)}?detail=1`).then(r => r.json());
+          const logs = ((detail.job || {}).logs || []).map(l => `${l.ts} [${l.level}] ${l.message}`).join("\n");
+          byId("jobLog").textContent = logs || "无日志";
+        };
+        root.appendChild(row);
+      }
+    }
+
+    async function refreshJobs() {
+      if (!isDevMode()) return;
+      try {
+        const url = activePoolId ? `/api/expert-review/jobs?pool_id=${encodeURIComponent(activePoolId)}` : "/api/expert-review/jobs";
+        const payload = await fetch(url).then(r => r.json());
+        renderJobs((payload && payload.jobs) || []);
+      } catch {
+        byId("jobsList").textContent = "无法加载 jobs";
+      }
+    }
+
     poolFile.addEventListener("change", async () => {
       const file = poolFile.files[0];
       if (!file) return;
@@ -470,14 +703,19 @@
       }
     });
 
-    gradeButtons.forEach((button) => button.addEventListener("click", () => {
+    gradeButtons.forEach((button) => button.addEventListener("click", async () => {
       const candidate = visible[currentIndex];
       candidate.grade = Number(button.dataset.grade);
       candidate.reviewer_id = reviewerId.value.trim();
-      saveState();
+      await persistGrade(candidate);
       render();
     }));
 
+    byId("reviewNotes").addEventListener("change", async (event) => {
+      visible[currentIndex].review_notes = event.target.value;
+      visible[currentIndex].reviewer_id = reviewerId.value.trim();
+      await persistGrade(visible[currentIndex]);
+    });
     byId("reviewNotes").addEventListener("input", (event) => {
       visible[currentIndex].review_notes = event.target.value;
       visible[currentIndex].reviewer_id = reviewerId.value.trim();
@@ -488,8 +726,8 @@
     byId("previousButton").addEventListener("click", () => { currentIndex--; render(); });
     byId("nextButton").addEventListener("click", () => { currentIndex++; render(); });
     byId("nextUngradedButton").addEventListener("click", () => {
-      const next = visible.findIndex((candidate, index) => index > currentIndex && !Number.isInteger(candidate.grade));
-      const wrapped = visible.findIndex((candidate) => !Number.isInteger(candidate.grade));
+      const next = visible.findIndex((candidate, index) => index > currentIndex && !isGraded(candidate));
+      const wrapped = visible.findIndex((candidate) => !isGraded(candidate));
       const target = next >= 0 ? next : wrapped;
       if (target >= 0) { currentIndex = target; render(); }
       else byId("statusText").textContent = "当前范围已全部评分";
@@ -504,9 +742,27 @@
       }
       render();
     });
-    exportButton.addEventListener("click", () => {
+    exportButton.addEventListener("click", async () => {
+      if (activePoolId) {
+        try {
+          const payload = await fetch(`/api/expert-review/pools/${encodeURIComponent(activePoolId)}/export`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}"
+          }).then(r => r.json());
+          if (payload && payload.ok && payload.pool) {
+            const blob = new Blob([JSON.stringify(payload.pool, null, 2) + "\n"], { type: "application/json" });
+            const link = document.createElement("a");
+            link.href = URL.createObjectURL(blob);
+            link.download = "judgment_pool.reviewed.json";
+            link.click();
+            URL.revokeObjectURL(link.href);
+            return;
+          }
+        } catch (e) {}
+      }
       for (const candidate of pool.candidates) candidate.reviewer_id = candidate.reviewer_id || reviewerId.value.trim();
-      const output = { ...pool, reviewed_at: new Date().toISOString(), reviewer_id: reviewerId.value.trim() };
+      const output = { ...pool, reviewed_at: new Date().toISOString(), reviewer_id: reviewerId.value.trim(), judgment_source: "human_verified" };
       const blob = new Blob([JSON.stringify(output, null, 2) + "\n"], { type: "application/json" });
       const link = document.createElement("a");
       link.href = URL.createObjectURL(blob);
@@ -520,12 +776,79 @@
     reviewMode.addEventListener("change", () => {
       const params = new URLSearchParams(window.location.search);
       params.set("mode", reviewMode.value);
-      const next = `${window.location.pathname}?${params.toString()}`;
-      window.history.replaceState({}, "", next);
+      window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
+      updateModeChrome();
       if (activePoolId) openServerPool();
+      else if (pool) applyFilter();
+    });
+    document.querySelectorAll("#queueBar button").forEach((button) => {
+      button.addEventListener("click", () => {
+        activeQueue = button.dataset.queue;
+        document.querySelectorAll("#queueBar button").forEach((b) => b.setAttribute("aria-pressed", String(b === button)));
+        applyFilter();
+      });
+    });
+    byId("bindImpactButton").addEventListener("click", async () => {
+      if (!activePoolId) { byId("impactText").textContent = "请先打开服务端登记池。"; return; }
+      const key_path = byId("impactKeyPath").value.trim();
+      const run_paths = byId("impactRunPaths").value.split(",").map(s => s.trim()).filter(Boolean);
+      const payload = await fetch("/api/expert-review/impact/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: activePoolId, pool_id: activePoolId, key_path, run_paths, mode: "test" })
+      }).then(r => r.json());
+      if (!payload.ok) {
+        byId("impactText").textContent = `绑定失败：${payload.error}`;
+        return;
+      }
+      const impact = await fetch(`/api/expert-review/pools/${encodeURIComponent(activePoolId)}/impact`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "test", impact_session_id: activePoolId })
+      }).then(r => r.json());
+      if (impact.ok) renderImpact(impact.impact);
+      else byId("impactText").textContent = `计算失败：${impact.error}`;
+    });
+    byId("startJobButton").addEventListener("click", async () => {
+      if (!activePoolId) { byId("jobLog").textContent = "请先打开服务端池。"; return; }
+      const profile_id = byId("profileSelect").value;
+      if (!profile_id) { byId("jobLog").textContent = "请选择 profile。"; return; }
+      const payload = await fetch("/api/expert-review/jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          pool_id: activePoolId,
+          profile_id,
+          independent_model: byId("independentModel").checked,
+          mode: currentMode(),
+          workers: 2
+        })
+      }).then(r => r.json());
+      if (!payload.ok) {
+        byId("jobLog").textContent = `启动失败：${payload.error}`;
+        return;
+      }
+      selectedJobId = payload.job.job_id;
+      byId("jobLog").textContent = `已启动 ${selectedJobId}`;
+      refreshJobs();
+      if (jobPollTimer) clearInterval(jobPollTimer);
+      jobPollTimer = setInterval(refreshJobs, 2000);
+    });
+    byId("refreshJobsButton").addEventListener("click", refreshJobs);
+    byId("cancelJobButton").addEventListener("click", async () => {
+      if (!selectedJobId) return;
+      await fetch(`/api/expert-review/jobs/${encodeURIComponent(selectedJobId)}/cancel`, { method: "POST" });
+      refreshJobs();
+    });
+    byId("retryJobButton").addEventListener("click", async () => {
+      if (!selectedJobId) return;
+      await fetch(`/api/expert-review/jobs/${encodeURIComponent(selectedJobId)}/retry-failed`, { method: "POST" });
+      refreshJobs();
     });
 
+    updateModeChrome();
     refreshRegistry();
   </script>
+
 </body>
 </html>

@@ -196,6 +196,33 @@ class ExpertPoolRegistry:
             "stats": record.get("stats") or self._compute_stats(document),
         }
 
+    def save_reviewed_pool(self, pool_id: str, pool: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist a reviewed pool document and refresh registry stats."""
+        validated = self._validate_pool(pool)
+        with _REGISTRY_LOCK:
+            record = self._load_record(pool_id)
+            if record is None:
+                raise ValueError("pool_not_found")
+            pool_dir = self.root / pool_id
+            pool_dir.mkdir(parents=True, exist_ok=True)
+            path = pool_dir / "pool.reviewed.json"
+            path.write_text(
+                json.dumps(validated, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            record = dict(record)
+            record["updated_at"] = _utc_now()
+            paths = dict(record.get("paths") or {})
+            paths["reviewed"] = "pool.reviewed.json"
+            if not paths.get("blinded") and (pool_dir / "pool.blinded.json").exists():
+                paths["blinded"] = "pool.blinded.json"
+            record["paths"] = paths
+            record["stats"] = self._compute_stats(validated)
+            record["judgment_source"] = str(validated.get("judgment_source") or "")
+            record["schema_version"] = str(validated.get("schema_version") or "")
+            self._write_record(pool_id, record)
+            return record
+
     def _allocate_pool_id(self, seed: str) -> str:
         base = _slugify(seed)
         if not _POOL_ID_RE.match(base):

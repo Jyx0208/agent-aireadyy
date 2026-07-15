@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -89,6 +89,14 @@ from agent.runtime.system_metrics import collect_system_metrics
 from agent.utils import write_json
 from agent.web.history import history_timestamp, merge_project_history_records, with_history_identity
 from agent.web.expert_review import ExpertPoolRegistry, expert_review_enabled, expert_review_root
+from agent.web.expert_review.grading import (
+    append_human_grade,
+    apply_human_grades_for_export,
+    effective_grade,
+    queue_bucket,
+)
+from agent.web.expert_review.impact import compute_impact, load_json
+from agent.web.expert_review.jobs import ExpertJudgeJobManager, reset_jobs_for_tests
 from agent.web.llm_config_store import LLMConfigStore
 
 
@@ -4249,6 +4257,45 @@ def _normalize_review_mode(raw: Any) -> str:
     return "expert"
 
 
+_impact_sessions: dict[str, dict[str, Any]] = {}
+_impact_sessions_lock = threading.Lock()
+
+
+def _expert_job_manager() -> ExpertJudgeJobManager:
+    store = _llm_config_store()
+
+    def resolve_profile(profile_id: str) -> dict[str, str]:
+        secrets = store.get_profile_secrets(profile_id)
+        if secrets is None:
+            raise ValueError("profile_not_found_or_incomplete")
+        return secrets
+
+    return ExpertJudgeJobManager(_expert_pool_registry(), resolve_profile=resolve_profile)
+
+
+def _load_impact_bundle(session: Mapping[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    key_payload = None
+    runs: list[dict[str, Any]] = []
+    key_path = session.get("key_path")
+    if key_path:
+        try:
+            key_payload = load_json(key_path)
+        except Exception:
+            key_payload = None
+    for path in session.get("run_paths") or []:
+        try:
+            payload = load_json(path)
+        except Exception:
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("runs"), list):
+            runs.extend([item for item in payload["runs"] if isinstance(item, dict)])
+        elif isinstance(payload, dict) and payload.get("selected_project_accessions") is not None:
+            runs.append(payload)
+        elif isinstance(payload, list):
+            runs.extend([item for item in payload if isinstance(item, dict)])
+    return key_payload, runs
+
+
 def _build_llm_config(llm_config: dict[str, Any]) -> tuple[dict[str, str] | None, str | None]:
     server_config, _ = _server_llm_config()
     fallback = server_config or {}
@@ -4678,6 +4725,258 @@ async def list_expert_review_candidates(
     if payload is None:
         return {"ok": False, "error": "pool_not_found"}
     return {"ok": True, **payload}
+
+
+@app.put("/api/expert-review/pools/{pool_id}/grades/{candidate_id}")
+async def upsert_expert_review_grade(pool_id: str, candidate_id: str, body: dict[str, Any]):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    mode = _normalize_review_mode(body.get("mode") or "expert")
+    registry = _expert_pool_registry()
+    document = registry.load_pool_document(pool_id, prefer_reviewed=True)
+    if document is None:
+        return {"ok": False, "error": "pool_not_found"}
+    candidates = [dict(item) for item in (document.get("candidates") or []) if isinstance(item, dict)]
+    target = None
+    for index, item in enumerate(candidates):
+        if str(item.get("candidate_id") or "") == candidate_id:
+            target = index
+            break
+    if target is None:
+        return {"ok": False, "error": "candidate_not_found"}
+    before = dict(candidates[target])
+    grade_before = effective_grade(before)
+    clear = bool(body.get("clear"))
+    notes = str(body.get("notes") or body.get("review_notes") or "")
+    reviewer_id = _clean_text(body.get("reviewer_id")) or ""
+    try:
+        if clear:
+            updated = append_human_grade(before, grade=None, notes=notes, reviewer_id=reviewer_id, clear=True)
+        else:
+            grade_raw = body.get("grade")
+            if grade_raw is None:
+                return {"ok": False, "error": "grade_required"}
+            updated = append_human_grade(
+                before,
+                grade=int(grade_raw),
+                notes=notes,
+                reviewer_id=reviewer_id,
+            )
+    except (TypeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    candidates[target] = updated
+    new_doc = dict(document)
+    new_doc["candidates"] = candidates
+    # Prefer human_verified when human grades exist on export; keep machine source on disk doc if mixed.
+    if any(item.get("human_grades") for item in candidates):
+        new_doc.setdefault("schema_version", "discovery-judgment-pool-reviewed/v2")
+    try:
+        record = registry.save_reviewed_pool(pool_id, new_doc)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    impact = None
+    if mode == "test":
+        session_id = _clean_text(body.get("impact_session_id")) or pool_id
+        with _impact_sessions_lock:
+            session = dict(_impact_sessions.get(session_id) or {})
+        key_payload, runs = _load_impact_bundle(session)
+        # temporary pools for before/after
+        before_doc = dict(document)
+        before_doc["candidates"] = [
+            before if str(item.get("candidate_id") or "") == candidate_id else item
+            for item in (document.get("candidates") or [])
+            if isinstance(item, dict)
+        ]
+        impact = compute_impact(
+            pool_before=before_doc,
+            pool_after=new_doc,
+            key_payload=key_payload,
+            runs=runs or None,
+            changed_candidate_id=candidate_id,
+            grade_before=grade_before,
+            grade_after=effective_grade(updated),
+        )
+
+    from agent.web.expert_review.pool_registry import blind_candidate_view
+
+    return {
+        "ok": True,
+        "pool": record,
+        "candidate": blind_candidate_view(updated, mode=mode),
+        "impact": impact,
+    }
+
+
+@app.post("/api/expert-review/pools/{pool_id}/export")
+async def export_expert_review_pool(pool_id: str, body: dict[str, Any] | None = None):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    body = body or {}
+    document = _expert_pool_registry().load_pool_document(pool_id, prefer_reviewed=True)
+    if document is None:
+        return {"ok": False, "error": "pool_not_found"}
+    exported = apply_human_grades_for_export(document)
+    return {"ok": True, "pool": exported}
+
+
+@app.post("/api/expert-review/impact/session")
+async def bind_expert_impact_session(body: dict[str, Any]):
+    mode = _normalize_review_mode(body.get("mode") or "test")
+    if mode == "expert":
+        return {"ok": False, "error": "impact_forbidden_in_expert_mode"}
+    session_id = _clean_text(body.get("session_id")) or _clean_text(body.get("pool_id")) or uuid.uuid4().hex[:10]
+    key_path = _clean_text(body.get("key_path"))
+    run_paths = body.get("run_paths") or []
+    if not isinstance(run_paths, list):
+        return {"ok": False, "error": "run_paths_must_be_list"}
+    cleaned_runs = [_clean_text(path) for path in run_paths if _clean_text(path)]
+    # allowlist under runs/ or absolute existing files only
+    def _allowed(path: str) -> bool:
+        candidate = Path(path)
+        if not candidate.exists() or not candidate.is_file():
+            return False
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return False
+        runs_root = Path("runs").resolve()
+        return str(resolved).startswith(str(runs_root)) or resolved.exists()
+
+    if key_path and not _allowed(key_path):
+        return {"ok": False, "error": "key_path_not_allowed"}
+    for path in cleaned_runs:
+        if not _allowed(path):
+            return {"ok": False, "error": f"run_path_not_allowed:{path}"}
+    with _impact_sessions_lock:
+        _impact_sessions[session_id] = {
+            "key_path": key_path or None,
+            "run_paths": cleaned_runs,
+            "updated_at": _now_app_iso(),
+        }
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "key_bound": bool(key_path),
+        "run_count": len(cleaned_runs),
+    }
+
+
+@app.post("/api/expert-review/pools/{pool_id}/impact")
+async def expert_review_impact(pool_id: str, body: dict[str, Any]):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    mode = _normalize_review_mode(body.get("mode") or "test")
+    if mode == "expert":
+        return {"ok": False, "error": "impact_forbidden_in_expert_mode"}
+    registry = _expert_pool_registry()
+    document = registry.load_pool_document(pool_id, prefer_reviewed=True)
+    if document is None:
+        return {"ok": False, "error": "pool_not_found"}
+    session_id = _clean_text(body.get("impact_session_id")) or pool_id
+    with _impact_sessions_lock:
+        session = dict(_impact_sessions.get(session_id) or {})
+    # allow one-shot paths
+    if body.get("key_path"):
+        session["key_path"] = _clean_text(body.get("key_path"))
+    if body.get("run_paths"):
+        session["run_paths"] = [_clean_text(p) for p in body.get("run_paths") or [] if _clean_text(p)]
+    key_payload, runs = _load_impact_bundle(session)
+    # optional hypothetical grade change
+    pool_after = dict(document)
+    grade_before = None
+    grade_after = None
+    changed_id = _clean_text(body.get("candidate_id")) or None
+    if changed_id and body.get("grade") is not None:
+        candidates = []
+        for item in document.get("candidates") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("candidate_id") or "") != changed_id:
+                candidates.append(item)
+                continue
+            grade_before = effective_grade(item)
+            updated = append_human_grade(
+                item,
+                grade=int(body.get("grade")),
+                notes=str(body.get("notes") or ""),
+                reviewer_id=_clean_text(body.get("reviewer_id")) or "",
+            )
+            grade_after = effective_grade(updated)
+            candidates.append(updated)
+        pool_after = {**document, "candidates": candidates}
+    impact = compute_impact(
+        pool_before=document,
+        pool_after=pool_after,
+        key_payload=key_payload,
+        runs=runs or None,
+        changed_candidate_id=changed_id,
+        grade_before=grade_before,
+        grade_after=grade_after,
+    )
+    return {"ok": True, "impact": impact}
+
+
+@app.get("/api/expert-review/jobs")
+async def list_expert_judge_jobs(pool_id: str | None = None):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled", "jobs": []}
+    return {"ok": True, "jobs": _expert_job_manager().list_jobs(pool_id=pool_id)}
+
+
+@app.post("/api/expert-review/jobs")
+async def start_expert_judge_job(body: dict[str, Any]):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    mode = _normalize_review_mode(body.get("mode") or "developer")
+    if mode == "expert":
+        return {"ok": False, "error": "jobs_forbidden_in_expert_mode"}
+    pool_id = _clean_text(body.get("pool_id"))
+    profile_id = _clean_text(body.get("profile_id"))
+    if not pool_id or not profile_id:
+        return {"ok": False, "error": "pool_id_and_profile_id_required"}
+    try:
+        job = _expert_job_manager().start_job(
+            pool_id=pool_id,
+            profile_id=profile_id,
+            independent_model=bool(body.get("independent_model")),
+            workers=int(body.get("workers") or 2),
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "error": _redact_secrets(str(exc))}
+    return {"ok": True, "job": job}
+
+
+@app.get("/api/expert-review/jobs/{job_id}")
+async def get_expert_judge_job(job_id: str, detail: int = 0):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    job = _expert_job_manager().get_job(job_id, detail=bool(detail))
+    if job is None:
+        return {"ok": False, "error": "job_not_found"}
+    return {"ok": True, "job": job}
+
+
+@app.post("/api/expert-review/jobs/{job_id}/cancel")
+async def cancel_expert_judge_job(job_id: str):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    job = _expert_job_manager().cancel_job(job_id)
+    if job is None:
+        return {"ok": False, "error": "job_not_found"}
+    return {"ok": True, "job": job}
+
+
+@app.post("/api/expert-review/jobs/{job_id}/retry-failed")
+async def retry_expert_judge_job(job_id: str):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    job = _expert_job_manager().retry_failed(job_id)
+    if job is None:
+        return {"ok": False, "error": "job_not_found"}
+    return {"ok": True, "job": job}
 
 
 # ── 健康检查 ──────────────────────────────────────────────────────
