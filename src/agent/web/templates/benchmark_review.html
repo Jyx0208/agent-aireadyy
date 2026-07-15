@@ -60,6 +60,19 @@
       padding: 18px 0;
       border-bottom: 1px solid var(--line);
     }
+    .registry-bar {
+      display: grid;
+      grid-template-columns: minmax(180px, 1.2fr) auto auto minmax(140px, 0.8fr);
+      gap: 10px;
+      align-items: end;
+      padding: 14px 0 0;
+    }
+    .pool-meta {
+      color: var(--muted);
+      font-size: 13px;
+      min-height: 20px;
+      padding-bottom: 8px;
+    }
     .field { display: grid; gap: 5px; }
     label { color: var(--muted); font-size: 13px; }
     input[type="text"], select, textarea {
@@ -125,13 +138,13 @@
     .status { min-height: 22px; color: var(--muted); padding-top: 8px; }
     @media (max-width: 760px) {
       .header-inner { align-items: flex-start; flex-direction: column; padding: 13px 0; }
-      .toolbar { grid-template-columns: 1fr 1fr; }
+      .toolbar, .registry-bar { grid-template-columns: 1fr 1fr; }
       .metadata { grid-template-columns: 1fr 1fr; }
       .grades { grid-template-columns: 1fr 1fr; }
     }
     @media (max-width: 480px) {
       .header-inner, main { width: min(100% - 20px, 1120px); }
-      .toolbar, .metadata, .grades { grid-template-columns: 1fr; }
+      .toolbar, .registry-bar, .metadata, .grades { grid-template-columns: 1fr; }
       .candidate-head, .navigation { flex-direction: column; }
       .navigation-group { width: 100%; }
       .navigation-group button { flex: 1; }
@@ -146,10 +159,28 @@
     </div>
   </header>
   <main>
+    <section class="registry-bar" aria-label="服务端评审池">
+      <div class="field">
+        <label for="serverPoolSelect">已登记评审池</label>
+        <select id="serverPoolSelect" disabled><option value="">加载中…</option></select>
+      </div>
+      <button id="refreshPoolsButton" type="button">刷新列表</button>
+      <button id="openServerPoolButton" type="button" disabled>打开登记池</button>
+      <div class="field">
+        <label for="reviewMode">模式</label>
+        <select id="reviewMode">
+          <option value="expert">专家盲评</option>
+          <option value="developer">开发者</option>
+          <option value="test">测试模式</option>
+        </select>
+      </div>
+    </section>
+    <div class="pool-meta" id="poolMeta"></div>
     <section class="toolbar" aria-label="评审工具栏">
       <div>
         <input id="poolFile" type="file" accept="application/json,.json">
-        <label class="file-button" for="poolFile" tabindex="0">打开盲评池</label>
+        <label class="file-button" for="poolFile" tabindex="0">打开本地盲评池</label>
+        <button id="importServerButton" type="button" style="margin-left:8px" disabled title="将当前本地池导入服务端登记">导入到服务端</button>
       </div>
       <div class="field">
         <label for="reviewerId">评审人编号</label>
@@ -163,7 +194,7 @@
     </section>
 
     <section class="review-shell">
-      <div class="empty" id="emptyState">请选择 judgment_pool.blinded.json</div>
+      <div class="empty" id="emptyState">请选择 judgment_pool.blinded.json，或从上方打开已登记评审池</div>
       <div class="review" id="reviewArea">
         <div class="task-band">
           <strong id="taskName"></strong>
@@ -207,6 +238,8 @@
     let pool = null;
     let visible = [];
     let currentIndex = 0;
+    let activePoolId = null;
+    let registryEnabled = true;
 
     const byId = (id) => document.getElementById(id);
     const poolFile = byId("poolFile");
@@ -214,6 +247,18 @@
     const taskFilter = byId("taskFilter");
     const exportButton = byId("exportButton");
     const gradeButtons = [...document.querySelectorAll(".grade")];
+    const serverPoolSelect = byId("serverPoolSelect");
+    const openServerPoolButton = byId("openServerPoolButton");
+    const importServerButton = byId("importServerButton");
+    const reviewMode = byId("reviewMode");
+
+    function queryMode() {
+      const params = new URLSearchParams(window.location.search);
+      const mode = (params.get("mode") || "expert").toLowerCase();
+      return ["expert", "developer", "test"].includes(mode) ? mode : "expert";
+    }
+
+    reviewMode.value = queryMode();
 
     function text(value) {
       if (Array.isArray(value)) return value.length ? value.join(", ") : "未记录";
@@ -284,6 +329,25 @@
       return wrapper;
     }
 
+    function setPoolMeta(message) {
+      byId("poolMeta").textContent = message || "";
+    }
+
+    function activatePool(parsed, metaMessage) {
+      if (!Array.isArray(parsed.candidates) || !parsed.candidates.length) throw new Error("评审池没有候选项目");
+      pool = parsed;
+      restoreState();
+      rebuildFilter();
+      visible = [...pool.candidates];
+      currentIndex = 0;
+      byId("emptyState").style.display = "none";
+      byId("reviewArea").style.display = "block";
+      exportButton.disabled = false;
+      importServerButton.disabled = !registryEnabled;
+      setPoolMeta(metaMessage || "");
+      render();
+    }
+
     function render() {
       if (!pool || !visible.length) return;
       const candidate = visible[currentIndex];
@@ -319,21 +383,88 @@
       byId("statusText").textContent = Number.isInteger(candidate.grade) ? `当前评分：${candidate.grade}` : "当前候选未评分";
     }
 
+    async function refreshRegistry() {
+      try {
+        const status = await fetch("/api/expert-review/status").then((r) => r.json());
+        registryEnabled = Boolean(status && status.enabled !== false && status.ok !== false);
+        if (!registryEnabled) {
+          serverPoolSelect.innerHTML = '<option value="">服务端登记未启用</option>';
+          serverPoolSelect.disabled = true;
+          openServerPoolButton.disabled = true;
+          importServerButton.disabled = true;
+          return;
+        }
+        const payload = await fetch("/api/expert-review/pools").then((r) => r.json());
+        const pools = (payload && payload.pools) || [];
+        serverPoolSelect.innerHTML = "";
+        if (!pools.length) {
+          serverPoolSelect.innerHTML = '<option value="">暂无已登记评审池</option>';
+          serverPoolSelect.disabled = true;
+          openServerPoolButton.disabled = true;
+        } else {
+          for (const item of pools) {
+            const option = document.createElement("option");
+            option.value = item.pool_id;
+            const count = (item.stats && item.stats.candidate_count) || "?";
+            option.textContent = `${item.label || item.pool_id} (${count})`;
+            serverPoolSelect.appendChild(option);
+          }
+          serverPoolSelect.disabled = false;
+          openServerPoolButton.disabled = false;
+          if (activePoolId) serverPoolSelect.value = activePoolId;
+        }
+      } catch (error) {
+        serverPoolSelect.innerHTML = '<option value="">无法连接登记服务</option>';
+        serverPoolSelect.disabled = true;
+        openServerPoolButton.disabled = true;
+        importServerButton.disabled = true;
+        registryEnabled = false;
+      }
+    }
+
+    async function openServerPool() {
+      const poolId = serverPoolSelect.value;
+      if (!poolId) return;
+      try {
+        const mode = reviewMode.value || "expert";
+        const payload = await fetch(`/api/expert-review/pools/${encodeURIComponent(poolId)}/candidates?mode=${encodeURIComponent(mode)}&limit=500`).then((r) => r.json());
+        if (!payload || !payload.ok) throw new Error((payload && payload.error) || "打开失败");
+        activePoolId = poolId;
+        activatePool(
+          { candidates: payload.candidates, tasks: payload.tasks || {} },
+          `服务端池 ${payload.label || poolId} · 模式 ${mode} · 候选 ${payload.total}`
+        );
+      } catch (error) {
+        byId("emptyState").style.display = "grid";
+        byId("reviewArea").style.display = "none";
+        byId("emptyState").textContent = `无法打开登记池：${error.message}`;
+      }
+    }
+
+    async function importCurrentPool() {
+      if (!pool || !registryEnabled) return;
+      try {
+        const payload = await fetch("/api/expert-review/pools/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pool, label: pool.label || "imported-pool" })
+        }).then((r) => r.json());
+        if (!payload || !payload.ok) throw new Error((payload && payload.error) || "导入失败");
+        activePoolId = payload.pool.pool_id;
+        setPoolMeta(`已导入服务端：${payload.pool.label} (${payload.pool.pool_id})`);
+        await refreshRegistry();
+      } catch (error) {
+        byId("statusText").textContent = `导入失败：${error.message}`;
+      }
+    }
+
     poolFile.addEventListener("change", async () => {
       const file = poolFile.files[0];
       if (!file) return;
       try {
         const parsed = JSON.parse(await file.text());
-        if (!Array.isArray(parsed.candidates) || !parsed.candidates.length) throw new Error("评审池没有候选项目");
-        pool = parsed;
-        restoreState();
-        rebuildFilter();
-        visible = [...pool.candidates];
-        currentIndex = 0;
-        byId("emptyState").style.display = "none";
-        byId("reviewArea").style.display = "block";
-        exportButton.disabled = false;
-        render();
+        activePoolId = null;
+        activatePool(parsed, `本地文件：${file.name}`);
       } catch (error) {
         byId("emptyState").textContent = `无法读取评审池：${error.message}`;
       }
@@ -383,6 +514,18 @@
       link.click();
       URL.revokeObjectURL(link.href);
     });
+    byId("refreshPoolsButton").addEventListener("click", refreshRegistry);
+    openServerPoolButton.addEventListener("click", openServerPool);
+    importServerButton.addEventListener("click", importCurrentPool);
+    reviewMode.addEventListener("change", () => {
+      const params = new URLSearchParams(window.location.search);
+      params.set("mode", reviewMode.value);
+      const next = `${window.location.pathname}?${params.toString()}`;
+      window.history.replaceState({}, "", next);
+      if (activePoolId) openServerPool();
+    });
+
+    refreshRegistry();
   </script>
 </body>
 </html>

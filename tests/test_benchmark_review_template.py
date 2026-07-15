@@ -17,5 +17,7 @@ def test_benchmark_review_template_supports_blind_scoring_and_export() -> None:
     assert 'id="exportButton"' in html
     assert "judgment_pool.reviewed.json" in html
     assert "localStorage" in html
+    assert 'id="serverPoolSelect"' in html
+    assert "/api/expert-review/pools" in html
     assert "project_accession" not in html
     assert "openai_agents" not in html

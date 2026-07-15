@@ -88,6 +88,7 @@ from agent.repositories.registry import RepositoryRegistry
 from agent.runtime.system_metrics import collect_system_metrics
 from agent.utils import write_json
 from agent.web.history import history_timestamp, merge_project_history_records, with_history_identity
+from agent.web.expert_review import ExpertPoolRegistry, expert_review_enabled, expert_review_root
 from agent.web.llm_config_store import LLMConfigStore
 
 
@@ -4223,13 +4224,29 @@ def _server_llm_config() -> tuple[dict[str, str] | None, str]:
 
 def _public_llm_config() -> dict[str, Any]:
     config, source = _server_llm_config()
+    store = _llm_config_store()
+    profiles = store.list_profiles(include_secrets=False)
+    default_profile = next((item for item in profiles if item.get("is_default")), None)
     return {
         "api_key_set": config is not None,
         "base_url": (config or {}).get("base_url") or _DEFAULT_CONFIG["base_url"],
         "model": (config or {}).get("model") or _DEFAULT_CONFIG["model"],
         "timeout": (config or {}).get("timeout") or _DEFAULT_CONFIG["timeout"],
         "source": source,
+        "default_profile_id": (default_profile or {}).get("id"),
+        "profiles": profiles,
     }
+
+
+def _expert_pool_registry() -> ExpertPoolRegistry:
+    return ExpertPoolRegistry(expert_review_root())
+
+
+def _normalize_review_mode(raw: Any) -> str:
+    mode = str(raw or "expert").strip().lower()
+    if mode in {"expert", "developer", "test"}:
+        return mode
+    return "expert"
 
 
 def _build_llm_config(llm_config: dict[str, Any]) -> tuple[dict[str, str] | None, str | None]:
@@ -4599,6 +4616,70 @@ async def benchmark_review():
     return (_templates_dir / "benchmark_review.html").read_text(encoding="utf-8")
 
 
+@app.get("/api/expert-review/status")
+async def expert_review_status():
+    return {
+        "ok": True,
+        "enabled": expert_review_enabled(),
+        "root": str(expert_review_root()),
+    }
+
+
+@app.get("/api/expert-review/pools")
+async def list_expert_review_pools():
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled", "pools": []}
+    return {"ok": True, "pools": _expert_pool_registry().list_pools()}
+
+
+@app.post("/api/expert-review/pools/import")
+async def import_expert_review_pool(body: dict[str, Any]):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    pool = body.get("pool")
+    if not isinstance(pool, dict):
+        return {"ok": False, "error": "pool object is required"}
+    label = _clean_text(body.get("label")) or None
+    pool_id = _clean_text(body.get("pool_id")) or None
+    try:
+        record = _expert_pool_registry().import_pool(pool, label=label, pool_id=pool_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "pool": record}
+
+
+@app.get("/api/expert-review/pools/{pool_id}")
+async def get_expert_review_pool(pool_id: str, mode: str = "expert"):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    record = _expert_pool_registry().get_pool(pool_id)
+    if record is None:
+        return {"ok": False, "error": "pool_not_found"}
+    return {"ok": True, "pool": record, "mode": _normalize_review_mode(mode)}
+
+
+@app.get("/api/expert-review/pools/{pool_id}/candidates")
+async def list_expert_review_candidates(
+    pool_id: str,
+    mode: str = "expert",
+    task: str | None = None,
+    offset: int = 0,
+    limit: int = 200,
+):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    payload = _expert_pool_registry().candidates(
+        pool_id,
+        mode=_normalize_review_mode(mode),
+        task=task,
+        offset=offset,
+        limit=limit,
+    )
+    if payload is None:
+        return {"ok": False, "error": "pool_not_found"}
+    return {"ok": True, **payload}
+
+
 # ── 健康检查 ──────────────────────────────────────────────────────
 @app.get("/api/health")
 async def health():
@@ -4659,6 +4740,46 @@ async def save_llm_config(body: dict[str, Any]):
 @app.delete("/api/llm/config")
 async def delete_llm_config():
     return {"ok": True, "deleted": _llm_config_store().delete()}
+
+
+@app.get("/api/llm/profiles")
+async def list_llm_profiles():
+    return {"ok": True, "profiles": _llm_config_store().list_profiles(include_secrets=False)}
+
+
+@app.post("/api/llm/profiles")
+async def create_llm_profile(body: dict[str, Any]):
+    payload = body.get("profile", body)
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "profile payload must be an object"}
+    make_default = bool(body.get("make_default") or payload.get("make_default"))
+    try:
+        profile = _llm_config_store().upsert_profile(payload, make_default=make_default)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "profile": profile, "profiles": _llm_config_store().list_profiles(include_secrets=False)}
+
+
+@app.put("/api/llm/profiles/{profile_id}")
+async def update_llm_profile(profile_id: str, body: dict[str, Any]):
+    payload = body.get("profile", body)
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "profile payload must be an object"}
+    payload = {**payload, "id": profile_id}
+    make_default = bool(body.get("make_default") or payload.get("make_default"))
+    try:
+        profile = _llm_config_store().upsert_profile(payload, make_default=make_default)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "profile": profile, "profiles": _llm_config_store().list_profiles(include_secrets=False)}
+
+
+@app.delete("/api/llm/profiles/{profile_id}")
+async def delete_llm_profile(profile_id: str):
+    deleted = _llm_config_store().delete_profile(profile_id)
+    if not deleted:
+        return {"ok": False, "error": "profile_not_found"}
+    return {"ok": True, "deleted": True, "profiles": _llm_config_store().list_profiles(include_secrets=False)}
 
 
 @app.post("/api/llm/models")
