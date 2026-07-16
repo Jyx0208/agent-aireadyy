@@ -123,8 +123,8 @@ def score_runs_with_judgments(
 
 
 def compare_agent_workflow(scored: list[Mapping[str, Any]]) -> dict[str, Any]:
-    """Pair agent vs workflow runs by scenario/variant/repeat when possible."""
-    by_key: dict[tuple[str, str, int], dict[str, Mapping[str, Any]]] = {}
+    """Pair each Agent budget tier with the matching Workflow baseline run."""
+    by_key: dict[tuple[str, str, int], dict[str, Any]] = {}
     for item in scored:
         key = (
             str(item.get("scenario_id") or ""),
@@ -132,24 +132,34 @@ def compare_agent_workflow(scored: list[Mapping[str, Any]]) -> dict[str, Any]:
             int(item.get("repeat") or 0),
         )
         runtime = str(item.get("runtime") or "")
-        by_key.setdefault(key, {})[runtime] = item
+        group = by_key.setdefault(key, {"workflow": None, "agents": []})
+        if runtime == "workflow":
+            group["workflow"] = item
+        elif runtime in {"openai_agents", "agent"}:
+            group["agents"].append(item)
     wins = losses = ties = 0
     deltas: list[float] = []
     pairs = 0
-    for pair in by_key.values():
-        agent = pair.get("openai_agents") or pair.get("agent")
-        workflow = pair.get("workflow")
-        if not agent or not workflow:
+    for group in by_key.values():
+        workflow = group.get("workflow")
+        if not workflow:
             continue
-        pairs += 1
-        delta = float(agent.get("quality_score") or 0.0) - float(workflow.get("quality_score") or 0.0)
-        deltas.append(delta)
-        if delta > 1e-9:
-            wins += 1
-        elif delta < -1e-9:
-            losses += 1
-        else:
-            ties += 1
+        for agent in group.get("agents") or []:
+            pairs += 1
+            delta = float(agent.get("quality_score") or 0.0) - float(workflow.get("quality_score") or 0.0)
+            deltas.append(delta)
+            violations = int(agent.get("hard_constraint_violations") or 0) - int(workflow.get("hard_constraint_violations") or 0)
+            bundle_delta = float(agent.get("file_bundle_completeness") or 0.0) - float(workflow.get("file_bundle_completeness") or 0.0)
+            if violations > 0 or (violations == 0 and bundle_delta <= -0.5):
+                losses += 1
+            elif violations < 0 or (violations == 0 and bundle_delta >= 0.5):
+                wins += 1
+            elif delta >= 0.03:
+                wins += 1
+            elif delta <= -0.03:
+                losses += 1
+            else:
+                ties += 1
     avg_delta = sum(deltas) / len(deltas) if deltas else 0.0
     return {
         "pairs": pairs,

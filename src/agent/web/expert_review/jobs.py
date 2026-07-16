@@ -84,12 +84,31 @@ class ExpertJudgeJobManager:
                         if isinstance(payload, dict) and payload.get("job_id"):
                             jid = str(payload["job_id"])
                             if jid not in _JOBS:
+                                if payload.get("status") in {"running", "queued"}:
+                                    if payload.get("cancel_requested"):
+                                        payload["status"] = "cancelled"
+                                        payload["finished_at"] = payload.get("finished_at") or _utc_now()
+                                        payload.setdefault("logs", []).append(
+                                            {"ts": _utc_now(), "level": "warning", "message": "Recovered cancelled job after restart."}
+                                        )
+                                    else:
+                                        payload["status"] = "queued"
+                                        payload["started_at"] = None
+                                        payload["finished_at"] = None
+                                        payload["error"] = None
+                                        payload.setdefault("logs", []).append(
+                                            {"ts": _utc_now(), "level": "warning", "message": "Recovered after restart; queued to resume."}
+                                        )
                                 _JOBS[jid] = payload
                                 jobs.append(payload)
             if pool_id:
                 jobs = [job for job in jobs if job.get("pool_id") == pool_id]
             jobs.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
-            return [_public_job(job) for job in jobs]
+            should_resume = any(job.get("status") == "queued" and not job.get("cancel_requested") for job in jobs)
+            public = [_public_job(job) for job in jobs]
+        if should_resume:
+            self._kick()
+        return public
 
     def get_job(self, job_id: str, *, detail: bool = False) -> dict[str, Any] | None:
         with _JOBS_LOCK:
@@ -98,8 +117,22 @@ class ExpertJudgeJobManager:
                 job = self._load_job(job_id)
                 if job is None:
                     return None
+                if job.get("status") in {"running", "queued"}:
+                    if job.get("cancel_requested"):
+                        job["status"] = "cancelled"
+                        job["finished_at"] = job.get("finished_at") or _utc_now()
+                    else:
+                        job["status"] = "queued"
+                        job["started_at"] = None
+                        job["finished_at"] = None
                 _JOBS[job_id] = job
-            return _public_job(job, detail=detail)
+                should_resume = job.get("status") == "queued"
+            else:
+                should_resume = False
+            public = _public_job(job, detail=detail)
+        if should_resume:
+            self._kick()
+        return public
 
     def start_job(
         self,
@@ -163,18 +196,56 @@ class ExpertJudgeJobManager:
             if job is None:
                 return None
             _JOBS[job_id] = job
-            if job.get("status") in {"completed", "failed", "cancelled"}:
+            if job.get("status") in {"completed", "completed_with_errors", "failed", "cancelled"}:
                 return _public_job(job)
-            job["cancel_requested"] = True
-            self._append_log(job, "warning", "Cancel requested.")
+            if job.get("status") == "queued":
+                job["cancel_requested"] = True
+                job["status"] = "cancelled"
+                job["finished_at"] = _utc_now()
+                self._append_log(job, "warning", "Queued job cancelled.")
+            else:
+                job["cancel_requested"] = True
+                self._append_log(job, "warning", "Cancel requested.")
             self._persist_job(job)
             return _public_job(job)
+
+    def resume_job(self, job_id: str) -> dict[str, Any] | None:
+        with _JOBS_LOCK:
+            job = _JOBS.get(job_id) or self._load_job(job_id)
+            if job is None:
+                return None
+            if job.get("status") not in {"cancelled", "failed", "completed_with_errors"}:
+                self._append_log(job, "warning", "Resume is available only for interrupted terminal jobs.")
+                self._persist_job(job)
+                return _public_job(job)
+            pending = [cid for cid, status in (job.get("items") or {}).items() if status in {"pending", "failed"}]
+            if not pending:
+                self._append_log(job, "info", "No pending candidates to resume.")
+                self._persist_job(job)
+                return _public_job(job)
+            for cid in pending:
+                job.setdefault("items", {})[cid] = "pending"
+            job["failed_ids"] = []
+            job["progress"]["failed"] = 0
+            job["status"] = "queued"
+            job["cancel_requested"] = False
+            job["error"] = None
+            job["finished_at"] = None
+            self._append_log(job, "info", f"Resuming {len(pending)} pending candidates.")
+            _JOBS[job_id] = job
+            self._persist_job(job)
+        self._kick()
+        return _public_job(job)
 
     def retry_failed(self, job_id: str) -> dict[str, Any] | None:
         with _JOBS_LOCK:
             job = _JOBS.get(job_id) or self._load_job(job_id)
             if job is None:
                 return None
+            if job.get("status") not in {"completed_with_errors", "failed", "cancelled"}:
+                self._append_log(job, "warning", "Retry is available only after the job reaches a terminal state.")
+                self._persist_job(job)
+                return _public_job(job)
             failed_ids = list(job.get("failed_ids") or [])
             if not failed_ids:
                 self._append_log(job, "info", "No failed candidates to retry.")
@@ -226,6 +297,24 @@ class ExpertJudgeJobManager:
                 job = _JOBS.get(job_id)
             if job is None:
                 return
+            try:
+                secrets = self.resolve_profile(str(job.get("profile_id") or ""))
+            except Exception as exc:
+                self._finish(job_id, status="failed", error=redact_text(str(exc)))
+                return
+            with _JOBS_LOCK:
+                current = _JOBS.get(job_id)
+                if current is None:
+                    return
+                if (
+                    str(secrets.get("base_url") or "").rstrip("/") != str(current.get("base_url") or "").rstrip("/")
+                    or str(secrets.get("model") or "") != str(current.get("model") or "")
+                    or str(secrets.get("timeout") or "120") != str(current.get("timeout") or "120")
+                ):
+                    self._finish(job_id, status="failed", error="profile_configuration_changed; create a new job")
+                    return
+                current["api_key"] = secrets.get("api_key", "")
+                job = current
             if job.get("cancel_requested"):
                 self._finish(job_id, status="cancelled", error=None)
                 return
@@ -249,12 +338,16 @@ class ExpertJudgeJobManager:
                 self._append_log(job, "info", f"Starting judge with model {job.get('model')}.")
                 self._persist_job(job)
 
-            judge = self.judge_factory(
-                api_key=str(job.get("api_key") or ""),
-                base_url=str(job.get("base_url") or ""),
-                model=str(job.get("model") or ""),
-                timeout=float(job.get("timeout") or 120),
-            )
+            try:
+                judge = self.judge_factory(
+                    api_key=str(job.get("api_key") or ""),
+                    base_url=str(job.get("base_url") or ""),
+                    model=str(job.get("model") or ""),
+                    timeout=float(job.get("timeout") or 120),
+                )
+            except Exception as exc:
+                self._finish(job_id, status="failed", error=redact_text(str(exc)))
+                return
 
             def on_review(candidate: dict[str, Any]) -> None:
                 cid = str(candidate.get("candidate_id") or "")
@@ -270,6 +363,21 @@ class ExpertJudgeJobManager:
                     self._persist_job(current)
                 with progress_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps({"candidate_id": cid, "candidate": candidate}, ensure_ascii=False) + "\n")
+
+            def on_error(candidate_id: str, exc: Exception) -> None:
+                cid = str(candidate_id or "")
+                message = redact_text(str(exc))
+                with _JOBS_LOCK:
+                    current = _JOBS.get(job_id)
+                    if current is None:
+                        return
+                    current.setdefault("items", {})[cid] = "failed"
+                    current["failed_ids"] = sorted(
+                        candidate for candidate, status in current["items"].items() if status == "failed"
+                    )
+                    current["progress"]["failed"] = len(current["failed_ids"])
+                    self._append_log(current, "error", f"Failed {cid}: {message}")
+                    self._persist_job(current)
 
             # Filter pending only if cancel mid-flight: judge_blinded_pool uses existing_reviews.
             # For cancel, we wrap judge to check flag.
@@ -289,6 +397,7 @@ class ExpertJudgeJobManager:
                     workers=int(job.get("workers") or 1),
                     existing_reviews=existing,
                     on_review=on_review,
+                    on_error=on_error,
                 )
             except Exception as exc:
                 message = redact_text(str(exc))
@@ -298,70 +407,76 @@ class ExpertJudgeJobManager:
                     if partial:
                         partial_pool = {
                             **document,
-                            "candidates": [
-                                partial.get(str(c.get("candidate_id")), c)
-                                if str(c.get("candidate_id")) in partial
-                                else c
-                                for c in (document.get("candidates") or [])
-                                if isinstance(c, dict)
-                            ],
+                            "candidates": list(partial.values()),
                         }
-                        # simpler: rebuild from existing map
-                        candidates = []
-                        by_id = {
-                            str(c.get("candidate_id") or ""): c
-                            for c in (document.get("candidates") or [])
-                            if isinstance(c, dict)
-                        }
-                        by_id.update(partial)
-                        for c in document.get("candidates") or []:
-                            if isinstance(c, dict):
-                                candidates.append(by_id.get(str(c.get("candidate_id")), c))
-                        merged = merge_machine_reviews(document, {**document, "candidates": candidates})
-                        self._write_reviewed(pool_id, job_id, merged)
+
+                        def merge_partial(existing_doc: dict[str, Any]) -> dict[str, Any]:
+                            return merge_machine_reviews(
+                                existing_doc,
+                                partial_pool,
+                                job_id=job_id,
+                                profile_id=str(job.get("profile_id") or ""),
+                                model=str(job.get("model") or ""),
+                            )
+
+                        merged, _ = self.registry.mutate_reviewed_pool(pool_id, merge_partial)
+                        self._snapshot_reviewed(pool_id, job_id, merged)
                     self._finish(job_id, status="cancelled", error=None)
                     return
                 self._finish(job_id, status="failed", error=message)
                 return
 
             if job.get("cancel_requested"):
+                partial = self._load_progress(progress_path)
+                if partial:
+                    partial_pool = {**document, "candidates": list(partial.values())}
+
+                    def merge_cancelled(existing_doc: dict[str, Any]) -> dict[str, Any]:
+                        return merge_machine_reviews(
+                            existing_doc,
+                            partial_pool,
+                            job_id=job_id,
+                            profile_id=str(job.get("profile_id") or ""),
+                            model=str(job.get("model") or ""),
+                        )
+
+                    merged, _ = self.registry.mutate_reviewed_pool(pool_id, merge_cancelled)
+                    self._snapshot_reviewed(pool_id, job_id, merged)
                 self._finish(job_id, status="cancelled", error=None)
                 return
 
-            existing_doc = self.registry.load_pool_document(pool_id, prefer_reviewed=True) or document
-            merged = merge_machine_reviews(existing_doc, reviewed)
-            out_path = self._write_reviewed(pool_id, job_id, merged)
+            def merge_latest(existing_doc: dict[str, Any]) -> dict[str, Any]:
+                return merge_machine_reviews(
+                    existing_doc,
+                    reviewed,
+                    job_id=job_id,
+                    profile_id=str(job.get("profile_id") or ""),
+                    model=str(job.get("model") or ""),
+                )
+
+            merged, _ = self.registry.mutate_reviewed_pool(pool_id, merge_latest)
+            out_path = self._snapshot_reviewed(pool_id, job_id, merged)
             with _JOBS_LOCK:
                 current = _JOBS.get(job_id)
                 if current is not None:
                     current["output_reviewed_path"] = str(out_path)
                     self._persist_job(current)
-            self._finish(job_id, status="completed", error=None)
+            with _JOBS_LOCK:
+                current = _JOBS.get(job_id) or {}
+                failed = int((current.get("progress") or {}).get("failed") or 0)
+            self._finish(
+                job_id,
+                status="completed_with_errors" if failed else "completed",
+                error=f"{failed} candidate(s) failed" if failed else None,
+            )
         finally:
             with _JOBS_LOCK:
                 global _RUNNING
                 _RUNNING = max(0, _RUNNING - 1)
             self._kick()
 
-    def _write_reviewed(self, pool_id: str, job_id: str, pool: dict[str, Any]) -> Path:
-        pool_dir = self.registry.root / pool_id
-        pool_dir.mkdir(parents=True, exist_ok=True)
-        path = pool_dir / "pool.reviewed.json"
-        path.write_text(json.dumps(pool, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        # refresh registry stats
-        record = self.registry.get_pool(pool_id) or {
-            "pool_id": pool_id,
-            "label": pool_id,
-            "created_at": _utc_now(),
-            "paths": {},
-            "tags": [],
-        }
-        record["updated_at"] = _utc_now()
-        record.setdefault("paths", {})["reviewed"] = "pool.reviewed.json"
-        record["stats"] = self.registry._compute_stats(pool)
-        record["judgment_source"] = str(pool.get("judgment_source") or "")
-        self.registry._write_record(pool_id, record)
-        # also snapshot job output
+    def _snapshot_reviewed(self, pool_id: str, job_id: str, pool: dict[str, Any]) -> Path:
+        path = self.registry.root / pool_id / "pool.reviewed.json"
         snap = self._job_dir(pool_id) / f"{job_id}.reviewed.json"
         snap.write_text(json.dumps(pool, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return path
@@ -375,7 +490,7 @@ class ExpertJudgeJobManager:
             job["finished_at"] = _utc_now()
             job["error"] = error
             # strip secret before final persist public copy
-            self._append_log(job, "info" if status == "completed" else "error", f"Job {status}.")
+            self._append_log(job, "info" if status in {"completed", "completed_with_errors"} else "error", f"Job {status}.")
             self._persist_job(job)
 
     def _job_dir(self, pool_id: str) -> Path:

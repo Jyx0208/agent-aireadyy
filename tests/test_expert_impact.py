@@ -57,6 +57,21 @@ def _runs() -> list[dict]:
     ]
 
 
+def test_impact_pairs_each_budget_tier() -> None:
+    runs = _runs()
+    runs.extend([
+        {**runs[0], "budget_tier": "2x", "task_ready_precision": 0.8},
+        {**runs[1], "budget_tier": "2x", "task_ready_precision": 0.4},
+    ])
+    result = compute_impact(
+        pool_before=_pool(1),
+        pool_after=_pool(3),
+        key_payload=_key(),
+        runs=runs,
+    )
+    assert result["pair_after"]["pairs"] == 2
+
+
 def test_impact_degrades_without_key_and_runs() -> None:
     result = compute_impact(
         pool_before=_pool(1),

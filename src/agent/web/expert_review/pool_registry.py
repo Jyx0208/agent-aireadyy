@@ -21,6 +21,15 @@ _LEAKY_FIELDS = (
     "system_name",
     "agent_runtime",
     "workflow_name",
+    "generator",
+    "generator_model",
+    "generator_model_id",
+    "generator_provider",
+    "generator_requested_model",
+    "generator_resolved_model",
+    "generator_model_family",
+    "generator_runtime",
+    "candidate_generation_identity",
 )
 
 
@@ -42,25 +51,73 @@ def _slugify(label: str) -> str:
     return cleaned[:64] or uuid.uuid4().hex[:10]
 
 
-def blind_candidate_view(candidate: Mapping[str, Any], *, mode: str = "expert") -> dict[str, Any]:
-    """Return a candidate dict safe for the given review mode."""
-    item = {key: value for key, value in candidate.items() if key not in _LEAKY_FIELDS}
+_EXPERT_HIDDEN_FIELDS = (
+    "grade",
+    "review_notes",
+    "reviewer_id",
+    "human_grades",
+    "machine_reviews",
+    "machine_review_runs",
+    "judgment_confidence",
+    "review_model",
+    "confidence",
+    "judgment_source",
+    "review_method",
+    "rubric_version",
+)
+
+
+def _strip_leaky_fields(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _strip_leaky_fields(item)
+            for key, item in value.items()
+            if key not in _LEAKY_FIELDS
+        }
+    if isinstance(value, list):
+        return [_strip_leaky_fields(item) for item in value]
+    return value
+
+
+def blind_candidate_view(
+    candidate: Mapping[str, Any],
+    *,
+    mode: str = "expert",
+    reviewer_id: str = "",
+) -> dict[str, Any]:
+    """Return a candidate dict safe for the given review mode and reviewer."""
+    item = _strip_leaky_fields(dict(candidate))
     if mode == "expert":
-        item.pop("machine_reviews", None)
-        item.pop("judgment_confidence", None)
-        item.pop("review_model", None)
-        item.pop("confidence", None)
+        own_review = None
+        for entry in reversed(candidate.get("human_grades") or []):
+            if not isinstance(entry, Mapping):
+                continue
+            if str(entry.get("reviewer_id") or "") != reviewer_id:
+                continue
+            own_review = entry
+            break
+        for field in _EXPERT_HIDDEN_FIELDS:
+            item.pop(field, None)
+        if own_review is not None and not own_review.get("cleared") and own_review.get("grade") is not None:
+            item["grade"] = own_review.get("grade")
+            item["review_notes"] = str(own_review.get("notes") or "")
+            item["reviewer_id"] = reviewer_id
     return item
 
 
 def strip_pool_for_mode(pool: Mapping[str, Any], *, mode: str = "expert") -> dict[str, Any]:
-    payload = dict(pool)
+    payload = _strip_leaky_fields(dict(pool))
     candidates = [
         blind_candidate_view(item, mode=mode)
         for item in (payload.get("candidates") or [])
         if isinstance(item, dict)
     ]
     payload["candidates"] = candidates
+    if mode == "expert":
+        payload["tasks"] = _strip_leaky_fields(payload.get("tasks") or {})
+        payload.pop("tags", None)
+        payload.pop("judgment_source", None)
+        payload.pop("review_summary", None)
     return payload
 
 
@@ -108,6 +165,43 @@ class ExpertPoolRegistry:
             if not isinstance(payload, dict):
                 return None
             return payload
+
+    def import_generated_pool(
+        self,
+        pool: Mapping[str, Any],
+        *,
+        private_key: Mapping[str, Any],
+        label: str | None = None,
+        pool_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically register a generated blinded pool and its private key."""
+        validated = self._validate_pool(pool)
+        if self._looks_reviewed(validated):
+            raise ValueError("generated_pool_must_be_blinded")
+        if not isinstance(private_key, Mapping) or not isinstance(private_key.get("candidates"), list):
+            raise ValueError("generated_pool_requires_private_key")
+        with _REGISTRY_LOCK:
+            resolved_id = self._allocate_pool_id(pool_id or label or "prompt-pool")
+            pool_dir = self.root / resolved_id
+            private_dir = pool_dir / "private"
+            pool_dir.mkdir(parents=True, exist_ok=True)
+            private_dir.mkdir(parents=True, exist_ok=True)
+            now = _utc_now()
+            record = {
+                "pool_id": resolved_id,
+                "label": (label or "Prompt review pool").strip() or "Prompt review pool",
+                "created_at": now,
+                "updated_at": now,
+                "paths": {"blinded": "pool.blinded.json", "reviewed": None},
+                "stats": self._compute_stats(validated),
+                "tags": ["prompt_generated"],
+                "schema_version": str(validated.get("schema_version") or ""),
+                "judgment_source": "",
+            }
+            self._write_json_atomic(pool_dir / "pool.blinded.json", validated)
+            self._write_json_atomic(private_dir / "judgment.key.json", dict(private_key))
+            self._write_json_atomic(pool_dir / "registry.json", record)
+            return record
 
     def import_pool(
         self,
@@ -159,6 +253,7 @@ class ExpertPoolRegistry:
         pool_id: str,
         *,
         mode: str = "expert",
+        reviewer_id: str = "",
         task: str | None = None,
         offset: int = 0,
         limit: int = 100,
@@ -168,7 +263,7 @@ class ExpertPoolRegistry:
             return None
         mode = mode if mode in {"expert", "developer", "test"} else "expert"
         all_candidates = [
-            blind_candidate_view(item, mode=mode)
+            blind_candidate_view(item, mode=mode, reviewer_id=reviewer_id)
             for item in (document.get("candidates") or [])
             if isinstance(item, dict)
         ]
@@ -191,9 +286,17 @@ class ExpertPoolRegistry:
             "total": len(filtered),
             "offset": offset,
             "limit": limit,
-            "tasks": document.get("tasks") if isinstance(document.get("tasks"), dict) else {},
+            "tasks": (
+                _strip_leaky_fields(document.get("tasks") or {})
+                if mode == "expert"
+                else document.get("tasks") if isinstance(document.get("tasks"), dict) else {}
+            ),
             "candidates": page,
-            "stats": record.get("stats") or self._compute_stats(document),
+            "stats": (
+                {"candidate_count": len(filtered)}
+                if mode == "expert"
+                else record.get("stats") or self._compute_stats(document)
+            ),
         }
 
     def save_reviewed_pool(self, pool_id: str, pool: Mapping[str, Any]) -> dict[str, Any]:
@@ -222,6 +325,22 @@ class ExpertPoolRegistry:
             record["schema_version"] = str(validated.get("schema_version") or "")
             self._write_record(pool_id, record)
             return record
+
+    def mutate_reviewed_pool(
+        self,
+        pool_id: str,
+        mutator: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Atomically load, mutate, validate, and persist a reviewed pool."""
+        with _REGISTRY_LOCK:
+            document = self.load_pool_document(pool_id, prefer_reviewed=True)
+            if document is None:
+                raise ValueError("pool_not_found")
+            mutated = mutator(dict(document))
+            if not isinstance(mutated, Mapping):
+                raise ValueError("pool_mutator_must_return_object")
+            record = self.save_reviewed_pool(pool_id, mutated)
+            return dict(mutated), record
 
     def _allocate_pool_id(self, seed: str) -> str:
         base = _slugify(seed)
@@ -280,11 +399,18 @@ class ExpertPoolRegistry:
             return None
         return payload if isinstance(payload, dict) else None
 
+    @staticmethod
+    def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)
+
     def _write_record(self, pool_id: str, record: Mapping[str, Any]) -> None:
         pool_dir = self.root / pool_id
         pool_dir.mkdir(parents=True, exist_ok=True)
         path = pool_dir / "registry.json"
-        path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._write_json_atomic(path, record)
 
     @staticmethod
     def _validate_pool(pool: Mapping[str, Any]) -> dict[str, Any]:
@@ -294,12 +420,16 @@ class ExpertPoolRegistry:
         if not isinstance(candidates, list) or not candidates:
             raise ValueError("pool_requires_candidates")
         normalized: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
         for index, item in enumerate(candidates):
             if not isinstance(item, dict):
                 raise ValueError(f"candidate_{index}_must_be_object")
             candidate_id = str(item.get("candidate_id") or "").strip()
             if not candidate_id:
                 raise ValueError(f"candidate_{index}_missing_candidate_id")
+            if candidate_id in seen_ids:
+                raise ValueError(f"duplicate_candidate_id:{candidate_id}")
+            seen_ids.add(candidate_id)
             normalized.append(dict(item))
         payload = dict(pool)
         payload["candidates"] = normalized

@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
+from agent.web.expert_review.pool_registry import blind_candidate_view
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -55,6 +57,8 @@ def append_human_grade(
                 "notes": str(notes or ""),
                 "reviewer_id": str(reviewer_id or ""),
                 "source": "human_verified",
+                "judgment_source": "human_verified",
+                "rubric_version": "discovery-relevance-grade/v1",
                 "ts": _utc_now(),
                 "cleared": True,
             }
@@ -62,15 +66,13 @@ def append_human_grade(
         item["human_grades"] = history
         # Keep machine grade if present; only clear human effective grade surface.
         if item.get("machine_reviews"):
-            # Recompute top-level grade from machine if machine exists.
-            machine_grade = item.get("grade")
-            if machine_grade is None:
-                votes = item.get("machine_reviews") or []
-                grades = [int(v.get("grade")) for v in votes if isinstance(v, dict) and v.get("grade") is not None]
-                if grades:
-                    grades_sorted = sorted(grades)
-                    machine_grade = grades_sorted[len(grades_sorted) // 2]
-            item["grade"] = machine_grade
+            votes = item.get("machine_reviews") or []
+            grades = sorted(
+                int(vote.get("grade"))
+                for vote in votes
+                if isinstance(vote, dict) and vote.get("grade") is not None
+            )
+            item["grade"] = grades[len(grades) // 2] if grades else None
         else:
             item["grade"] = None
         item["review_notes"] = str(notes or "")
@@ -85,6 +87,8 @@ def append_human_grade(
             "notes": str(notes or ""),
             "reviewer_id": str(reviewer_id or ""),
             "source": "human_verified",
+            "judgment_source": "human_verified",
+            "rubric_version": "discovery-relevance-grade/v1",
             "ts": _utc_now(),
         }
     )
@@ -96,8 +100,23 @@ def append_human_grade(
     return item
 
 
-def apply_human_grades_for_export(pool: Mapping[str, Any]) -> dict[str, Any]:
-    """Build compile-compatible reviewed pool using effective grades."""
+def _latest_active_human(candidate: Mapping[str, Any], reviewer_id: str = "") -> Mapping[str, Any] | None:
+    humans = candidate.get("human_grades")
+    if not isinstance(humans, list) or not humans:
+        return None
+    for entry in reversed(humans):
+        if not isinstance(entry, Mapping):
+            continue
+        if reviewer_id and str(entry.get("reviewer_id") or "") != reviewer_id:
+            continue
+        if entry.get("cleared") or entry.get("grade") is None:
+            return None
+        return entry
+    return None
+
+
+def apply_human_grades_for_export(pool: Mapping[str, Any], *, reviewer_id: str = "") -> dict[str, Any]:
+    """Build a compile-compatible pool containing only active human judgments."""
     payload = dict(pool)
     candidates: list[dict[str, Any]] = []
     human_count = 0
@@ -105,20 +124,35 @@ def apply_human_grades_for_export(pool: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(raw, dict):
             continue
         item = dict(raw)
-        grade = effective_grade(item)
-        item["grade"] = grade
-        if item.get("human_grades"):
+        latest_human = _latest_active_human(item, reviewer_id=reviewer_id)
+        for field in (
+            "machine_reviews",
+            "machine_review_runs",
+            "judgment_confidence",
+            "confidence",
+            "review_model",
+            "review_method",
+        ):
+            item.pop(field, None)
+        if latest_human is not None:
             human_count += 1
-            last = item["human_grades"][-1] if item["human_grades"] else {}
-            if isinstance(last, dict):
-                item["reviewer_id"] = str(last.get("reviewer_id") or item.get("reviewer_id") or "")
-                item["review_notes"] = str(last.get("notes") or item.get("review_notes") or "")
+            item["grade"] = int(latest_human["grade"])
+            item["reviewer_id"] = str(latest_human.get("reviewer_id") or "")
+            item["review_notes"] = str(latest_human.get("notes") or "")
+        else:
+            item["grade"] = None
+            item.pop("reviewer_id", None)
+            item.pop("review_notes", None)
+        item.pop("human_grades", None)
+        item = blind_candidate_view(item, mode="developer")
         candidates.append(item)
     payload["candidates"] = candidates
-    if human_count:
-        payload["judgment_source"] = "human_verified"
-    elif not payload.get("judgment_source"):
-        payload["judgment_source"] = "provisional_same_family"
+    payload["judgment_source"] = "human_verified"
+    payload["review_summary"] = {
+        "graded_candidates": human_count,
+        "ungraded_candidates": len(candidates) - human_count,
+        "complete": bool(candidates) and human_count == len(candidates),
+    }
     if "reviewed" not in str(payload.get("schema_version") or ""):
         payload["schema_version"] = "discovery-judgment-pool-reviewed/v2"
     return payload
@@ -158,8 +192,12 @@ def queue_bucket(candidate: Mapping[str, Any], *, mode: str) -> str:
 def merge_machine_reviews(
     existing_pool: Mapping[str, Any],
     machine_pool: Mapping[str, Any],
+    *,
+    job_id: str = "",
+    profile_id: str = "",
+    model: str = "",
 ) -> dict[str, Any]:
-    """Merge machine-reviewed candidates without wiping human grades."""
+    """Merge machine-reviewed candidates without wiping humans or prior model runs."""
     existing_by_id = {
         str(item.get("candidate_id") or ""): dict(item)
         for item in (existing_pool.get("candidates") or [])
@@ -193,14 +231,37 @@ def merge_machine_reviews(
             merged.append(base)
             continue
         item = dict(base)
-        # preserve human history and notes
         human_grades = item.get("human_grades")
         reviewer_id = item.get("reviewer_id")
         review_notes = item.get("review_notes")
+        prior_runs = [
+            dict(run)
+            for run in (item.get("machine_review_runs") or [])
+            if isinstance(run, dict)
+        ]
+        resolved_model = str(model or machine_pool.get("review_model") or machine.get("review_model") or "")
+        run_record = {
+            "job_id": str(job_id or ""),
+            "profile_id": str(profile_id or ""),
+            "model": resolved_model,
+            "grade": machine.get("grade"),
+            "confidence": machine.get("judgment_confidence") or machine.get("confidence"),
+            "votes": [dict(vote) for vote in (machine.get("machine_reviews") or []) if isinstance(vote, dict)],
+            "judgment_source": machine_pool.get("judgment_source"),
+            "rubric_version": machine_pool.get("rubric_version"),
+            "created_at": _utc_now(),
+        }
+        run_key = (run_record["job_id"], run_record["profile_id"], run_record["model"])
+        prior_runs = [
+            run for run in prior_runs
+            if (str(run.get("job_id") or ""), str(run.get("profile_id") or ""), str(run.get("model") or "")) != run_key
+        ]
+        if run_record["votes"] or run_record["grade"] is not None:
+            prior_runs.append(run_record)
         item.update(machine)
+        item["machine_review_runs"] = prior_runs
         if human_grades:
             item["human_grades"] = human_grades
-            # effective grade remains human
             item["grade"] = effective_grade(item)
             if reviewer_id:
                 item["reviewer_id"] = reviewer_id
@@ -210,13 +271,11 @@ def merge_machine_reviews(
 
     payload = dict(existing_pool)
     for key, value in machine_pool.items():
-        if key != "candidates":
+        if key != "candidates" and key not in {"judgment_source", "review_summary"}:
             payload[key] = value
     payload["candidates"] = merged
-    # if any human grades exist keep human_verified as optional export choice later
-    if any(item.get("human_grades") for item in merged):
-        # keep machine source at pool level only when no humans — else leave prior
-        pass
+    if any(_latest_active_human(item) is not None for item in merged):
+        payload["judgment_source"] = existing_pool.get("judgment_source") or "human_verified"
     elif machine_pool.get("judgment_source"):
         payload["judgment_source"] = machine_pool.get("judgment_source")
     return payload

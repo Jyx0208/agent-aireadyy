@@ -5,6 +5,7 @@ import concurrent.futures
 import json
 import os
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -20,7 +21,7 @@ from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
 from agent.agent_core.harness import run_agent_harness
 from agent.ai_ready.agent_run_bridge import build_ai_ready_from_agent_run
@@ -97,6 +98,7 @@ from agent.web.expert_review.grading import (
 )
 from agent.web.expert_review.impact import compute_impact, load_json
 from agent.web.expert_review.jobs import ExpertJudgeJobManager, reset_jobs_for_tests
+from agent.web.expert_review.pool_builds import ExpertPoolBuildManager
 from agent.web.llm_config_store import LLMConfigStore
 
 
@@ -4246,6 +4248,33 @@ def _public_llm_config() -> dict[str, Any]:
     }
 
 
+def _review_developer_allowed(request: Request) -> bool:
+    token = (os.getenv("AGENT_EXPERT_REVIEW_DEVELOPER_TOKEN") or "").strip()
+    supplied = (request.headers.get("x-expert-review-token") or "").strip()
+    if token:
+        return bool(supplied and secrets.compare_digest(token, supplied))
+    allow_local = (os.getenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER") or "").strip().lower() in {"1", "true", "yes", "on"}
+    client_host = str(getattr(request.client, "host", "") or "")
+    return allow_local and client_host in {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+def _request_review_mode(request: Request, raw: Any) -> str:
+    requested = _normalize_review_mode(raw)
+    if requested != "expert" and not _review_developer_allowed(request):
+        return "expert"
+    return requested
+
+
+def _public_pool_record(record: Mapping[str, Any], *, mode: str) -> dict[str, Any]:
+    payload = dict(record)
+    if mode == "expert":
+        stats = dict(payload.get("stats") or {})
+        payload["stats"] = {"candidate_count": int(stats.get("candidate_count") or 0)}
+        payload.pop("judgment_source", None)
+        payload.pop("paths", None)
+    return payload
+
+
 def _expert_pool_registry() -> ExpertPoolRegistry:
     return ExpertPoolRegistry(expert_review_root())
 
@@ -4273,6 +4302,52 @@ def _expert_job_manager() -> ExpertJudgeJobManager:
     return ExpertJudgeJobManager(_expert_pool_registry(), resolve_profile=resolve_profile)
 
 
+def _expert_pool_build_manager() -> ExpertPoolBuildManager:
+    def start_discovery(payload: dict[str, Any]) -> dict[str, Any]:
+        return asyncio.run(start_discovery_job(payload, background_tasks=None))
+
+    def get_discovery(job_id: str) -> dict[str, Any]:
+        return asyncio.run(get_discovery_job(job_id, detail=1))
+
+    def cancel_discovery(job_id: str) -> dict[str, Any]:
+        return asyncio.run(cancel_discovery_job(job_id))
+
+    def start_review(pool_id: str, review: Mapping[str, Any]) -> dict[str, Any]:
+        profile_id = _clean_text(review.get("profile_id"))
+        if not profile_id:
+            profiles = _llm_config_store().list_profiles()
+            default_profile = next((item for item in profiles if item.get("is_default")), None)
+            profile_id = _clean_text((default_profile or {}).get("id"))
+        if not profile_id:
+            raise ValueError("review_profile_id_required")
+        return _expert_job_manager().start_job(
+            pool_id=pool_id,
+            profile_id=profile_id,
+            independent_model=bool(review.get("independent_model")),
+            workers=int(review.get("workers") or 2),
+        )
+
+    return ExpertPoolBuildManager(
+        _expert_pool_registry(),
+        start_discovery=start_discovery,
+        get_discovery=get_discovery,
+        cancel_discovery=cancel_discovery,
+        start_review=start_review,
+    )
+
+
+def _impact_path_allowed(path: str) -> bool:
+    candidate = Path(path)
+    if not candidate.exists() or not candidate.is_file():
+        return False
+    try:
+        resolved = candidate.resolve()
+        roots = [Path("runs").resolve(), expert_review_root().resolve()]
+    except OSError:
+        return False
+    return any(resolved == root or root in resolved.parents for root in roots)
+
+
 def _load_impact_bundle(session: Mapping[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     key_payload = None
     runs: list[dict[str, Any]] = []
@@ -4289,6 +4364,11 @@ def _load_impact_bundle(session: Mapping[str, Any]) -> tuple[dict[str, Any] | No
             continue
         if isinstance(payload, dict) and isinstance(payload.get("runs"), list):
             runs.extend([item for item in payload["runs"] if isinstance(item, dict)])
+        elif isinstance(payload, dict) and (
+            isinstance(payload.get("workflow_runs"), list) or isinstance(payload.get("agent_runs"), list)
+        ):
+            runs.extend([item for item in payload.get("workflow_runs") or [] if isinstance(item, dict)])
+            runs.extend([item for item in payload.get("agent_runs") or [] if isinstance(item, dict)])
         elif isinstance(payload, dict) and payload.get("selected_project_accessions") is not None:
             runs.append(payload)
         elif isinstance(payload, list):
@@ -4594,6 +4674,13 @@ def _llm_check_error(exc: Exception) -> str:
     return f"大模型 API 检查失败：{exc}"
 
 
+def _llm_trust_environment_proxy(base_url: str) -> bool:
+    from urllib.parse import urlparse
+
+    hostname = (urlparse(base_url).hostname or "").lower()
+    return hostname not in {"localhost", "127.0.0.1", "::1"}
+
+
 async def _check_llm_api(config: dict[str, str]) -> tuple[bool, str]:
     check_timeout = max(5.0, min(_positive_float(config["timeout"], 15.0), 15.0))
     payload = {
@@ -4604,7 +4691,7 @@ async def _check_llm_api(config: dict[str, str]) -> tuple[bool, str]:
     }
     timeout = httpx.Timeout(connect=5.0, read=check_timeout, write=5.0, pool=5.0)
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=_llm_trust_environment_proxy(config["base_url"])) as client:
             response = await client.post(
                 f"{config['base_url']}/chat/completions",
                 headers={"Authorization": f"Bearer {config['api_key']}"},
@@ -4622,7 +4709,7 @@ async def _run_llm_check(config: dict[str, str]) -> tuple[bool, str]:
 
 async def _fetch_llm_models(config: dict[str, str]) -> list[str]:
     timeout = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, trust_env=_llm_trust_environment_proxy(config["base_url"])) as client:
         response = await client.get(
             f"{config['base_url']}/models",
             headers={"Authorization": f"Bearer {config['api_key']}"},
@@ -4664,30 +4751,46 @@ async def benchmark_review():
 
 
 @app.get("/api/expert-review/status")
-async def expert_review_status():
+async def expert_review_status(request: Request):
     return {
         "ok": True,
         "enabled": expert_review_enabled(),
-        "root": str(expert_review_root()),
+        "developer_allowed": _review_developer_allowed(request),
     }
 
 
 @app.get("/api/expert-review/pools")
-async def list_expert_review_pools():
+async def list_expert_review_pools(request: Request, mode: str = "expert"):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled", "pools": []}
-    return {"ok": True, "pools": _expert_pool_registry().list_pools()}
+    resolved_mode = _request_review_mode(request, mode)
+    pools = [_public_pool_record(item, mode=resolved_mode) for item in _expert_pool_registry().list_pools()]
+    return {"ok": True, "mode": resolved_mode, "pools": pools}
 
 
 @app.post("/api/expert-review/pools/import")
-async def import_expert_review_pool(body: dict[str, Any]):
+async def import_expert_review_pool(body: dict[str, Any], request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
+    developer = _review_developer_allowed(request)
     pool = body.get("pool")
     if not isinstance(pool, dict):
         return {"ok": False, "error": "pool object is required"}
-    label = _clean_text(body.get("label")) or None
-    pool_id = _clean_text(body.get("pool_id")) or None
+    if not developer:
+        from agent.web.expert_review.pool_registry import strip_pool_for_mode
+
+        candidates = [item for item in (pool.get("candidates") or []) if isinstance(item, dict)]
+        if any(
+            item.get("grade") is not None or item.get("review_notes") or item.get("human_grades") or item.get("machine_reviews") or item.get("machine_review_runs")
+            for item in candidates
+        ):
+            return {"ok": False, "error": "expert_import_requires_unreviewed_blinded_pool"}
+        pool = strip_pool_for_mode(pool, mode="expert")
+        label = "expert-blind-pool"
+        pool_id = None
+    else:
+        label = _clean_text(body.get("label")) or None
+        pool_id = _clean_text(body.get("pool_id")) or None
     try:
         record = _expert_pool_registry().import_pool(pool, label=label, pool_id=pool_id)
     except ValueError as exc:
@@ -4696,19 +4799,22 @@ async def import_expert_review_pool(body: dict[str, Any]):
 
 
 @app.get("/api/expert-review/pools/{pool_id}")
-async def get_expert_review_pool(pool_id: str, mode: str = "expert"):
+async def get_expert_review_pool(pool_id: str, request: Request, mode: str = "expert"):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
     record = _expert_pool_registry().get_pool(pool_id)
     if record is None:
         return {"ok": False, "error": "pool_not_found"}
-    return {"ok": True, "pool": record, "mode": _normalize_review_mode(mode)}
+    resolved_mode = _request_review_mode(request, mode)
+    return {"ok": True, "pool": _public_pool_record(record, mode=resolved_mode), "mode": resolved_mode}
 
 
 @app.get("/api/expert-review/pools/{pool_id}/candidates")
 async def list_expert_review_candidates(
     pool_id: str,
+    request: Request,
     mode: str = "expert",
+    reviewer_id: str = "",
     task: str | None = None,
     offset: int = 0,
     limit: int = 200,
@@ -4717,7 +4823,8 @@ async def list_expert_review_candidates(
         return {"ok": False, "error": "expert_review_disabled"}
     payload = _expert_pool_registry().candidates(
         pool_id,
-        mode=_normalize_review_mode(mode),
+        mode=_request_review_mode(request, mode),
+        reviewer_id=_clean_text(reviewer_id),
         task=task,
         offset=offset,
         limit=limit,
@@ -4728,52 +4835,60 @@ async def list_expert_review_candidates(
 
 
 @app.put("/api/expert-review/pools/{pool_id}/grades/{candidate_id}")
-async def upsert_expert_review_grade(pool_id: str, candidate_id: str, body: dict[str, Any]):
+async def upsert_expert_review_grade(pool_id: str, candidate_id: str, body: dict[str, Any], request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    mode = _normalize_review_mode(body.get("mode") or "expert")
+    mode = _request_review_mode(request, body.get("mode") or "expert")
     registry = _expert_pool_registry()
-    document = registry.load_pool_document(pool_id, prefer_reviewed=True)
-    if document is None:
-        return {"ok": False, "error": "pool_not_found"}
-    candidates = [dict(item) for item in (document.get("candidates") or []) if isinstance(item, dict)]
-    target = None
-    for index, item in enumerate(candidates):
-        if str(item.get("candidate_id") or "") == candidate_id:
-            target = index
-            break
-    if target is None:
-        return {"ok": False, "error": "candidate_not_found"}
-    before = dict(candidates[target])
-    grade_before = effective_grade(before)
     clear = bool(body.get("clear"))
     notes = str(body.get("notes") or body.get("review_notes") or "")
     reviewer_id = _clean_text(body.get("reviewer_id")) or ""
-    try:
+    if not reviewer_id:
+        return {"ok": False, "error": "reviewer_id_required"}
+    change: dict[str, Any] = {}
+
+    def mutate(document: dict[str, Any]) -> dict[str, Any]:
+        candidates = [dict(item) for item in (document.get("candidates") or []) if isinstance(item, dict)]
+        target = next(
+            (index for index, item in enumerate(candidates) if str(item.get("candidate_id") or "") == candidate_id),
+            None,
+        )
+        if target is None:
+            raise ValueError("candidate_not_found")
+        before = dict(candidates[target])
+        grade_before = effective_grade(before)
         if clear:
             updated = append_human_grade(before, grade=None, notes=notes, reviewer_id=reviewer_id, clear=True)
         else:
             grade_raw = body.get("grade")
             if grade_raw is None:
-                return {"ok": False, "error": "grade_required"}
+                raise ValueError("grade_required")
             updated = append_human_grade(
                 before,
                 grade=int(grade_raw),
                 notes=notes,
                 reviewer_id=reviewer_id,
             )
+        candidates[target] = updated
+        new_document = {**document, "candidates": candidates}
+        new_document.setdefault("schema_version", "discovery-judgment-pool-reviewed/v2")
+        change.update(
+            before=before,
+            after=updated,
+            document_before=document,
+            document_after=new_document,
+            grade_before=grade_before,
+        )
+        return new_document
+
+    try:
+        new_doc, record = registry.mutate_reviewed_pool(pool_id, mutate)
     except (TypeError, ValueError) as exc:
         return {"ok": False, "error": str(exc)}
-    candidates[target] = updated
-    new_doc = dict(document)
-    new_doc["candidates"] = candidates
-    # Prefer human_verified when human grades exist on export; keep machine source on disk doc if mixed.
-    if any(item.get("human_grades") for item in candidates):
-        new_doc.setdefault("schema_version", "discovery-judgment-pool-reviewed/v2")
-    try:
-        record = registry.save_reviewed_pool(pool_id, new_doc)
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    before = change["before"]
+    updated = change["after"]
+    document = change["document_before"]
+    grade_before = change["grade_before"]
 
     impact = None
     if mode == "test":
@@ -4802,51 +4917,44 @@ async def upsert_expert_review_grade(pool_id: str, candidate_id: str, body: dict
 
     return {
         "ok": True,
-        "pool": record,
-        "candidate": blind_candidate_view(updated, mode=mode),
+        "pool": _public_pool_record(record, mode=mode),
+        "candidate": blind_candidate_view(updated, mode=mode, reviewer_id=reviewer_id),
         "impact": impact,
     }
 
 
 @app.post("/api/expert-review/pools/{pool_id}/export")
-async def export_expert_review_pool(pool_id: str, body: dict[str, Any] | None = None):
+async def export_expert_review_pool(pool_id: str, request: Request, body: dict[str, Any] | None = None):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
     body = body or {}
     document = _expert_pool_registry().load_pool_document(pool_id, prefer_reviewed=True)
     if document is None:
         return {"ok": False, "error": "pool_not_found"}
-    exported = apply_human_grades_for_export(document)
+    reviewer_id = _clean_text(body.get("reviewer_id"))
+    if not reviewer_id:
+        return {"ok": False, "error": "reviewer_id_required"}
+    exported = apply_human_grades_for_export(document, reviewer_id=reviewer_id)
     return {"ok": True, "pool": exported}
 
 
 @app.post("/api/expert-review/impact/session")
-async def bind_expert_impact_session(body: dict[str, Any]):
-    mode = _normalize_review_mode(body.get("mode") or "test")
-    if mode == "expert":
-        return {"ok": False, "error": "impact_forbidden_in_expert_mode"}
+async def bind_expert_impact_session(body: dict[str, Any], request: Request):
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    mode = _request_review_mode(request, body.get("mode") or "test")
+    if mode != "test":
+        return {"ok": False, "error": "impact_requires_test_mode"}
     session_id = _clean_text(body.get("session_id")) or _clean_text(body.get("pool_id")) or uuid.uuid4().hex[:10]
     key_path = _clean_text(body.get("key_path"))
     run_paths = body.get("run_paths") or []
     if not isinstance(run_paths, list):
         return {"ok": False, "error": "run_paths_must_be_list"}
     cleaned_runs = [_clean_text(path) for path in run_paths if _clean_text(path)]
-    # allowlist under runs/ or absolute existing files only
-    def _allowed(path: str) -> bool:
-        candidate = Path(path)
-        if not candidate.exists() or not candidate.is_file():
-            return False
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            return False
-        runs_root = Path("runs").resolve()
-        return str(resolved).startswith(str(runs_root)) or resolved.exists()
-
-    if key_path and not _allowed(key_path):
+    if key_path and not _impact_path_allowed(key_path):
         return {"ok": False, "error": "key_path_not_allowed"}
     for path in cleaned_runs:
-        if not _allowed(path):
+        if not _impact_path_allowed(path):
             return {"ok": False, "error": f"run_path_not_allowed:{path}"}
     with _impact_sessions_lock:
         _impact_sessions[session_id] = {
@@ -4863,12 +4971,14 @@ async def bind_expert_impact_session(body: dict[str, Any]):
 
 
 @app.post("/api/expert-review/pools/{pool_id}/impact")
-async def expert_review_impact(pool_id: str, body: dict[str, Any]):
+async def expert_review_impact(pool_id: str, body: dict[str, Any], request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    mode = _normalize_review_mode(body.get("mode") or "test")
-    if mode == "expert":
-        return {"ok": False, "error": "impact_forbidden_in_expert_mode"}
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    mode = _request_review_mode(request, body.get("mode") or "test")
+    if mode != "test":
+        return {"ok": False, "error": "impact_requires_test_mode"}
     registry = _expert_pool_registry()
     document = registry.load_pool_document(pool_id, prefer_reviewed=True)
     if document is None:
@@ -4876,11 +4986,17 @@ async def expert_review_impact(pool_id: str, body: dict[str, Any]):
     session_id = _clean_text(body.get("impact_session_id")) or pool_id
     with _impact_sessions_lock:
         session = dict(_impact_sessions.get(session_id) or {})
-    # allow one-shot paths
     if body.get("key_path"):
-        session["key_path"] = _clean_text(body.get("key_path"))
+        key_path = _clean_text(body.get("key_path"))
+        if not _impact_path_allowed(key_path):
+            return {"ok": False, "error": "key_path_not_allowed"}
+        session["key_path"] = key_path
     if body.get("run_paths"):
-        session["run_paths"] = [_clean_text(p) for p in body.get("run_paths") or [] if _clean_text(p)]
+        run_paths = [_clean_text(p) for p in body.get("run_paths") or [] if _clean_text(p)]
+        for path in run_paths:
+            if not _impact_path_allowed(path):
+                return {"ok": False, "error": f"run_path_not_allowed:{path}"}
+        session["run_paths"] = run_paths
     key_payload, runs = _load_impact_bundle(session)
     # optional hypothetical grade change
     pool_after = dict(document)
@@ -4918,17 +5034,21 @@ async def expert_review_impact(pool_id: str, body: dict[str, Any]):
 
 
 @app.get("/api/expert-review/jobs")
-async def list_expert_judge_jobs(pool_id: str | None = None):
+async def list_expert_judge_jobs(request: Request, pool_id: str | None = None):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled", "jobs": []}
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required", "jobs": []}
     return {"ok": True, "jobs": _expert_job_manager().list_jobs(pool_id=pool_id)}
 
 
 @app.post("/api/expert-review/jobs")
-async def start_expert_judge_job(body: dict[str, Any]):
+async def start_expert_judge_job(body: dict[str, Any], request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    mode = _normalize_review_mode(body.get("mode") or "developer")
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    mode = _request_review_mode(request, body.get("mode") or "developer")
     if mode == "expert":
         return {"ok": False, "error": "jobs_forbidden_in_expert_mode"}
     pool_id = _clean_text(body.get("pool_id"))
@@ -4950,9 +5070,11 @@ async def start_expert_judge_job(body: dict[str, Any]):
 
 
 @app.get("/api/expert-review/jobs/{job_id}")
-async def get_expert_judge_job(job_id: str, detail: int = 0):
+async def get_expert_judge_job(job_id: str, request: Request, detail: int = 0):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
     job = _expert_job_manager().get_job(job_id, detail=bool(detail))
     if job is None:
         return {"ok": False, "error": "job_not_found"}
@@ -4960,23 +5082,119 @@ async def get_expert_judge_job(job_id: str, detail: int = 0):
 
 
 @app.post("/api/expert-review/jobs/{job_id}/cancel")
-async def cancel_expert_judge_job(job_id: str):
+async def cancel_expert_judge_job(job_id: str, request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
     job = _expert_job_manager().cancel_job(job_id)
     if job is None:
         return {"ok": False, "error": "job_not_found"}
     return {"ok": True, "job": job}
 
 
-@app.post("/api/expert-review/jobs/{job_id}/retry-failed")
-async def retry_expert_judge_job(job_id: str):
+@app.post("/api/expert-review/jobs/{job_id}/resume")
+async def resume_expert_judge_job(job_id: str, request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    job = _expert_job_manager().resume_job(job_id)
+    if job is None:
+        return {"ok": False, "error": "job_not_found"}
+    return {"ok": True, "job": job}
+
+
+@app.post("/api/expert-review/jobs/{job_id}/retry-failed")
+async def retry_expert_judge_job(job_id: str, request: Request):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
     job = _expert_job_manager().retry_failed(job_id)
     if job is None:
         return {"ok": False, "error": "job_not_found"}
     return {"ok": True, "job": job}
+
+
+@app.get("/api/benchmark-review/builds")
+@app.get("/api/expert-review/pool-builds")
+async def list_expert_pool_builds(request: Request):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled", "builds": []}
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required", "builds": []}
+    return {"ok": True, "builds": _expert_pool_build_manager().list_builds()}
+
+
+@app.post("/api/benchmark-review/builds")
+@app.post("/api/expert-review/pool-builds")
+async def start_expert_pool_build(body: dict[str, Any], request: Request):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    prompt = _clean_text(body.get("prompt"))
+    if not prompt:
+        return {"ok": False, "error": "prompt_required"}
+    advanced = body.get("advanced") if isinstance(body.get("advanced"), dict) else {}
+    discovery = body.get("discovery") if isinstance(body.get("discovery"), dict) else {}
+    discovery_body = {**advanced, **discovery, "prompt": prompt}
+    request_id = _clean_text(body.get("idempotency_key") or body.get("client_request_id")) or uuid.uuid4().hex
+    review = body.get("review") if isinstance(body.get("review"), dict) else {}
+    try:
+        build = _expert_pool_build_manager().start_build(
+            discovery_request=discovery_body,
+            action=_clean_text(body.get("action") or "build_and_review"),
+            label=_clean_text(body.get("label")) or None,
+            preset_id=_clean_text(body.get("preset_id") or "default/v1"),
+            review=review,
+            idempotency_key=request_id,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "error": _redact_secrets(str(exc))}
+    return {"ok": True, "build": build}
+
+
+@app.get("/api/benchmark-review/builds/{build_id}")
+@app.get("/api/expert-review/pool-builds/{build_id}")
+async def get_expert_pool_build(build_id: str, request: Request):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    build = _expert_pool_build_manager().get_build(build_id)
+    if build is None:
+        return {"ok": False, "error": "build_not_found"}
+    return {"ok": True, "build": build}
+
+
+@app.post("/api/benchmark-review/builds/{build_id}/cancel")
+@app.post("/api/expert-review/pool-builds/{build_id}/cancel")
+async def cancel_expert_pool_build(build_id: str, request: Request):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    build = _expert_pool_build_manager().cancel_build(build_id)
+    if build is None:
+        return {"ok": False, "error": "build_not_found"}
+    return {"ok": True, "build": build}
+
+
+@app.post("/api/benchmark-review/builds/{build_id}/reconcile")
+@app.post("/api/expert-review/pool-builds/{build_id}/reconcile")
+async def reconcile_expert_pool_build(build_id: str, request: Request):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    build = _expert_pool_build_manager().reconcile_review(build_id)
+    if build is None:
+        return {"ok": False, "error": "build_not_found"}
+    return {"ok": True, "build": build}
 
 
 # ── 健康检查 ──────────────────────────────────────────────────────
@@ -5013,17 +5231,23 @@ async def get_config():
 
 
 @app.get("/api/llm/config")
-async def get_llm_config():
+async def get_llm_config(request: Request):
     return _public_llm_config()
 
 
 @app.put("/api/llm/config")
-async def save_llm_config(body: dict[str, Any]):
+async def save_llm_config(body: dict[str, Any], request: Request):
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
     payload = body.get("llm_config", body)
     if not isinstance(payload, dict):
         payload = {}
     existing = _llm_config_store().load() or {}
     api_key = _clean_text(payload.get("api_key")) or existing.get("api_key", "")
+    requested_base = _clean_text(payload.get("base_url")).rstrip("/")
+    existing_base = str(existing.get("base_url") or "").rstrip("/")
+    if not _review_developer_allowed(request) and api_key == existing.get("api_key") and requested_base and requested_base != existing_base:
+        return {"ok": False, "error": "developer_access_required_for_base_url_change"}
     if not api_key:
         return {"ok": False, "error": "API Key is required before saving configuration."}
     config, error = _build_llm_config({**existing, **payload, "api_key": api_key})
@@ -5037,17 +5261,21 @@ async def save_llm_config(body: dict[str, Any]):
 
 
 @app.delete("/api/llm/config")
-async def delete_llm_config():
+async def delete_llm_config(request: Request):
     return {"ok": True, "deleted": _llm_config_store().delete()}
 
 
 @app.get("/api/llm/profiles")
-async def list_llm_profiles():
+async def list_llm_profiles(request: Request):
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required", "profiles": []}
     return {"ok": True, "profiles": _llm_config_store().list_profiles(include_secrets=False)}
 
 
 @app.post("/api/llm/profiles")
-async def create_llm_profile(body: dict[str, Any]):
+async def create_llm_profile(body: dict[str, Any], request: Request):
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
     payload = body.get("profile", body)
     if not isinstance(payload, dict):
         return {"ok": False, "error": "profile payload must be an object"}
@@ -5060,7 +5288,9 @@ async def create_llm_profile(body: dict[str, Any]):
 
 
 @app.put("/api/llm/profiles/{profile_id}")
-async def update_llm_profile(profile_id: str, body: dict[str, Any]):
+async def update_llm_profile(profile_id: str, body: dict[str, Any], request: Request):
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
     payload = body.get("profile", body)
     if not isinstance(payload, dict):
         return {"ok": False, "error": "profile payload must be an object"}
@@ -5074,7 +5304,9 @@ async def update_llm_profile(profile_id: str, body: dict[str, Any]):
 
 
 @app.delete("/api/llm/profiles/{profile_id}")
-async def delete_llm_profile(profile_id: str):
+async def delete_llm_profile(profile_id: str, request: Request):
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
     deleted = _llm_config_store().delete_profile(profile_id)
     if not deleted:
         return {"ok": False, "error": "profile_not_found"}
@@ -5082,29 +5314,60 @@ async def delete_llm_profile(profile_id: str):
 
 
 @app.post("/api/llm/models")
-async def list_llm_models(body: dict[str, Any]):
+async def list_llm_models(body: dict[str, Any], request: Request):
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required", "models": []}
     payload = body.get("llm_config", body)
     if not isinstance(payload, dict):
         payload = {}
-    config, error = _build_llm_config(payload)
+    profile_id = _clean_text(body.get("profile_id") or payload.get("profile_id"))
+    explicit_key = _clean_text(payload.get("api_key"))
+    saved = _llm_config_store().get_profile_secrets(profile_id) if profile_id else None
+    explicit_base = _clean_text(payload.get("base_url")).rstrip("/")
+    if explicit_key:
+        merged = {
+            **(saved or {}),
+            **{key: value for key, value in payload.items() if key in {"api_key", "base_url", "model", "timeout"}},
+            "api_key": explicit_key,
+        }
+    elif saved is not None:
+        saved_base = str(saved.get("base_url") or "").rstrip("/")
+        if explicit_base and explicit_base != saved_base:
+            return {"ok": False, "error": "api_key_required_for_new_base_url", "models": []}
+        merged = {
+            **saved,
+            **{key: value for key, value in payload.items() if key in {"model", "timeout"} and str(value or "").strip()},
+        }
+    else:
+        return {"ok": False, "error": "profile_not_found_or_api_key_required", "models": []}
+    selected_model = _clean_text(merged.get("model"))
+    merged["model"] = selected_model or "__model_discovery__"
+    config, error = _build_llm_config(merged)
     if error or config is None:
         return {"ok": False, "error": error, "models": []}
     try:
         models = await _fetch_llm_models(config)
     except Exception as exc:
         return {"ok": False, "error": _llm_check_error(exc), "models": []}
+    models = [model for model in _ordered_models(models, selected_model) if model != "__model_discovery__"]
     return {
         "ok": True,
-        "models": _ordered_models(models, config["model"]),
-        "selected": config["model"],
+        "models": models,
+        "selected": selected_model if selected_model in models else (models[0] if models else ""),
     }
 
 
 @app.post("/api/llm/check")
-async def check_llm(body: dict[str, Any]):
+async def check_llm(body: dict[str, Any], request: Request):
     llm_config = body.get("llm_config", body)
     if not isinstance(llm_config, dict):
         llm_config = {}
+    existing = _llm_config_store().load() or {}
+    requested_base = _clean_text(llm_config.get("base_url")).rstrip("/")
+    existing_base = str(existing.get("base_url") or "").rstrip("/")
+    explicit_key = _clean_text(llm_config.get("api_key"))
+    if not _review_developer_allowed(request) and not explicit_key and requested_base and requested_base != existing_base:
+        return {"ok": False, "error": "developer_access_required_for_base_url_change"}
     config, error = _build_llm_config(llm_config)
     if error or config is None:
         return {"ok": False, "error": error}

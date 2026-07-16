@@ -160,6 +160,11 @@ class LLMConfigStore:
             timeout = str(profile.get("timeout") or (existing or {}).get("timeout") or "").strip()
             if not all([api_key, base_url, model, timeout]):
                 raise ValueError("llm_config_requires_api_key_base_url_model_and_timeout")
+            try:
+                if float(timeout) <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise ValueError("llm_config_timeout_must_be_positive_number") from None
             payload = {
                 "id": profile_id,
                 "label": label,
@@ -175,10 +180,8 @@ class LLMConfigStore:
                     payload if str(item.get("id") or "") == profile_id else item
                     for item in profiles
                 ]
-            if not document.get("default_profile_id") or make_default or existing is None and len(profiles) == 1:
-                if make_default or not document.get("default_profile_id"):
-                    document["default_profile_id"] = profile_id
-            if make_default:
+            first_profile = existing is None and len(profiles) == 1
+            if make_default or first_profile or not document.get("default_profile_id"):
                 document["default_profile_id"] = profile_id
             document["version"] = 2
             document["profiles"] = profiles

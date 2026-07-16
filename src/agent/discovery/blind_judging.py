@@ -48,6 +48,7 @@ class BlindCandidateJudgment(JsonModel):
 
 JudgeCall = Callable[[str, str], Mapping[str, Any]]
 ReviewCallback = Callable[[dict[str, Any]], None]
+ReviewErrorCallback = Callable[[str, Exception], None]
 JUDGING_RUBRIC_VERSION = "adaptive-blind-judge/v2"
 
 
@@ -69,6 +70,7 @@ def judge_blinded_pool(
     workers: int = 1,
     existing_reviews: Mapping[str, Mapping[str, Any]] | None = None,
     on_review: ReviewCallback | None = None,
+    on_error: ReviewErrorCallback | None = None,
 ) -> dict[str, Any]:
     candidates = [item for item in pool.get("candidates") or [] if isinstance(item, dict)]
     if workers < 1:
@@ -90,9 +92,19 @@ def judge_blinded_pool(
         if on_review is not None:
             on_review(item)
 
+    def handle_error(candidate: Mapping[str, Any], exc: Exception) -> None:
+        if str(exc) == "job_cancelled":
+            raise exc
+        if on_error is None:
+            raise exc
+        on_error(str(candidate.get("candidate_id") or ""), exc)
+
     if workers == 1:
         for candidate in pending:
-            store_result(candidate, judge_candidate(candidate, judge))
+            try:
+                store_result(candidate, judge_candidate(candidate, judge))
+            except Exception as exc:
+                handle_error(candidate, exc)
     else:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
@@ -100,10 +112,15 @@ def judge_blinded_pool(
                 for candidate in pending
             }
             for future in as_completed(futures):
-                store_result(futures[future], future.result())
+                candidate = futures[future]
+                try:
+                    store_result(candidate, future.result())
+                except Exception as exc:
+                    handle_error(candidate, exc)
     reviewed = [
         reviewed_by_id[str(candidate.get("candidate_id") or "")]
         for candidate in candidates
+        if str(candidate.get("candidate_id") or "") in reviewed_by_id
     ]
     confidence_counts: Counter[str] = Counter()
     vote_count = 0
@@ -220,19 +237,23 @@ def _call_judge(
     return BlindJudgmentVote.model_validate(payload)
 
 
-def _visible_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
+def _strip_hidden(value: Any) -> Any:
     hidden = {
-        "grade",
-        "review_notes",
-        "reviewer_id",
-        "judgment_confidence",
-        "machine_reviews",
-        "runtime",
-        "project_accession",
-        "observed_in",
-        "source",
+        "grade", "review_notes", "reviewer_id", "human_grades", "judgment_confidence",
+        "machine_reviews", "machine_review_runs", "judgment_source", "review_model",
+        "review_method", "rubric_version", "runtime", "runtime_label", "project_accession",
+        "accession", "observed_in", "source", "source_system", "system_name", "agent_runtime",
+        "workflow_name",
     }
-    return {key: value for key, value in candidate.items() if key not in hidden}
+    if isinstance(value, Mapping):
+        return {key: _strip_hidden(item) for key, item in value.items() if key not in hidden}
+    if isinstance(value, list):
+        return [_strip_hidden(item) for item in value]
+    return value
+
+
+def _visible_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    return _strip_hidden(dict(candidate))
 
 
 def _confidence(grades: list[int]) -> JudgmentConfidence:

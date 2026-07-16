@@ -32,7 +32,9 @@ class _FakeClient:
 
 def test_redact_text_hides_keys() -> None:
     assert "sk-***" in redact_text("token sk-abcdefghi123456")
-    assert "***" in redact_text("Authorization: Bearer secret-token-value")
+    redacted = redact_text("Authorization: Bearer secret-token-value")
+    assert "secret-token-value" not in redacted
+    assert "Bearer ***" in redacted
 
 
 def test_openai_sdk_judge_parses_json() -> None:

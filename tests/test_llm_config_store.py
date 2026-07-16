@@ -35,6 +35,23 @@ def test_llm_config_store_treats_corrupt_or_incomplete_files_as_unconfigured(tmp
     assert store.load() is None
 
 
+def test_first_named_profile_becomes_default(tmp_path: Path) -> None:
+    store = LLMConfigStore(tmp_path / "llm_config.json")
+    created = store.upsert_profile(
+        {
+            "id": "judge-a",
+            "label": "Judge A",
+            "api_key": "secret",
+            "base_url": "https://example.com/v1",
+            "model": "model-a",
+            "timeout": "30",
+        }
+    )
+    assert created["is_default"] is True
+    assert store.list_profiles()[0]["is_default"] is True
+    assert store.load()["model"] == "model-a"
+
+
 def test_llm_config_store_migrates_legacy_and_supports_multi_profiles(tmp_path: Path) -> None:
     path = tmp_path / "llm_config.json"
     path.write_text(

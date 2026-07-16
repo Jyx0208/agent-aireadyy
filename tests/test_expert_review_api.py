@@ -7,6 +7,16 @@ from fastapi.testclient import TestClient
 from agent.web import app as web_app
 
 
+def test_developer_mode_requires_token_by_default(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_DIR", str(tmp_path / "expert_review"))
+    monkeypatch.delenv("AGENT_EXPERT_REVIEW_DEVELOPER_TOKEN", raising=False)
+    monkeypatch.delenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", raising=False)
+    client = TestClient(web_app.app)
+    status = client.get("/api/expert-review/status").json()
+    assert status["developer_allowed"] is False
+    assert client.get("/api/llm/profiles").json()["error"] == "developer_access_required"
+
+
 def test_benchmark_review_template_supports_registry_shell() -> None:
     html = Path("src/agent/web/templates/benchmark_review.html").read_text(encoding="utf-8")
     assert 'id="serverPoolSelect"' in html
@@ -21,6 +31,7 @@ def test_benchmark_review_template_supports_registry_shell() -> None:
 def test_expert_review_pool_api_import_and_list(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AGENT_EXPERT_REVIEW_DIR", str(tmp_path / "expert_review"))
     monkeypatch.setenv("AGENT_EXPERT_REVIEW_ENABLED", "1")
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", "1")
     client = TestClient(web_app.app)
 
     status = client.get("/api/expert-review/status")
@@ -60,9 +71,18 @@ def test_expert_review_pool_api_import_and_list(tmp_path: Path, monkeypatch) -> 
     assert expert.status_code == 200
     expert_body = expert.json()
     assert expert_body["ok"] is True
-    assert expert_body["candidates"][0]["candidate_id"] == "cand-1"
-    assert "project_accession" not in expert_body["candidates"][0]
-    assert "machine_reviews" not in expert_body["candidates"][0]
+    expert_candidate = expert_body["candidates"][0]
+    assert expert_candidate["candidate_id"] == "cand-1"
+    for hidden_field in (
+        "project_accession",
+        "machine_reviews",
+        "machine_review_runs",
+        "grade",
+        "review_notes",
+        "reviewer_id",
+        "human_grades",
+    ):
+        assert hidden_field not in expert_candidate
 
     developer = client.get(
         f"/api/expert-review/pools/{pool_id}/candidates",
@@ -75,6 +95,7 @@ def test_expert_review_pool_api_import_and_list(tmp_path: Path, monkeypatch) -> 
 def test_expert_review_grade_export_and_impact_forbidden_for_expert(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AGENT_EXPERT_REVIEW_DIR", str(tmp_path / "expert_review"))
     monkeypatch.setenv("AGENT_EXPERT_REVIEW_ENABLED", "1")
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", "1")
     client = TestClient(web_app.app)
     pool = {
         "schema_version": "discovery-judgment-pool-blinded/v2",
@@ -103,7 +124,7 @@ def test_expert_review_grade_export_and_impact_forbidden_for_expert(tmp_path: Pa
     expert_view = client.get(f"/api/expert-review/pools/{pool_id}/candidates", params={"mode": "expert"}).json()
     assert "machine_reviews" not in expert_view["candidates"][0]
 
-    exported = client.post(f"/api/expert-review/pools/{pool_id}/export", json={}).json()
+    exported = client.post(f"/api/expert-review/pools/{pool_id}/export", json={"reviewer_id": "r1"}).json()
     assert exported["ok"] is True
     assert exported["pool"]["judgment_source"] == "human_verified"
     assert exported["pool"]["candidates"][0]["grade"] == 3
@@ -115,9 +136,56 @@ def test_expert_review_grade_export_and_impact_forbidden_for_expert(tmp_path: Pa
     assert forbidden["ok"] is False
 
 
+def test_pool_build_apis_are_developer_only(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_DIR", str(tmp_path / "expert_review"))
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ENABLED", "1")
+    monkeypatch.delenv("AGENT_EXPERT_REVIEW_DEVELOPER_TOKEN", raising=False)
+    monkeypatch.delenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", raising=False)
+    client = TestClient(web_app.app)
+
+    forbidden = client.get("/api/benchmark-review/builds").json()
+    assert forbidden["ok"] is False
+    assert forbidden["error"] == "developer_access_required"
+
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", "1")
+    allowed = client.get("/api/expert-review/pool-builds").json()
+    assert allowed == {"ok": True, "builds": []}
+
+
+def test_pool_build_api_requires_only_prompt_and_defaults_to_review(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_DIR", str(tmp_path / "expert_review"))
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ENABLED", "1")
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", "1")
+    captured: dict = {}
+
+    class _Manager:
+        def start_build(self, **kwargs):
+            captured.update(kwargs)
+            return {"build_id": "build-1", "status": "discovering"}
+
+    monkeypatch.setattr(web_app, "_expert_pool_build_manager", lambda: _Manager())
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/benchmark-review/builds",
+        json={"prompt": "Find human DDA proteomics", "idempotency_key": "request-1"},
+    ).json()
+
+    assert response["ok"] is True
+    assert response["build"]["build_id"] == "build-1"
+    assert captured["discovery_request"] == {"prompt": "Find human DDA proteomics"}
+    assert captured["action"] == "build_and_review"
+    assert captured["label"] is None
+    assert captured["preset_id"] == "default/v1"
+    assert captured["review"] == {}
+    assert captured["idempotency_key"] == "request-1"
+
+
 def test_benchmark_template_has_developer_surfaces() -> None:
     html = Path("src/agent/web/templates/benchmark_review.html").read_text(encoding="utf-8")
     assert 'id="machineRail"' in html
     assert 'id="impactPanel"' in html
     assert 'id="jobsPanel"' in html
     assert 'id="queueBar"' in html
+    assert 'id="fetchModelsButton"' in html
+    assert 'id="saveProfileButton"' in html
+    assert 'id="profileModelSelect"' in html

@@ -25,77 +25,24 @@
       background: var(--canvas);
       color: var(--ink);
       font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
-      letter-spacing: 0;
     }
-    button, input, select, textarea { font: inherit; letter-spacing: 0; }
+    button, input, select, textarea { font: inherit; }
     button, .file-button {
-      min-height: 36px;
+      min-height: 38px;
       border: 1px solid var(--line);
       border-radius: 6px;
       background: var(--surface);
       color: var(--ink);
-      padding: 7px 12px;
+      padding: 8px 12px;
       cursor: pointer;
     }
     button:hover, .file-button:hover { border-color: var(--accent); }
-    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, .file-button:focus-visible {
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, .file-button:focus-visible, .job-row:focus-visible {
       outline: 3px solid rgba(8, 127, 140, .24);
-      outline-offset: 1px;
+      outline-offset: 2px;
     }
-    button:disabled { cursor: not-allowed; opacity: .45; }
-    header {
-      background: #202a33;
-      color: #fff;
-      border-bottom: 3px solid var(--accent);
-    }
-    .header-inner, main { width: min(1120px, calc(100% - 32px)); margin: 0 auto; }
-    .header-inner { min-height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-    h1 { margin: 0; font-size: 20px; font-weight: 650; }
-    .progress-text { color: #d9e3e8; font-variant-numeric: tabular-nums; }
-    .toolbar {
-      display: grid;
-      grid-template-columns: auto minmax(150px, 1fr) minmax(190px, 1.3fr) auto;
-      gap: 10px;
-      align-items: end;
-      padding: 18px 0;
-      border-bottom: 1px solid var(--line);
-    }
-    .registry-bar {
-      display: grid;
-      grid-template-columns: minmax(180px, 1.2fr) auto auto minmax(140px, 0.8fr);
-      gap: 10px;
-      align-items: end;
-      padding: 14px 0 0;
-    }
-    .pool-meta {
-      color: var(--muted);
-      font-size: 13px;
-      min-height: 20px;
-      padding-bottom: 8px;
-    }
-    .queue-bar { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 0 12px; }
-    .queue-bar button[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); }
-    .layout-split { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 14px; align-items: start; }
-    .side-rail, .impact-panel, .jobs-panel {
-      background: var(--surface);
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 12px;
-    }
-    .side-rail h3, .impact-panel h3, .jobs-panel h3 { margin: 0 0 8px; font-size: 14px; }
-    .side-rail.hidden, .impact-panel.hidden, .jobs-panel.hidden, .dev-only.hidden { display: none !important; }
-    .vote-item { border-top: 1px solid var(--line); padding: 8px 0; font-size: 13px; line-height: 1.45; }
-    .impact-panel { margin-top: 14px; }
-    .impact-panel p { margin: 0 0 8px; line-height: 1.5; }
-    .jobs-panel { margin-top: 14px; }
-    .jobs-panel .job-row { border-top: 1px solid var(--line); padding: 8px 0; font-size: 13px; }
-    .jobs-controls { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; margin-bottom: 10px; }
-    .progress-bar { height: 8px; background: #e8ecef; border-radius: 99px; overflow: hidden; margin: 6px 0; }
-    .progress-bar > span { display: block; height: 100%; background: var(--accent); width: 0; }
-    .log-box { max-height: 140px; overflow: auto; background: #f8fafb; border: 1px solid var(--line); padding: 8px; font-size: 12px; white-space: pre-wrap; }
-    .field { display: grid; gap: 5px; }
-    label { color: var(--muted); font-size: 13px; }
-    input[type="text"], select, textarea {
+    button:disabled, input:disabled, select:disabled, textarea:disabled { cursor: not-allowed; opacity: .5; }
+    input[type="text"], input[type="password"], input[type="number"], select, textarea {
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -104,70 +51,104 @@
       padding: 8px 10px;
     }
     input[type="file"] { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
+    header { background: #202a33; color: #fff; border-bottom: 3px solid var(--accent); }
+    .header-inner, main { width: min(1180px, calc(100% - 32px)); margin: 0 auto; }
+    .header-inner { min-height: 66px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    h1 { margin: 0; font-size: 20px; font-weight: 650; }
+    h2 { margin: 0; font-size: 20px; line-height: 1.35; }
+    h3 { margin: 0; font-size: 15px; }
+    .progress-text { color: #d9e3e8; font-variant-numeric: tabular-nums; }
+    .stage { padding: 18px 0; border-bottom: 1px solid var(--line); }
+    .stage-heading { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; }
+    .stage-number { color: var(--accent); font-weight: 750; font-variant-numeric: tabular-nums; }
+    .stage-heading p { margin: 0; color: var(--muted); font-size: 13px; }
+    .registry-bar { display: grid; grid-template-columns: minmax(220px, 1.3fr) auto auto minmax(140px, .7fr); gap: 10px; align-items: end; }
+    .token-row { display: grid; grid-template-columns: minmax(220px, 1fr) auto; gap: 10px; align-items: end; margin-top: 10px; }
+    .toolbar { display: grid; grid-template-columns: auto minmax(160px, .8fr) minmax(190px, 1fr) auto; gap: 10px; align-items: end; }
+    .pool-meta { color: var(--muted); font-size: 13px; min-height: 20px; padding-top: 8px; line-height: 1.5; }
+    .mode-banner { color: var(--ink); font-weight: 600; }
+    .queue-bar { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+    .queue-bar button[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); }
+    .field { display: grid; gap: 5px; min-width: 0; }
+    label { color: var(--muted); font-size: 13px; }
+    .file-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
     .file-button { display: inline-flex; align-items: center; white-space: nowrap; }
     .primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-    .review-shell { padding: 18px 0 32px; }
-    .empty {
-      min-height: 300px;
-      display: grid;
-      place-items: center;
-      color: var(--muted);
-      text-align: center;
-    }
+    .danger-copy { color: var(--danger); }
+    .hidden { display: none !important; }
+    .review-shell { padding: 16px 0 8px; }
+    .empty { min-height: 180px; display: grid; place-items: center; color: var(--muted); text-align: center; border-block: 1px dashed var(--line); padding: 20px; }
     .review { display: none; }
-    .task-band {
-      border-left: 4px solid var(--accent);
-      background: var(--accent-soft);
-      padding: 12px 14px;
-      margin-bottom: 16px;
-    }
+    .candidate-empty { min-height: 220px; display: grid; place-items: center; color: var(--muted); text-align: center; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 20px; }
+    .task-band { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 12px 14px; margin-bottom: 16px; }
     .task-band strong { display: block; margin-bottom: 5px; font-size: 14px; }
     .task-prompt { line-height: 1.55; }
-    .candidate {
-      background: var(--surface);
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 18px;
-    }
+    .layout-split { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 14px; align-items: start; }
+    .candidate { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 18px; }
     .candidate-head { display: flex; justify-content: space-between; align-items: start; gap: 14px; }
-    h2 { margin: 0; font-size: 20px; line-height: 1.35; }
     .candidate-index { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
     .description { margin: 14px 0; color: #35404b; line-height: 1.55; white-space: pre-wrap; }
-    .metadata {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      border-top: 1px solid var(--line);
-      border-bottom: 1px solid var(--line);
-      margin: 16px 0;
-    }
+    .metadata { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-block: 1px solid var(--line); margin: 16px 0; }
     .meta { padding: 10px 12px 10px 0; min-width: 0; }
     .meta dt { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
     .meta dd { margin: 0; overflow-wrap: anywhere; }
     .grade-label { color: var(--ink); font-size: 14px; font-weight: 650; margin-bottom: 8px; }
     .grades { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
-    .grade { min-height: 48px; text-align: left; }
+    .grade { min-height: 50px; text-align: left; }
     .grade[data-grade="0"] { border-left: 4px solid var(--danger); }
     .grade[data-grade="1"] { border-left: 4px solid var(--blue); }
     .grade[data-grade="2"] { border-left: 4px solid var(--warning); }
     .grade[data-grade="3"] { border-left: 4px solid var(--success); }
     .grade.selected { background: #202a33; border-color: #202a33; color: #fff; }
     .notes { margin-top: 16px; }
-    textarea { min-height: 86px; resize: vertical; }
+    textarea { min-height: 92px; resize: vertical; }
     .navigation { display: flex; justify-content: space-between; gap: 12px; margin-top: 14px; }
-    .navigation-group { display: flex; gap: 8px; }
-    .status { min-height: 22px; color: var(--muted); padding-top: 8px; }
-    @media (max-width: 760px) {
+    .navigation-group, .job-actions, .profile-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .status { min-height: 24px; color: var(--muted); padding-top: 8px; }
+    .status.error { color: var(--danger); font-weight: 600; }
+    .status.success { color: var(--success); }
+    .side-rail { background: var(--surface); border-left: 3px solid var(--accent); padding: 12px; }
+    .side-rail h3 { margin-bottom: 8px; }
+    .vote-item, .run-item { border-top: 1px solid var(--line); padding: 8px 0; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+    .developer-tools { padding-bottom: 32px; }
+    .tool-section { border-top: 2px solid #202a33; padding: 14px 0 20px; }
+    .tool-section + .tool-section { border-top-color: var(--line); }
+    .tool-section > h3 { margin-bottom: 8px; }
+    .help { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0 0 10px; }
+    .profile-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+    .profile-grid .full { grid-column: 1 / -1; }
+    .jobs-controls { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(180px, .7fr) auto; gap: 8px; align-items: end; margin: 14px 0 10px; }
+    .job-row { width: 100%; display: block; border: 0; border-top: 1px solid var(--line); border-radius: 0; text-align: left; padding: 10px 4px; min-height: 0; }
+    .job-row[aria-pressed="true"] { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); padding-left: 10px; }
+    .job-title { font-weight: 650; overflow-wrap: anywhere; }
+    .progress-bar { height: 10px; background: #e8ecef; border-radius: 99px; overflow: hidden; margin: 7px 0; }
+    .progress-bar > span { display: block; height: 100%; background: var(--accent); width: 0; transition: width .2s ease; }
+    .job-detail { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 10px; }
+    .job-items { max-height: 180px; overflow: auto; font-size: 12px; line-height: 1.5; }
+    .log-box { max-height: 180px; min-height: 72px; overflow: auto; background: #f8fafb; border: 1px solid var(--line); padding: 8px; font-size: 12px; white-space: pre-wrap; }
+    .impact-inputs { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: end; }
+    .impact-stats { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 13px; }
+    .impact-stats th, .impact-stats td { border: 1px solid var(--line); padding: 7px 8px; text-align: left; }
+    .impact-stats th { background: #f8fafb; }
+    .impact-guidance { border-left: 3px solid var(--warning); padding-left: 10px; color: var(--muted); }
+    @media (max-width: 800px) {
       .header-inner { align-items: flex-start; flex-direction: column; padding: 13px 0; }
-      .toolbar, .registry-bar, .layout-split, .jobs-controls { grid-template-columns: 1fr; }
+      .registry-bar, .toolbar, .layout-split, .impact-inputs { grid-template-columns: 1fr; }
+      .jobs-controls { grid-template-columns: 1fr 1fr; }
+      .jobs-controls .primary { grid-column: 1 / -1; }
       .metadata { grid-template-columns: 1fr 1fr; }
       .grades { grid-template-columns: 1fr 1fr; }
     }
-    @media (max-width: 480px) {
-      .header-inner, main { width: min(100% - 20px, 1120px); }
-      .toolbar, .registry-bar, .metadata, .grades { grid-template-columns: 1fr; }
+    @media (max-width: 520px) {
+      .header-inner, main { width: min(100% - 20px, 1180px); }
+      .token-row, .profile-grid, .jobs-controls, .metadata, .grades { grid-template-columns: 1fr; }
+      .profile-grid .full, .jobs-controls .primary { grid-column: auto; }
       .candidate-head, .navigation { flex-direction: column; }
-      .navigation-group { width: 100%; }
-      .navigation-group button { flex: 1; }
+      .navigation-group, .job-actions, .profile-actions { width: 100%; }
+      .navigation-group button, .job-actions button, .profile-actions button { flex: 1 1 140px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
     }
   </style>
 </head>
@@ -179,142 +160,279 @@
     </div>
   </header>
   <main>
-    <section class="registry-bar" aria-label="服务端评审池">
-      <div class="field">
-        <label for="serverPoolSelect">已登记评审池</label>
-        <select id="serverPoolSelect" disabled><option value="">加载中…</option></select>
+    <section class="stage" aria-labelledby="workspaceHeading">
+      <div class="stage-heading">
+        <span class="stage-number">01</span>
+        <h2 id="workspaceHeading">选择工作区</h2>
+        <p>打开登记池或本地盲评文件，并确认评审身份。</p>
       </div>
-      <button id="refreshPoolsButton" type="button">刷新列表</button>
-      <button id="openServerPoolButton" type="button" disabled>打开登记池</button>
-      <div class="field">
-        <label for="reviewMode">模式</label>
-        <select id="reviewMode">
-          <option value="expert">专家盲评</option>
-          <option value="developer">开发者</option>
-          <option value="test">测试模式</option>
-        </select>
+      <div class="registry-bar">
+        <div class="field">
+          <label for="serverPoolSelect">已登记评审池</label>
+          <select id="serverPoolSelect" disabled><option value="">加载中…</option></select>
+        </div>
+        <button id="refreshPoolsButton" type="button">刷新列表</button>
+        <button id="openServerPoolButton" type="button" disabled>打开登记池</button>
+        <div class="field">
+          <label for="reviewMode">模式</label>
+          <select id="reviewMode">
+            <option value="expert">专家盲评</option>
+            <option value="developer">开发者</option>
+            <option value="test">测试模式</option>
+          </select>
+        </div>
       </div>
-    </section>
-    <div class="pool-meta" id="poolMeta"></div>
-    <div class="queue-bar" id="queueBar" aria-label="优先级队列">
-      <button type="button" data-queue="all" aria-pressed="true">全部</button>
-      <button type="button" data-queue="ungraded">未评分</button>
-      <button type="button" data-queue="low_confidence" class="dev-only">低置信</button>
-      <button type="button" data-queue="vote_disagreement" class="dev-only">投票分歧</button>
-      <button type="button" data-queue="hard_constraint_conflicts" class="dev-only">硬约束冲突</button>
-    </div>
-    <section class="toolbar" aria-label="评审工具栏">
-      <div>
-        <input id="poolFile" type="file" accept="application/json,.json">
-        <label class="file-button" for="poolFile" tabindex="0">打开本地盲评池</label>
-        <button id="importServerButton" type="button" style="margin-left:8px" disabled title="将当前本地池导入服务端登记">导入到服务端</button>
+      <div class="token-row">
+        <div class="field">
+          <label for="developerToken">开发者令牌（仅本次页面会话，不保存）</label>
+          <input id="developerToken" type="password" autocomplete="off" aria-describedby="developerTokenHint">
+        </div>
+        <button id="applyDeveloperTokenButton" type="button">验证令牌</button>
       </div>
-      <div class="field">
-        <label for="reviewerId">评审人编号</label>
-        <input id="reviewerId" type="text" autocomplete="off">
+      <div class="pool-meta" id="developerTokenHint">专家盲评无需令牌。开发者或测试模式会通过 X-Expert-Review-Token 请求头发送此值。</div>
+      <div class="pool-meta mode-banner" id="modeBanner" role="status" aria-live="polite"></div>
+      <section class="tool-section developer-tools hidden" id="poolBuildPanel">
+        <h3>从 Prompt 一键构建评审池</h3>
+        <p class="help">输入自然语言任务后，系统会自动发现候选、注册评审池，并默认使用所选专家 Profile 启动评审。</p>
+        <div class="field">
+          <label for="poolBuildPrompt">评审任务 Prompt</label>
+          <textarea id="poolBuildPrompt" placeholder="例如：寻找适用于人类 DDA 蛋白质组分析、包含原始数据和搜索结果的公开项目"></textarea>
+        </div>
+        <div class="jobs-controls">
+          <div class="field">
+            <label for="poolBuildAction">动作</label>
+            <select id="poolBuildAction">
+              <option value="build_and_review">构建并评审</option>
+              <option value="build_only">仅构建评审池</option>
+            </select>
+          </div>
+          <button id="startPoolBuildButton" class="primary" type="button">构建并评审</button>
+          <button id="refreshPoolBuildsButton" type="button">刷新构建状态</button>
+        </div>
+        <div class="status" id="poolBuildStatus" role="status" aria-live="polite"></div>
+        <div id="poolBuildList" aria-live="polite"></div>
+      </section>
+      <div class="pool-meta" id="poolMeta"></div>
+      <div class="toolbar">
+        <div class="file-actions">
+          <input id="poolFile" type="file" accept="application/json,.json">
+          <label class="file-button" id="poolFileButton" for="poolFile" role="button" tabindex="0">打开本地盲评池</label>
+          <button id="importServerButton" type="button" disabled title="将当前本地池导入服务端登记">导入到服务端</button>
+        </div>
+        <div class="field">
+          <label for="reviewerId">评审人编号</label>
+          <input id="reviewerId" type="text" autocomplete="off" required>
+        </div>
+        <div class="field">
+          <label for="taskFilter">问题</label>
+          <select id="taskFilter" disabled><option value="all">全部问题</option></select>
+        </div>
+        <button class="primary" id="exportButton" type="button" disabled>导出评分</button>
       </div>
-      <div class="field">
-        <label for="taskFilter">问题</label>
-        <select id="taskFilter" disabled><option value="all">全部问题</option></select>
-      </div>
-      <button class="primary" id="exportButton" type="button" disabled>导出评分</button>
     </section>
 
-    <section class="review-shell">
-      <div class="empty" id="emptyState">请选择 judgment_pool.blinded.json，或从上方打开已登记评审池</div>
-      <div class="review" id="reviewArea">
-        <div class="task-band">
-          <strong id="taskName"></strong>
-          <div class="task-prompt" id="taskPrompt"></div>
-        </div>
-        <div class="layout-split">
-          <article class="candidate">
-            <div class="candidate-head">
-              <h2 id="projectTitle"></h2>
-              <div class="candidate-index" id="candidateIndex"></div>
+    <section class="stage" aria-labelledby="reviewHeading">
+      <div class="stage-heading">
+        <span class="stage-number">02</span>
+        <h2 id="reviewHeading">评审候选</h2>
+        <p>按问题或优先级队列逐项评分。</p>
+      </div>
+      <div class="queue-bar" id="queueBar" aria-label="优先级队列">
+        <button type="button" data-queue="all" aria-pressed="true">全部</button>
+        <button type="button" data-queue="ungraded" aria-pressed="false">未评分</button>
+        <button type="button" data-queue="low_confidence" class="dev-only" aria-pressed="false">低置信</button>
+        <button type="button" data-queue="vote_disagreement" class="dev-only" aria-pressed="false">投票分歧</button>
+        <button type="button" data-queue="hard_constraint_conflicts" class="dev-only" aria-pressed="false">硬约束冲突</button>
+      </div>
+      <section class="review-shell">
+        <div class="empty" id="emptyState">请选择 judgment_pool.blinded.json，或从上方打开已登记评审池。开发者配置 API 不需要先打开池。</div>
+        <div class="review" id="reviewArea">
+          <div class="candidate-empty hidden" id="candidateEmptyState" role="status">当前队列或筛选下没有候选。请切换到“全部”或选择其他问题。</div>
+          <div id="reviewContent">
+            <div class="task-band" id="taskBand">
+              <strong id="taskName"></strong>
+              <div class="task-prompt" id="taskPrompt"></div>
             </div>
-            <div class="description" id="projectDescription"></div>
-            <dl class="metadata" id="metadata"></dl>
-            <div class="grade-label">相关性评分</div>
-            <div class="grades" role="group" aria-label="相关性评分">
-              <button class="grade" type="button" data-grade="0">0 不相关或冲突</button>
-              <button class="grade" type="button" data-grade="1">1 相关但不适用</button>
-              <button class="grade" type="button" data-grade="2">2 高度相关</button>
-              <button class="grade" type="button" data-grade="3">3 直接满足</button>
+            <div class="layout-split">
+              <article class="candidate">
+                <div class="candidate-head">
+                  <h2 id="projectTitle" tabindex="-1"></h2>
+                  <div class="candidate-index" id="candidateIndex"></div>
+                </div>
+                <div class="description" id="projectDescription"></div>
+                <dl class="metadata" id="metadata"></dl>
+                <div class="grade-label">相关性评分</div>
+                <div class="grades" role="group" aria-label="相关性评分">
+                  <button class="grade" type="button" data-grade="0">0 不相关或冲突</button>
+                  <button class="grade" type="button" data-grade="1">1 相关但不适用</button>
+                  <button class="grade" type="button" data-grade="2">2 高度相关</button>
+                  <button class="grade" type="button" data-grade="3">3 直接满足</button>
+                </div>
+                <div class="field notes">
+                  <label for="reviewNotes">评分理由</label>
+                  <textarea id="reviewNotes"></textarea>
+                </div>
+              </article>
+              <aside class="side-rail hidden" id="machineRail">
+                <h3>机器评审轨迹（仅开发者）</h3>
+                <div id="machineSummary" class="pool-meta"></div>
+                <div id="machineVotes"></div>
+                <div id="machineRuns"></div>
+              </aside>
             </div>
-            <div class="field notes">
-              <label for="reviewNotes">评分理由</label>
-              <textarea id="reviewNotes"></textarea>
-            </div>
-          </article>
-          <aside class="side-rail hidden" id="machineRail">
-            <h3>机器票（仅开发者）</h3>
-            <div id="machineSummary" class="pool-meta"></div>
-            <div id="machineVotes"></div>
-          </aside>
-        </div>
-        <nav class="navigation" aria-label="候选导航">
-          <div class="navigation-group">
-            <button id="previousButton" type="button" title="上一个候选" aria-label="上一个候选">&#8592;</button>
-            <button id="nextButton" type="button" title="下一个候选" aria-label="下一个候选">&#8594;</button>
+            <nav class="navigation" aria-label="候选导航">
+              <div class="navigation-group">
+                <button id="previousButton" type="button" title="上一个候选" aria-label="上一个候选">&#8592;</button>
+                <button id="nextButton" type="button" title="下一个候选" aria-label="下一个候选">&#8594;</button>
+              </div>
+              <div class="navigation-group">
+                <button id="nextUngradedButton" type="button">下一个未评分</button>
+                <button id="clearButton" type="button">清除当前候选评分</button>
+              </div>
+            </nav>
           </div>
-          <div class="navigation-group">
-            <button id="nextUngradedButton" type="button">下一个未评分</button>
-            <button id="clearButton" type="button">清空本地评分</button>
-          </div>
-        </nav>
-        <div class="status" id="statusText" role="status" aria-live="polite"></div>
-        <section class="impact-panel hidden" id="impactPanel">
-          <h3>测试模式影响</h3>
+          <div class="status" id="statusText" role="status" aria-live="polite"></div>
+        </div>
+      </section>
+    </section>
+
+    <section class="stage developer-tools hidden" id="developerTools" aria-labelledby="developerHeading">
+      <div class="stage-heading">
+        <span class="stage-number">03</span>
+        <h2 id="developerHeading">开发者工具</h2>
+        <p>配置模型、运行 Agent 专家 Job，并检查测试影响。</p>
+      </div>
+      <div class="pool-meta dev-only" id="apiConfigHint">API Key 仅提交到当前服务端配置接口；开发者令牌只保留在本页内存中。</div>
+
+      <section class="tool-section" id="jobsPanel">
+        <h3>Agent 专家 API 配置与 Job</h3>
+        <p class="help">Profile 编辑器与 Job 使用的 Profile 选择器彼此独立。切换 Job Profile 不会覆盖尚未保存的编辑内容。</p>
+        <div class="field" style="max-width:560px;margin-bottom:10px">
+          <label for="profileEditorSelect">编辑已保存 Profile</label>
+          <select id="profileEditorSelect"><option value="">选择一个 Profile，或新建空白</option></select>
+        </div>
+        <div class="profile-grid" id="profileEditor">
           <div class="field">
-            <label for="impactKeyPath">key 路径（服务端可读，runs/ 下）</label>
+            <label for="profileIdInput">Profile ID</label>
+            <input id="profileIdInput" type="text" placeholder="gpt-judge / grok-judge / deepseek-judge">
+          </div>
+          <div class="field">
+            <label for="profileLabelInput">显示名</label>
+            <input id="profileLabelInput" type="text" placeholder="GPT 专家">
+          </div>
+          <div class="field full">
+            <label for="profileApiKeyInput">API Key</label>
+            <input id="profileApiKeyInput" type="password" autocomplete="off" placeholder="更新时留空表示保留原 key">
+          </div>
+          <div class="field full">
+            <label for="profileBaseUrlInput">Base URL（OpenAI 兼容）</label>
+            <input id="profileBaseUrlInput" type="text" placeholder="https://api.openai.com/v1">
+          </div>
+          <div class="field">
+            <label for="profileModelSelect">模型（拉取后选择）</label>
+            <select id="profileModelSelect"><option value="">先获取模型列表</option></select>
+          </div>
+          <div class="field">
+            <label for="profileModelManual">或手填模型名</label>
+            <input id="profileModelManual" type="text" placeholder="gpt-5 / deepseek-chat / grok">
+          </div>
+          <div class="field">
+            <label for="profileTimeoutInput">Timeout 秒</label>
+            <input id="profileTimeoutInput" type="number" min="1" value="120">
+          </div>
+          <div class="field" style="align-content:end">
+            <label><input id="profileMakeDefault" type="checkbox"> 设为默认 Profile</label>
+          </div>
+        </div>
+        <div class="profile-actions">
+          <button id="fetchModelsButton" type="button">获取模型列表</button>
+          <button id="saveProfileButton" type="button" class="primary">保存 Profile</button>
+          <button id="newProfileButton" type="button">新建空白</button>
+          <button id="deleteProfileButton" type="button" disabled>删除编辑中的 Profile</button>
+        </div>
+        <div class="status" id="profileStatus" role="status" aria-live="polite"></div>
+
+        <div class="jobs-controls">
+          <div class="field">
+            <label for="profileSelect">用于本 Job 的专家 Profile</label>
+            <select id="profileSelect"><option value="">加载中…</option></select>
+          </div>
+          <label><input id="independentModel" type="checkbox"> 独立模型族（provisional_independent_model）</label>
+          <button id="startJobButton" type="button" class="primary">启动 Agent 专家 Job</button>
+        </div>
+        <div id="jobsList" aria-live="polite"></div>
+        <div class="job-detail" id="jobDetail" aria-live="polite">请选择一个 Job 查看详情。</div>
+        <div class="field" style="margin-top:8px">
+          <label for="jobLog">选中 Job 日志</label>
+          <div class="log-box" id="jobLog" role="log" aria-live="polite" aria-relevant="additions text" tabindex="0">尚未选择 Job。</div>
+        </div>
+        <div class="job-actions" style="margin-top:8px">
+          <button id="refreshJobsButton" type="button">刷新 Jobs</button>
+          <button id="cancelJobButton" type="button" disabled>取消选中</button>
+          <button id="resumeJobButton" type="button" disabled>恢复未完成</button>
+          <button id="retryJobButton" type="button" disabled>重试失败</button>
+        </div>
+        <div class="status" id="jobStatus" role="status" aria-live="polite"></div>
+      </section>
+
+      <section class="tool-section hidden" id="impactPanel">
+        <h3>测试模式影响</h3>
+        <p class="help">绑定服务端可读的 key 与 run JSON。结果以数据表和文字展示，不使用装饰性图表。</p>
+        <div class="impact-inputs">
+          <div class="field">
+            <label for="impactKeyPath">key 路径（runs/ 下）</label>
             <input id="impactKeyPath" type="text" placeholder="runs/.../judgment_pool.key.json">
           </div>
-          <div class="field" style="margin-top:8px">
+          <div class="field">
             <label for="impactRunPaths">run JSON 路径（逗号分隔）</label>
             <input id="impactRunPaths" type="text" placeholder="runs/.../agent_run.json,runs/.../workflow_run.json">
           </div>
-          <div style="margin-top:8px; display:flex; gap:8px;">
-            <button id="bindImpactButton" type="button">绑定影响数据</button>
-          </div>
-          <div id="impactText" style="margin-top:10px"></div>
-        </section>
-        <section class="jobs-panel hidden" id="jobsPanel">
-          <h3>Agent 专家评审 Job</h3>
-          <div class="jobs-controls">
-            <div class="field">
-              <label for="profileSelect">LLM profile</label>
-              <select id="profileSelect"><option value="">加载中…</option></select>
-            </div>
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px;">
-              <input id="independentModel" type="checkbox"> 独立模型族
-            </label>
-            <button id="startJobButton" type="button" class="primary">启动 Job</button>
-          </div>
-          <div id="jobsList"></div>
-          <div class="field" style="margin-top:8px">
-            <label>选中 Job 日志</label>
-            <div class="log-box" id="jobLog"></div>
-          </div>
-          <div style="display:flex; gap:8px; margin-top:8px;">
-            <button id="refreshJobsButton" type="button">刷新 Jobs</button>
-            <button id="cancelJobButton" type="button">取消选中</button>
-            <button id="retryJobButton" type="button">重试失败</button>
-          </div>
-        </section>
-      </div>
+          <button id="bindImpactButton" type="button">绑定并计算</button>
+        </div>
+        <div id="impactText" aria-live="polite" style="margin-top:10px">尚未计算影响。</div>
+      </section>
     </section>
   </main>
   <script>
-    const storageKey = "discovery-blind-review/v1";
+    const storagePrefix = "discovery-blind-review/v2";
+    const terminalJobStatuses = new Set(["completed", "completed_with_errors", "failed", "cancelled"]);
+    const activeJobStatuses = new Set(["queued", "running"]);
+    const PAGE_LIMIT = 500;
+
     let pool = null;
+    let poolBase = null;
+    let poolIdentity = "";
+    let poolSource = "";
     let visible = [];
     let currentIndex = 0;
     let activePoolId = null;
+    let activePoolRecord = null;
+    let serverTotal = 0;
     let registryEnabled = true;
+    let developerAllowed = false;
     let activeQueue = "all";
+    let reviewerContext = "";
     let selectedJobId = null;
+    let selectedJobDetail = null;
     let jobPollTimer = null;
+    let jobsRequestInFlight = false;
+    let jobActionBusy = false;
+    let importBusy = false;
+    let poolRequestBusy = false;
+    let saveQueue = Promise.resolve();
+    let savingCount = 0;
+    let pendingNoteTimer = null;
+    let pendingNoteCandidateId = null;
+    let stickyStatusError = false;
+    let profiles = [];
+    let editingProfileId = null;
+    let profileBusy = false;
+    let impactBusy = false;
+    let impactGeneration = 0;
+    let lastJobStatuses = new Map();
+    let poolBuildBusy = false;
+    let poolBuildPollTimer = null;
+    const terminalPoolReloads = new Set();
 
     const byId = (id) => document.getElementById(id);
     const poolFile = byId("poolFile");
@@ -326,95 +444,201 @@
     const openServerPoolButton = byId("openServerPoolButton");
     const importServerButton = byId("importServerButton");
     const reviewMode = byId("reviewMode");
+    const developerToken = byId("developerToken");
 
-    function queryMode() {
-      const params = new URLSearchParams(window.location.search);
-      const mode = (params.get("mode") || "expert").toLowerCase();
+    function requestedModeFromQuery() {
+      const mode = (new URLSearchParams(window.location.search).get("mode") || "expert").toLowerCase();
       return ["expert", "developer", "test"].includes(mode) ? mode : "expert";
     }
-    function currentMode() { return reviewMode.value || queryMode(); }
-    function isDevMode() { return currentMode() !== "expert"; }
-    reviewMode.value = queryMode();
 
+    function currentMode() { return reviewMode.value || "expert"; }
+    function isDevMode() { return currentMode() !== "expert" && developerAllowed; }
+    function isTerminalJob(status) { return terminalJobStatuses.has(String(status || "")); }
+    function currentCandidate() {
+      if (!pool || !visible.length || currentIndex < 0 || currentIndex >= visible.length) return null;
+      return visible[currentIndex] || null;
+    }
+    function cloneData(value) { return JSON.parse(JSON.stringify(value)); }
+    function isGraded(candidate) { return Boolean(candidate) && [0, 1, 2, 3].includes(candidate.grade); }
+    function taskKey(candidate) { return candidate ? `${candidate.scenario_id || ""}:${candidate.variant_id || ""}` : ""; }
     function text(value) {
-      if (Array.isArray(value)) return value.length ? value.join(", ") : "未记录";
+      if (Array.isArray(value)) return value.length ? value.map((item) => text(item)).join("；") : "未记录";
+      if (value && typeof value === "object") return JSON.stringify(value);
       if (value === null || value === undefined || value === "") return "未记录";
       return String(value);
     }
-
-    function reviewState() {
-      try { return JSON.parse(localStorage.getItem(storageKey) || "{}"); }
-      catch { return {}; }
+    function asTextList(value) {
+      if (Array.isArray(value)) return value.flatMap((item) => asTextList(item)).filter(Boolean);
+      if (value === null || value === undefined || value === "") return [];
+      if (typeof value === "object") return [JSON.stringify(value)];
+      return [String(value)];
+    }
+    function formatDate(value) {
+      if (!value) return "未知";
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("zh-CN");
+    }
+    function setOptions(select, items, placeholder) {
+      select.replaceChildren();
+      if (placeholder !== null) {
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = placeholder;
+        select.appendChild(option);
+      }
+      for (const item of items) {
+        const option = document.createElement("option");
+        option.value = item.value;
+        option.textContent = item.label;
+        select.appendChild(option);
+      }
     }
 
-    function saveState() {
-      if (!pool) return;
+    async function apiRequest(url, options = {}) {
+      const headers = new Headers(options.headers || {});
+      const token = developerToken.value.trim();
+      if (token) headers.set("X-Expert-Review-Token", token);
+      const response = await fetch(url, { ...options, headers });
+      let payload;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        throw new Error(`服务端返回了无效响应（HTTP ${response.status}）`);
+      }
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      return payload;
+    }
+
+    function setReviewStatus(message, kind = "info", sticky = false) {
+      const root = byId("statusText");
+      root.textContent = message || "";
+      root.classList.toggle("error", kind === "error");
+      root.classList.toggle("success", kind === "success");
+      stickyStatusError = sticky && kind === "error";
+    }
+    function clearReviewError() {
+      stickyStatusError = false;
+      byId("statusText").classList.remove("error", "success");
+    }
+    function setProfileStatus(message, error = false) {
+      byId("profileStatus").textContent = message || "";
+      byId("profileStatus").classList.toggle("error", error);
+    }
+    function setJobStatus(message, error = false) {
+      byId("jobStatus").textContent = message || "";
+      byId("jobStatus").classList.toggle("error", error);
+    }
+
+    function storageKeyFor(reviewer = reviewerContext) {
+      if (!poolIdentity || !reviewer) return null;
+      return `${storagePrefix}/${encodeURIComponent(poolIdentity)}/${encodeURIComponent(reviewer)}`;
+    }
+    function reviewState(reviewer = reviewerContext) {
+      const key = storageKeyFor(reviewer);
+      if (!key) return {};
+      try {
+        return JSON.parse(localStorage.getItem(key) || "{}");
+      } catch (error) {
+        setReviewStatus("本地草稿损坏，已忽略。服务端登记池内容未受影响。", "error", true);
+        return {};
+      }
+    }
+    function saveState(reviewer = reviewerContext) {
+      if (!pool || !reviewer) return;
+      const key = storageKeyFor(reviewer);
+      if (!key) return;
       const reviews = {};
-      for (const candidate of pool.candidates) {
-        if ((candidate.grade !== null && candidate.grade !== undefined) || candidate.review_notes) {
+      for (const candidate of pool.candidates || []) {
+        if (isGraded(candidate) || candidate.review_notes || candidate.__unsaved) {
           reviews[candidate.candidate_id] = {
-            grade: candidate.grade,
+            grade: isGraded(candidate) ? candidate.grade : null,
             review_notes: candidate.review_notes || "",
-            reviewer_id: candidate.reviewer_id || reviewerId.value.trim()
+            reviewer_id: reviewer,
+            unsaved: Boolean(candidate.__unsaved),
+            saved_at: new Date().toISOString()
           };
         }
       }
-      localStorage.setItem(storageKey, JSON.stringify({ reviewer_id: reviewerId.value.trim(), reviews }));
+      localStorage.setItem(key, JSON.stringify({ pool_identity: poolIdentity, reviewer_id: reviewer, reviews }));
     }
-
     function restoreState() {
+      if (!pool || !reviewerContext) return;
       const saved = reviewState();
-      reviewerId.value = saved.reviewer_id || "";
-      for (const candidate of pool.candidates) {
-        const review = (saved.reviews || {})[candidate.candidate_id];
-        if (!review) continue;
-        if (candidate.grade === null || candidate.grade === undefined) {
-          candidate.grade = review.grade;
-          candidate.review_notes = review.review_notes || "";
-          candidate.reviewer_id = review.reviewer_id || "";
+      if (saved.pool_identity !== poolIdentity || saved.reviewer_id !== reviewerContext) return;
+      for (const candidate of pool.candidates || []) {
+        const draft = (saved.reviews || {})[candidate.candidate_id];
+        if (!draft || draft.reviewer_id !== reviewerContext) continue;
+        const serverHasReview = isGraded(candidate) || Boolean(candidate.review_notes);
+        if (poolSource === "local" || !serverHasReview || draft.unsaved) {
+          candidate.grade = [0, 1, 2, 3].includes(draft.grade) ? draft.grade : null;
+          candidate.review_notes = draft.review_notes || "";
+          candidate.reviewer_id = reviewerContext;
+          candidate.__unsaved = Boolean(draft.unsaved);
+          candidate.__draftFallback = poolSource === "server";
         }
       }
     }
-
-    function taskKey(candidate) { return `${candidate.scenario_id}:${candidate.variant_id}`; }
-    function isGraded(candidate) {
-      return candidate.grade === 0 || candidate.grade === 1 || candidate.grade === 2 || candidate.grade === 3;
+    function resetPoolToBase() {
+      if (!poolBase) return;
+      pool = cloneData(poolBase);
+      restoreState();
     }
+
+    function localIdentity(parsed, fileName) {
+      const ids = (parsed.candidates || []).map((candidate) => String(candidate.candidate_id || "")).join("|");
+      let hash = 2166136261;
+      const seed = `${parsed.schema_version || ""}|${parsed.label || ""}|${fileName || ""}|${ids}`;
+      for (let index = 0; index < seed.length; index += 1) {
+        hash ^= seed.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+      }
+      return `local:${fileName || "pool"}:${(hash >>> 0).toString(16)}`;
+    }
+
     function queueOf(candidate) {
       if (!isGraded(candidate)) return "ungraded";
       if (!isDevMode()) return "graded";
-      const votes = candidate.machine_reviews || [];
-      const conflicts = [];
-      for (const vote of votes) {
-        for (const item of (vote.constraint_conflicts || [])) if (item) conflicts.push(item);
-      }
+      const votes = Array.isArray(candidate.machine_reviews) ? candidate.machine_reviews : candidate.machine_reviews ? [candidate.machine_reviews] : [];
+      const conflicts = votes.flatMap((vote) => asTextList(vote && vote.constraint_conflicts));
       if (conflicts.length) return "hard_constraint_conflicts";
-      const grades = [...new Set(votes.map(v => Number(v.grade)).filter(Number.isInteger))];
-      if (grades.length >= 2 && (Math.max(...grades) - Math.min(...grades) >= 2)) return "vote_disagreement";
+      const grades = [...new Set(votes.map((vote) => Number(vote && vote.grade)).filter(Number.isInteger))];
+      if (grades.length >= 2 && Math.max(...grades) - Math.min(...grades) >= 2) return "vote_disagreement";
       if ((candidate.judgment_confidence || candidate.confidence) === "low") return "low_confidence";
       return "graded";
     }
 
-    function rebuildFilter() {
-      const keys = [...new Set(pool.candidates.map(taskKey))].sort();
-      taskFilter.innerHTML = '<option value="all">全部问题</option>';
-      for (const key of keys) {
-        const option = document.createElement("option");
-        option.value = key;
-        option.textContent = key;
-        taskFilter.appendChild(option);
-      }
-      taskFilter.disabled = false;
+    function setActiveQueue(queue) {
+      activeQueue = queue;
+      document.querySelectorAll("#queueBar button").forEach((button) => {
+        button.setAttribute("aria-pressed", String(button.dataset.queue === queue));
+      });
     }
 
-    function applyFilter() {
-      visible = pool.candidates.filter((candidate) => {
-        const taskOk = taskFilter.value === "all" || taskKey(candidate) === taskFilter.value;
-        const queueOk = activeQueue === "all" || queueOf(candidate) === activeQueue;
-        return taskOk && queueOk;
+    function rebuildFilter() {
+      const previous = taskFilter.value || "all";
+      const keys = [...new Set((pool.candidates || []).map(taskKey).filter(Boolean))].sort();
+      setOptions(taskFilter, [{ value: "all", label: "全部问题" }, ...keys.map((key) => ({ value: key, label: key }))], null);
+      taskFilter.value = keys.includes(previous) || previous === "all" ? previous : "all";
+      taskFilter.disabled = keys.length === 0;
+    }
+
+    function applyFilter(preferredCandidateId = null, focusHeading = true) {
+      if (!pool) {
+        visible = [];
+        currentIndex = 0;
+        render({ focusHeading: false });
+        return;
+      }
+      const previousCandidate = preferredCandidateId || (currentCandidate() && currentCandidate().candidate_id);
+      visible = (pool.candidates || []).filter((candidate) => {
+        const taskMatches = taskFilter.value === "all" || taskKey(candidate) === taskFilter.value;
+        const queueMatches = activeQueue === "all" || queueOf(candidate) === activeQueue;
+        return taskMatches && queueMatches;
       });
-      currentIndex = Math.min(currentIndex, Math.max(0, visible.length - 1));
-      render();
+      const preservedIndex = previousCandidate ? visible.findIndex((candidate) => candidate.candidate_id === previousCandidate) : -1;
+      if (preservedIndex >= 0) currentIndex = preservedIndex;
+      else currentIndex = Math.min(currentIndex, Math.max(0, visible.length - 1));
+      render({ focusHeading });
     }
 
     function meta(label, value) {
@@ -428,67 +652,126 @@
       return wrapper;
     }
 
-    function setPoolMeta(message) { byId("poolMeta").textContent = message || ""; }
-
-    function updateModeChrome() {
-      const dev = isDevMode();
-      document.querySelectorAll(".dev-only").forEach((el) => el.classList.toggle("hidden", !dev));
-      byId("machineRail").classList.toggle("hidden", !dev);
-      byId("impactPanel").classList.toggle("hidden", currentMode() !== "test");
-      byId("jobsPanel").classList.toggle("hidden", !dev);
-      if (dev) { refreshProfiles(); refreshJobs(); }
+    function setPoolMeta() {
+      const root = byId("poolMeta");
+      if (!pool) {
+        root.textContent = "";
+        return;
+      }
+      if (poolSource === "local") {
+        root.textContent = `当前工作区：本地评审池 · ${(pool.candidates || []).length} 个候选。导出文件仅包含本地工作区内容。`;
+        return;
+      }
+      if (!isDevMode()) {
+        root.textContent = "当前工作区：已登记评审池。开发者统计与路径信息在专家模式下隐藏。";
+        return;
+      }
+      const stats = (activePoolRecord && activePoolRecord.stats) || pool.__stats || {};
+      const parts = [
+        `服务端池 ${activePoolRecord && (activePoolRecord.label || activePoolRecord.pool_id) || activePoolId}`,
+        `候选 ${serverTotal}`,
+        `人工评分 ${stats.graded_human ?? "未知"}`,
+        `机器评分 ${stats.graded_machine ?? "未知"}`,
+        `低置信 ${stats.low_confidence ?? "未知"}`,
+        `更新时间 ${formatDate(activePoolRecord && activePoolRecord.updated_at)}`
+      ];
+      root.textContent = parts.join(" · ");
     }
 
-    function activatePool(parsed, metaMessage) {
-      if (!Array.isArray(parsed.candidates) || !parsed.candidates.length) throw new Error("评审池没有候选项目");
-      pool = parsed;
-      restoreState();
-      rebuildFilter();
-      byId("emptyState").style.display = "none";
-      byId("reviewArea").style.display = "block";
-      exportButton.disabled = false;
-      importServerButton.disabled = !registryEnabled;
-      setPoolMeta(metaMessage || "");
-      updateModeChrome();
-      currentIndex = 0;
-      applyFilter();
+    function updateModeChrome(explanation = "") {
+      const dev = isDevMode();
+      document.querySelectorAll(".dev-only").forEach((element) => element.classList.toggle("hidden", !dev));
+      byId("developerTools").classList.toggle("hidden", !dev);
+      byId("poolBuildPanel").classList.toggle("hidden", !dev);
+      byId("machineRail").classList.toggle("hidden", !dev || !currentCandidate());
+      byId("impactPanel").classList.toggle("hidden", currentMode() !== "test" || !developerAllowed);
+      if (!dev) stopJobPolling();
+      const banner = byId("modeBanner");
+      if (explanation) banner.textContent = explanation;
+      else if (currentMode() === "expert") banner.textContent = "当前模式：专家盲评。机器票、API Profile、Job 与影响数据均隐藏。";
+      else if (currentMode() === "test") banner.textContent = "当前模式：测试模式。可配置模型、运行 Job 并查看评分影响。";
+      else banner.textContent = "当前模式：开发者。可配置模型并运行 Agent 专家 Job。";
+      setPoolMeta();
+    }
+
+    function clearCandidateDisplay() {
+      byId("taskName").textContent = "";
+      byId("taskPrompt").textContent = "";
+      byId("projectTitle").textContent = "";
+      byId("projectDescription").textContent = "";
+      byId("candidateIndex").textContent = "";
+      byId("metadata").replaceChildren();
+      byId("reviewNotes").value = "";
+      byId("machineSummary").textContent = "";
+      byId("machineVotes").replaceChildren();
+      byId("machineRuns").replaceChildren();
+      for (const button of gradeButtons) {
+        button.classList.remove("selected");
+        button.setAttribute("aria-pressed", "false");
+      }
+    }
+
+    function setReviewControlsDisabled(disabled) {
+      const noCandidate = !currentCandidate();
+      const reviewerMissing = !reviewerId.value.trim();
+      const gradeDisabled = disabled || noCandidate || reviewerMissing || savingCount > 0;
+      gradeButtons.forEach((button) => { button.disabled = gradeDisabled; });
+      byId("reviewNotes").disabled = disabled || noCandidate || savingCount > 0;
+      byId("previousButton").disabled = disabled || noCandidate || currentIndex <= 0 || savingCount > 0;
+      byId("nextButton").disabled = disabled || noCandidate || currentIndex >= visible.length - 1 || savingCount > 0;
+      byId("nextUngradedButton").disabled = disabled || noCandidate || savingCount > 0;
+      byId("clearButton").disabled = disabled || noCandidate || reviewerMissing || savingCount > 0;
     }
 
     function renderMachineRail(candidate) {
-      if (!isDevMode()) return;
-      const votes = candidate.machine_reviews || [];
+      if (!isDevMode() || !candidate) return;
+      const rawVotes = candidate.machine_reviews;
+      const votes = Array.isArray(rawVotes) ? rawVotes : rawVotes ? [rawVotes] : [];
       byId("machineSummary").textContent = votes.length
-        ? `置信度：${candidate.judgment_confidence || candidate.confidence || "未知"} · ${votes.length} 票 · 模型 ${candidate.review_model || "未知"}`
-        : "当前候选没有机器票";
-      const box = byId("machineVotes");
-      box.replaceChildren();
+        ? `置信度：${candidate.judgment_confidence || candidate.confidence || "未知"} · 当前累计 ${votes.length} 票`
+        : "当前候选没有机器票。";
+      const votesRoot = byId("machineVotes");
+      votesRoot.replaceChildren();
       votes.forEach((vote, index) => {
-        const div = document.createElement("div");
-        div.className = "vote-item";
-        const evidence = (vote.supporting_evidence || []).join("；") || "无";
-        const conflicts = (vote.constraint_conflicts || []).join("；") || "无";
-        div.textContent = `#${index + 1} 分 ${vote.grade}｜${vote.reason || ""}｜证据：${evidence}｜冲突：${conflicts}`;
-        box.appendChild(div);
+        const item = document.createElement("div");
+        item.className = "vote-item";
+        const evidence = asTextList(vote && vote.supporting_evidence).join("；") || "无";
+        const conflicts = asTextList(vote && vote.constraint_conflicts).join("；") || "无";
+        item.textContent = `票 ${index + 1} · 分数 ${text(vote && vote.grade)} · 模型 ${text(vote && (vote.model || vote.review_model))} · 理由 ${text(vote && vote.reason)} · 证据 ${evidence} · 冲突 ${conflicts}`;
+        votesRoot.appendChild(item);
       });
-    }
-
-    function renderImpact(impact) {
-      const root = byId("impactText");
-      if (!impact) { root.textContent = "尚未计算影响。"; return; }
-      root.replaceChildren();
-      for (const sentence of (impact.sentences || [])) {
-        const p = document.createElement("p");
-        p.textContent = sentence;
-        root.appendChild(p);
+      const runsRoot = byId("machineRuns");
+      runsRoot.replaceChildren();
+      const runs = Array.isArray(candidate.machine_review_runs) ? candidate.machine_review_runs : candidate.machine_review_runs ? [candidate.machine_review_runs] : [];
+      if (runs.length) {
+        const heading = document.createElement("h3");
+        heading.textContent = "累计运行";
+        runsRoot.appendChild(heading);
+        runs.forEach((run, index) => {
+          const item = document.createElement("div");
+          item.className = "run-item";
+          item.textContent = `运行 ${index + 1} · Job ${text(run && (run.job_id || run.run_id))} · 模型 ${text(run && (run.model || run.profile_id))} · 状态 ${text(run && run.status)} · 时间 ${formatDate(run && (run.finished_at || run.created_at || run.updated_at))}`;
+          runsRoot.appendChild(item);
+        });
       }
     }
 
-    function render() {
-      if (!pool || !visible.length) {
-        if (pool && !visible.length) byId("statusText").textContent = "当前队列/筛选下没有候选";
+    function render({ focusHeading = false } = {}) {
+      const hasPool = Boolean(pool);
+      const candidate = currentCandidate();
+      byId("emptyState").style.display = hasPool ? "none" : "grid";
+      byId("reviewArea").style.display = hasPool ? "block" : "none";
+      byId("candidateEmptyState").classList.toggle("hidden", !hasPool || Boolean(candidate));
+      byId("reviewContent").classList.toggle("hidden", !candidate);
+      if (!candidate) {
+        clearCandidateDisplay();
+        setReviewControlsDisabled(true);
+        if (hasPool && !stickyStatusError) setReviewStatus("当前队列/筛选下没有候选。评分、备注和导航已禁用。", "info");
+        const graded = (pool && pool.candidates || []).filter(isGraded).length;
+        const denominator = poolSource === "server" ? serverTotal : (pool && pool.candidates || []).length;
+        byId("progressText").textContent = hasPool ? `已评分 ${graded} / ${denominator}` : "尚未载入评审池";
         return;
       }
-      const candidate = visible[currentIndex];
       const key = taskKey(candidate);
       const task = (pool.tasks || {})[key] || {};
       byId("taskName").textContent = key;
@@ -496,8 +779,7 @@
       byId("projectTitle").textContent = candidate.project_title || "未命名项目";
       byId("projectDescription").textContent = candidate.project_description || "没有项目描述";
       byId("candidateIndex").textContent = `${currentIndex + 1} / ${visible.length}`;
-      const metadata = byId("metadata");
-      metadata.replaceChildren(
+      byId("metadata").replaceChildren(
         meta("物种", candidate.species),
         meta("采集模式", candidate.acquisition_mode),
         meta("标记方式", candidate.labeling_strategy),
@@ -514,341 +796,1147 @@
         button.setAttribute("aria-pressed", String(selected));
       }
       byId("reviewNotes").value = candidate.review_notes || "";
-      byId("previousButton").disabled = currentIndex === 0;
-      byId("nextButton").disabled = currentIndex >= visible.length - 1;
-      const graded = pool.candidates.filter((item) => isGraded(item)).length;
-      byId("progressText").textContent = `已评分 ${graded} / ${pool.candidates.length}`;
-      byId("statusText").textContent = isGraded(candidate) ? `当前评分：${candidate.grade}` : "当前候选未评分";
+      const graded = (pool.candidates || []).filter(isGraded).length;
+      const denominator = poolSource === "server" ? serverTotal : (pool.candidates || []).length;
+      byId("progressText").textContent = `已评分 ${graded} / ${denominator}`;
+      if (!stickyStatusError) {
+        const draftCopy = candidate.__unsaved ? "（未保存草稿）" : candidate.__draftFallback ? "（本地草稿回显）" : "";
+        setReviewStatus(isGraded(candidate) ? `当前评分：${candidate.grade}${draftCopy}` : `当前候选未评分${draftCopy}`, candidate.__unsaved ? "error" : "info", Boolean(candidate.__unsaved));
+      }
+      byId("machineRail").classList.toggle("hidden", !isDevMode());
       renderMachineRail(candidate);
+      setReviewControlsDisabled(false);
+      if (focusHeading) requestAnimationFrame(() => byId("projectTitle").focus());
     }
 
-    async function persistGrade(candidate) {
-      saveState();
-      if (!activePoolId) return;
+    function resetPoolDependentDeveloperState() {
+      selectedJobId = null;
+      selectedJobDetail = null;
+      byId("jobLog").textContent = "尚未选择 Job。";
+      byId("jobDetail").textContent = "请选择一个 Job 查看详情。";
+      byId("jobsList").replaceChildren();
+      setJobStatus("");
+      impactGeneration += 1;
+      byId("impactKeyPath").value = "";
+      byId("impactRunPaths").value = "";
+      byId("impactText").textContent = "尚未计算影响。";
+      stopJobPolling();
+      lastJobStatuses = new Map();
+    }
+
+    function activatePool(parsed, options) {
+      if (!parsed || !Array.isArray(parsed.candidates) || !parsed.candidates.length) throw new Error("评审池没有候选项目");
+      const previousPoolIdentity = poolIdentity;
+      poolSource = options.source;
+      activePoolId = options.poolId || null;
+      activePoolRecord = options.record || null;
+      serverTotal = Number.isInteger(options.total) ? options.total : parsed.candidates.length;
+      poolIdentity = options.identity;
+      poolBase = cloneData(parsed);
+      pool = cloneData(parsed);
+      reviewerContext = reviewerId.value.trim();
+      restoreState();
+      rebuildFilter();
+      if (previousPoolIdentity !== poolIdentity) resetPoolDependentDeveloperState();
+      const preferred = options.preferredCandidateId || null;
+      currentIndex = 0;
+      importServerButton.disabled = poolSource !== "local" || !registryEnabled;
+      exportButton.disabled = false;
+      setPoolMeta();
+      applyFilter(preferred, false);
+      if (isDevMode()) void refreshJobs();
+    }
+
+    async function refreshStatus() {
       try {
-        const payload = await fetch(`/api/expert-review/pools/${encodeURIComponent(activePoolId)}/grades/${encodeURIComponent(candidate.candidate_id)}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            grade: candidate.grade,
-            notes: candidate.review_notes || "",
-            reviewer_id: reviewerId.value.trim(),
-            mode: currentMode(),
-            impact_session_id: activePoolId
-          })
-        }).then(r => r.json());
-        if (payload && payload.ok && payload.candidate) {
-          Object.assign(candidate, payload.candidate);
-          if (payload.impact) renderImpact(payload.impact);
-        } else if (payload && payload.error) {
-          byId("statusText").textContent = `保存失败：${payload.error}`;
+        const payload = await apiRequest("/api/expert-review/status");
+        registryEnabled = Boolean(payload && payload.enabled !== false && payload.ok !== false);
+        developerAllowed = Boolean(payload && payload.developer_allowed);
+        const requested = currentMode();
+        if (requested !== "expert" && !developerAllowed) {
+          reviewMode.value = "expert";
+          setActiveQueue("all");
+          updateUrlMode("expert");
+          updateModeChrome("请求的开发者/测试模式未获授权，已切回专家盲评。请填写有效开发者令牌后重试。");
+        } else {
+          updateModeChrome();
         }
+        importServerButton.disabled = poolSource !== "local" || !registryEnabled || !developerAllowed || importBusy;
+        return true;
       } catch (error) {
-        byId("statusText").textContent = `保存失败：${error.message}`;
+        registryEnabled = false;
+        developerAllowed = false;
+        if (currentMode() !== "expert") reviewMode.value = "expert";
+        updateModeChrome(`无法验证开发者权限，已使用专家盲评：${error.message}`);
+        return false;
       }
     }
 
     async function refreshRegistry() {
-      try {
-        const status = await fetch("/api/expert-review/status").then((r) => r.json());
-        registryEnabled = Boolean(status && status.enabled !== false && status.ok !== false);
-        if (!registryEnabled) {
-          serverPoolSelect.innerHTML = '<option value="">服务端登记未启用</option>';
-          serverPoolSelect.disabled = true;
-          openServerPoolButton.disabled = true;
-          importServerButton.disabled = true;
-          return;
-        }
-        const payload = await fetch("/api/expert-review/pools").then((r) => r.json());
-        const pools = (payload && payload.pools) || [];
-        serverPoolSelect.innerHTML = "";
-        if (!pools.length) {
-          serverPoolSelect.innerHTML = '<option value="">暂无已登记评审池</option>';
-          serverPoolSelect.disabled = true;
-          openServerPoolButton.disabled = true;
-        } else {
-          for (const item of pools) {
-            const option = document.createElement("option");
-            option.value = item.pool_id;
-            const count = (item.stats && item.stats.candidate_count) || "?";
-            option.textContent = `${item.label || item.pool_id} (${count})`;
-            serverPoolSelect.appendChild(option);
-          }
-          serverPoolSelect.disabled = false;
-          openServerPoolButton.disabled = false;
-          if (activePoolId) serverPoolSelect.value = activePoolId;
-        }
-      } catch (error) {
-        serverPoolSelect.innerHTML = '<option value="">无法连接登记服务</option>';
+      const allowed = await refreshStatus();
+      if (!allowed || !registryEnabled) {
+        setOptions(serverPoolSelect, [], "服务端登记未启用或不可用");
         serverPoolSelect.disabled = true;
         openServerPoolButton.disabled = true;
-        importServerButton.disabled = true;
-        registryEnabled = false;
+        return;
+      }
+      byId("refreshPoolsButton").disabled = true;
+      try {
+        const payload = await apiRequest(`/api/expert-review/pools?mode=${encodeURIComponent(currentMode())}`);
+        if (!payload || !payload.ok) throw new Error(payload && payload.error || "无法加载评审池");
+        if (payload.mode && payload.mode !== currentMode()) {
+          reviewMode.value = "expert";
+          setActiveQueue("all");
+          updateUrlMode("expert");
+          updateModeChrome("服务端拒绝了开发者模式，已切回专家盲评。");
+        }
+        const records = Array.isArray(payload.pools) ? payload.pools : [];
+        window.__expertPoolRecords = records;
+        const previous = activePoolId || serverPoolSelect.value;
+        setOptions(serverPoolSelect, records.map((record) => ({
+          value: record.pool_id,
+          label: `${record.label || record.pool_id} (${(record.stats && record.stats.candidate_count) ?? "?"})`
+        })), records.length ? "选择评审池" : "暂无已登记评审池");
+        serverPoolSelect.disabled = records.length === 0;
+        if (previous && records.some((record) => record.pool_id === previous)) serverPoolSelect.value = previous;
+        openServerPoolButton.disabled = !serverPoolSelect.value;
+      } catch (error) {
+        setOptions(serverPoolSelect, [], "无法连接登记服务");
+        serverPoolSelect.disabled = true;
+        openServerPoolButton.disabled = true;
+        setReviewStatus(`评审池列表加载失败：${error.message}`, "error", true);
+      } finally {
+        byId("refreshPoolsButton").disabled = false;
       }
     }
 
-    async function openServerPool() {
-      const poolId = serverPoolSelect.value;
-      if (!poolId) return;
+    async function openServerPool(poolId = serverPoolSelect.value, preferredCandidateId = null) {
+      if (!poolId || poolRequestBusy) return false;
+      poolRequestBusy = true;
+      openServerPoolButton.disabled = true;
+      clearReviewError();
       try {
         const mode = currentMode();
-        const payload = await fetch(`/api/expert-review/pools/${encodeURIComponent(poolId)}/candidates?mode=${encodeURIComponent(mode)}&limit=500`).then((r) => r.json());
-        if (!payload || !payload.ok) throw new Error((payload && payload.error) || "打开失败");
-        activePoolId = poolId;
-        activatePool(
-          { candidates: payload.candidates, tasks: payload.tasks || {} },
-          `服务端池 ${payload.label || poolId} · 模式 ${mode} · 候选 ${payload.total}`
-        );
+        let offset = 0;
+        let total = null;
+        let tasks = {};
+        let stats = {};
+        let label = poolId;
+        const candidates = [];
+        while (total === null || offset < total) {
+          const reviewer = reviewerId.value.trim();
+          const reviewerQuery = reviewer ? `&reviewer_id=${encodeURIComponent(reviewer)}` : "";
+          const url = `/api/expert-review/pools/${encodeURIComponent(poolId)}/candidates?mode=${encodeURIComponent(mode)}&limit=${PAGE_LIMIT}&offset=${offset}${reviewerQuery}`;
+          const payload = await apiRequest(url);
+          if (!payload || !payload.ok) throw new Error(payload && payload.error || "打开失败");
+          if (payload.mode && payload.mode !== mode) {
+            reviewMode.value = "expert";
+            setActiveQueue("all");
+            updateUrlMode("expert");
+            updateModeChrome("服务端未授权所请求的模式，已切回专家盲评。");
+          }
+          const page = Array.isArray(payload.candidates) ? payload.candidates : [];
+          total = Number.isInteger(payload.total) ? payload.total : page.length;
+          candidates.push(...page);
+          tasks = payload.tasks || tasks;
+          stats = payload.stats || stats;
+          label = payload.label || label;
+          offset += page.length;
+          if (!page.length && offset < total) throw new Error(`分页在 ${offset}/${total} 提前结束`);
+        }
+        const records = window.__expertPoolRecords || [];
+        const record = records.find((item) => item.pool_id === poolId) || { pool_id: poolId, label, stats };
+        record.stats = record.stats || stats;
+        activatePool({ candidates, tasks, __stats: stats }, {
+          source: "server",
+          poolId,
+          identity: `server:${poolId}`,
+          total,
+          record,
+          preferredCandidateId
+        });
+        serverPoolSelect.value = poolId;
+        importServerButton.disabled = true;
+        setReviewStatus(`已从服务端载入 ${total} 个候选。`, "success");
+        return true;
       } catch (error) {
-        byId("emptyState").style.display = "grid";
-        byId("reviewArea").style.display = "none";
-        byId("emptyState").textContent = `无法打开登记池：${error.message}`;
+        setReviewStatus(`无法打开登记池：${error.message}。当前工作区保持不变。`, "error", true);
+        return false;
+      } finally {
+        poolRequestBusy = false;
+        openServerPoolButton.disabled = !serverPoolSelect.value;
       }
     }
 
     async function importCurrentPool() {
-      if (!pool || !registryEnabled) return;
+      if (!pool || poolSource !== "local" || !registryEnabled || importBusy) return;
+      importBusy = true;
+      importServerButton.disabled = true;
+      clearReviewError();
       try {
-        const payload = await fetch("/api/expert-review/pools/import", {
+        const payload = await apiRequest("/api/expert-review/pools/import", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ pool, label: pool.label || "imported-pool" })
-        }).then((r) => r.json());
-        if (!payload || !payload.ok) throw new Error((payload && payload.error) || "导入失败");
-        activePoolId = payload.pool.pool_id;
-        setPoolMeta(`已导入服务端：${payload.pool.label} (${payload.pool.pool_id})`);
+          body: JSON.stringify({ pool: poolBase, label: pool.label || "imported-pool" })
+        });
+        if (!payload || !payload.ok || !payload.pool) throw new Error(payload && payload.error || "导入失败");
         await refreshRegistry();
+        serverPoolSelect.value = payload.pool.pool_id;
+        const opened = await openServerPool(payload.pool.pool_id, currentCandidate() && currentCandidate().candidate_id);
+        if (!opened) throw new Error("已登记，但重新打开服务端池失败");
+        setReviewStatus(`已导入并切换到服务端登记池：${payload.pool.label || payload.pool.pool_id}`, "success");
       } catch (error) {
-        byId("statusText").textContent = `导入失败：${error.message}`;
+        setReviewStatus(`导入失败：${error.message}`, "error", true);
+      } finally {
+        importBusy = false;
+        importServerButton.disabled = poolSource !== "local" || !registryEnabled;
       }
     }
 
-    async function refreshProfiles() {
-      try {
-        const payload = await fetch("/api/llm/profiles").then(r => r.json());
-        const profiles = (payload && payload.profiles) || [];
-        const select = byId("profileSelect");
-        select.innerHTML = "";
-        if (!profiles.length) {
-          select.innerHTML = '<option value="">无已保存 profile（请在设置页添加）</option>';
+    function serializeServerSave(operation) {
+      const run = saveQueue.then(operation, operation);
+      saveQueue = run.then(() => undefined, () => undefined);
+      return run;
+    }
+
+    async function persistCandidate(candidate, { clear = false, reason = "评分", reviewerOverride = null } = {}) {
+      if (!candidate) return false;
+      const reviewer = String(reviewerOverride === null ? reviewerId.value : reviewerOverride).trim();
+      if (!reviewer) {
+        candidate.__unsaved = true;
+        saveState(reviewerContext);
+        setReviewStatus("请先填写评审人编号；当前修改仅保留为页面草稿。", "error", true);
+        reviewerId.focus();
+        return false;
+      }
+      reviewerContext = reviewer;
+      candidate.reviewer_id = reviewer;
+      candidate.__unsaved = poolSource === "server";
+      saveState();
+      if (poolSource !== "server" || !activePoolId) {
+        const history = Array.isArray(candidate.human_grades) ? candidate.human_grades : [];
+        const nextEntry = {
+          grade: clear ? null : candidate.grade,
+          notes: candidate.review_notes || "",
+          reviewer_id: reviewer,
+          source: "human_verified",
+          judgment_source: "human_verified",
+          rubric_version: "discovery-relevance-grade/v1",
+          ts: new Date().toISOString(),
+          ...(clear ? { cleared: true } : {})
+        };
+        const previous = history[history.length - 1] || {};
+        const duplicate = previous.grade === nextEntry.grade && previous.notes === nextEntry.notes && previous.reviewer_id === reviewer && Boolean(previous.cleared) === clear;
+        if (!duplicate) candidate.human_grades = [...history, nextEntry];
+        candidate.__unsaved = false;
+        saveState();
+        setReviewStatus(`${reason}已保存到当前本地评审池草稿。`, "success");
+        return true;
+      }
+      if (!clear && !isGraded(candidate)) {
+        candidate.__unsaved = true;
+        saveState();
+        setReviewStatus("备注已保存为当前池、当前评审人的本地草稿；完成评分时会与分数一并提交服务端。", "success");
+        return true;
+      }
+      const candidateId = candidate.candidate_id;
+      return serializeServerSave(async () => {
+        savingCount += 1;
+        setReviewControlsDisabled(false);
+        if (!stickyStatusError) setReviewStatus(`正在保存${reason}…`);
+        try {
+          const body = {
+            notes: candidate.review_notes || "",
+            reviewer_id: reviewer,
+            mode: currentMode(),
+            impact_session_id: activePoolId
+          };
+          if (clear) body.clear = true;
+          else body.grade = candidate.grade;
+          const payload = await apiRequest(`/api/expert-review/pools/${encodeURIComponent(activePoolId)}/grades/${encodeURIComponent(candidateId)}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body)
+          });
+          if (!payload || !payload.ok) throw new Error(payload && payload.error || "保存失败");
+          const localGrade = clear ? null : candidate.grade;
+          const localNotes = candidate.review_notes || "";
+          if (payload.candidate) Object.assign(candidate, payload.candidate);
+          if (!Object.prototype.hasOwnProperty.call(payload.candidate || {}, "grade")) candidate.grade = localGrade;
+          if (!Object.prototype.hasOwnProperty.call(payload.candidate || {}, "review_notes")) candidate.review_notes = localNotes;
+          candidate.reviewer_id = reviewer;
+          candidate.__unsaved = false;
+          candidate.__draftFallback = currentMode() === "expert";
+          saveState();
+          if (payload.impact) renderImpact(payload.impact);
+          clearReviewError();
+          setReviewStatus(`${reason}已保存到服务端。`, "success");
+          return true;
+        } catch (error) {
+          candidate.__unsaved = true;
+          saveState();
+          setReviewStatus(`${reason}保存失败：${error.message}。未保存内容已保留为当前池、当前评审人的本地草稿。`, "error", true);
+          return false;
+        } finally {
+          savingCount = Math.max(0, savingCount - 1);
+          setReviewControlsDisabled(false);
+        }
+      });
+    }
+
+    function scheduleNotesSave(candidate) {
+      if (!candidate) return;
+      if (pendingNoteTimer) window.clearTimeout(pendingNoteTimer);
+      pendingNoteCandidateId = candidate.candidate_id;
+      pendingNoteTimer = window.setTimeout(() => {
+        pendingNoteTimer = null;
+        const target = (pool && pool.candidates || []).find((item) => item.candidate_id === pendingNoteCandidateId);
+        pendingNoteCandidateId = null;
+        if (target) void persistCandidate(target, { reason: "备注" });
+      }, 500);
+    }
+
+    async function flushPendingNotes(reviewerOverride = null) {
+      if (!pendingNoteCandidateId) return true;
+      if (pendingNoteTimer) window.clearTimeout(pendingNoteTimer);
+      pendingNoteTimer = null;
+      const candidateId = pendingNoteCandidateId;
+      pendingNoteCandidateId = null;
+      const target = (pool && pool.candidates || []).find((item) => item.candidate_id === candidateId);
+      return target ? persistCandidate(target, { reason: "备注", reviewerOverride }) : true;
+    }
+
+    async function navigateTo(index) {
+      const candidate = currentCandidate();
+      if (!candidate) return;
+      await flushPendingNotes();
+      currentIndex = Math.max(0, Math.min(index, visible.length - 1));
+      render({ focusHeading: true });
+    }
+
+    function downloadPool(output, localCopy) {
+      const blob = new Blob([`${JSON.stringify(output, null, 2)}\n`], { type: "application/json" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = "judgment_pool.reviewed.json";
+      link.click();
+      URL.revokeObjectURL(link.href);
+      setReviewStatus(localCopy ? "已导出本地评审池副本。此文件不是服务端登记池的完整导出。" : "已导出服务端完整评审池。", "success");
+    }
+
+    async function exportCurrentPool() {
+      if (!pool) return;
+      await flushPendingNotes();
+      if (poolSource === "server") {
+        const reviewer = reviewerId.value.trim();
+        if (!reviewer) {
+          setReviewStatus("导出服务端评审前必须填写评审人编号。", "error", true);
+          reviewerId.focus();
           return;
         }
-        for (const profile of profiles) {
-          const option = document.createElement("option");
-          option.value = profile.id;
-          option.textContent = `${profile.label || profile.id} · ${profile.model}`;
-          if (profile.is_default) option.selected = true;
-          select.appendChild(option);
+        exportButton.disabled = true;
+        clearReviewError();
+        try {
+          const payload = await apiRequest(`/api/expert-review/pools/${encodeURIComponent(activePoolId)}/export`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ reviewer_id: reviewer })
+          });
+          if (!payload || !payload.ok || !payload.pool) throw new Error(payload && payload.error || "服务端未返回完整评审池");
+          downloadPool(payload.pool, false);
+        } catch (error) {
+          setReviewStatus(`服务端导出失败：${error.message}。为避免导出不完整数据，未回退到客户端副本。`, "error", true);
+        } finally {
+          exportButton.disabled = false;
         }
-      } catch {
-        byId("profileSelect").innerHTML = '<option value="">无法加载 profiles</option>';
+        return;
       }
+      const reviewer = reviewerId.value.trim();
+      if (!reviewer) {
+        setReviewStatus("导出本地评审池前必须填写评审人编号。", "error", true);
+        reviewerId.focus();
+        return;
+      }
+      const output = cloneData(pool);
+      for (const candidate of output.candidates || []) {
+        candidate.reviewer_id = candidate.reviewer_id || reviewer;
+        delete candidate.__unsaved;
+        delete candidate.__draftFallback;
+      }
+      output.reviewed_at = new Date().toISOString();
+      output.reviewer_id = reviewer;
+      output.judgment_source = "human_verified";
+      downloadPool(output, true);
+    }
+
+    function formatMetric(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number.toFixed(4) : "—";
+    }
+    function renderImpact(impact) {
+      const root = byId("impactText");
+      root.replaceChildren();
+      if (!impact) {
+        root.textContent = "尚未计算影响。";
+        return;
+      }
+      if (impact.mode === "full" && impact.metrics_before && impact.metrics_after) {
+        const table = document.createElement("table");
+        table.className = "impact-stats";
+        const caption = document.createElement("caption");
+        caption.textContent = "评分变更前后指标";
+        const head = document.createElement("tr");
+        ["指标", "变更前", "变更后", "差值"].forEach((label) => {
+          const th = document.createElement("th");
+          th.scope = "col";
+          th.textContent = label;
+          head.appendChild(th);
+        });
+        const thead = document.createElement("thead");
+        thead.appendChild(head);
+        const tbody = document.createElement("tbody");
+        const metrics = [
+          ["NDCG@5", "ndcg_at_5"],
+          ["High relevance recall", "high_relevance_recall"],
+          ["Quality score", "quality_score"],
+          ["Run count", "run_count"]
+        ];
+        metrics.forEach(([label, key]) => {
+          const before = Number(impact.metrics_before[key]);
+          const after = Number(impact.metrics_after[key]);
+          const row = document.createElement("tr");
+          [label, formatMetric(before), formatMetric(after), Number.isFinite(before) && Number.isFinite(after) ? formatMetric(after - before) : "—"].forEach((value) => {
+            const cell = document.createElement("td");
+            cell.textContent = value;
+            row.appendChild(cell);
+          });
+          tbody.appendChild(row);
+        });
+        table.append(caption, thead, tbody);
+        root.appendChild(table);
+        const pairs = document.createElement("p");
+        const beforePair = impact.pair_before || {};
+        const afterPair = impact.pair_after || {};
+        pairs.textContent = `配对数 ${beforePair.pairs ?? 0} → ${afterPair.pairs ?? 0}；胜/负/平 ${beforePair.wins ?? 0}/${beforePair.losses ?? 0}/${beforePair.ties ?? 0} → ${afterPair.wins ?? 0}/${afterPair.losses ?? 0}/${afterPair.ties ?? 0}。`;
+        root.appendChild(pairs);
+      } else {
+        const guidance = document.createElement("p");
+        guidance.className = "impact-guidance";
+        const missing = asTextList(impact.missing).join("、") || "完整 key 或 run 数据";
+        guidance.textContent = `当前为降级结果：缺少 ${missing}。请绑定 judgment key 与可配对的 Agent/Workflow run 后重算完整指标。`;
+        root.appendChild(guidance);
+      }
+      for (const sentence of asTextList(impact.sentences)) {
+        const paragraph = document.createElement("p");
+        paragraph.textContent = sentence;
+        root.appendChild(paragraph);
+      }
+    }
+
+    async function bindImpact() {
+      if (!activePoolId) {
+        byId("impactText").textContent = "请先打开服务端登记池。";
+        return;
+      }
+      if (impactBusy) return;
+      impactBusy = true;
+      const generation = ++impactGeneration;
+      const poolId = activePoolId;
+      byId("bindImpactButton").disabled = true;
+      byId("impactText").textContent = "正在绑定并计算影响…";
+      try {
+        const key_path = byId("impactKeyPath").value.trim();
+        const run_paths = byId("impactRunPaths").value.split(",").map((value) => value.trim()).filter(Boolean);
+        const bound = await apiRequest("/api/expert-review/impact/session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: poolId, pool_id: poolId, key_path, run_paths, mode: "test" })
+        });
+        if (!bound.ok) throw new Error(bound.error || "绑定失败");
+        const payload = await apiRequest(`/api/expert-review/pools/${encodeURIComponent(poolId)}/impact`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode: "test", impact_session_id: poolId })
+        });
+        if (!payload.ok) throw new Error(payload.error || "计算失败");
+        if (generation !== impactGeneration || poolId !== activePoolId) return;
+        renderImpact(payload.impact);
+      } catch (error) {
+        if (generation === impactGeneration && poolId === activePoolId) byId("impactText").textContent = `影响计算失败：${error.message}`;
+      } finally {
+        impactBusy = false;
+        byId("bindImpactButton").disabled = false;
+      }
+    }
+
+    function setProfileBusy(busy) {
+      profileBusy = busy;
+      ["fetchModelsButton", "saveProfileButton", "newProfileButton", "profileEditorSelect"].forEach((id) => { byId(id).disabled = busy; });
+      byId("deleteProfileButton").disabled = busy || !editingProfileId;
+    }
+    function selectedModelName() { return (byId("profileModelManual").value || byId("profileModelSelect").value || "").trim(); }
+    function fillProfileEditor(profile) {
+      if (!profile) return;
+      editingProfileId = profile.id;
+      byId("profileIdInput").value = profile.id || "";
+      byId("profileIdInput").disabled = true;
+      byId("profileLabelInput").value = profile.label || "";
+      byId("profileApiKeyInput").value = "";
+      byId("profileBaseUrlInput").value = profile.base_url || "";
+      byId("profileTimeoutInput").value = profile.timeout || "120";
+      byId("profileMakeDefault").checked = Boolean(profile.is_default);
+      byId("profileModelManual").value = profile.model || "";
+      setOptions(byId("profileModelSelect"), profile.model ? [{ value: profile.model, label: profile.model }] : [], profile.model ? null : "先获取模型列表");
+      if (profile.model) byId("profileModelSelect").value = profile.model;
+      byId("deleteProfileButton").disabled = false;
+      setProfileStatus(`正在编辑 ${profile.id}。Job Profile 选择不会改变此表单。`);
+    }
+    function clearProfileEditor() {
+      editingProfileId = null;
+      byId("profileEditorSelect").value = "";
+      byId("profileIdInput").disabled = false;
+      byId("profileIdInput").value = "";
+      byId("profileLabelInput").value = "";
+      byId("profileApiKeyInput").value = "";
+      byId("profileBaseUrlInput").value = "https://api.openai.com/v1";
+      byId("profileModelManual").value = "";
+      byId("profileTimeoutInput").value = "120";
+      byId("profileMakeDefault").checked = false;
+      setOptions(byId("profileModelSelect"), [], "先获取模型列表");
+      byId("deleteProfileButton").disabled = true;
+      setProfileStatus("已新建空白编辑器。首次获取模型必须填写 API Key 与 Base URL。");
+    }
+
+    async function refreshProfiles() {
+      if (!isDevMode()) return;
+      const previousJobProfile = byId("profileSelect").value;
+      const previousEditor = editingProfileId;
+      try {
+        const payload = await apiRequest("/api/llm/profiles");
+        if (!payload.ok) throw new Error(payload.error || "无法加载 Profiles");
+        profiles = Array.isArray(payload.profiles) ? payload.profiles : [];
+        const options = profiles.map((profile) => ({ value: profile.id, label: `${profile.label || profile.id} · ${profile.model}${profile.is_default ? "（默认）" : ""}` }));
+        setOptions(byId("profileSelect"), options, profiles.length ? "选择 Job Profile" : "尚无 Profile");
+        setOptions(byId("profileEditorSelect"), options, "选择一个 Profile，或新建空白");
+        if (previousJobProfile && profiles.some((profile) => profile.id === previousJobProfile)) byId("profileSelect").value = previousJobProfile;
+        else {
+          const preferred = profiles.find((profile) => profile.is_default) || profiles[0];
+          if (preferred) byId("profileSelect").value = preferred.id;
+        }
+        if (previousEditor && profiles.some((profile) => profile.id === previousEditor)) byId("profileEditorSelect").value = previousEditor;
+        setProfileStatus(`已加载 ${profiles.length} 个专家 Profile。编辑器内容未被 Job 选择器覆盖。`);
+      } catch (error) {
+        setOptions(byId("profileSelect"), [], "无法加载 Profiles");
+        setOptions(byId("profileEditorSelect"), [], "无法加载 Profiles");
+        setProfileStatus(`无法加载 Profiles：${error.message}`, true);
+      }
+    }
+
+    async function fetchModelsForEditor() {
+      if (profileBusy) return;
+      const apiKey = byId("profileApiKeyInput").value.trim();
+      const baseUrl = byId("profileBaseUrlInput").value.trim();
+      const timeout = byId("profileTimeoutInput").value.trim() || "120";
+      const model = selectedModelName();
+      const editing = editingProfileId ? profiles.find((profile) => profile.id === editingProfileId) : null;
+      if (!baseUrl) {
+        setProfileStatus("请先填写 Base URL。", true);
+        return;
+      }
+      if (!editingProfileId && !apiKey) {
+        setProfileStatus("新 Profile 获取模型时必须填写显式 API Key。", true);
+        return;
+      }
+      if (editing && !apiKey && String(editing.base_url || "").replace(/\/$/, "") !== baseUrl.replace(/\/$/, "")) {
+        setProfileStatus("已保存 Profile 更换 Base URL 时必须填写显式 API Key。", true);
+        return;
+      }
+      setProfileBusy(true);
+      setProfileStatus("正在获取模型列表…");
+      try {
+        const body = { llm_config: { base_url: baseUrl, timeout } };
+        if (editingProfileId) body.profile_id = editingProfileId;
+        if (apiKey) body.llm_config.api_key = apiKey;
+        if (model) body.llm_config.model = model;
+        const payload = await apiRequest("/api/llm/models", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        if (!payload.ok) throw new Error(payload.error || "获取模型失败");
+        const models = Array.isArray(payload.models) ? payload.models : [];
+        setOptions(byId("profileModelSelect"), models.map((name) => ({ value: name, label: name })), models.length ? null : "接口未返回模型，请手填");
+        if (payload.selected && models.includes(payload.selected)) byId("profileModelSelect").value = payload.selected;
+        if (!byId("profileModelManual").value.trim() && byId("profileModelSelect").value) byId("profileModelManual").value = byId("profileModelSelect").value;
+        setProfileStatus(models.length ? `已获取 ${models.length} 个模型。` : "未获取到模型，可手填模型名后保存。");
+      } catch (error) {
+        setProfileStatus(`获取模型失败：${error.message}`, true);
+      } finally {
+        setProfileBusy(false);
+      }
+    }
+
+    async function saveProfileFromEditor() {
+      if (profileBusy) return;
+      const id = byId("profileIdInput").value.trim();
+      const label = byId("profileLabelInput").value.trim() || id;
+      const apiKey = byId("profileApiKeyInput").value.trim();
+      const baseUrl = byId("profileBaseUrlInput").value.trim();
+      const model = selectedModelName();
+      const timeout = byId("profileTimeoutInput").value.trim() || "120";
+      if (!id || !baseUrl || !model) {
+        setProfileStatus("Profile ID、Base URL、模型为必填。", true);
+        return;
+      }
+      if (!editingProfileId && !apiKey) {
+        setProfileStatus("新 Profile 必须填写 API Key。", true);
+        return;
+      }
+      setProfileBusy(true);
+      setProfileStatus("正在保存 Profile…");
+      try {
+        const profile = { id, label, base_url: baseUrl, model, timeout };
+        if (apiKey) profile.api_key = apiKey;
+        const url = editingProfileId ? `/api/llm/profiles/${encodeURIComponent(editingProfileId)}` : "/api/llm/profiles";
+        const payload = await apiRequest(url, {
+          method: editingProfileId ? "PUT" : "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ make_default: byId("profileMakeDefault").checked, profile })
+        });
+        if (!payload.ok) throw new Error(payload.error || "保存失败");
+        editingProfileId = payload.profile && payload.profile.id || id;
+        byId("profileApiKeyInput").value = "";
+        await refreshProfiles();
+        byId("profileEditorSelect").value = editingProfileId;
+        byId("profileSelect").value = editingProfileId;
+        const saved = profiles.find((item) => item.id === editingProfileId);
+        if (saved) fillProfileEditor(saved);
+        setProfileStatus(`已保存 Profile：${editingProfileId}（${model}）。`);
+      } catch (error) {
+        setProfileStatus(`保存失败：${error.message}`, true);
+      } finally {
+        setProfileBusy(false);
+      }
+    }
+
+    async function deleteEditorProfile() {
+      if (profileBusy || !editingProfileId) return;
+      const id = editingProfileId;
+      if (!window.confirm(`仅删除编辑器中的 Profile「${id}」？此操作不会按 Job 选择器删除其他 Profile。`)) return;
+      setProfileBusy(true);
+      try {
+        const payload = await apiRequest(`/api/llm/profiles/${encodeURIComponent(id)}`, { method: "DELETE" });
+        if (!payload.ok) throw new Error(payload.error || "删除失败");
+        clearProfileEditor();
+        await refreshProfiles();
+        setProfileStatus(`已删除 ${id}。`);
+      } catch (error) {
+        setProfileStatus(`删除失败：${error.message}`, true);
+      } finally {
+        setProfileBusy(false);
+      }
+    }
+
+    function renderPoolBuilds(builds) {
+      const root = byId("poolBuildList");
+      root.replaceChildren();
+      if (!builds.length) {
+        root.textContent = "暂无 Prompt 构建记录。";
+        return;
+      }
+      for (const build of builds.slice(0, 8)) {
+        const row = document.createElement("div");
+        row.className = "job-row";
+        const title = document.createElement("strong");
+        title.textContent = `${build.build_id} · ${build.status || "未知"}`;
+        const detail = document.createElement("div");
+        detail.textContent = `Discovery ${build.discovery_status || "待启动"} · Pool ${build.pool_id || "未就绪"} · Review ${build.review_job_id || build.review_status || "未请求"}${build.error ? ` · 错误 ${build.error}` : build.review_error ? ` · 评审错误 ${build.review_error}` : ""}`;
+        row.append(title, detail);
+        if (build.pool_id) {
+          const open = document.createElement("button");
+          open.type = "button";
+          open.textContent = "打开评审池";
+          open.addEventListener("click", () => { void openServerPool(build.pool_id); });
+          row.appendChild(open);
+        }
+        root.appendChild(row);
+      }
+    }
+
+    function stopPoolBuildPolling() {
+      if (poolBuildPollTimer) window.clearTimeout(poolBuildPollTimer);
+      poolBuildPollTimer = null;
+    }
+
+    async function refreshPoolBuilds() {
+      if (!isDevMode()) return;
+      try {
+        const payload = await apiRequest("/api/benchmark-review/builds");
+        if (!payload.ok) throw new Error(payload.error || "无法加载构建记录");
+        const builds = Array.isArray(payload.builds) ? payload.builds : [];
+        renderPoolBuilds(builds);
+        const active = builds.some((build) => ["queued", "discovering"].includes(build.status));
+        stopPoolBuildPolling();
+        if (active) poolBuildPollTimer = window.setTimeout(() => { void refreshPoolBuilds(); }, 2000);
+        byId("poolBuildStatus").textContent = builds.length ? `已加载 ${builds.length} 条构建记录。` : "暂无构建记录。";
+      } catch (error) {
+        stopPoolBuildPolling();
+        byId("poolBuildStatus").textContent = `构建状态加载失败：${error.message}`;
+      }
+    }
+
+    async function startPoolBuild() {
+      if (poolBuildBusy) return;
+      const prompt = byId("poolBuildPrompt").value.trim();
+      if (!prompt) {
+        byId("poolBuildStatus").textContent = "请输入评审任务 Prompt。";
+        return;
+      }
+      const action = byId("poolBuildAction").value || "build_and_review";
+      const profileId = byId("profileSelect").value;
+      if (action === "build_and_review" && !profileId) {
+        byId("poolBuildStatus").textContent = "请先在开发者工具中配置并选择专家 Profile。";
+        return;
+      }
+      poolBuildBusy = true;
+      byId("startPoolBuildButton").disabled = true;
+      try {
+        const payload = await apiRequest("/api/benchmark-review/builds", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt,
+            action,
+            preset_id: "default/v1",
+            idempotency_key: (window.crypto && window.crypto.randomUUID) ? window.crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
+            review: action === "build_and_review" ? { profile_id: profileId, workers: 2 } : {}
+          })
+        });
+        if (!payload.ok || !payload.build) throw new Error(payload.error || "构建启动失败");
+        byId("poolBuildStatus").textContent = `已启动 ${payload.build.build_id}。`;
+        await refreshPoolBuilds();
+      } catch (error) {
+        byId("poolBuildStatus").textContent = `构建启动失败：${error.message}`;
+      } finally {
+        poolBuildBusy = false;
+        byId("startPoolBuildButton").disabled = false;
+      }
+    }
+
+    function progressCounts(job) {
+      const progress = job.progress || {};
+      return {
+        done: Number(progress.done || 0),
+        failed: Number(progress.failed || 0),
+        total: Number(progress.total || 0),
+        skipped: Number(progress.skipped_resume || 0)
+      };
     }
 
     function renderJobs(jobs) {
       const root = byId("jobsList");
       root.replaceChildren();
       if (!jobs.length) {
-        root.textContent = "暂无 job。";
+        root.textContent = activePoolId ? "当前评审池暂无 Job。" : "打开服务端池后可查看该池 Job。";
         return;
       }
       for (const job of jobs) {
-        const row = document.createElement("div");
+        const counts = progressCounts(job);
+        const percent = counts.total ? Math.min(100, Math.round(100 * (counts.done + counts.failed) / counts.total)) : 0;
+        const row = document.createElement("button");
+        row.type = "button";
         row.className = "job-row";
-        const prog = job.progress || {};
-        const done = prog.done || 0;
-        const total = prog.total || 0;
-        const pct = total ? Math.round(100 * done / total) : 0;
+        row.dataset.jobId = job.job_id;
+        row.setAttribute("aria-pressed", String(job.job_id === selectedJobId));
+        row.setAttribute("aria-label", `Job ${job.job_id}，状态 ${job.status}，进度 ${counts.done + counts.failed}/${counts.total}`);
         const title = document.createElement("div");
-        title.innerHTML = `<strong>${job.job_id}</strong> · ${job.status} · ${job.model || ""}`;
+        title.className = "job-title";
+        title.textContent = `${job.job_id} · ${job.status || "未知"} · ${job.model || job.profile_id || "未知模型"}`;
         const bar = document.createElement("div");
         bar.className = "progress-bar";
-        const span = document.createElement("span");
-        span.style.width = pct + "%";
-        bar.appendChild(span);
-        const counts = document.createElement("div");
-        counts.textContent = `${done}/${total} 完成 · 失败 ${prog.failed || 0}`;
-        row.append(title, bar, counts);
-        row.style.cursor = "pointer";
-        row.onclick = async () => {
+        bar.setAttribute("role", "progressbar");
+        bar.setAttribute("aria-label", `${job.job_id} 进度`);
+        bar.setAttribute("aria-valuemin", "0");
+        bar.setAttribute("aria-valuemax", String(counts.total || 1));
+        bar.setAttribute("aria-valuenow", String(counts.done + counts.failed));
+        const fill = document.createElement("span");
+        fill.style.width = `${percent}%`;
+        bar.appendChild(fill);
+        const summary = document.createElement("div");
+        summary.textContent = `完成 ${counts.done} · 失败 ${counts.failed} · 总数 ${counts.total} · 跳过/恢复 ${counts.skipped}${job.error ? ` · 错误 ${job.error}` : ""}`;
+        row.append(title, bar, summary);
+        row.addEventListener("click", () => {
           selectedJobId = job.job_id;
-          const detail = await fetch(`/api/expert-review/jobs/${encodeURIComponent(job.job_id)}?detail=1`).then(r => r.json());
-          const logs = ((detail.job || {}).logs || []).map(l => `${l.ts} [${l.level}] ${l.message}`).join("\n");
-          byId("jobLog").textContent = logs || "无日志";
-        };
+          renderJobs(jobs);
+          void refreshSelectedJobDetail();
+        });
         root.appendChild(row);
       }
     }
 
-    async function refreshJobs() {
-      if (!isDevMode()) return;
+    function renderJobDetail(job) {
+      selectedJobDetail = job || null;
+      const detailRoot = byId("jobDetail");
+      detailRoot.replaceChildren();
+      if (!job) {
+        detailRoot.textContent = "请选择一个 Job 查看详情。";
+        byId("jobLog").textContent = "尚未选择 Job。";
+        byId("cancelJobButton").disabled = true;
+        byId("resumeJobButton").disabled = true;
+        byId("retryJobButton").disabled = true;
+        return;
+      }
+      const counts = progressCounts(job);
+      const summary = document.createElement("p");
+      summary.textContent = `状态：${job.status || "未知"}；完成 ${counts.done}，失败 ${counts.failed}，总数 ${counts.total}。${job.error ? `错误：${job.error}` : ""}`;
+      detailRoot.appendChild(summary);
+      const items = job.items && typeof job.items === "object" ? Object.entries(job.items) : [];
+      if (items.length) {
+        const statusCounts = {};
+        items.forEach(([, status]) => { statusCounts[status] = (statusCounts[status] || 0) + 1; });
+        const itemSummary = document.createElement("p");
+        itemSummary.textContent = `逐项状态：${Object.entries(statusCounts).map(([status, count]) => `${status} ${count}`).join(" · ")}`;
+        const details = document.createElement("details");
+        const disclosure = document.createElement("summary");
+        disclosure.textContent = "查看候选逐项状态";
+        const list = document.createElement("div");
+        list.className = "job-items";
+        items.forEach(([candidateId, status]) => {
+          const line = document.createElement("div");
+          line.textContent = `${candidateId}：${status}`;
+          list.appendChild(line);
+        });
+        details.append(disclosure, list);
+        detailRoot.append(itemSummary, details);
+      }
+      const logs = Array.isArray(job.logs) ? job.logs : Array.isArray(job.log_tail) ? job.log_tail : [];
+      byId("jobLog").textContent = logs.map((log) => `${log.ts || ""} [${log.level || "info"}] ${log.message || ""}`).join("\n") || "无日志。";
+      byId("cancelJobButton").disabled = jobActionBusy || !activeJobStatuses.has(job.status);
+      const itemStatuses = job.items && typeof job.items === "object" ? Object.values(job.items) : [];
+      byId("resumeJobButton").disabled = jobActionBusy || !terminalJobStatuses.has(job.status) || !itemStatuses.some((status) => status === "pending" || status === "failed");
+      byId("retryJobButton").disabled = jobActionBusy || activeJobStatuses.has(job.status) || counts.failed <= 0;
+    }
+
+    async function refreshSelectedJobDetail() {
+      if (!selectedJobId || !isDevMode()) {
+        renderJobDetail(null);
+        return null;
+      }
+      const requestedJobId = selectedJobId;
       try {
-        const url = activePoolId ? `/api/expert-review/jobs?pool_id=${encodeURIComponent(activePoolId)}` : "/api/expert-review/jobs";
-        const payload = await fetch(url).then(r => r.json());
-        renderJobs((payload && payload.jobs) || []);
-      } catch {
-        byId("jobsList").textContent = "无法加载 jobs";
+        const payload = await apiRequest(`/api/expert-review/jobs/${encodeURIComponent(requestedJobId)}?detail=1`);
+        if (selectedJobId !== requestedJobId) return null;
+        if (!payload.ok || !payload.job) throw new Error(payload.error || "无法加载 Job 详情");
+        renderJobDetail(payload.job);
+        return payload.job;
+      } catch (error) {
+        setJobStatus(`Job 详情加载失败：${error.message}`, true);
+        byId("jobLog").textContent = `无法加载日志：${error.message}`;
+        return null;
       }
     }
 
+    function stopJobPolling() {
+      if (jobPollTimer) window.clearTimeout(jobPollTimer);
+      jobPollTimer = null;
+    }
+    function scheduleJobPolling() {
+      stopJobPolling();
+      if (!isDevMode()) return;
+      jobPollTimer = window.setTimeout(() => { void refreshJobs({ fromPoll: true }); }, 2000);
+    }
+
+    async function refreshJobs({ fromPoll = false } = {}) {
+      if (!isDevMode() || jobsRequestInFlight) return;
+      jobsRequestInFlight = true;
+      if (!fromPoll) byId("refreshJobsButton").disabled = true;
+      const requestedPoolId = activePoolId;
+      try {
+        const url = requestedPoolId ? `/api/expert-review/jobs?pool_id=${encodeURIComponent(requestedPoolId)}` : "/api/expert-review/jobs";
+        const payload = await apiRequest(url);
+        if (activePoolId !== requestedPoolId) return;
+        if (!payload.ok) throw new Error(payload.error || "无法加载 Jobs");
+        const jobs = Array.isArray(payload.jobs) ? payload.jobs : [];
+        if (!selectedJobId && jobs.some((job) => activeJobStatuses.has(job.status))) selectedJobId = jobs.find((job) => activeJobStatuses.has(job.status)).job_id;
+        if (selectedJobId && !jobs.some((job) => job.job_id === selectedJobId)) selectedJobId = null;
+        renderJobs(jobs);
+        const detail = selectedJobId ? await refreshSelectedJobDetail() : null;
+        for (const job of jobs) {
+          const previous = lastJobStatuses.get(job.job_id);
+          if (previous && !isTerminalJob(previous) && isTerminalJob(job.status) && activePoolId && !terminalPoolReloads.has(job.job_id)) {
+            terminalPoolReloads.add(job.job_id);
+            const preferred = currentCandidate() && currentCandidate().candidate_id;
+            void openServerPool(activePoolId, preferred);
+          }
+          lastJobStatuses.set(job.job_id, job.status);
+        }
+        if (detail) lastJobStatuses.set(detail.job_id, detail.status);
+        const anyActive = jobs.some((job) => activeJobStatuses.has(job.status)) || Boolean(detail && activeJobStatuses.has(detail.status));
+        if (anyActive) scheduleJobPolling();
+        else stopJobPolling();
+        setJobStatus(jobs.length ? `已加载 ${jobs.length} 个 Job。` : "暂无 Job。");
+      } catch (error) {
+        stopJobPolling();
+        setJobStatus(`Jobs 加载失败：${error.message}`, true);
+      } finally {
+        jobsRequestInFlight = false;
+        byId("refreshJobsButton").disabled = false;
+      }
+    }
+
+    async function startJob() {
+      if (!activePoolId) {
+        setJobStatus("请先打开服务端登记池。", true);
+        return;
+      }
+      const profileId = byId("profileSelect").value;
+      if (!profileId) {
+        setJobStatus("请选择用于本 Job 的专家 Profile。", true);
+        return;
+      }
+      byId("startJobButton").disabled = true;
+      try {
+        const payload = await apiRequest("/api/expert-review/jobs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            pool_id: activePoolId,
+            profile_id: profileId,
+            independent_model: byId("independentModel").checked,
+            mode: currentMode(),
+            workers: 2
+          })
+        });
+        if (!payload.ok || !payload.job) throw new Error(payload.error || "启动失败");
+        selectedJobId = payload.job.job_id;
+        setJobStatus(`已启动 ${selectedJobId}。`);
+        await refreshJobs();
+        scheduleJobPolling();
+      } catch (error) {
+        setJobStatus(`启动失败：${error.message}`, true);
+      } finally {
+        byId("startJobButton").disabled = false;
+      }
+    }
+
+    async function runJobAction(action) {
+      if (!selectedJobId || jobActionBusy) return;
+      jobActionBusy = true;
+      renderJobDetail(selectedJobDetail);
+      try {
+        const payload = await apiRequest(`/api/expert-review/jobs/${encodeURIComponent(selectedJobId)}/${action}`, { method: "POST" });
+        if (!payload.ok) throw new Error(payload.error || "操作失败");
+        renderJobDetail(payload.job || selectedJobDetail);
+        setJobStatus(action === "cancel" ? "已提交取消请求。" : action === "resume" ? "已恢复未完成候选。" : "已提交失败项重试。" );
+        await refreshJobs();
+        if (payload.job && activeJobStatuses.has(payload.job.status)) scheduleJobPolling();
+      } catch (error) {
+        setJobStatus(`${action === "cancel" ? "取消" : action === "resume" ? "恢复" : "重试"}失败：${error.message}`, true);
+      } finally {
+        jobActionBusy = false;
+        renderJobDetail(selectedJobDetail);
+      }
+    }
+
+    function updateUrlMode(mode) {
+      const params = new URLSearchParams(window.location.search);
+      params.set("mode", mode);
+      window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
+    }
+
     poolFile.addEventListener("change", async () => {
-      const file = poolFile.files[0];
+      const file = poolFile.files && poolFile.files[0];
       if (!file) return;
       try {
         const parsed = JSON.parse(await file.text());
-        activePoolId = null;
-        activatePool(parsed, `本地文件：${file.name}`);
+        if (!Array.isArray(parsed.candidates) || !parsed.candidates.length) throw new Error("评审池没有候选项目");
+        if (parsed.candidates.some((candidate) => !candidate || !candidate.candidate_id)) throw new Error("候选缺少 candidate_id");
+        if (currentMode() === "expert") {
+          const reviewed = parsed.candidates.some((candidate) =>
+            [0, 1, 2, 3].includes(candidate.grade) || candidate.review_notes || candidate.human_grades || candidate.machine_reviews || candidate.machine_review_runs
+          );
+          if (reviewed) throw new Error("专家盲评只能打开未评分的 blinded pool；请由开发者导入 reviewed pool 到服务端后按 reviewer 范围打开");
+        }
+        activatePool(parsed, { source: "local", identity: localIdentity(parsed, file.name), total: parsed.candidates.length });
+        setReviewStatus(`已打开本地文件：${file.name}。服务端池未被修改。`, "success");
       } catch (error) {
-        byId("emptyState").textContent = `无法读取评审池：${error.message}`;
+        setReviewStatus(`无法读取本地评审池：${error.message}。当前工作区保持不变。`, "error", true);
+      } finally {
+        poolFile.value = "";
       }
     });
 
     gradeButtons.forEach((button) => button.addEventListener("click", async () => {
-      const candidate = visible[currentIndex];
+      const candidate = currentCandidate();
+      if (!candidate || savingCount > 0) return;
+      await flushPendingNotes();
+      clearReviewError();
       candidate.grade = Number(button.dataset.grade);
       candidate.reviewer_id = reviewerId.value.trim();
-      await persistGrade(candidate);
+      candidate.__unsaved = true;
+      saveState(reviewerId.value.trim());
       render();
+      const saved = await persistCandidate(candidate, { reason: "评分" });
+      if (activeQueue === "ungraded") applyFilter(null, true);
+      else render({ focusHeading: false });
+      if (!saved && activeQueue === "ungraded") setReviewStatus("评分未保存，已保留草稿；候选已按当前草稿从未评分队列移出。", "error", true);
     }));
 
-    byId("reviewNotes").addEventListener("change", async (event) => {
-      visible[currentIndex].review_notes = event.target.value;
-      visible[currentIndex].reviewer_id = reviewerId.value.trim();
-      await persistGrade(visible[currentIndex]);
-    });
     byId("reviewNotes").addEventListener("input", (event) => {
-      visible[currentIndex].review_notes = event.target.value;
-      visible[currentIndex].reviewer_id = reviewerId.value.trim();
-      saveState();
+      const candidate = currentCandidate();
+      if (!candidate) return;
+      candidate.review_notes = event.target.value;
+      candidate.reviewer_id = reviewerId.value.trim();
+      candidate.__unsaved = poolSource === "server";
+      saveState(reviewerId.value.trim() || reviewerContext);
+      pendingNoteCandidateId = candidate.candidate_id;
     });
-    reviewerId.addEventListener("input", saveState);
-    taskFilter.addEventListener("change", applyFilter);
-    byId("previousButton").addEventListener("click", () => { currentIndex--; render(); });
-    byId("nextButton").addEventListener("click", () => { currentIndex++; render(); });
-    byId("nextUngradedButton").addEventListener("click", () => {
+    byId("reviewNotes").addEventListener("blur", () => { void flushPendingNotes(); });
+
+    reviewerId.addEventListener("change", async () => {
+      await flushPendingNotes(reviewerContext);
+      if (reviewerContext) saveState(reviewerContext);
+      reviewerContext = reviewerId.value.trim();
+      if (poolSource === "server" && activePoolId && reviewerContext) {
+        const preferred = currentCandidate() && currentCandidate().candidate_id;
+        await openServerPool(activePoolId, preferred);
+      } else {
+        resetPoolToBase();
+        rebuildFilter();
+        applyFilter(null, false);
+      }
+      setReviewControlsDisabled(false);
+      if (!reviewerContext) setReviewStatus("请填写评审人编号后再评分或清除服务端评分。", "error", true);
+      else setReviewStatus(`已切换到评审人 ${reviewerContext} 的独立草稿空间。`, "success");
+    });
+    reviewerId.addEventListener("input", () => setReviewControlsDisabled(false));
+
+    taskFilter.addEventListener("change", async () => {
+      await flushPendingNotes();
+      clearReviewError();
+      currentIndex = 0;
+      applyFilter(null, true);
+    });
+    byId("previousButton").addEventListener("click", () => { void navigateTo(currentIndex - 1); });
+    byId("nextButton").addEventListener("click", () => { void navigateTo(currentIndex + 1); });
+    byId("nextUngradedButton").addEventListener("click", async () => {
+      await flushPendingNotes();
+      if (!visible.length) return;
       const next = visible.findIndex((candidate, index) => index > currentIndex && !isGraded(candidate));
       const wrapped = visible.findIndex((candidate) => !isGraded(candidate));
       const target = next >= 0 ? next : wrapped;
-      if (target >= 0) { currentIndex = target; render(); }
-      else byId("statusText").textContent = "当前范围已全部评分";
+      if (target >= 0) await navigateTo(target);
+      else setReviewStatus("当前范围已全部评分。", "success");
     });
-    byId("clearButton").addEventListener("click", () => {
-      if (!pool || !confirm("清空当前浏览器中的全部评分？")) return;
-      localStorage.removeItem(storageKey);
-      for (const candidate of pool.candidates) {
-        candidate.grade = null;
-        candidate.review_notes = "";
-        candidate.reviewer_id = "";
+
+    byId("clearButton").addEventListener("click", async () => {
+      const candidate = currentCandidate();
+      if (!candidate) return;
+      await flushPendingNotes();
+      const copy = poolSource === "server"
+        ? "清除当前候选的服务端评分？需要评审人编号，且不会清除其他候选。"
+        : "清除当前候选的本地评分与备注？不会影响其他候选。";
+      if (!window.confirm(copy)) return;
+      candidate.grade = null;
+      candidate.review_notes = "";
+      candidate.__unsaved = true;
+      byId("reviewNotes").value = "";
+      const saved = await persistCandidate(candidate, { clear: poolSource === "server", reason: "当前候选清除" });
+      applyFilter(candidate.candidate_id, true);
+      if (!saved) render();
+    });
+
+    exportButton.addEventListener("click", () => { void exportCurrentPool(); });
+    byId("refreshPoolsButton").addEventListener("click", () => { void refreshRegistry(); });
+    serverPoolSelect.addEventListener("change", () => { openServerPoolButton.disabled = !serverPoolSelect.value; });
+    openServerPoolButton.addEventListener("click", () => { void openServerPool(); });
+    importServerButton.addEventListener("click", () => { void importCurrentPool(); });
+
+    reviewMode.addEventListener("change", async () => {
+      await flushPendingNotes();
+      const requested = reviewMode.value;
+      if (requested !== "expert") {
+        const allowed = await refreshStatus();
+        if (!allowed || !developerAllowed) return;
       }
-      render();
-    });
-    exportButton.addEventListener("click", async () => {
-      if (activePoolId) {
-        try {
-          const payload = await fetch(`/api/expert-review/pools/${encodeURIComponent(activePoolId)}/export`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: "{}"
-          }).then(r => r.json());
-          if (payload && payload.ok && payload.pool) {
-            const blob = new Blob([JSON.stringify(payload.pool, null, 2) + "\n"], { type: "application/json" });
-            const link = document.createElement("a");
-            link.href = URL.createObjectURL(blob);
-            link.download = "judgment_pool.reviewed.json";
-            link.click();
-            URL.revokeObjectURL(link.href);
-            return;
-          }
-        } catch (e) {}
-      }
-      for (const candidate of pool.candidates) candidate.reviewer_id = candidate.reviewer_id || reviewerId.value.trim();
-      const output = { ...pool, reviewed_at: new Date().toISOString(), reviewer_id: reviewerId.value.trim(), judgment_source: "human_verified" };
-      const blob = new Blob([JSON.stringify(output, null, 2) + "\n"], { type: "application/json" });
-      const link = document.createElement("a");
-      link.href = URL.createObjectURL(blob);
-      link.download = "judgment_pool.reviewed.json";
-      link.click();
-      URL.revokeObjectURL(link.href);
-    });
-    byId("refreshPoolsButton").addEventListener("click", refreshRegistry);
-    openServerPoolButton.addEventListener("click", openServerPool);
-    importServerButton.addEventListener("click", importCurrentPool);
-    reviewMode.addEventListener("change", () => {
-      const params = new URLSearchParams(window.location.search);
-      params.set("mode", reviewMode.value);
-      window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
+      if (reviewMode.value === "expert") setActiveQueue("all");
+      updateUrlMode(reviewMode.value);
       updateModeChrome();
-      if (activePoolId) openServerPool();
-      else if (pool) applyFilter();
+      const preferred = currentCandidate() && currentCandidate().candidate_id;
+      if (activePoolId) await openServerPool(activePoolId, preferred);
+      else if (pool) applyFilter(preferred, false);
+      if (isDevMode()) {
+        await Promise.all([refreshProfiles(), refreshJobs()]);
+      }
     });
+
     document.querySelectorAll("#queueBar button").forEach((button) => {
-      button.addEventListener("click", () => {
-        activeQueue = button.dataset.queue;
-        document.querySelectorAll("#queueBar button").forEach((b) => b.setAttribute("aria-pressed", String(b === button)));
-        applyFilter();
+      button.addEventListener("click", async () => {
+        await flushPendingNotes();
+        clearReviewError();
+        setActiveQueue(button.dataset.queue);
+        currentIndex = 0;
+        applyFilter(null, true);
       });
     });
-    byId("bindImpactButton").addEventListener("click", async () => {
-      if (!activePoolId) { byId("impactText").textContent = "请先打开服务端登记池。"; return; }
-      const key_path = byId("impactKeyPath").value.trim();
-      const run_paths = byId("impactRunPaths").value.split(",").map(s => s.trim()).filter(Boolean);
-      const payload = await fetch("/api/expert-review/impact/session", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: activePoolId, pool_id: activePoolId, key_path, run_paths, mode: "test" })
-      }).then(r => r.json());
-      if (!payload.ok) {
-        byId("impactText").textContent = `绑定失败：${payload.error}`;
-        return;
+
+    byId("poolFileButton").addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        poolFile.click();
       }
-      const impact = await fetch(`/api/expert-review/pools/${encodeURIComponent(activePoolId)}/impact`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: "test", impact_session_id: activePoolId })
-      }).then(r => r.json());
-      if (impact.ok) renderImpact(impact.impact);
-      else byId("impactText").textContent = `计算失败：${impact.error}`;
     });
-    byId("startJobButton").addEventListener("click", async () => {
-      if (!activePoolId) { byId("jobLog").textContent = "请先打开服务端池。"; return; }
-      const profile_id = byId("profileSelect").value;
-      if (!profile_id) { byId("jobLog").textContent = "请选择 profile。"; return; }
-      const payload = await fetch("/api/expert-review/jobs", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          pool_id: activePoolId,
-          profile_id,
-          independent_model: byId("independentModel").checked,
-          mode: currentMode(),
-          workers: 2
-        })
-      }).then(r => r.json());
-      if (!payload.ok) {
-        byId("jobLog").textContent = `启动失败：${payload.error}`;
-        return;
+    byId("applyDeveloperTokenButton").addEventListener("click", async () => {
+      const allowed = await refreshStatus();
+      if (allowed && developerAllowed) {
+        byId("modeBanner").textContent = "开发者令牌验证成功。请选择开发者或测试模式。";
+        await refreshRegistry();
+        if (currentMode() !== "expert") await Promise.all([refreshProfiles(), refreshJobs()]);
       }
-      selectedJobId = payload.job.job_id;
-      byId("jobLog").textContent = `已启动 ${selectedJobId}`;
-      refreshJobs();
-      if (jobPollTimer) clearInterval(jobPollTimer);
-      jobPollTimer = setInterval(refreshJobs, 2000);
-    });
-    byId("refreshJobsButton").addEventListener("click", refreshJobs);
-    byId("cancelJobButton").addEventListener("click", async () => {
-      if (!selectedJobId) return;
-      await fetch(`/api/expert-review/jobs/${encodeURIComponent(selectedJobId)}/cancel`, { method: "POST" });
-      refreshJobs();
-    });
-    byId("retryJobButton").addEventListener("click", async () => {
-      if (!selectedJobId) return;
-      await fetch(`/api/expert-review/jobs/${encodeURIComponent(selectedJobId)}/retry-failed`, { method: "POST" });
-      refreshJobs();
     });
 
+    byId("bindImpactButton").addEventListener("click", () => { void bindImpact(); });
+    byId("fetchModelsButton").addEventListener("click", () => { void fetchModelsForEditor(); });
+    byId("saveProfileButton").addEventListener("click", () => { void saveProfileFromEditor(); });
+    byId("newProfileButton").addEventListener("click", clearProfileEditor);
+    byId("deleteProfileButton").addEventListener("click", () => { void deleteEditorProfile(); });
+    byId("profileEditorSelect").addEventListener("change", () => {
+      const profile = profiles.find((item) => item.id === byId("profileEditorSelect").value);
+      if (profile) fillProfileEditor(profile);
+      else clearProfileEditor();
+    });
+    byId("profileModelSelect").addEventListener("change", () => {
+      if (byId("profileModelSelect").value) byId("profileModelManual").value = byId("profileModelSelect").value;
+    });
+    byId("startJobButton").addEventListener("click", () => { void startJob(); });
+    byId("refreshJobsButton").addEventListener("click", () => { void refreshJobs(); });
+    byId("cancelJobButton").addEventListener("click", () => { void runJobAction("cancel"); });
+    byId("resumeJobButton").addEventListener("click", () => { void runJobAction("resume"); });
+    byId("retryJobButton").addEventListener("click", () => { void runJobAction("retry-failed"); });
+    byId("startPoolBuildButton").addEventListener("click", () => { void startPoolBuild(); });
+    byId("refreshPoolBuildsButton").addEventListener("click", () => { void refreshPoolBuilds(); });
+    byId("poolBuildAction").addEventListener("change", () => {
+      byId("startPoolBuildButton").textContent = byId("poolBuildAction").value === "build_only" ? "仅构建评审池" : "构建并评审";
+    });
+
+    window.addEventListener("beforeunload", () => {
+      stopPoolBuildPolling();
+      const candidate = currentCandidate();
+      if (candidate) {
+        candidate.review_notes = byId("reviewNotes").value;
+        candidate.__unsaved = poolSource === "server" || candidate.__unsaved;
+        saveState(reviewerId.value.trim() || reviewerContext);
+      }
+    });
+
+    reviewMode.value = requestedModeFromQuery();
+    setActiveQueue("all");
+    clearProfileEditor();
     updateModeChrome();
-    refreshRegistry();
+    void (async () => {
+      await refreshRegistry();
+      if (isDevMode()) await Promise.all([refreshProfiles(), refreshJobs(), refreshPoolBuilds()]);
+    })();
   </script>
-
 </body>
 </html>
