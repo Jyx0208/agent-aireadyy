@@ -132,6 +132,8 @@ def apply_human_grades_for_export(pool: Mapping[str, Any], *, reviewer_id: str =
             "confidence",
             "review_model",
             "review_method",
+            "model_expert_judgments",
+            "model_expert_consensus",
         ):
             item.pop(field, None)
         if latest_human is not None:
@@ -147,7 +149,11 @@ def apply_human_grades_for_export(pool: Mapping[str, Any], *, reviewer_id: str =
         item = blind_candidate_view(item, mode="developer")
         candidates.append(item)
     payload["candidates"] = candidates
-    payload["judgment_source"] = "human_verified"
+    payload["judgment_source"] = (
+        "human_verified"
+        if human_count
+        else str(pool.get("judgment_source") or "legacy_unverified")
+    )
     payload["review_summary"] = {
         "graded_candidates": human_count,
         "ungraded_candidates": len(candidates) - human_count,
@@ -279,3 +285,102 @@ def merge_machine_reviews(
     elif machine_pool.get("judgment_source"):
         payload["judgment_source"] = machine_pool.get("judgment_source")
     return payload
+
+
+def merge_model_expert_results(
+    existing_pool: Mapping[str, Any],
+    results: Mapping[str, Any],
+    *,
+    job_id: str,
+) -> dict[str, Any]:
+    """Merge deterministic model-expert results without touching human history."""
+    normalized_results = {
+        str(candidate_id): _model_dump(result)
+        for candidate_id, result in results.items()
+        if str(candidate_id).strip()
+    }
+    candidates: list[dict[str, Any]] = []
+    statuses: list[str] = []
+    for raw in existing_pool.get("candidates") or []:
+        if not isinstance(raw, Mapping):
+            continue
+        item = dict(raw)
+        candidate_id = str(item.get("candidate_id") or "")
+        result = normalized_results.get(candidate_id)
+        if result is None:
+            candidates.append(item)
+            continue
+        judgments = [
+            _model_dump(judgment)
+            for judgment in (result.get("judgments") or [])
+            if isinstance(judgment, Mapping) or hasattr(judgment, "model_dump")
+        ]
+        prior = {
+            str(judgment.get("judgment_id") or ""): dict(judgment)
+            for judgment in (item.get("model_expert_judgments") or [])
+            if isinstance(judgment, Mapping) and str(judgment.get("judgment_id") or "")
+        }
+        for judgment in judgments:
+            judgment_id = str(judgment.get("judgment_id") or "")
+            if judgment_id:
+                prior[judgment_id] = judgment
+        item["model_expert_judgments"] = list(prior.values())
+        status = str(result.get("status") or "model_expert_provisional")
+        statuses.append(status)
+        consensus = {
+            key: value
+            for key, value in result.items()
+            if key != "judgments"
+        }
+        consensus["job_id"] = str(job_id or "")
+        consensus["judgment_ids"] = [
+            str(judgment.get("judgment_id") or "")
+            for judgment in judgments
+            if str(judgment.get("judgment_id") or "")
+        ]
+        consensus["created_at"] = _utc_now()
+        item["model_expert_consensus"] = consensus
+        if _latest_active_human(item) is None:
+            item["grade"] = result.get("consensus_grade")
+            item["judgment_confidence"] = _consensus_confidence(judgments)
+            item["review_notes"] = status
+            item.pop("reviewer_id", None)
+        else:
+            item["grade"] = effective_grade(item)
+        candidates.append(item)
+
+    payload = dict(existing_pool)
+    payload["candidates"] = candidates
+    if any(_latest_active_human(candidate) is not None for candidate in candidates):
+        payload["judgment_source"] = str(existing_pool.get("judgment_source") or "human_verified")
+    elif "needs_adjudication" in statuses:
+        payload["judgment_source"] = "needs_adjudication"
+    elif "model_expert_provisional" in statuses:
+        payload["judgment_source"] = "model_expert_provisional"
+    elif statuses:
+        payload["judgment_source"] = "model_expert_consensus"
+    payload["review_summary"] = {
+        "model_expert_candidates": len(statuses),
+        "model_expert_consensus": statuses.count("model_expert_consensus"),
+        "model_expert_provisional": statuses.count("model_expert_provisional"),
+        "needs_adjudication": statuses.count("needs_adjudication"),
+    }
+    if "reviewed" not in str(payload.get("schema_version") or ""):
+        payload["schema_version"] = "discovery-judgment-pool-reviewed/v2"
+    return payload
+
+
+def _model_dump(value: Any) -> dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        dumped = value.model_dump(mode="json")
+        return dict(dumped) if isinstance(dumped, Mapping) else {}
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _consensus_confidence(judgments: list[dict[str, Any]]) -> str:
+    confidences = [str(judgment.get("confidence") or "low") for judgment in judgments]
+    if confidences and all(confidence == "high" for confidence in confidences):
+        return "high"
+    if confidences and all(confidence in {"high", "medium"} for confidence in confidences):
+        return "medium"
+    return "low"

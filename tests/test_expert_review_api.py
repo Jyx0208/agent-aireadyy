@@ -180,6 +180,53 @@ def test_pool_build_api_requires_only_prompt_and_defaults_to_review(tmp_path: Pa
     assert captured["idempotency_key"] == "request-1"
 
 
+def test_build_review_handoff_defaults_to_automatic_consensus(monkeypatch) -> None:
+    captured: dict = {}
+
+    class _Jobs:
+        def start_consensus_job(self, **kwargs):
+            captured.update(kwargs)
+            return {"job_id": "consensus-1", "status": "queued"}
+
+    monkeypatch.setattr(web_app, "_expert_job_manager", lambda: _Jobs())
+    manager = web_app._expert_pool_build_manager()
+    started = manager.start_review("pool-1", {"workers": 3})
+
+    assert started["job_id"] == "consensus-1"
+    assert captured["pool_id"] == "pool-1"
+    assert captured["workers"] == 3
+    assert captured["generator_identity"] == {}
+    assert captured["idempotency_key"] == "pool-1:model-expert-consensus"
+
+
+def test_consensus_job_api_does_not_require_single_profile(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_DIR", str(tmp_path / "expert_review"))
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ENABLED", "1")
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", "1")
+    captured: dict = {}
+
+    class _Jobs:
+        def start_consensus_job(self, **kwargs):
+            captured.update(kwargs)
+            return {"job_id": "consensus-1", "status": "queued", "job_type": "model_expert_consensus"}
+
+    monkeypatch.setattr(web_app, "_expert_job_manager", lambda: _Jobs())
+    client = TestClient(web_app.app)
+    response = client.post(
+        "/api/expert-review/jobs",
+        json={
+            "pool_id": "pool-1",
+            "job_type": "model_expert_consensus",
+            "generator_identity": {"model_family": "gpt", "identity_verification": "verified"},
+        },
+    ).json()
+
+    assert response["ok"] is True
+    assert response["job"]["job_id"] == "consensus-1"
+    assert captured["pool_id"] == "pool-1"
+    assert captured["generator_identity"]["model_family"] == "gpt"
+
+
 def test_benchmark_template_has_developer_surfaces() -> None:
     html = Path("src/agent/web/templates/benchmark_review.html").read_text(encoding="utf-8")
     assert 'id="machineRail"' in html

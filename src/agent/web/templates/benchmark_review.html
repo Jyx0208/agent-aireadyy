@@ -325,8 +325,23 @@
             <input id="profileApiKeyInput" type="password" autocomplete="off" placeholder="更新时留空表示保留原 key">
           </div>
           <div class="field full">
-            <label for="profileBaseUrlInput">Base URL（OpenAI 兼容）</label>
+            <label for="profileBaseUrlInput">Base URL / Provider Endpoint</label>
             <input id="profileBaseUrlInput" type="text" placeholder="https://api.openai.com/v1">
+          </div>
+          <div class="field">
+            <label for="profileProviderInput">Provider</label>
+            <select id="profileProviderInput">
+              <option value="openai_compatible">OpenAI compatible</option>
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="google">Google</option>
+              <option value="xai">xAI</option>
+              <option value="deepseek">DeepSeek</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="profileModelFamilyInput">Model Family</label>
+            <input id="profileModelFamilyInput" type="text" placeholder="claude / gpt / gemini / grok">
           </div>
           <div class="field">
             <label for="profileModelSelect">模型（拉取后选择）</label>
@@ -340,8 +355,24 @@
             <label for="profileTimeoutInput">Timeout 秒</label>
             <input id="profileTimeoutInput" type="number" min="1" value="120">
           </div>
+          <div class="field">
+            <label for="profileResolvedModelInput">Resolved Model ID</label>
+            <input id="profileResolvedModelInput" type="text" placeholder="仅在可验证时填写">
+          </div>
+          <div class="field">
+            <label for="profileEndpointIdentityInput">Endpoint Identity</label>
+            <input id="profileEndpointIdentityInput" type="text" placeholder="provider:route / deployment id">
+          </div>
+          <div class="field">
+            <label for="profileIdentityVerificationInput">Identity Verification</label>
+            <select id="profileIdentityVerificationInput">
+              <option value="unverified">unverified</option>
+              <option value="provider_attested">provider_attested</option>
+            </select>
+          </div>
           <div class="field" style="align-content:end">
             <label><input id="profileMakeDefault" type="checkbox"> 设为默认 Profile</label>
+            <label><input id="profileEnabledInput" type="checkbox" checked> 允许自动专家选择</label>
           </div>
         </div>
         <div class="profile-actions">
@@ -1283,6 +1314,12 @@
       byId("profileLabelInput").value = profile.label || "";
       byId("profileApiKeyInput").value = "";
       byId("profileBaseUrlInput").value = profile.base_url || "";
+      byId("profileProviderInput").value = profile.provider || "openai_compatible";
+      byId("profileModelFamilyInput").value = profile.model_family || profile.model || "";
+      byId("profileResolvedModelInput").value = profile.resolved_model_id || "";
+      byId("profileEndpointIdentityInput").value = profile.endpoint_identity || profile.base_url || "";
+      byId("profileIdentityVerificationInput").value = profile.identity_verification || "unverified";
+      byId("profileEnabledInput").checked = profile.enabled !== false;
       byId("profileTimeoutInput").value = profile.timeout || "120";
       byId("profileMakeDefault").checked = Boolean(profile.is_default);
       byId("profileModelManual").value = profile.model || "";
@@ -1299,6 +1336,12 @@
       byId("profileLabelInput").value = "";
       byId("profileApiKeyInput").value = "";
       byId("profileBaseUrlInput").value = "https://api.openai.com/v1";
+      byId("profileProviderInput").value = "openai_compatible";
+      byId("profileModelFamilyInput").value = "";
+      byId("profileResolvedModelInput").value = "";
+      byId("profileEndpointIdentityInput").value = "";
+      byId("profileIdentityVerificationInput").value = "unverified";
+      byId("profileEnabledInput").checked = true;
       byId("profileModelManual").value = "";
       byId("profileTimeoutInput").value = "120";
       byId("profileMakeDefault").checked = false;
@@ -1315,7 +1358,7 @@
         const payload = await apiRequest("/api/llm/profiles");
         if (!payload.ok) throw new Error(payload.error || "无法加载 Profiles");
         profiles = Array.isArray(payload.profiles) ? payload.profiles : [];
-        const options = profiles.map((profile) => ({ value: profile.id, label: `${profile.label || profile.id} · ${profile.model}${profile.is_default ? "（默认）" : ""}` }));
+        const options = profiles.map((profile) => ({ value: profile.id, label: `${profile.label || profile.id} · ${profile.model_family || profile.model} · ${profile.identity_verification || "unverified"}${profile.is_default ? "（默认）" : ""}` }));
         setOptions(byId("profileSelect"), options, profiles.length ? "选择 Job Profile" : "尚无 Profile");
         setOptions(byId("profileEditorSelect"), options, "选择一个 Profile，或新建空白");
         if (previousJobProfile && profiles.some((profile) => profile.id === previousJobProfile)) byId("profileSelect").value = previousJobProfile;
@@ -1384,6 +1427,11 @@
       const baseUrl = byId("profileBaseUrlInput").value.trim();
       const model = selectedModelName();
       const timeout = byId("profileTimeoutInput").value.trim() || "120";
+      const provider = byId("profileProviderInput").value;
+      const modelFamily = byId("profileModelFamilyInput").value.trim() || model;
+      const resolvedModel = byId("profileResolvedModelInput").value.trim();
+      const endpointIdentity = byId("profileEndpointIdentityInput").value.trim() || baseUrl;
+      const identityVerification = byId("profileIdentityVerificationInput").value;
       if (!id || !baseUrl || !model) {
         setProfileStatus("Profile ID、Base URL、模型为必填。", true);
         return;
@@ -1395,7 +1443,21 @@
       setProfileBusy(true);
       setProfileStatus("正在保存 Profile…");
       try {
-        const profile = { id, label, base_url: baseUrl, model, timeout };
+        const profile = {
+          id,
+          label,
+          base_url: baseUrl,
+          model,
+          timeout,
+          provider,
+          requested_model_id: model,
+          resolved_model_id: resolvedModel || null,
+          model_family: modelFamily,
+          endpoint_identity: endpointIdentity,
+          routing_profile_id: id,
+          identity_verification: identityVerification,
+          enabled: byId("profileEnabledInput").checked
+        };
         if (apiKey) profile.api_key = apiKey;
         const url = editingProfileId ? `/api/llm/profiles/${encodeURIComponent(editingProfileId)}` : "/api/llm/profiles";
         const payload = await apiRequest(url, {
@@ -1493,11 +1555,6 @@
         return;
       }
       const action = byId("poolBuildAction").value || "build_and_review";
-      const profileId = byId("profileSelect").value;
-      if (action === "build_and_review" && !profileId) {
-        byId("poolBuildStatus").textContent = "请先在开发者工具中配置并选择专家 Profile。";
-        return;
-      }
       poolBuildBusy = true;
       byId("startPoolBuildButton").disabled = true;
       try {
@@ -1509,7 +1566,7 @@
             action,
             preset_id: "default/v1",
             idempotency_key: (window.crypto && window.crypto.randomUUID) ? window.crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
-            review: action === "build_and_review" ? { profile_id: profileId, workers: 2 } : {}
+            review: action === "build_and_review" ? { workers: 2 } : {}
           })
         });
         if (!payload.ok || !payload.build) throw new Error(payload.error || "构建启动失败");

@@ -146,7 +146,18 @@ def test_build_and_review_failure_keeps_pool_and_reconciles_without_discovery(tm
         nonlocal review_starts
         review_starts += 1
         assert pool_id
-        assert options == {"profile_id": "profile-1"}
+        assert options == {
+            "profile_id": "profile-1",
+            "generator_identity": {
+                "provider": "local",
+                "requested_model_id": "workflow-discovery/v1",
+                "resolved_model_id": "workflow-discovery/v1",
+                "model_family": "workflow-discovery",
+                "runtime": "workflow",
+                "endpoint_identity": "local:workflow-discovery",
+                "identity_verification": "verified",
+            },
+        }
         if review_starts == 1:
             raise RuntimeError("review service unavailable")
         return {"job_id": "review-job", "status": "queued", "api_key": "must-not-leak"}
@@ -371,3 +382,16 @@ def test_empty_discovery_result_is_rejected_before_registration(tmp_path: Path) 
     failed = _wait(manager, started["build_id"], {"failed"})
     assert "discovery_result_has_no_candidates" in str(failed["error"])
     assert registry.list_pools() == []
+
+
+def test_agentic_workflow_generator_identity_remains_unverified() -> None:
+    identity = ExpertPoolBuildManager._candidate_generation_identity(
+        {
+            "runtime": "workflow",
+            "summary": {"agentic": {"enabled": True, "model": "planner-alias"}},
+        }
+    )
+
+    assert identity["runtime"] == "agentic_workflow"
+    assert identity["model_family"] == "planner-alias"
+    assert identity["identity_verification"] == "unverified"

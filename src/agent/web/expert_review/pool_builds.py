@@ -294,6 +294,12 @@ class ExpertPoolBuildManager:
                     if isinstance(record.get("discovery_request"), Mapping)
                     else {}
                 )
+                review = dict(record.get("review") or {})
+                if record.get("action") == "build_and_review" and not isinstance(
+                    review.get("generator_identity"), Mapping
+                ):
+                    review["generator_identity"] = self._candidate_generation_identity(discovery_record)
+                    record["review"] = review
                 supplied_pool = discovery_record.get("pool")
                 if isinstance(supplied_pool, Mapping):
                     pool = strip_pool_for_mode(self._validated_pool(supplied_pool), mode="expert")
@@ -421,6 +427,42 @@ class ExpertPoolBuildManager:
         if key_candidate_ids != pool_candidate_ids:
             raise ValueError("private_key_candidate_ids_mismatch")
         return dict(sanitized)
+
+    @staticmethod
+    def _candidate_generation_identity(discovery_record: Mapping[str, Any]) -> dict[str, Any]:
+        runtime = str(discovery_record.get("runtime") or "workflow").strip().lower()
+        summary = discovery_record.get("summary")
+        summary = summary if isinstance(summary, Mapping) else {}
+        agentic = summary.get("agentic")
+        agentic = agentic if isinstance(agentic, Mapping) else {}
+        if runtime == "workflow" and agentic.get("enabled") is not True:
+            return {
+                "provider": "local",
+                "requested_model_id": "workflow-discovery/v1",
+                "resolved_model_id": "workflow-discovery/v1",
+                "model_family": "workflow-discovery",
+                "runtime": "workflow",
+                "endpoint_identity": "local:workflow-discovery",
+                "identity_verification": "verified",
+            }
+        agent = discovery_record.get("agent")
+        agent = agent if isinstance(agent, Mapping) else {}
+        model = str(
+            agent.get("resolved_model_id")
+            or agent.get("requested_model_id")
+            or agent.get("model")
+            or agentic.get("model")
+            or ""
+        ).strip()
+        return {
+            "provider": str(agent.get("provider") or "openai_compatible"),
+            "requested_model_id": str(agent.get("requested_model_id") or model) or None,
+            "resolved_model_id": str(agent.get("resolved_model_id") or "") or None,
+            "model_family": str(agent.get("model_family") or model) or None,
+            "runtime": "agentic_workflow" if runtime == "workflow" else runtime or "unknown",
+            "endpoint_identity": str(agent.get("endpoint_identity") or "") or None,
+            "identity_verification": str(agent.get("identity_verification") or "unverified"),
+        }
 
     def _fail(self, record: dict[str, Any], error: str) -> None:
         with _BUILDS_LOCK:

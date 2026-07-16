@@ -58,6 +58,8 @@ _EXPERT_HIDDEN_FIELDS = (
     "human_grades",
     "machine_reviews",
     "machine_review_runs",
+    "model_expert_judgments",
+    "model_expert_consensus",
     "judgment_confidence",
     "review_model",
     "confidence",
@@ -445,7 +447,12 @@ class ExpertPoolRegistry:
         for item in pool.get("candidates") or []:
             if not isinstance(item, dict):
                 continue
-            if item.get("machine_reviews") or item.get("grade") is not None:
+            if (
+                item.get("machine_reviews")
+                or item.get("model_expert_judgments")
+                or item.get("model_expert_consensus")
+                or item.get("grade") is not None
+            ):
                 return True
         return False
 
@@ -472,10 +479,15 @@ class ExpertPoolRegistry:
         low_confidence = 0
         for item in candidates:
             if item.get("grade") is not None and (
-                item.get("reviewer_id") or item.get("human_grades") or str(item.get("judgment_source") or "") == "human_verified"
+                item.get("human_grades")
+                or str(item.get("judgment_source") or "") == "human_verified"
             ):
                 graded_human += 1
-            elif item.get("grade") is not None or item.get("machine_reviews"):
+            elif (
+                item.get("grade") is not None
+                or item.get("machine_reviews")
+                or item.get("model_expert_judgments")
+            ):
                 graded_machine += 1
             confidence = str(item.get("judgment_confidence") or item.get("confidence") or "")
             if confidence == "low":

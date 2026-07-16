@@ -4,6 +4,7 @@ from agent.web.expert_review.grading import (
     append_human_grade,
     apply_human_grades_for_export,
     effective_grade,
+    merge_model_expert_results,
     merge_machine_reviews,
     queue_bucket,
 )
@@ -219,3 +220,107 @@ def test_merge_machine_reviews_keeps_humans() -> None:
     assert item["human_grades"]
     assert item["grade"] == 3
     assert item["machine_reviews"]
+
+
+def test_merge_model_expert_results_is_idempotent_and_never_creates_human_grades() -> None:
+    existing = {
+        "schema_version": "discovery-judgment-pool-blinded/v2",
+        "candidates": [{"candidate_id": "c1", "project_title": "Visible"}],
+    }
+    result = {
+        "candidate_id": "c1",
+        "status": "model_expert_consensus",
+        "hard_gate_outcome": "pass",
+        "consensus_grade": 2,
+        "trigger_reasons": [],
+        "used_third_vote": False,
+        "formal_independence": True,
+        "policy_version": "deterministic-model-consensus/v1",
+        "judgments": [
+            {
+                "judgment_id": "j1",
+                "candidate_id": "c1",
+                "profile": {"profile_id": "a", "model_family": "claude"},
+                "hard_gate_outcome": "pass",
+                "final_grade": 2,
+                "confidence": "high",
+            },
+            {
+                "judgment_id": "j2",
+                "candidate_id": "c1",
+                "profile": {"profile_id": "b", "model_family": "gemini"},
+                "hard_gate_outcome": "pass",
+                "final_grade": 2,
+                "confidence": "high",
+            },
+        ],
+    }
+
+    merged = merge_model_expert_results(existing, {"c1": result}, job_id="consensus-job")
+    repeated = merge_model_expert_results(merged, {"c1": result}, job_id="consensus-job")
+    candidate = repeated["candidates"][0]
+
+    assert candidate["grade"] == 2
+    assert "human_grades" not in candidate
+    assert "reviewer_id" not in candidate
+    assert [item["judgment_id"] for item in candidate["model_expert_judgments"]] == ["j1", "j2"]
+    assert candidate["model_expert_consensus"]["status"] == "model_expert_consensus"
+    assert candidate["model_expert_consensus"]["job_id"] == "consensus-job"
+    assert repeated["judgment_source"] == "model_expert_consensus"
+
+
+def test_merge_model_expert_results_preserves_human_effective_grade() -> None:
+    existing = {
+        "schema_version": "discovery-judgment-pool-reviewed/v2",
+        "judgment_source": "human_verified",
+        "candidates": [
+            {
+                "candidate_id": "c1",
+                "grade": 3,
+                "human_grades": [{"grade": 3, "reviewer_id": "human"}],
+            }
+        ],
+    }
+    result = {
+        "candidate_id": "c1",
+        "status": "needs_adjudication",
+        "hard_gate_outcome": "unknown",
+        "consensus_grade": None,
+        "trigger_reasons": ["hard_gate_conflict"],
+        "used_third_vote": True,
+        "formal_independence": True,
+        "policy_version": "deterministic-model-consensus/v1",
+        "judgments": [],
+    }
+
+    merged = merge_model_expert_results(existing, {"c1": result}, job_id="consensus-job")
+    candidate = merged["candidates"][0]
+
+    assert candidate["grade"] == 3
+    assert candidate["human_grades"] == [{"grade": 3, "reviewer_id": "human"}]
+    assert candidate["model_expert_consensus"]["status"] == "needs_adjudication"
+    assert merged["judgment_source"] == "human_verified"
+
+
+def test_human_export_without_human_grades_never_claims_human_verified() -> None:
+    pool = {
+        "schema_version": "discovery-judgment-pool-reviewed/v2",
+        "judgment_source": "model_expert_consensus",
+        "candidates": [
+            {
+                "candidate_id": "c1",
+                "grade": 3,
+                "model_expert_judgments": [{"judgment_id": "j1"}],
+                "model_expert_consensus": {"status": "model_expert_consensus"},
+            }
+        ],
+    }
+
+    exported = apply_human_grades_for_export(pool)
+    candidate = exported["candidates"][0]
+
+    assert exported["judgment_source"] == "model_expert_consensus"
+    assert exported["review_summary"]["graded_candidates"] == 0
+    assert candidate["grade"] is None
+    assert "model_expert_judgments" not in candidate
+    assert "model_expert_consensus" not in candidate

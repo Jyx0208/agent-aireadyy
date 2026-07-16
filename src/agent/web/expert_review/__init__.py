@@ -1,5 +1,11 @@
 """Expert review workbench services (pool registry, later impact/jobs)."""
 
+from agent.web.expert_review.consensus import (
+    CandidateGenerationIdentity,
+    ExpertConsensusEngine,
+    ExpertJudgment,
+    ExpertModelProfile,
+)
 from agent.web.expert_review.pool_builds import ExpertPoolBuildManager
 from agent.web.expert_review.pool_registry import (
     ExpertPoolRegistry,
@@ -9,6 +15,10 @@ from agent.web.expert_review.pool_registry import (
 )
 
 __all__ = [
+    "CandidateGenerationIdentity",
+    "ExpertConsensusEngine",
+    "ExpertJudgment",
+    "ExpertModelProfile",
     "ExpertPoolBuildManager",
     "ExpertPoolRegistry",
     "blind_candidate_view",

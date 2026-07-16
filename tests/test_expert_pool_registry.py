@@ -134,3 +134,17 @@ def test_pool_registry_rejects_empty_pool(tmp_path: Path) -> None:
         assert False, "expected ValueError"
     except ValueError as exc:
         assert "candidates" in str(exc)
+
+
+def test_model_consensus_is_counted_as_machine_not_human(tmp_path: Path) -> None:
+    registry = ExpertPoolRegistry(tmp_path / "expert_review")
+    pool = _sample_pool()
+    candidate = pool["candidates"][0]
+    candidate["reviewer_id"] = "model-expert-consensus"
+    candidate["model_expert_judgments"] = [{"judgment_id": "j1"}]
+    candidate["model_expert_consensus"] = {"status": "model_expert_consensus"}
+
+    record = registry.import_pool(pool, label="model-only")
+
+    assert record["stats"]["graded_human"] == 0
+    assert record["stats"]["graded_machine"] == 1

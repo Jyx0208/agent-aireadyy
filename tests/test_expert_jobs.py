@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
+from agent.web.expert_review.consensus import ExpertJudgment, ExpertModelProfile
 from agent.web.expert_review.jobs import ExpertJudgeJobManager, reset_jobs_for_tests
 from agent.web.expert_review.openai_judge import OpenAISdkJudge, redact_text
 from agent.web.expert_review.pool_registry import ExpertPoolRegistry
@@ -114,3 +115,194 @@ def test_job_manager_runs_with_mock_judge(tmp_path: Path) -> None:
     assert any(item["job_id"] == job["job_id"] for item in listed)
     for item in listed:
         assert "api_key" not in item
+
+
+def test_consensus_job_selects_heterogeneous_panel_and_persists_model_only_results(tmp_path: Path) -> None:
+    reset_jobs_for_tests()
+    registry = ExpertPoolRegistry(tmp_path / "expert_review")
+    record = registry.import_pool(
+        {
+            "schema_version": "discovery-judgment-pool-blinded/v2",
+            "candidates": [
+                {
+                    "candidate_id": "c1",
+                    "scenario_id": "s",
+                    "variant_id": "v",
+                    "project_title": "Visible",
+                    "visible_prompt": "Find a suitable project",
+                }
+            ],
+        },
+        label="consensus-pool",
+    )
+    profiles = [
+        {
+            "id": "claude",
+            "provider": "anthropic",
+            "requested_model_id": "claude-opus-4-8",
+            "resolved_model_id": "claude-opus-4-8",
+            "model_family": "claude",
+            "endpoint_identity": "anthropic:primary",
+            "routing_profile_id": "claude",
+            "identity_verification": "verified",
+            "enabled": True,
+        },
+        {
+            "id": "gemini",
+            "provider": "google",
+            "requested_model_id": "gemini-3-pro",
+            "resolved_model_id": "gemini-3-pro",
+            "model_family": "gemini",
+            "endpoint_identity": "google:primary",
+            "routing_profile_id": "gemini",
+            "identity_verification": "verified",
+            "enabled": True,
+        },
+        {
+            "id": "grok",
+            "provider": "xai",
+            "requested_model_id": "grok-4.1",
+            "resolved_model_id": "grok-4.1",
+            "model_family": "grok",
+            "endpoint_identity": "xai:primary",
+            "routing_profile_id": "grok",
+            "identity_verification": "verified",
+            "enabled": True,
+        },
+    ]
+    grades = {"claude": 3, "gemini": 1, "grok": 3}
+    calls: list[str] = []
+
+    def run(profile: ExpertModelProfile, candidate: Mapping[str, Any]) -> ExpertJudgment:
+        calls.append(profile.profile_id)
+        return ExpertJudgment(
+            judgment_id=f"judgment-{profile.profile_id}",
+            candidate_id=str(candidate["candidate_id"]),
+            profile=profile,
+            hard_gate_outcome="pass",
+            final_grade=grades[profile.profile_id],
+            confidence="high",
+            investigation_status="completed",
+            summary="result",
+        )
+
+    manager = ExpertJudgeJobManager(
+        registry,
+        resolve_profile=lambda _profile_id: {},
+        list_profiles=lambda: profiles,
+        expert_runner=run,
+        max_running=1,
+    )
+    first = manager.start_consensus_job(
+        pool_id=record["pool_id"],
+        generator_identity={"model_family": "gpt", "identity_verification": "verified"},
+        idempotency_key="same-consensus-request",
+    )
+    replay = manager.start_consensus_job(
+        pool_id=record["pool_id"],
+        generator_identity={"model_family": "gpt", "identity_verification": "verified"},
+        idempotency_key="same-consensus-request",
+    )
+    assert replay["job_id"] == first["job_id"]
+
+    deadline = time.time() + 10
+    final = None
+    while time.time() < deadline:
+        final = manager.get_job(first["job_id"], detail=True)
+        if final and final["status"] in {"completed", "failed", "completed_with_errors"}:
+            break
+        time.sleep(0.05)
+    assert final is not None
+    assert final["status"] == "completed"
+    assert final["job_type"] == "model_expert_consensus"
+    assert final["profile_ids"] == ["claude", "gemini", "grok"]
+    assert sorted(calls) == ["claude", "gemini", "grok"]
+    assert "api_key" not in str(final)
+
+    reviewed = registry.load_pool_document(record["pool_id"], prefer_reviewed=True)
+    assert reviewed is not None
+    candidate = reviewed["candidates"][0]
+    assert candidate["grade"] == 3
+    assert "human_grades" not in candidate
+    assert len(candidate["model_expert_judgments"]) == 3
+    assert candidate["model_expert_consensus"]["status"] == "model_expert_consensus"
+    assert reviewed["judgment_source"] == "model_expert_consensus"
+
+
+def test_consensus_retry_reuses_checkpointed_primary_judgments(tmp_path: Path) -> None:
+    reset_jobs_for_tests()
+    registry = ExpertPoolRegistry(tmp_path / "expert_review")
+    record = registry.import_pool(
+        {
+            "schema_version": "discovery-judgment-pool-blinded/v2",
+            "candidates": [{"candidate_id": "c1", "project_title": "Visible"}],
+        },
+        label="retry-consensus",
+    )
+    profiles = [
+        {
+            "id": profile_id,
+            "provider": provider,
+            "requested_model_id": model,
+            "resolved_model_id": model,
+            "model_family": family,
+            "endpoint_identity": f"{provider}:primary",
+            "routing_profile_id": profile_id,
+            "identity_verification": "verified",
+            "enabled": True,
+        }
+        for profile_id, provider, family, model in (
+            ("a", "anthropic", "claude", "claude-opus-4-8"),
+            ("b", "google", "gemini", "gemini-3-pro"),
+            ("c", "xai", "grok", "grok-4.1"),
+        )
+    ]
+    calls = {"a": 0, "b": 0, "c": 0}
+
+    def run(profile: ExpertModelProfile, candidate: Mapping[str, Any]) -> ExpertJudgment:
+        calls[profile.profile_id] += 1
+        if profile.profile_id == "c" and calls["c"] == 1:
+            raise RuntimeError("temporary third expert failure")
+        grade = 3 if profile.profile_id in {"a", "c"} else 1
+        return ExpertJudgment(
+            judgment_id=f"{candidate['candidate_id']}:{profile.profile_id}",
+            candidate_id=str(candidate["candidate_id"]),
+            profile=profile,
+            hard_gate_outcome="pass",
+            final_grade=grade,
+            confidence="high",
+            investigation_status="completed",
+            summary="result",
+        )
+
+    manager = ExpertJudgeJobManager(
+        registry,
+        resolve_profile=lambda _profile_id: {},
+        list_profiles=lambda: profiles,
+        expert_runner=run,
+        max_running=1,
+    )
+    job = manager.start_consensus_job(
+        pool_id=record["pool_id"],
+        generator_identity={"model_family": "gpt", "identity_verification": "verified"},
+    )
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        failed = manager.get_job(job["job_id"], detail=True)
+        if failed and failed["status"] == "completed_with_errors":
+            break
+        time.sleep(0.05)
+    assert failed is not None
+    assert failed["status"] == "completed_with_errors"
+
+    manager.retry_failed(job["job_id"])
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        completed = manager.get_job(job["job_id"], detail=True)
+        if completed and completed["status"] == "completed":
+            break
+        time.sleep(0.05)
+    assert completed is not None
+    assert completed["status"] == "completed"
+    assert calls == {"a": 1, "b": 1, "c": 2}

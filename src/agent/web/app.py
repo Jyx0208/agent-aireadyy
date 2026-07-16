@@ -2350,6 +2350,11 @@ def _run_web_discovery(
         budget_audit = control_summary.get("budget_audit") or {}
         agent_summary = {
             "runtime": "openai_agents",
+            "provider": "openai_compatible",
+            "requested_model_id": str(agent_llm_config.get("model") or ""),
+            "model_family": str(agent_llm_config.get("model") or ""),
+            "endpoint_identity": str(agent_llm_config.get("base_url") or ""),
+            "identity_verification": "unverified",
             "status": result.status,
             "run_id": result.run_id,
             "discovery_rounds": result.discovery_round_count,
@@ -4293,13 +4298,17 @@ _impact_sessions_lock = threading.Lock()
 def _expert_job_manager() -> ExpertJudgeJobManager:
     store = _llm_config_store()
 
-    def resolve_profile(profile_id: str) -> dict[str, str]:
-        secrets = store.get_profile_secrets(profile_id)
-        if secrets is None:
+    def resolve_profile(profile_id: str) -> dict[str, Any]:
+        profile = store.get_profile(profile_id, include_secrets=True)
+        if profile is None:
             raise ValueError("profile_not_found_or_incomplete")
-        return secrets
+        return profile
 
-    return ExpertJudgeJobManager(_expert_pool_registry(), resolve_profile=resolve_profile)
+    return ExpertJudgeJobManager(
+        _expert_pool_registry(),
+        resolve_profile=resolve_profile,
+        list_profiles=lambda: store.list_profiles(include_secrets=False),
+    )
 
 
 def _expert_pool_build_manager() -> ExpertPoolBuildManager:
@@ -4313,18 +4322,29 @@ def _expert_pool_build_manager() -> ExpertPoolBuildManager:
         return asyncio.run(cancel_discovery_job(job_id))
 
     def start_review(pool_id: str, review: Mapping[str, Any]) -> dict[str, Any]:
-        profile_id = _clean_text(review.get("profile_id"))
-        if not profile_id:
-            profiles = _llm_config_store().list_profiles()
-            default_profile = next((item for item in profiles if item.get("is_default")), None)
-            profile_id = _clean_text((default_profile or {}).get("id"))
-        if not profile_id:
-            raise ValueError("review_profile_id_required")
-        return _expert_job_manager().start_job(
+        if review.get("single_model") is True:
+            profile_id = _clean_text(review.get("profile_id"))
+            if not profile_id:
+                profiles = _llm_config_store().list_profiles()
+                default_profile = next((item for item in profiles if item.get("is_default")), None)
+                profile_id = _clean_text((default_profile or {}).get("id"))
+            if not profile_id:
+                raise ValueError("review_profile_id_required")
+            return _expert_job_manager().start_job(
+                pool_id=pool_id,
+                profile_id=profile_id,
+                independent_model=bool(review.get("independent_model")),
+                workers=int(review.get("workers") or 2),
+            )
+        generator_identity = review.get("generator_identity")
+        if not isinstance(generator_identity, Mapping):
+            generator_identity = {}
+        return _expert_job_manager().start_consensus_job(
             pool_id=pool_id,
-            profile_id=profile_id,
-            independent_model=bool(review.get("independent_model")),
-            workers=int(review.get("workers") or 2),
+            generator_identity=generator_identity,
+            workers=int(review.get("workers") or 1),
+            idempotency_key=_clean_text(review.get("idempotency_key"))
+            or f"{pool_id}:model-expert-consensus",
         )
 
     return ExpertPoolBuildManager(
@@ -5052,6 +5072,25 @@ async def start_expert_judge_job(body: dict[str, Any], request: Request):
     if mode == "expert":
         return {"ok": False, "error": "jobs_forbidden_in_expert_mode"}
     pool_id = _clean_text(body.get("pool_id"))
+    job_type = _clean_text(body.get("job_type") or "single_model")
+    if job_type == "model_expert_consensus":
+        if not pool_id:
+            return {"ok": False, "error": "pool_id_required"}
+        generator_identity = body.get("generator_identity")
+        if not isinstance(generator_identity, dict):
+            generator_identity = {}
+        try:
+            job = _expert_job_manager().start_consensus_job(
+                pool_id=pool_id,
+                generator_identity=generator_identity,
+                workers=int(body.get("workers") or 1),
+                idempotency_key=_clean_text(body.get("idempotency_key")) or None,
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "error": _redact_secrets(str(exc))}
+        return {"ok": True, "job": job}
     profile_id = _clean_text(body.get("profile_id"))
     if not pool_id or not profile_id:
         return {"ok": False, "error": "pool_id_and_profile_id_required"}

@@ -7,9 +7,14 @@ import threading
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit, urlunsplit
+
+from agent.errors import redact_secrets
+from agent.web.expert_review.consensus import ExpertModelProfile
 
 
 _FIELDS = ("api_key", "base_url", "model", "timeout")
+_IDENTITY_VERIFICATIONS = {"verified", "provider_attested", "unverified"}
 _STORE_LOCK = threading.RLock()
 _PROFILE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 
@@ -165,6 +170,13 @@ class LLMConfigStore:
                     raise ValueError
             except (TypeError, ValueError):
                 raise ValueError("llm_config_timeout_must_be_positive_number") from None
+            identity = self._identity_metadata(
+                profile,
+                existing=existing,
+                profile_id=profile_id,
+                base_url=base_url,
+                model=model,
+            )
             payload = {
                 "id": profile_id,
                 "label": label,
@@ -172,6 +184,7 @@ class LLMConfigStore:
                 "base_url": base_url,
                 "model": model,
                 "timeout": timeout,
+                **identity,
             }
             if existing is None:
                 profiles.append(payload)
@@ -312,14 +325,89 @@ class LLMConfigStore:
     @staticmethod
     def _public_profile(profile: Mapping[str, Any], *, default_id: str) -> dict[str, Any]:
         profile_id = str(profile.get("id") or "")
+        model = str(profile.get("model") or "")
+        base_url = _normalize_endpoint_identity(profile.get("base_url"))
+        endpoint_identity = _normalize_endpoint_identity(
+            profile.get("endpoint_identity") or base_url
+        )
+        verification = str(profile.get("identity_verification") or "unverified")
+        identity = ExpertModelProfile.from_mapping(
+            {
+                **profile,
+                "base_url": base_url,
+                "endpoint_identity": endpoint_identity,
+                "identity_verification": (
+                    "provider_attested" if verification == "verified" else verification
+                ),
+            }
+        )
         return {
             "id": profile_id,
             "label": str(profile.get("label") or profile_id),
-            "base_url": str(profile.get("base_url") or "").rstrip("/"),
-            "model": str(profile.get("model") or ""),
+            "base_url": base_url,
+            "model": model,
             "timeout": str(profile.get("timeout") or ""),
+            "provider": identity.provider,
+            "requested_model_id": identity.requested_model_id,
+            "resolved_model_id": identity.resolved_model_id,
+            "model_family": identity.model_family,
+            "endpoint_identity": endpoint_identity,
+            "routing_profile_id": identity.routing_profile_id,
+            "identity_verification": identity.identity_verification,
+            "enabled": identity.enabled,
+            "capabilities": list(identity.capabilities),
+            "config_version": identity.config_version,
             "api_key_set": bool(str(profile.get("api_key") or "").strip()),
             "is_default": profile_id == default_id,
+        }
+
+    @staticmethod
+    def _identity_metadata(
+        profile: Mapping[str, Any],
+        *,
+        existing: Mapping[str, Any] | None,
+        profile_id: str,
+        base_url: str,
+        model: str,
+    ) -> dict[str, Any]:
+        current = existing or {}
+        verification = str(
+            profile.get("identity_verification")
+            or current.get("identity_verification")
+            or "unverified"
+        ).strip()
+        if verification not in _IDENTITY_VERIFICATIONS:
+            raise ValueError("invalid_identity_verification")
+        if verification == "verified":
+            raise ValueError("verified_identity_requires_runtime_attestation")
+        if "resolved_model_id" in profile:
+            resolved_model_id = str(profile.get("resolved_model_id") or "").strip() or None
+        else:
+            resolved_model_id = str(current.get("resolved_model_id") or "").strip() or None
+        raw_capabilities = profile.get("capabilities", current.get("capabilities") or [])
+        if isinstance(raw_capabilities, str):
+            raw_capabilities = [raw_capabilities]
+        if not isinstance(raw_capabilities, list):
+            raise ValueError("profile_capabilities_must_be_list")
+        return {
+            "provider": str(profile.get("provider") or current.get("provider") or "openai_compatible").strip(),
+            "requested_model_id": str(
+                profile.get("requested_model_id") or current.get("requested_model_id") or model
+            ).strip(),
+            "resolved_model_id": resolved_model_id,
+            "model_family": str(profile.get("model_family") or current.get("model_family") or model).strip(),
+            "endpoint_identity": _normalize_endpoint_identity(
+                profile.get("endpoint_identity") or current.get("endpoint_identity") or base_url
+            ),
+            "routing_profile_id": str(
+                profile.get("routing_profile_id") or current.get("routing_profile_id") or profile_id
+            ).strip(),
+            "identity_verification": verification,
+            "enabled": _as_bool(profile.get("enabled", current.get("enabled")), default=True),
+            "capabilities": [str(item) for item in raw_capabilities if str(item).strip()],
+            "config_version": str(
+                profile.get("config_version") or current.get("config_version") or "expert-model-profile/v1"
+            ).strip(),
         }
 
     @staticmethod
@@ -332,3 +420,38 @@ def _restrict_permissions(path: Path, mode: int) -> None:
         os.chmod(path, mode)
     except OSError:
         pass
+
+
+def _as_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
+    return bool(value)
+
+
+def _normalize_endpoint_identity(value: Any) -> str:
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return ""
+    if "://" not in text:
+        if redact_secrets(text) != text:
+            raise ValueError("endpoint_identity_must_not_contain_credentials")
+        if re.search(r"[\s?#@&=]", text):
+            raise ValueError("invalid_endpoint_identity")
+        return text
+    try:
+        parsed = urlsplit(text)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("invalid_endpoint_identity") from None
+    if not parsed.scheme or not parsed.hostname:
+        raise ValueError("invalid_endpoint_identity")
+    hostname = parsed.hostname
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc = f"{hostname}:{port}" if port is not None else hostname
+    normalized = urlunsplit((parsed.scheme.lower(), netloc, parsed.path.rstrip("/"), "", ""))
+    if redact_secrets(normalized) != normalized:
+        raise ValueError("endpoint_identity_must_not_contain_credentials")
+    return normalized

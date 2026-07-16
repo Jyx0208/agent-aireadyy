@@ -51,6 +51,16 @@ def test_benchmark_review_template_has_repair_contract_markers() -> None:
     assert 'id="poolBuildAction"' in html
     assert "/api/benchmark-review/builds" in html
     assert "build_and_review" in html
+    assert 'id="profileProviderInput"' in html
+    assert 'id="profileModelFamilyInput"' in html
+    assert 'id="profileResolvedModelInput"' in html
+    assert 'id="profileEndpointIdentityInput"' in html
+    assert 'id="profileIdentityVerificationInput"' in html
+    assert 'id="profileEnabledInput"' in html
+    assert "requested_model_id" in html
+    assert '<option value="verified">' not in html
+    assert "请先在开发者工具中配置并选择专家 Profile" not in html
+    assert 'review: action === "build_and_review" ? { profile_id:' not in html
 
 
 def test_benchmark_review_template_avoids_known_unsafe_fallbacks() -> None:
