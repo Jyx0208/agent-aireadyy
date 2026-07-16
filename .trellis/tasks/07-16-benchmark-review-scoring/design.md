@@ -285,7 +285,132 @@ queued
 
 通过 feature flag 隔离新 runner、外部调查和 overlay。回滚时停止新 Job 并切回旧读取路径；append-only 新记录保留，不删除或伪装成旧格式。
 
-## 12. Key Trade-offs
+## 12. One-Prompt Pool Builder
+
+### 12.1 Product API
+
+新增一个面向产品的一键入口，默认动作是 `build_and_review`：
+
+```text
+POST /api/benchmark-review/builds
+{
+  "prompt": "...",
+  "action": "build_and_review",   // or build_only
+  "preset_id": "default/v1",
+  "idempotency_key": "...",
+  "advanced": { ...optional overrides... }
+}
+```
+
+立即返回：
+
+```text
+build_id
+status
+current_stage
+pool_id | null
+review_job_id | null
+warnings[]
+```
+
+状态查询和取消使用独立 build resource；pool 和 review job 是其产物，不让前端串联多个内部 API。CLI 可调用同一 service，不另写一套构建逻辑。
+
+### 12.2 Build State Machine
+
+```text
+queued
+ -> parsing_prompt
+ -> discovering_candidates
+ -> hydrating_projects
+ -> deduplicating
+ -> evaluating_hard_gates
+ -> collecting_evidence
+ -> packaging
+ -> validating_pool
+ -> pool_ready
+ -> selecting_experts          (build_and_review only)
+ -> review_started
+ -> completed
+```
+
+任一阶段可进入 `needs_input`、`failed` 或 `cancelled`。每个阶段保存输入 hash、输出引用、计数和事件；恢复时从最后一个成功 checkpoint 继续。`pool_ready` 是持久边界，因此评审启动失败不会导致重新发现和重新取证。
+
+### 12.3 Prompt to TaskSpec
+
+复用现有 discovery goal parse 能力，但输出升级为版本化 TaskSpec：
+
+```text
+original_prompt
+normalized_goal
+hard_constraints[]
+soft_preferences[]
+search_concepts[]
+required_evidence_fields[]
+source_scope
+candidate_budget
+assumptions[]
+ambiguities[]
+parser_profile/version
+```
+
+原始 Prompt 永不被规范化结果替代。确定性显式覆盖优先于模型解析；解析结果通过 schema 与领域规则校验。普通缺省项使用 preset 并记录 assumption，只有会导致不安全搜索或无法确定任务单位的歧义才进入 `needs_input`。
+
+### 12.4 Candidate Discovery Adapter
+
+构建器通过 adapter 调用现有 discovery pipeline，而不是复制其搜索逻辑：
+
+```text
+CandidateSource.discover(task_spec, build_context) -> CandidateObservation[]
+```
+
+首个 adapter 使用现有 discovery job/candidate pool manifest。后续可增加上传 manifest、历史 discovery run 或受支持的外部项目来源。每个 observation 保存 source、query/round、rank、runtime 和 artifact reference；这些 provenance 仅进入私有构建记录，不进入专家 Prompt。
+
+### 12.5 Deduplication and Hydration
+
+- 首选稳定 canonical project identity（如 source + accession）；
+- 缺少稳定 ID 时使用规范化 canonical URL，再退化到受审计 fingerprint；
+- 合并重复 observation 时保留全部发现 provenance，选择信息最完整的字段并记录冲突；
+- hydration 获取项目详情、文件摘要、canonical URL 和 evidence completeness；
+- 设置候选预算和最低覆盖策略，避免单 Prompt 触发无界搜索与评审成本。
+
+### 12.6 Pool Bundle
+
+构建产物不是单一可随意修改的 JSON，而是逻辑 bundle：
+
+```text
+pool.manifest.json          # schema, task spec hash, preset, counts, artifact hashes
+pool.expert.json            # 专家安全视图和 Evidence Package refs
+pool.identity.json          # 私有 candidate -> canonical identity/provenance 映射
+pool.build-report.json      # 阶段、告警、失败和证据覆盖
+```
+
+物理存储可以先由现有 registry 管理，但 API 只暴露领域对象。`pool.identity.json` 永远不通过 expert endpoint 返回。manifest 在注册前校验候选非空、ID 唯一、hash 完整、TaskSpec 可追溯、hard-gate 语义合法和秘密扫描通过。
+
+### 12.7 Orchestration Boundary
+
+`PoolBuildService` 负责构建到 `pool_ready`；`ExpertReviewService` 负责专家选择和评审。`build_and_review` 由上层 coordinator 串联二者：
+
+1. 调用 builder；
+2. 持久化并注册 pool；
+3. 基于生成模型身份和能力选择专家；
+4. 创建 review job；
+5. 将 `pool_id`、`review_job_id` 回写 build resource。
+
+这种边界保留真正的一键体验，同时避免把候选搜索、pool 数据模型和专家执行耦合成不可恢复的单函数。
+
+### 12.8 Existing Reuse and Gaps
+
+可复用证据：
+
+- `src/agent/web/app.py` 已有自然语言 discovery goal 解析和 discovery Job API；
+- `src/agent/control_plane/discovery.py` 已持久化 candidate pool manifest；
+- `scripts/run_discovery_replacement_benchmark.py` 已能从运行结果合并候选并生成 blind pool/key；
+- `ExpertPoolRegistry.import_pool()` 已能注册 pool；
+- `ExpertJudgeJobManager.start_job()` 已能启动异步 Judge Job。
+
+当前缺口是这些能力彼此割裂：需要用户预先定义 scenario、运行脚本、手工导入文件并再次启动 Job；旧 pool 构建还隐藏项目 accession/URL 且 rubric 只允许“根据 repository metadata”评分。新 Builder 将这些步骤迁移到统一 service，并生成允许受控项目探索的新 Evidence Package。
+
+## 13. Key Trade-offs
 
 - **跨 provider 优先而非绝对强制**：提高认知多样性，但在 Provider 不足时允许明确降级；降级不能冒充已验证共识。
 - **无万能裁判模型**：降低单一模型覆写独立证据的风险；代价是部分案例会停在 `needs_adjudication`。

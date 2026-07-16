@@ -64,6 +64,34 @@ Tests:
 - [ ] 页面不可达和超时产生结构化失败，不伪造证据；
 - [ ] 相同规范化输入产生相同 package hash。
 
+## Phase 3A — One-Prompt Pool Builder
+
+- [ ] 定义版本化 TaskSpec、BuildPreset、PoolBuildRecord、BuildStageEvent 和 PoolManifest。
+- [ ] 将现有 discovery goal parser 封装为 Prompt-to-TaskSpec 服务，保留原始 Prompt、显式覆盖、假设和歧义。
+- [ ] 实现 CandidateSource adapter，首版复用现有 discovery Job 和 candidate pool manifest。
+- [ ] 实现候选 hydration、稳定身份去重、冲突记录和候选预算。
+- [ ] 串联 hard-gate evaluation、Evidence Package Builder、专家安全视图和私有 identity map。
+- [ ] 在注册前执行 pool validator：非空、ID 唯一、hash、schema、TaskSpec、hard-gate 和 secret scan。
+- [ ] 实现 `PoolBuildService` 的 checkpoint、取消、失败恢复和幂等键。
+- [ ] 增加统一 `build_and_review` coordinator：pool 达到 `pool_ready` 后选择异构专家并启动 review job。
+- [ ] 提供 `build_only` 高级动作；评审启动失败时允许复用已有 `pool_id` 重试。
+- [ ] 增加一个只要求 Prompt 的 Web 入口和薄 API；高级选项折叠并使用 `default/v1` preset。
+- [ ] CLI 若需要，调用同一 service，不复制业务逻辑。
+
+Tests:
+
+- [ ] 单 Prompt 使用默认 preset 可构建非空、可注册的 pool 并自动启动 review job；
+- [ ] 一键路径不依赖 scenario JSON、手工 CLI 中间步骤或文件上传；
+- [ ] 原始 Prompt、TaskSpec、assumptions、preset 和 artifact hashes 可追溯；
+- [ ] 重复 idempotency key 返回同一个 build/pool/job，不重复调用收费模型；
+- [ ] discovery 中断后从 checkpoint 恢复，已完成 hydration/evidence 不重复执行；
+- [ ] 多轮重复项目按 canonical identity 合并，并保留全部私有 provenance；
+- [ ] pool validator 拒绝空候选、重复 ID、hash 不匹配、秘密泄漏和非法 hard-gate；
+- [ ] build_only 停在 `pool_ready`，后续可单独启动评审；
+- [ ] review start 失败不删除 pool，重试不重新构建；
+- [ ] 候选为空、证据不足和 parser 无法安全解析时返回结构化诊断；
+- [ ] expert pool 不暴露 generator/runtime/private identity，但包含 canonical project URL 和 Evidence Package refs。
+
 ## Phase 4 — Rubric and Expert Runner
 
 - [ ] 将五维 rubric、0–3 grade anchors 和 Prompt 版本化。
@@ -120,6 +148,8 @@ Tests:
 
 - [ ] 在 `web/app.py` 增加薄 API 适配，不在路由层实现聚合规则。
 - [ ] UI 增加专家 profile、实际模型身份验证状态、证据来源、调查状态、逐维评分和共识状态。
+- [ ] 在评审页面或统一工作台增加 Prompt 输入与“构建并评审”主按钮，并显示 parsing、discovery、evidence、pool、review 各阶段进度。
+- [ ] 高级区支持 build_only、候选预算、来源范围和 preset，但默认一键路径不要求填写。
 - [ ] 明确区分 Model Expert 与 Human Verification。
 - [ ] 对隐藏字段做服务端过滤，不能依赖前端不显示。
 - [ ] 保留 Job 启动、取消、恢复和错误展示。

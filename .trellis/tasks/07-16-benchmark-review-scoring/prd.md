@@ -156,6 +156,34 @@
 
 小样本、无重叠、全同分、模型身份无法验证、证据覆盖不足等条件必须产生明确警告，不输出误导性的精确结论。
 
+### R10. Prompt 一键构建评审池
+
+用户只提供一个自然语言 Prompt，即可使用默认策略启动异步的“构建并评审”工作流，无需手工准备 scenario JSON、运行 benchmark 脚本、上传 `judgment_pool.blinded.json` 或再次创建 Judge Job。
+
+默认流水线必须完成：
+
+1. 解析原始 Prompt，提取任务目标、硬约束、软偏好、检索范围和需要补证的字段；
+2. 保留原始 Prompt，并生成版本化、可审计的结构化 TaskSpec；
+3. 调用现有 discovery/candidate-pool 能力搜索候选项目，同时允许导入已有候选来源；
+4. 合并多轮或多查询结果，按稳定项目身份去重，但保留每个候选的发现 provenance；
+5. 获取项目详情、原项目 URL、文件/元数据摘要和必要外部证据；
+6. 对候选执行 deterministic hard gate，并保留 `pass / fail / unknown|review` 及原因；
+7. 构建、校验并固化每个候选的 Evidence Package；
+8. 生成评审安全视图、私有 identity/provenance 映射和不可变 pool manifest；
+9. 注册评审池，并在默认“构建并评审”动作下自动选择异构专家、启动首评 Job；
+10. 返回统一 build/job ID，前端持续显示阶段、候选数、失败、证据覆盖和可恢复状态。
+
+产品交互：
+
+- 主入口只要求 Prompt，一个主按钮为“构建并评审”；高级选项折叠展示，未填写时使用版本化默认 preset。
+- 同时提供“仅构建评审池”高级动作，便于控制成本和人工检查，但不应成为完成一键流程的必需步骤。
+- Prompt 解析不确定或关键条件缺失时，系统应使用保守默认值并在 TaskSpec 中标记假设；只有无法安全执行的歧义才停止为 `needs_input`。
+- 每次构建必须记录 Prompt、TaskSpec、preset、discovery 配置、模型/工具版本和产物 hash，允许复现。
+- 同一幂等键的重复提交不得创建重复池或重复计费；失败后可从最近完整阶段恢复。
+- 候选为空、证据不足、外部来源失败或独立专家不足时，必须返回可操作的诊断，不得创建看似成功的空共识。
+- pool 构建与 expert judgment 是两个明确阶段；构建成功但评审启动失败时，已构建 pool 仍可重试使用。
+- Prompt 和构建产物不得把候选生成模型身份、秘密或私有来源泄漏给专家安全视图。
+
 ## Acceptance Criteria
 
 - [ ] 可配置至少三条专家 profile，并记录 provider、请求模型、解析模型、model family 和路由身份。
@@ -172,6 +200,13 @@
 - [ ] replacement benchmark 能显式选择 `model_expert_consensus` overlay，并与 heuristic、hard gate、human verification 分开展示。
 - [ ] 报告对模型身份不可验证、证据不足和统计不可解释条件给出警告。
 - [ ] 未来真实人类复核可追加并升级单个案例为 `human_verified`，且模型评审历史仍保留。
+- [ ] 用户仅输入一个 Prompt 并点击“构建并评审”，系统即可异步完成 TaskSpec 解析、候选发现、去重、证据采集、hard gate、Evidence Package、pool 注册和专家首评启动。
+- [ ] 一键流程不要求用户手工制作 scenario JSON、运行 CLI、上传 pool 文件或再次创建 Judge Job；高级参数均有版本化默认 preset。
+- [ ] 原始 Prompt、结构化 TaskSpec、解析假设、构建配置、发现 provenance、pool manifest 和产物 hash 均可审计和复现。
+- [ ] 同一幂等请求不会重复创建 pool 或重复启动计费评审；中断后可从最近完成阶段恢复。
+- [ ] “仅构建评审池”可独立完成并返回可用 pool；后续专家启动失败不会损坏或丢失该 pool。
+- [ ] 候选为空、证据覆盖不足、来源不可达或独立专家不足时返回明确诊断和可重试阶段，不生成伪成功共识。
+- [ ] 一键构建生成的专家安全视图包含项目 URL 和任务证据，但不包含候选生成模型、runtime、其他专家意见或秘密。
 
 ## Out of Scope for First Vertical Slice
 
