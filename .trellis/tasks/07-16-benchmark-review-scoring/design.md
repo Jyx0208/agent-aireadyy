@@ -254,6 +254,10 @@ queued
 
 ## 9. Compatibility and Migration
 
+### Implementation baseline
+
+实施以现有 `worktree-expert-review-q4-continue` 为基线，而不是从 `origin/main` 或本规划分支重新实现。该工作树已经包含已提交的 expert pool registry、评分 UI、impact 和 Judge Job，并存在尚未提交的 `pool_builder.py`、`pool_builds.py` 及相关测试。启动后必须先运行基线测试、审查这些变更并保留可复用行为；新领域边界应增量提取，禁止整文件覆盖或平行建立第二套 pool builder。
+
 - 保留旧 pool 导入，但对 `human_grades` 与模型机器票进行来源审计；无法证明真实人类来源的记录标为 `legacy_unverified`。
 - 修改 `grading.py` 时新增 model expert 专用路径，保留真实 human API 但不供 Judge Job 调用。
 - `compile_discovery_blind_judgments.py` 必须要求显式 `judgment_source`，移除缺省升级为 `human_verified` 的行为。

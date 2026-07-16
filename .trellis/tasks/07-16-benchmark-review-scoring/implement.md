@@ -4,7 +4,9 @@
 
 ## Phase 0 — Baseline and Safety
 
-- [ ] 在隔离工作树内记录当前相关文件 diff，尤其保护 `src/agent/web/app.py` 的已有 staged/unstaged 工作。
+- [ ] 进入并继续使用 `worktree-expert-review-q4-continue` 作为实施基线；不得从本规划工作树或 `origin/main` 平行重写。
+- [ ] 保护该工作树已有 21 个修改/新增路径，重点审查未提交的 `pool_builder.py`、`pool_builds.py` 和对应测试，先理解再增量修改。
+- [ ] 记录当前相关文件 diff，尤其保护 `src/agent/web/app.py` 和大型 `benchmark_review.html` 的已有工作。
 - [ ] 运行现有 expert review、blind judging、replacement evaluation 相关测试，保存 baseline 失败清单。
 - [ ] 建立 feature flags，默认关闭新 expert orchestration、外部调查和 consensus overlay。
 - [ ] 确认新代码不读取或序列化 API key、token 和代理凭据。
