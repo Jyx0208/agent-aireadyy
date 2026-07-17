@@ -107,8 +107,9 @@
     .status { min-height: 24px; color: var(--muted); padding-top: 8px; }
     .status.error { color: var(--danger); font-weight: 600; }
     .status.success { color: var(--success); }
-    .side-rail { background: var(--surface); border-left: 3px solid var(--accent); padding: 12px; }
+    .side-rail { position: sticky; top: 12px; display: flex; flex-direction: column; max-height: calc(100vh - 24px); background: var(--surface); border-left: 3px solid var(--accent); padding: 12px; }
     .side-rail h3 { margin-bottom: 8px; }
+    .machine-trace-scroll { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding-right: 6px; }
     .vote-item, .run-item { border-top: 1px solid var(--line); padding: 8px 0; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
     .developer-tools { padding-bottom: 32px; }
     .tool-section { border-top: 2px solid #202a33; padding: 14px 0 20px; }
@@ -145,6 +146,7 @@
     @media (max-width: 800px) {
       .header-inner { align-items: flex-start; flex-direction: column; padding: 13px 0; }
       .registry-bar, .toolbar, .layout-split, .impact-inputs { grid-template-columns: 1fr; }
+      .side-rail { position: static; max-height: 68vh; }
       .jobs-controls { grid-template-columns: 1fr 1fr; }
       .jobs-controls .primary { grid-column: 1 / -1; }
       .metadata { grid-template-columns: 1fr 1fr; }
@@ -315,6 +317,7 @@
       <div class="queue-bar" id="queueBar" aria-label="优先级队列">
         <button type="button" data-queue="all" aria-pressed="true">全部</button>
         <button type="button" data-queue="ungraded" aria-pressed="false">未评分</button>
+        <button type="button" data-queue="graded" aria-pressed="false">已评分</button>
         <button type="button" data-queue="low_confidence" class="dev-only" aria-pressed="false">低置信</button>
         <button type="button" data-queue="vote_disagreement" class="dev-only" aria-pressed="false">内部复核分歧</button>
         <button type="button" data-queue="hard_constraint_conflicts" class="dev-only" aria-pressed="false">硬约束冲突</button>
@@ -352,9 +355,11 @@
               </article>
               <aside class="side-rail hidden" id="machineRail" tabindex="-1">
                 <h3>机器评审轨迹（仅开发者）</h3>
-                <div id="machineSummary" class="pool-meta"></div>
-                <div id="machineVotes"></div>
-                <div id="machineRuns"></div>
+                <div class="machine-trace-scroll" id="machineTraceScroll" tabindex="0" aria-label="机器评审轨迹滚动区域">
+                  <div id="machineSummary" class="pool-meta"></div>
+                  <div id="machineVotes"></div>
+                  <div id="machineRuns"></div>
+                </div>
               </aside>
             </div>
             <nav class="navigation" aria-label="候选导航">
@@ -896,6 +901,20 @@
       });
     }
 
+    function updateQueueCounts() {
+      const candidates = pool && Array.isArray(pool.candidates) ? pool.candidates : [];
+      const gradedCount = candidates.filter(isGraded).length;
+      const labels = {
+        all: `全部 ${candidates.length}`,
+        ungraded: `未评分 ${candidates.length - gradedCount}`,
+        graded: `已评分 ${gradedCount}`,
+      };
+      for (const [queue, label] of Object.entries(labels)) {
+        const button = document.querySelector(`#queueBar button[data-queue="${queue}"]`);
+        if (button) button.textContent = label;
+      }
+    }
+
     function rebuildFilter() {
       const previous = taskFilter.value || "all";
       const keys = [...new Set((pool.candidates || []).map(taskKey).filter(Boolean))].sort();
@@ -914,7 +933,8 @@
       const previousCandidate = preferredCandidateId || (currentCandidate() && currentCandidate().candidate_id);
       visible = (pool.candidates || []).filter((candidate) => {
         const taskMatches = taskFilter.value === "all" || taskKey(candidate) === taskFilter.value;
-        const queueMatches = activeQueue === "all" || queueOf(candidate) === activeQueue;
+        const queueMatches = activeQueue === "all"
+          || (activeQueue === "graded" ? isGraded(candidate) : queueOf(candidate) === activeQueue);
         return taskMatches && queueMatches;
       });
       const preservedIndex = previousCandidate ? visible.findIndex((candidate) => candidate.candidate_id === previousCandidate) : -1;
@@ -1145,6 +1165,7 @@
     }
 
     function render({ focusHeading = false } = {}) {
+      updateQueueCounts();
       const hasPool = Boolean(pool);
       const candidate = currentCandidate();
       byId("emptyState").style.display = hasPool ? "none" : "grid";

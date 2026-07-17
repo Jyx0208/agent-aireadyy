@@ -87,6 +87,14 @@ def test_benchmark_review_template_has_repair_contract_markers() -> None:
     assert "await refreshJobs({ autoSelectActive: false })" in html
     assert 'id="candidateMachineStatus"' in html
     assert 'id="candidateMachineTraceButton"' in html
+    assert 'id="machineTraceScroll"' in html
+    assert 'class="machine-trace-scroll"' in html
+    assert "overflow-y: auto" in html
+    assert "max-height: calc(100vh - 24px)" in html
+    assert 'data-queue="graded"' in html
+    assert "function updateQueueCounts()" in html
+    assert "graded: `已评分 ${gradedCount}`" in html
+    assert 'activeQueue === "graded" ? isGraded(candidate)' in html
     assert "查看机器评审轨迹（仅开发者）" in html
     assert "function renderCandidateMachineStatus(candidate)" in html
     assert "function machineReviewProjection(candidate)" in html
