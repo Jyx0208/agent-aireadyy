@@ -120,15 +120,22 @@ def test_benchmark_review_template_has_repair_contract_markers() -> None:
     assert 'const deletionBlocked = job.status === "running"' in html
     assert 'selectedJobDetail.status === "running"' in html
     assert "当前展示为历史模型任务/复核轮次记录" in html
-    assert "专家最终票 1 票 · 最终 ${text(runs[0] && runs[0].grade)} 分" in html
+    assert "function createMachineDisclosure" in html
+    assert "function appendMachineFacts" in html
+    assert "最终共识" in html
+    assert "模型专家最终票" in html
+    assert "查看专家证据与审计信息" in html
+    assert "旧版同模型复核审计（不计专家票）" in html
+    assert "function consensusDisplayLabel(consensus)" in html
+    assert "暂定模型结论" in html
+    assert "待仲裁结论" in html
     assert "每位专家只计 1 票" in html
     assert "currentJudgmentIds.has" in html
-    assert "同模型内部复核 ${runRounds} 轮（仅作稳定性审计）" in html
-    assert "内部复核轮次未记录" in html
-    assert "不自动算作独立专家票" in html
-    assert "模型任务 ${index + 1} 最终结论 · 1 票" in html
+    assert '["内部复核轮次", "未记录；该专家最终只计 1 票"]' in html
+    assert "不计为多个专家票" in html
+    assert "模型任务 ${index + 1}" in html
     assert "旧记录：模型身份未记录/不可验证" in html
-    assert "复核轮次 ${roundIndex + 1}" in html
+    assert "轮次 ${roundIndex + 1}" in html
     assert "当前累计 ${votes.length} 票" not in html
     assert "activeJobSummary || selectedJobDetail" in html
     assert "|| activeJobSummary || null" in html
@@ -144,6 +151,39 @@ def test_benchmark_review_template_has_repair_contract_markers() -> None:
     assert '<option value="verified">' not in html
     assert "请先在开发者工具中配置并选择专家 Profile" not in html
     assert 'review: action === "build_and_review" ? { profile_id:' not in html
+
+
+def test_benchmark_review_template_restores_safe_workspace_cursor() -> None:
+    html = TEMPLATE.read_text(encoding="utf-8")
+    workspace_block = html.split("const workspaceMemory = (() => {", 1)[1].split("})();", 1)[0]
+
+    assert "workspaceStorageKey" in html
+    assert "benchmark-review-workspace/v1" in html
+    assert 'id="restoreWorkspaceButton"' in html
+    assert 'id="forgetWorkspaceButton"' in html
+    assert "function workspaceSnapshot()" in html
+    assert "function applyWorkspaceControls(state)" in html
+    assert "async function restoreRecentWorkspace" in html
+    assert "await restoreRecentWorkspace({ automatic: true })" in html
+    assert "workspace.reviewer_id !== undefined" in html
+    assert 'options.workspace || (poolSource === "local" ? workspaceMemory.load() : null)' in html
+    assert "if (workspace) workspace.reviewer_id = reviewerContext" in html
+    assert "reviewerQuery" in html
+    assert 'new URLSearchParams(window.location.search).has("mode")' in html
+    assert 'if (!initialModeWasExplicit) reviewMode.value = state.desired_mode || "expert"' in html
+    assert "浏览器不能自动重读本地文件" in html
+    assert "浏览器不会保存文件路径或完整池内容" in html
+    assert "服务端登记池、评分和 Job 仍保存在磁盘" in html
+    assert "forgottenWorkspaceSignature" in html
+    assert "signature === forgottenWorkspaceSignature" in html
+    assert "selectedExpertJudgments.flatMap" in html
+    assert "profileId ? [[profileId, judgment]] : []" in html
+    assert "restrictedModeIntent" in html
+    assert "preserveRestrictedPreferences" in html
+    assert 'const seed = `${fileName || ""}|${JSON.stringify(parsed)}`' in html
+    assert "developerToken" not in workspace_block
+    assert "api_key" not in workspace_block.lower()
+    assert "candidates" not in workspace_block
 
 
 def test_benchmark_review_template_has_independent_pool_builder_llm_config() -> None:

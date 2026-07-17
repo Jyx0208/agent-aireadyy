@@ -67,6 +67,10 @@
     .toolbar { display: grid; grid-template-columns: auto minmax(160px, .8fr) minmax(190px, 1fr) auto; gap: 10px; align-items: end; }
     .pool-meta { color: var(--muted); font-size: 13px; min-height: 20px; padding-top: 8px; line-height: 1.5; }
     .mode-banner { color: var(--ink); font-weight: 600; }
+    .workspace-memory { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin: 12px 0; padding: 11px 12px; border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 7px; background: var(--accent-soft); }
+    .workspace-memory strong { display: block; margin-bottom: 3px; }
+    .workspace-memory-copy { color: var(--muted); font-size: 13px; line-height: 1.45; }
+    .workspace-memory-actions { display: flex; flex-wrap: wrap; gap: 8px; flex: 0 0 auto; }
     .review-filter-panel { display: grid; gap: 9px; margin: 12px 0 16px; padding: 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
     .filter-row { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 10px; align-items: center; }
     .filter-label { color: var(--muted); font-size: 12px; font-weight: 650; }
@@ -117,6 +121,13 @@
     .side-rail { position: sticky; top: 12px; display: flex; flex-direction: column; max-height: calc(100vh - 24px); background: var(--surface); border-left: 3px solid var(--accent); padding: 12px; }
     .side-rail h3 { margin-bottom: 8px; }
     .machine-trace-scroll { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding-right: 6px; }
+    .machine-disclosure { margin-top: 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+    .machine-disclosure > summary { cursor: pointer; padding: 9px 10px; font-weight: 650; line-height: 1.45; }
+    .machine-disclosure[open] > summary { border-bottom: 1px solid var(--line); background: #f7f9fa; }
+    .machine-disclosure-body { padding: 9px 10px; font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
+    .machine-facts { display: grid; gap: 5px; margin: 0; }
+    .machine-facts dt { color: var(--muted); font-size: 12px; }
+    .machine-facts dd { margin: 0 0 4px; }
     .vote-item, .run-item { border-top: 1px solid var(--line); padding: 8px 0; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
     .developer-tools { padding-bottom: 32px; }
     .tool-section { border-top: 2px solid #202a33; padding: 14px 0 20px; }
@@ -154,6 +165,7 @@
       .header-inner { align-items: flex-start; flex-direction: column; padding: 13px 0; }
       .registry-bar, .toolbar, .layout-split, .impact-inputs { grid-template-columns: 1fr; }
       .filter-row { grid-template-columns: 1fr; gap: 5px; }
+      .workspace-memory { align-items: flex-start; flex-direction: column; }
       .side-rail { position: static; max-height: 68vh; }
       .jobs-controls { grid-template-columns: 1fr 1fr; }
       .jobs-controls .primary { grid-column: 1 / -1; }
@@ -260,6 +272,16 @@
       </div>
       <div class="pool-meta" id="developerTokenHint">专家盲评无需令牌。开发者或测试模式会通过 X-Expert-Review-Token 请求头发送此值。</div>
       <div class="pool-meta mode-banner" id="modeBanner" role="status" aria-live="polite"></div>
+      <div class="workspace-memory" id="workspaceMemoryPanel">
+        <div>
+          <strong>最近评审工作区</strong>
+          <div class="workspace-memory-copy" id="workspaceMemoryStatus">尚未记录可恢复的工作区。</div>
+        </div>
+        <div class="workspace-memory-actions">
+          <button id="restoreWorkspaceButton" type="button" disabled>恢复最近工作区</button>
+          <button id="forgetWorkspaceButton" type="button" disabled>忘记记录</button>
+        </div>
+      </div>
       <section class="tool-section developer-tools hidden" id="poolBuildPanel">
         <h3>从 Prompt 一键构建评审池</h3>
         <p class="help">输入目标后，系统依次理解需求、检索候选、生成评审池并启动异构模型评审。每条记录会明确显示当前步骤；“建池完成”不等于“模型共识已经评完”。</p>
@@ -539,6 +561,7 @@
   </main>
   <script>
     const storagePrefix = "discovery-blind-review/v2";
+    const workspaceStorageKey = `${storagePrefix}/workspace/v1`;
     const terminalJobStatuses = new Set(["completed", "completed_with_errors", "failed", "cancelled"]);
     const activeJobStatuses = new Set(["queued", "running"]);
     const PAGE_LIMIT = 500;
@@ -547,6 +570,10 @@
     let poolBase = null;
     let poolIdentity = "";
     let poolSource = "";
+    let activeLocalFileName = "";
+    let forgottenWorkspaceSignature = "";
+    let initialModeWasExplicit = false;
+    let initialRequestedMode = "expert";
     let visible = [];
     let currentIndex = 0;
     let activePoolId = null;
@@ -594,6 +621,50 @@
     const importServerButton = byId("importServerButton");
     const reviewMode = byId("reviewMode");
     const developerToken = byId("developerToken");
+
+    const workspaceMemory = (() => {
+      const allowedSources = new Set(["server", "local"]);
+      const allowedModes = new Set(["expert", "developer", "test"]);
+      const allowedCompletionFilters = new Set(["all", "graded", "ungraded"]);
+      const allowedScoreFilters = new Set(["all", "0", "1", "2", "3"]);
+      const allowedFlagFilters = new Set(["all", "low_confidence", "vote_disagreement", "hard_constraint_conflicts"]);
+
+      function normalize(raw) {
+        if (!raw || typeof raw !== "object" || !allowedSources.has(raw.source)) return null;
+        const poolIdentityValue = String(raw.pool_identity || "").trim();
+        if (!poolIdentityValue) return null;
+        return {
+          schema_version: "benchmark-review-workspace/v1",
+          source: raw.source,
+          pool_id: raw.source === "server" ? String(raw.pool_id || "").trim() : "",
+          pool_identity: poolIdentityValue,
+          local_file_name: raw.source === "local" ? String(raw.local_file_name || "").trim() : "",
+          reviewer_id: String(raw.reviewer_id || "").trim(),
+          candidate_id: String(raw.candidate_id || "").trim(),
+          task_filter: String(raw.task_filter || "all"),
+          completion_filter: allowedCompletionFilters.has(raw.completion_filter) ? raw.completion_filter : "all",
+          score_filter: allowedScoreFilters.has(String(raw.score_filter)) ? String(raw.score_filter) : "all",
+          flag_filter: allowedFlagFilters.has(raw.flag_filter) ? raw.flag_filter : "all",
+          desired_mode: allowedModes.has(raw.desired_mode) ? raw.desired_mode : "expert",
+          updated_at: String(raw.updated_at || ""),
+        };
+      }
+
+      return {
+        load() {
+          try { return normalize(JSON.parse(localStorage.getItem(workspaceStorageKey) || "null")); }
+          catch (_error) { return null; }
+        },
+        save(snapshot) {
+          const normalized = normalize(snapshot);
+          if (!normalized) return null;
+          normalized.updated_at = new Date().toISOString();
+          localStorage.setItem(workspaceStorageKey, JSON.stringify(normalized));
+          return normalized;
+        },
+        clear() { localStorage.removeItem(workspaceStorageKey); },
+      };
+    })();
 
     function requestedModeFromQuery() {
       const mode = (new URLSearchParams(window.location.search).get("mode") || "expert").toLowerCase();
@@ -902,15 +973,107 @@
       restoreState();
     }
 
-    function localIdentity(parsed, fileName) {
-      const ids = (parsed.candidates || []).map((candidate) => String(candidate.candidate_id || "")).join("|");
-      let hash = 2166136261;
-      const seed = `${parsed.schema_version || ""}|${parsed.label || ""}|${fileName || ""}|${ids}`;
-      for (let index = 0; index < seed.length; index += 1) {
-        hash ^= seed.charCodeAt(index);
-        hash = Math.imul(hash, 16777619);
+    function workspaceSnapshot() {
+      if (!poolIdentity || !["server", "local"].includes(poolSource)) return null;
+      const candidate = currentCandidate();
+      const previous = workspaceMemory.load();
+      const previousMatches = previous && previous.pool_identity === poolIdentity;
+      const restrictedModeIntent = currentMode() === "expert" && !developerAllowed
+        ? initialModeWasExplicit && initialRequestedMode !== "expert"
+          ? initialRequestedMode
+          : previousMatches && previous.desired_mode !== "expert"
+            ? previous.desired_mode
+            : "expert"
+        : currentMode();
+      const preserveRestrictedPreferences = currentMode() === "expert"
+        && restrictedModeIntent !== "expert"
+        && previousMatches;
+      return {
+        source: poolSource,
+        pool_id: poolSource === "server" ? activePoolId : "",
+        pool_identity: poolIdentity,
+        local_file_name: poolSource === "local" ? activeLocalFileName : "",
+        reviewer_id: reviewerId.value.trim() || reviewerContext,
+        candidate_id: candidate && candidate.candidate_id || previousMatches && previous.candidate_id || "",
+        task_filter: taskFilter.value || "all",
+        completion_filter: activeQueue,
+        score_filter: activeScoreFilter,
+        flag_filter: preserveRestrictedPreferences ? previous.flag_filter : activeReviewFlag,
+        desired_mode: restrictedModeIntent,
+      };
+    }
+
+    function updateWorkspaceMemoryStatus(state = workspaceMemory.load()) {
+      const status = byId("workspaceMemoryStatus");
+      const restoreButton = byId("restoreWorkspaceButton");
+      const forgetButton = byId("forgetWorkspaceButton");
+      restoreButton.disabled = !state;
+      forgetButton.disabled = !state;
+      if (!state) {
+        status.textContent = "尚未记录可恢复的工作区。服务端登记池、评分和 Job 仍保存在磁盘。";
+        return;
       }
-      return `local:${fileName || "pool"}:${(hash >>> 0).toString(16)}`;
+      const updated = state.updated_at ? formatDate(state.updated_at) : "未知时间";
+      if (state.source === "server") {
+        status.textContent = `服务端池 ${state.pool_id} · 评审人 ${state.reviewer_id || "未填写"} · 上次候选 ${state.candidate_id || "未记录"} · ${updated}`;
+      } else {
+        status.textContent = `本地文件 ${state.local_file_name || "未命名文件"} · 浏览器不能自动重读本地文件；重新选择同一文件后会恢复位置和筛选 · ${updated}`;
+      }
+    }
+
+    function saveWorkspaceMemory() {
+      const snapshot = workspaceSnapshot();
+      if (!snapshot) return null;
+      const signature = JSON.stringify(snapshot);
+      if (forgottenWorkspaceSignature && signature === forgottenWorkspaceSignature) return null;
+      forgottenWorkspaceSignature = "";
+      const saved = workspaceMemory.save(snapshot);
+      updateWorkspaceMemoryStatus(saved);
+      return saved;
+    }
+
+    function applyWorkspaceControls(state) {
+      if (!state || state.pool_identity !== poolIdentity) return false;
+      if (state.task_filter && [...taskFilter.options].some((option) => option.value === state.task_filter)) {
+        taskFilter.value = state.task_filter;
+      }
+      setActiveQueue(state.completion_filter || "all");
+      if (state.completion_filter === "graded") {
+        setActiveScoreFilter(state.score_filter || "all");
+        setActiveReviewFlag(isDevMode() ? state.flag_filter || "all" : "all");
+      }
+      return true;
+    }
+
+    async function restoreRecentWorkspace({ automatic = false } = {}) {
+      const state = workspaceMemory.load();
+      updateWorkspaceMemoryStatus(state);
+      if (!state) return false;
+      if (state.source === "local") {
+        if (!automatic) poolFile.click();
+        setReviewStatus(`上次工作区来自本地文件 ${state.local_file_name || "未命名文件"}。请重新选择该文件；浏览器不会保存文件路径或完整池内容。`, "info");
+        return false;
+      }
+      if (!state.pool_id) return false;
+      reviewerId.value = state.reviewer_id || "";
+      reviewerContext = reviewerId.value.trim();
+      if (!initialModeWasExplicit) reviewMode.value = state.desired_mode || "expert";
+      await refreshStatus();
+      return openServerPool(state.pool_id, state.candidate_id || null, state);
+    }
+
+    function localIdentity(parsed, fileName) {
+      const seed = `${fileName || ""}|${JSON.stringify(parsed)}`;
+      let hashA = 2166136261;
+      let hashB = 3339675911;
+      for (let index = 0; index < seed.length; index += 1) {
+        const code = seed.charCodeAt(index);
+        hashA ^= code;
+        hashA = Math.imul(hashA, 16777619);
+        hashB ^= code + index;
+        hashB = Math.imul(hashB, 2246822519);
+      }
+      return `local:${fileName || "pool"}:${(hashA >>> 0).toString(16)}${(hashB >>> 0).toString(16)}`;
     }
 
     function reviewFlags(candidate) {
@@ -1110,9 +1273,13 @@
       const consensus = candidate.model_expert_consensus && typeof candidate.model_expert_consensus === "object" ? candidate.model_expert_consensus : null;
       const allExpertJudgments = Array.isArray(candidate.model_expert_judgments) ? candidate.model_expert_judgments : [];
       const currentJudgmentIds = new Set(Array.isArray(consensus && consensus.judgment_ids) ? consensus.judgment_ids.map(String) : []);
-      const expertJudgments = currentJudgmentIds.size
+      const selectedExpertJudgments = currentJudgmentIds.size
         ? allExpertJudgments.filter((judgment) => currentJudgmentIds.has(String(judgment && judgment.judgment_id || "")))
-        : [...new Map(allExpertJudgments.map((judgment) => [String(judgment && judgment.profile && judgment.profile.profile_id || judgment && judgment.judgment_id || ""), judgment])).values()];
+        : allExpertJudgments;
+      const expertJudgments = [...new Map(selectedExpertJudgments.flatMap((judgment) => {
+        const profileId = String(judgment && judgment.profile && judgment.profile.profile_id || "").trim();
+        return profileId ? [[profileId, judgment]] : [];
+      })).values()];
       return {
         votes,
         runs,
@@ -1120,6 +1287,39 @@
         consensus,
         hasHistory: Boolean(votes.length || runs.length || expertJudgments.length || consensus),
       };
+    }
+
+    function createMachineDisclosure(summaryText, { open = false, className = "" } = {}) {
+      const details = document.createElement("details");
+      details.className = `machine-disclosure ${className}`.trim();
+      details.open = open;
+      const summary = document.createElement("summary");
+      summary.textContent = summaryText;
+      const body = document.createElement("div");
+      body.className = "machine-disclosure-body";
+      details.append(summary, body);
+      return { details, body };
+    }
+
+    function appendMachineFacts(root, facts) {
+      const list = document.createElement("dl");
+      list.className = "machine-facts";
+      for (const [label, value] of facts) {
+        const dt = document.createElement("dt");
+        const dd = document.createElement("dd");
+        dt.textContent = label;
+        dd.textContent = text(value);
+        list.append(dt, dd);
+      }
+      root.appendChild(list);
+    }
+
+    function consensusDisplayLabel(consensus) {
+      const status = String(consensus && consensus.status || "");
+      if (status === "model_expert_consensus") return "最终共识";
+      if (status === "model_expert_provisional") return "暂定模型结论";
+      if (status === "needs_adjudication") return "待仲裁结论";
+      return "模型专家结论";
     }
 
     function renderMachineRail(candidate) {
@@ -1132,55 +1332,96 @@
         return [];
       });
       const runRounds = roundsByRun.reduce((total, rounds) => total + rounds.length, 0);
+      const independence = consensus && consensus.formal_independence ? "独立性已验证" : consensus ? "独立性未验证" : "";
+      const consensusLabel = consensusDisplayLabel(consensus);
       byId("machineSummary").textContent = expertJudgments.length
-        ? `独立专家最终票 ${expertJudgments.length} 票 · 每位专家只计 1 票 · 共识结果 ${text(consensus && consensus.consensus_grade)} · 状态 ${text(consensus && consensus.status)}`
+        ? `模型专家最终票 ${expertJudgments.length} 票 · 每位专家只计 1 票 · ${consensusLabel} ${text(consensus && consensus.consensus_grade)} 分 · ${independence}`
         : runs.length
-          ? runs.length === 1
-            ? `专家最终票 1 票 · 最终 ${text(runs[0] && runs[0].grade)} 分 · ${runRounds ? `同模型内部复核 ${runRounds} 轮（仅作稳定性审计）` : "内部复核轮次未记录"}`
-            : `历史模型任务 ${runs.length} 次 · 每次只产生 1 个最终结论 · ${runRounds ? `内部复核共 ${runRounds} 轮` : "内部复核轮次未记录"}，不自动算作独立专家票`
-        : votes.length
-          ? `旧记录：模型身份未记录/不可验证 · ${votes.length} 个内部复核轮次 · 最终只计 1 个专家结果`
-          : "当前候选没有机器评审记录。";
+          ? `旧版模型任务 ${runs.length} 次 · 每次只产生 1 个最终结论 · 内部复核 ${runRounds || "未记录"} 轮，不计为多个专家票`
+          : votes.length
+            ? `旧记录：模型身份未记录/不可验证 · ${votes.length} 个内部复核轮次 · 最终只计 1 个模型结果`
+            : "当前候选没有机器评审记录。";
+
       const votesRoot = byId("machineVotes");
+      const runsRoot = byId("machineRuns");
       votesRoot.replaceChildren();
+      runsRoot.replaceChildren();
+
+      if (consensus) {
+        const consensusBlock = createMachineDisclosure(
+          `${consensusLabel} · ${text(consensus.consensus_grade)} 分 · ${text(consensus.status)}`,
+          { open: true, className: "machine-consensus" },
+        );
+        appendMachineFacts(consensusBlock.body, [
+          ["Hard gate", consensus.hard_gate_outcome],
+          ["模型专家数", expertJudgments.length],
+          ["独立性", independence],
+          ["第三位专家", consensus.used_third_vote ? "已触发" : "未触发"],
+          ["分歧/触发原因", asTextList(consensus.trigger_reasons).join("；") || "无"],
+          ["Job", consensus.job_id],
+        ]);
+        votesRoot.appendChild(consensusBlock.details);
+      }
+
       expertJudgments.forEach((judgment, index) => {
-        const item = document.createElement("div");
-        item.className = "vote-item";
         const profile = judgment && judgment.profile && typeof judgment.profile === "object" ? judgment.profile : {};
         const model = profile.resolved_model_id || profile.requested_model_id || profile.model_family || "未记录";
-        item.textContent = `专家最终票 ${index + 1} · Profile ${text(profile.profile_id)} · 模型 ${text(model)} · 最终分 ${text(judgment && judgment.final_grade)} · 置信度 ${text(judgment && judgment.confidence)} · 硬约束 ${text(judgment && judgment.hard_gate_outcome)} · 结论 ${text(judgment && judgment.summary)}`;
-        votesRoot.appendChild(item);
+        const expertBlock = createMachineDisclosure(
+          `专家 ${index + 1} · ${text(model)} · 最终 ${text(judgment && judgment.final_grade)} 分 · ${text(judgment && judgment.confidence)}`,
+        );
+        appendMachineFacts(expertBlock.body, [
+          ["Profile", profile.profile_id],
+          ["Provider", profile.provider],
+          ["模型家族", profile.model_family],
+          ["模型身份验证", profile.identity_verification],
+          ["Hard gate", judgment && judgment.hard_gate_outcome],
+          ["调查状态", judgment && judgment.investigation_status],
+          ["证据冲突", judgment && judgment.evidence_conflict ? "是" : "否"],
+          ["最终结论", judgment && judgment.summary],
+        ]);
+        const auditBlock = createMachineDisclosure("查看专家证据与审计信息");
+        appendMachineFacts(auditBlock.body, [
+          ["证据引用", asTextList(judgment && judgment.evidence_refs).join("；") || "无"],
+          ["缺失信息", asTextList(judgment && judgment.missing_information).join("；") || "无"],
+          ["Endpoint", profile.endpoint_identity],
+          ["角色", profile.role],
+          ["内部复核轮次", "未记录；该专家最终只计 1 票"],
+        ]);
+        expertBlock.body.appendChild(auditBlock.details);
+        votesRoot.appendChild(expertBlock.details);
       });
-      const runsRoot = byId("machineRuns");
-      runsRoot.replaceChildren();
-      if (runs.length) {
-        runs.forEach((run, index) => {
-          const group = document.createElement("div");
-          group.className = "run-item";
-          const runVotes = roundsByRun[index] || [];
-          const heading = document.createElement("strong");
-          heading.textContent = `模型任务 ${index + 1} 最终结论 · 1 票 · 分数 ${text(run && run.grade)} · Job ${text(run && (run.job_id || run.run_id))} · Profile ${text(run && run.profile_id)} · 模型 ${text(run && run.model)} · ${runVotes.length ? `内部复核 ${runVotes.length} 轮` : "内部复核轮次未记录"}`;
-          group.appendChild(heading);
-          const rounds = runVotes.length ? runVotes : (run && run.grade != null ? [run] : []);
-          rounds.forEach((vote, roundIndex) => {
-            const item = document.createElement("div");
-            item.className = "vote-item";
-            const evidence = asTextList(vote && vote.supporting_evidence).join("；") || "无";
-            const conflicts = asTextList(vote && vote.constraint_conflicts).join("；") || "无";
-            item.textContent = `复核轮次 ${roundIndex + 1} · 分数 ${text(vote && vote.grade)} · 理由 ${text(vote && vote.reason)} · 证据 ${evidence} · 冲突 ${conflicts}`;
-            group.appendChild(item);
-          });
-          runsRoot.appendChild(group);
+
+      if (runs.length || votes.length) {
+        const legacyBlock = createMachineDisclosure(
+          `旧版同模型复核审计（不计专家票） · ${runs.length || 1} 个模型任务`,
+        );
+        const legacyRuns = runs.length ? runs : [{ votes, grade: candidate.grade }];
+        legacyRuns.forEach((run, index) => {
+          const runVotes = runs.length ? roundsByRun[index] || [] : votes;
+          const runBlock = createMachineDisclosure(
+            `模型任务 ${index + 1} · ${text(run && run.model || "模型未记录")} · 最终 ${text(run && run.grade)} 分`,
+          );
+          appendMachineFacts(runBlock.body, [
+            ["Job", run && (run.job_id || run.run_id)],
+            ["Profile", run && run.profile_id],
+            ["置信度", run && run.confidence],
+            ["内部复核轮次", runVotes.length || "未记录"],
+          ]);
+          if (runVotes.length) {
+            const roundsBlock = createMachineDisclosure(`展开 ${runVotes.length} 个内部复核轮次（不计专家票）`);
+            runVotes.forEach((vote, roundIndex) => {
+              const item = document.createElement("div");
+              item.className = "vote-item";
+              const evidence = asTextList(vote && vote.supporting_evidence).join("；") || "无";
+              const conflicts = asTextList(vote && vote.constraint_conflicts).join("；") || "无";
+              item.textContent = `轮次 ${roundIndex + 1} · 分数 ${text(vote && vote.grade)} · 理由 ${text(vote && vote.reason)} · 证据 ${evidence} · 冲突 ${conflicts}`;
+              roundsBlock.body.appendChild(item);
+            });
+            runBlock.body.appendChild(roundsBlock.details);
+          }
+          legacyBlock.body.appendChild(runBlock.details);
         });
-      } else {
-        votes.forEach((vote, index) => {
-          const item = document.createElement("div");
-          item.className = "vote-item";
-          const evidence = asTextList(vote && vote.supporting_evidence).join("；") || "无";
-          const conflicts = asTextList(vote && vote.constraint_conflicts).join("；") || "无";
-          item.textContent = `旧记录复核轮次 ${index + 1} · 分数 ${text(vote && vote.grade)} · 理由 ${text(vote && vote.reason)} · 证据 ${evidence} · 冲突 ${conflicts}`;
-          votesRoot.appendChild(item);
-        });
+        runsRoot.appendChild(legacyBlock.details);
       }
     }
 
@@ -1248,6 +1489,7 @@
         const graded = (pool && pool.candidates || []).filter(isGraded).length;
         const denominator = poolSource === "server" ? serverTotal : (pool && pool.candidates || []).length;
         byId("progressText").textContent = hasPool ? `已评分 ${graded} / ${denominator}` : "尚未载入评审池";
+        if (hasPool) saveWorkspaceMemory();
         return;
       }
       const key = taskKey(candidate);
@@ -1285,6 +1527,7 @@
       renderMachineRail(candidate);
       renderCandidateMachineStatus(candidate);
       setReviewControlsDisabled(false);
+      saveWorkspaceMemory();
       if (focusHeading) requestAnimationFrame(() => byId("projectTitle").focus());
     }
 
@@ -1311,21 +1554,32 @@
       const previousPoolIdentity = poolIdentity;
       poolSource = options.source;
       activePoolId = options.poolId || null;
+      activeLocalFileName = poolSource === "local" ? String(options.fileName || "") : "";
+      forgottenWorkspaceSignature = "";
       activePoolRecord = options.record || null;
       serverTotal = Number.isInteger(options.total) ? options.total : parsed.candidates.length;
       poolIdentity = options.identity;
+      const savedWorkspace = options.workspace || (poolSource === "local" ? workspaceMemory.load() : null);
+      const rememberedWorkspace = savedWorkspace && savedWorkspace.pool_identity === poolIdentity ? savedWorkspace : null;
+      if (rememberedWorkspace && rememberedWorkspace.reviewer_id) reviewerId.value = rememberedWorkspace.reviewer_id;
       poolBase = cloneData(parsed);
       pool = cloneData(parsed);
       reviewerContext = reviewerId.value.trim();
       restoreState();
       rebuildFilter();
+      if (rememberedWorkspace) applyWorkspaceControls(rememberedWorkspace);
+      else setActiveQueue("all");
       if (previousPoolIdentity !== poolIdentity) resetPoolDependentDeveloperState();
-      const preferred = options.preferredCandidateId || null;
+      const preferred =
+        options.preferredCandidateId ||
+        (rememberedWorkspace && rememberedWorkspace.candidate_id) ||
+        null;
       currentIndex = 0;
       importServerButton.disabled = poolSource !== "local" || !registryEnabled;
       exportButton.disabled = false;
       setPoolMeta();
       applyFilter(preferred, false);
+      saveWorkspaceMemory();
       if (isDevMode()) void refreshJobs();
     }
 
@@ -1392,12 +1646,16 @@
       }
     }
 
-    async function openServerPool(poolId = serverPoolSelect.value, preferredCandidateId = null) {
+    async function openServerPool(poolId = serverPoolSelect.value, preferredCandidateId = null, workspace = null) {
       if (!poolId || poolRequestBusy) return false;
       poolRequestBusy = true;
       openServerPoolButton.disabled = true;
       clearReviewError();
       try {
+        if (workspace && workspace.reviewer_id !== undefined) {
+          reviewerId.value = workspace.reviewer_id || "";
+          reviewerContext = reviewerId.value.trim();
+        }
         const mode = currentMode();
         let offset = 0;
         let total = null;
@@ -1435,7 +1693,8 @@
           identity: `server:${poolId}`,
           total,
           record,
-          preferredCandidateId
+          preferredCandidateId,
+          workspace,
         });
         serverPoolSelect.value = poolId;
         importServerButton.disabled = true;
@@ -2559,7 +2818,7 @@
           );
           if (reviewed) throw new Error("专家盲评只能打开未评分的 blinded pool；请由开发者导入 reviewed pool 到服务端后按 reviewer 范围打开");
         }
-        activatePool(parsed, { source: "local", identity: localIdentity(parsed, file.name), total: parsed.candidates.length });
+        activatePool(parsed, { source: "local", identity: localIdentity(parsed, file.name), fileName: file.name, total: parsed.candidates.length });
         setReviewStatus(`已打开本地文件：${file.name}。服务端池未被修改。`, "success");
       } catch (error) {
         setReviewStatus(`无法读取本地评审池：${error.message}。当前工作区保持不变。`, "error", true);
@@ -2602,7 +2861,9 @@
       reviewerContext = reviewerId.value.trim();
       if (poolSource === "server" && activePoolId && reviewerContext) {
         const preferred = currentCandidate() && currentCandidate().candidate_id;
-        await openServerPool(activePoolId, preferred);
+        const workspace = workspaceSnapshot();
+        if (workspace) workspace.reviewer_id = reviewerContext;
+        await openServerPool(activePoolId, preferred, workspace);
       } else {
         resetPoolToBase();
         rebuildFilter();
@@ -2666,7 +2927,7 @@
       updateUrlMode(reviewMode.value);
       updateModeChrome();
       const preferred = currentCandidate() && currentCandidate().candidate_id;
-      if (activePoolId) await openServerPool(activePoolId, preferred);
+      if (activePoolId) await openServerPool(activePoolId, preferred, workspaceSnapshot());
       else if (pool) applyFilter(preferred, false);
       if (isDevMode()) {
         await Promise.all([loadPoolBuilderConfig(), refreshProfiles(), refreshJobs()]);
@@ -2721,6 +2982,14 @@
         if (currentMode() !== "expert") await Promise.all([loadPoolBuilderConfig(), refreshProfiles(), refreshJobs()]);
       }
     });
+    byId("restoreWorkspaceButton").addEventListener("click", () => { void restoreRecentWorkspace(); });
+    byId("forgetWorkspaceButton").addEventListener("click", () => {
+      const snapshot = workspaceSnapshot();
+      forgottenWorkspaceSignature = snapshot ? JSON.stringify(snapshot) : "";
+      workspaceMemory.clear();
+      updateWorkspaceMemoryStatus(null);
+      setReviewStatus("已忘记浏览器中的最近工作区游标；评审池、评分和 Job 文件没有删除。", "success");
+    });
 
     byId("bindImpactButton").addEventListener("click", () => { void bindImpact(); });
     byId("fetchModelsButton").addEventListener("click", () => { void fetchModelsForEditor(); });
@@ -2768,14 +3037,22 @@
         candidate.__unsaved = poolSource === "server" || candidate.__unsaved;
         saveState(reviewerId.value.trim() || reviewerContext);
       }
+      saveWorkspaceMemory();
     });
 
-    reviewMode.value = requestedModeFromQuery();
+    const initialWorkspace = workspaceMemory.load();
+    initialModeWasExplicit = new URLSearchParams(window.location.search).has("mode");
+    initialRequestedMode = requestedModeFromQuery();
+    reviewMode.value = initialModeWasExplicit
+      ? requestedModeFromQuery()
+      : initialWorkspace && initialWorkspace.desired_mode || requestedModeFromQuery();
     setActiveQueue("all");
     clearProfileEditor();
     updateModeChrome();
+    updateWorkspaceMemoryStatus(initialWorkspace);
     void (async () => {
       await refreshRegistry();
+      await restoreRecentWorkspace({ automatic: true });
       if (isDevMode()) await Promise.all([loadPoolBuilderConfig(), refreshProfiles(), refreshJobs(), refreshPoolBuilds()]);
     })();
   </script>
