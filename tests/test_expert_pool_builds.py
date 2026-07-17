@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
+from agent.web.expert_review import pool_builds as pool_builds_module
 from agent.web.expert_review.pool_builds import ExpertPoolBuildManager
 from agent.web.expert_review.pool_registry import ExpertPoolRegistry
 
@@ -384,6 +386,123 @@ def test_empty_discovery_result_is_rejected_before_registration(tmp_path: Path) 
     assert registry.list_pools() == []
 
 
+def test_pool_build_prepares_chinese_prompt_before_discovery(tmp_path: Path) -> None:
+    registry = ExpertPoolRegistry(tmp_path / "expert_review")
+    discovery_starts: list[dict[str, Any]] = []
+
+    def prepare_discovery_request(payload: dict[str, Any]) -> dict[str, Any]:
+        assert payload["prompt"] == "寻找免疫肽相关公开数据，越多越好"
+        return {
+            "request": {
+                **payload,
+                "goal": "immunopeptidomics",
+                "query_terms": ["immunopeptidomics", "HLA ligandome", "MHC ligandome"],
+                "max_projects": 20,
+            },
+            "parser": "llm",
+            "warnings": [],
+            "reasoning": "Translated the Chinese request into repository-searchable English terms.",
+        }
+
+    def start_discovery(payload: dict[str, Any]) -> dict[str, Any]:
+        discovery_starts.append(payload)
+        return {"job_id": "disc-job", "status": "queued"}
+
+    manager = ExpertPoolBuildManager(
+        registry,
+        start_discovery=start_discovery,
+        get_discovery=lambda job_id: _completed_discovery(job_id),
+        cancel_discovery=lambda _job_id: None,
+        prepare_discovery_request=prepare_discovery_request,
+    )
+    started = manager.start_build(
+        discovery_request={"prompt": "寻找免疫肽相关公开数据，越多越好"}
+    )
+    completed = _wait(manager, started["build_id"], {"pool_ready"})
+
+    assert discovery_starts[0]["goal"] == "immunopeptidomics"
+    assert discovery_starts[0]["query_terms"] == [
+        "immunopeptidomics",
+        "HLA ligandome",
+        "MHC ligandome",
+    ]
+    assert completed["prompt_parse"]["parser"] == "llm"
+    assert completed["prompt_parse"]["query_terms"] == discovery_starts[0]["query_terms"]
+
+
+def test_pool_build_exposes_live_discovery_progress(tmp_path: Path) -> None:
+    registry = ExpertPoolRegistry(tmp_path / "expert_review")
+    release_discovery = threading.Event()
+
+    def get_discovery(job_id: str) -> dict[str, Any]:
+        if not release_discovery.is_set():
+            return {
+                "job_id": job_id,
+                "status": "running",
+                "logs": [
+                    {
+                        "ts": "2026-07-16T13:00:00Z",
+                        "level": "info",
+                        "message": "Project search returned 7 raw records so far.",
+                    }
+                ],
+                "record": {
+                    "summary": {
+                        "candidate_projects_seen": 7,
+                        "selected_projects": 2,
+                        "selected_files": 11,
+                    }
+                },
+            }
+        completed = _completed_discovery(job_id)
+        completed["logs"] = [
+            {
+                "ts": "2026-07-16T13:00:01Z",
+                "level": "info",
+                "message": "Discovery job completed.",
+            }
+        ]
+        completed["record"]["summary"] = {
+            "candidate_projects_seen": 7,
+            "selected_projects": 1,
+            "selected_files": 2,
+        }
+        return completed
+
+    manager = ExpertPoolBuildManager(
+        registry,
+        start_discovery=lambda _payload: {"job_id": "disc-job", "status": "queued"},
+        get_discovery=get_discovery,
+        cancel_discovery=lambda _job_id: None,
+        poll_interval=0.02,
+    )
+    started = manager.start_build(discovery_request={"prompt": "寻找免疫肽公开数据"})
+
+    deadline = time.time() + 5
+    live = None
+    while time.time() < deadline:
+        current = manager.get_build(started["build_id"])
+        if current and (current.get("progress") or {}).get("counts", {}).get("candidate_projects_seen") == 7:
+            live = current
+            break
+        time.sleep(0.01)
+    assert live is not None
+    assert live["progress"]["phase"] == "discovering"
+    assert live["progress"]["percent"] == 25
+    assert live["progress"]["counts"] == {
+        "candidate_projects_seen": 7,
+        "selected_projects": 2,
+        "selected_files": 11,
+    }
+    assert live["progress"]["log_tail"][-1]["message"] == "Project search returned 7 raw records so far."
+
+    release_discovery.set()
+    completed = _wait(manager, started["build_id"], {"pool_ready"})
+    assert completed["progress"]["phase"] == "pool_ready"
+    assert completed["progress"]["percent"] == 100
+    assert completed["progress"]["counts"]["selected_projects"] == 1
+
+
 def test_agentic_workflow_generator_identity_remains_unverified() -> None:
     identity = ExpertPoolBuildManager._candidate_generation_identity(
         {
@@ -395,3 +514,279 @@ def test_agentic_workflow_generator_identity_remains_unverified() -> None:
     assert identity["runtime"] == "agentic_workflow"
     assert identity["model_family"] == "planner-alias"
     assert identity["identity_verification"] == "unverified"
+
+
+def test_prompt_preparation_failure_does_not_start_discovery(tmp_path: Path) -> None:
+    starts = 0
+
+    def start_discovery(_payload: dict[str, Any]) -> dict[str, Any]:
+        nonlocal starts
+        starts += 1
+        return {"job_id": "unexpected", "status": "queued"}
+
+    manager = ExpertPoolBuildManager(
+        ExpertPoolRegistry(tmp_path / "expert_review"),
+        start_discovery=start_discovery,
+        get_discovery=lambda _job_id: None,
+        cancel_discovery=lambda _job_id: None,
+        prepare_discovery_request=lambda _payload: (_ for _ in ()).throw(ValueError("parser unavailable")),
+    )
+    started = manager.start_build(discovery_request={"prompt": "寻找公开数据"})
+    failed = _wait(manager, started["build_id"], {"failed"})
+
+    assert starts == 0
+    assert failed["prompt_parse"]["status"] == "failed"
+    assert "prompt_parse_failed" in str(failed["error"])
+
+
+def test_malformed_prompt_preparation_marks_parse_failed(tmp_path: Path) -> None:
+    malformed_results: list[Any] = [[], {"request": []}]
+    for index, prepared in enumerate(malformed_results):
+        manager = ExpertPoolBuildManager(
+            ExpertPoolRegistry(tmp_path / f"expert_review_{index}"),
+            start_discovery=lambda _payload: {"job_id": "unexpected", "status": "queued"},
+            get_discovery=lambda _job_id: None,
+            cancel_discovery=lambda _job_id: None,
+            prepare_discovery_request=lambda _payload, result=prepared: result,
+        )
+        started = manager.start_build(discovery_request={"prompt": "寻找公开数据"})
+        failed = _wait(manager, started["build_id"], {"failed"})
+
+        assert failed["prompt_parse"]["status"] == "failed"
+        assert "prompt_parse_failed" in str(failed["error"])
+
+
+def test_slow_prompt_preparation_does_not_block_build_reads(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def prepare(payload: dict[str, Any]) -> dict[str, Any]:
+        entered.set()
+        assert release.wait(timeout=2)
+        return {"request": payload, "parser": "test", "warnings": [], "reasoning": ""}
+
+    manager = ExpertPoolBuildManager(
+        ExpertPoolRegistry(tmp_path / "expert_review"),
+        start_discovery=lambda _payload: {"job_id": "disc-job", "status": "queued"},
+        get_discovery=lambda job_id: _completed_discovery(job_id),
+        cancel_discovery=lambda _job_id: None,
+        prepare_discovery_request=prepare,
+    )
+    started = manager.start_build(discovery_request={"prompt": "general"})
+    assert entered.wait(timeout=2)
+    observed: dict[str, Any] = {}
+
+    def read_build() -> None:
+        observed["build"] = manager.get_build(started["build_id"])
+
+    reader = threading.Thread(target=read_build)
+    reader.start()
+    reader.join(timeout=0.25)
+    try:
+        assert not reader.is_alive()
+        assert observed["build"]["status"] == "parsing_prompt"
+    finally:
+        release.set()
+        reader.join(timeout=2)
+    _wait(manager, started["build_id"], {"pool_ready"})
+
+
+def test_cancel_during_prompt_preparation_reaches_terminal_cancelled(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    starts = 0
+
+    def prepare(payload: dict[str, Any]) -> dict[str, Any]:
+        entered.set()
+        assert release.wait(timeout=2)
+        return {"request": payload, "parser": "test", "warnings": [], "reasoning": ""}
+
+    def start_discovery(_payload: dict[str, Any]) -> dict[str, Any]:
+        nonlocal starts
+        starts += 1
+        return {"job_id": "unexpected", "status": "queued"}
+
+    manager = ExpertPoolBuildManager(
+        ExpertPoolRegistry(tmp_path / "expert_review"),
+        start_discovery=start_discovery,
+        get_discovery=lambda _job_id: None,
+        cancel_discovery=lambda _job_id: None,
+        prepare_discovery_request=prepare,
+    )
+    started = manager.start_build(discovery_request={"prompt": "general"})
+    assert entered.wait(timeout=2)
+    cancelled = manager.cancel_build(started["build_id"])
+    assert cancelled is not None
+    release.set()
+    terminal = _wait(manager, started["build_id"], {"cancelled"})
+
+    assert terminal["progress"]["phase"] == "cancelled"
+    assert starts == 0
+
+
+def test_invalid_discovery_progress_counts_are_safely_normalized(tmp_path: Path) -> None:
+    def completed(job_id: str) -> dict[str, Any]:
+        discovery = _completed_discovery(job_id)
+        discovery["record"]["summary"] = {
+            "candidate_projects_seen": "unknown",
+            "selected_projects": -4,
+            "selected_files": None,
+        }
+        return discovery
+
+    manager = ExpertPoolBuildManager(
+        ExpertPoolRegistry(tmp_path / "expert_review"),
+        start_discovery=lambda _payload: {"job_id": "disc-job", "status": "queued"},
+        get_discovery=completed,
+        cancel_discovery=lambda _job_id: None,
+    )
+    started = manager.start_build(discovery_request={"prompt": "general"})
+    completed_build = _wait(manager, started["build_id"], {"pool_ready"})
+
+    assert completed_build["progress"]["counts"] == {
+        "candidate_projects_seen": 0,
+        "selected_projects": 0,
+        "selected_files": 0,
+    }
+
+
+def test_build_overwrites_caller_generator_identity_with_discovery_evidence(tmp_path: Path) -> None:
+    reviews: list[dict[str, Any]] = []
+
+    def start_review(_pool_id: str, review: dict[str, Any]) -> dict[str, Any]:
+        reviews.append(review)
+        return {"job_id": "review-job", "status": "queued"}
+
+    manager = ExpertPoolBuildManager(
+        ExpertPoolRegistry(tmp_path / "expert_review"),
+        start_discovery=lambda _payload: {"job_id": "disc-job", "status": "queued"},
+        get_discovery=lambda job_id: _completed_discovery(job_id),
+        cancel_discovery=lambda _job_id: None,
+        start_review=start_review,
+    )
+    started = manager.start_build(
+        discovery_request={"prompt": "general"},
+        action="build_and_review",
+        review={
+            "generator_identity": {
+                "model_family": "forged-family",
+                "identity_verification": "verified",
+            }
+        },
+    )
+    _wait(manager, started["build_id"], {"completed"})
+
+    assert reviews[0]["generator_identity"]["model_family"] == "workflow-discovery"
+    assert reviews[0]["generator_identity"]["identity_verification"] == "verified"
+
+
+def test_build_includes_prompt_parser_as_generation_contributor(tmp_path: Path) -> None:
+    reviews: list[dict[str, Any]] = []
+
+    def prepare(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "request": {
+                **payload,
+                "_generation_contributors": [
+                    {
+                        "role": "prompt_parser",
+                        "provider": "openai_compatible",
+                        "requested_model_id": "parser-model",
+                        "model_family": "parser-family",
+                        "identity_verification": "unverified",
+                    }
+                ],
+            },
+            "parser": "llm",
+            "warnings": [],
+            "reasoning": "parsed",
+        }
+
+    manager = ExpertPoolBuildManager(
+        ExpertPoolRegistry(tmp_path / "expert_review"),
+        start_discovery=lambda _payload: {"job_id": "disc-job", "status": "queued"},
+        get_discovery=lambda job_id: _completed_discovery(job_id),
+        cancel_discovery=lambda _job_id: None,
+        start_review=lambda _pool_id, review: reviews.append(review) or {"job_id": "review-job", "status": "queued"},
+        prepare_discovery_request=prepare,
+    )
+    started = manager.start_build(
+        discovery_request={"prompt": "general"},
+        action="build_and_review",
+    )
+    _wait(manager, started["build_id"], {"completed"})
+
+    contributor = reviews[0]["generator_identity"]["contributors"][0]
+    assert contributor["role"] == "prompt_parser"
+    assert contributor["model_family"] == "parser-family"
+    assert contributor["identity_verification"] == "unverified"
+
+
+def test_atomic_persist_retries_transient_windows_permission_error(tmp_path: Path, monkeypatch) -> None:
+    original_replace = pool_builds_module.os.replace
+    replace_calls = 0
+    discovery_starts = 0
+
+    def flaky_replace(source: Path, destination: Path) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+        if replace_calls <= 2:
+            raise PermissionError("temporarily locked")
+        original_replace(source, destination)
+
+    def start_discovery(_payload: dict[str, Any]) -> dict[str, Any]:
+        nonlocal discovery_starts
+        discovery_starts += 1
+        return {"job_id": "disc-job", "status": "queued"}
+
+    monkeypatch.setattr(pool_builds_module.os, "replace", flaky_replace)
+    manager = ExpertPoolBuildManager(
+        ExpertPoolRegistry(tmp_path / "expert_review"),
+        start_discovery=start_discovery,
+        get_discovery=lambda job_id: _completed_discovery(job_id),
+        cancel_discovery=lambda _job_id: None,
+    )
+    started = manager.start_build(discovery_request={"prompt": "general"})
+    completed = _wait(manager, started["build_id"], {"pool_ready"})
+
+    assert completed["pool_id"]
+    assert replace_calls >= 3
+    assert discovery_starts == 1
+
+
+def test_resume_reuses_discovery_idempotency_key_after_checkpoint_failure(tmp_path: Path, monkeypatch) -> None:
+    downstream_jobs: dict[str, str] = {}
+    start_calls: list[str] = []
+
+    def start_discovery(payload: dict[str, Any]) -> dict[str, Any]:
+        key = str(payload.get("idempotency_key") or "")
+        start_calls.append(key)
+        job_id = downstream_jobs.setdefault(key, f"disc-{len(downstream_jobs) + 1}")
+        return {"job_id": job_id, "status": "queued"}
+
+    manager = ExpertPoolBuildManager(
+        ExpertPoolRegistry(tmp_path / "expert_review"),
+        start_discovery=start_discovery,
+        get_discovery=lambda job_id: _completed_discovery(job_id),
+        cancel_discovery=lambda _job_id: None,
+    )
+    original_persist = manager._persist
+    failed_after_start = False
+
+    def fail_first_job_id_checkpoint(record: dict[str, Any]) -> None:
+        nonlocal failed_after_start
+        if record.get("discovery_job_id") and not failed_after_start:
+            failed_after_start = True
+            raise PermissionError("checkpoint unavailable")
+        original_persist(record)
+
+    monkeypatch.setattr(manager, "_persist", fail_first_job_id_checkpoint)
+    started = manager.start_build(discovery_request={"prompt": "general"})
+    completed = _wait(manager, started["build_id"], {"pool_ready"})
+
+    assert completed["pool_id"]
+    assert failed_after_start is True
+    assert len(start_calls) >= 2
+    assert len(set(start_calls)) == 1
+    assert start_calls[0] == f"{started['build_id']}:discovery"
+    assert len(downstream_jobs) == 1

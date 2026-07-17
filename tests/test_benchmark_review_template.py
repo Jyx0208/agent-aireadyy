@@ -49,6 +49,31 @@ def test_benchmark_review_template_has_repair_contract_markers() -> None:
     assert 'id="poolBuildPrompt"' in html
     assert 'id="startPoolBuildButton"' in html
     assert 'id="poolBuildAction"' in html
+    assert 'id="poolBuildScale"' in html
+    assert '<option value="curated">' in html
+    assert '<option value="balanced">' in html
+    assert '<option value="exhaustive">' in html
+    assert 'id="poolBuildOutputLanguage"' in html
+    assert '<option value="zh-CN">' in html
+    assert 'scale_mode: scaleMode' in html
+    assert 'output_language: outputLanguage' in html
+    assert "build.prompt_parse" in html
+    assert "progress.counts" in html
+    assert "candidate_projects_seen" in html
+    assert "selected_projects" in html
+    assert "selected_files" in html
+    assert "English query terms" in html
+    assert 'className = "pool-build-steps"' in html
+    assert 'className = "pool-build-now"' in html
+    assert "启动模型评审" in html
+    assert "形成专家共识" in html
+    assert "专家共识仍在后台运行" in html
+    assert "Build review pool" in html
+    assert "build.review_progress" in html
+    assert "已结束但存在失败" in html
+    assert "模型评审任务已结束" in html
+    assert "localizedJobStatus" in html
+    assert "localizedJobLogMessage" in html
     assert "/api/benchmark-review/builds" in html
     assert "build_and_review" in html
     assert 'id="profileProviderInput"' in html

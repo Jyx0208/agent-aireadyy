@@ -117,12 +117,23 @@
     .help { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0 0 10px; }
     .profile-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
     .profile-grid .full { grid-column: 1 / -1; }
-    .jobs-controls { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(180px, .7fr) auto; gap: 8px; align-items: end; margin: 14px 0 10px; }
+    .jobs-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; align-items: end; margin: 14px 0 10px; }
     .job-row { width: 100%; display: block; border: 0; border-top: 1px solid var(--line); border-radius: 0; text-align: left; padding: 10px 4px; min-height: 0; }
     .job-row[aria-pressed="true"] { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); padding-left: 10px; }
     .job-title { font-weight: 650; overflow-wrap: anywhere; }
     .progress-bar { height: 10px; background: #e8ecef; border-radius: 99px; overflow: hidden; margin: 7px 0; }
     .progress-bar > span { display: block; height: 100%; background: var(--accent); width: 0; transition: width .2s ease; }
+    .pool-build-summary { display: grid; gap: 5px; margin-top: 6px; color: var(--muted); }
+    .pool-build-now { margin: 8px 0; padding: 9px 11px; border-left: 3px solid var(--accent); background: var(--accent-soft); color: var(--text); font-weight: 600; }
+    .pool-build-steps { display: grid; grid-template-columns: repeat(6, minmax(105px, 1fr)); gap: 6px; margin: 10px 0 8px; }
+    .pool-build-step { position: relative; min-height: 54px; padding: 8px 9px; border: 1px solid var(--line); border-radius: 7px; background: #f8fafb; color: var(--muted); font-size: 12px; line-height: 1.35; }
+    .pool-build-step strong { display: block; margin-bottom: 2px; color: inherit; font-size: 13px; }
+    .pool-build-step.complete { border-color: #8fc8aa; background: #eef8f2; color: #17653b; }
+    .pool-build-step.current { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); box-shadow: inset 0 -3px var(--accent); }
+    .pool-build-step.error { border-color: #d69292; background: #fff1f1; color: var(--danger); }
+    .pool-build-counts { display: flex; flex-wrap: wrap; gap: 10px; font-size: 13px; }
+    .pool-build-terms { direction: ltr; text-align: left; overflow-wrap: anywhere; }
+    .pool-build-log { margin: 6px 0 0; padding-left: 20px; max-height: 130px; overflow: auto; font-size: 12px; }
     .job-detail { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 10px; }
     .job-items { max-height: 180px; overflow: auto; font-size: 12px; line-height: 1.5; }
     .log-box { max-height: 180px; min-height: 72px; overflow: auto; background: #f8fafb; border: 1px solid var(--line); padding: 8px; font-size: 12px; white-space: pre-wrap; }
@@ -138,6 +149,8 @@
       .jobs-controls .primary { grid-column: 1 / -1; }
       .metadata { grid-template-columns: 1fr 1fr; }
       .grades { grid-template-columns: 1fr 1fr; }
+      .pool-build-steps { display: flex; overflow-x: auto; padding-bottom: 4px; }
+      .pool-build-step { min-width: 150px; }
     }
     @media (max-width: 520px) {
       .header-inner, main { width: min(100% - 20px, 1180px); }
@@ -193,12 +206,28 @@
       <div class="pool-meta mode-banner" id="modeBanner" role="status" aria-live="polite"></div>
       <section class="tool-section developer-tools hidden" id="poolBuildPanel">
         <h3>从 Prompt 一键构建评审池</h3>
-        <p class="help">输入自然语言任务后，系统会自动发现候选、注册评审池，并默认使用所选专家 Profile 启动评审。</p>
+        <p class="help">输入目标后，系统依次理解需求、检索候选、生成评审池并启动异构模型评审。每条记录会明确显示当前步骤；“建池完成”不等于“模型共识已经评完”。</p>
         <div class="field">
           <label for="poolBuildPrompt">评审任务 Prompt</label>
           <textarea id="poolBuildPrompt" placeholder="例如：寻找适用于人类 DDA 蛋白质组分析、包含原始数据和搜索结果的公开项目"></textarea>
         </div>
         <div class="jobs-controls">
+          <div class="field">
+            <label for="poolBuildScale">覆盖规模</label>
+            <select id="poolBuildScale">
+              <option value="auto">自动理解 Prompt（推荐）</option>
+              <option value="curated">精选（约 10～30 个项目）</option>
+              <option value="balanced">均衡（约 50～100 个项目）</option>
+              <option value="exhaustive">尽量搜全（安全上限内尽量多）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="poolBuildOutputLanguage">说明语言</label>
+            <select id="poolBuildOutputLanguage">
+              <option value="zh-CN">中文</option>
+              <option value="en">English</option>
+            </select>
+          </div>
           <div class="field">
             <label for="poolBuildAction">动作</label>
             <select id="poolBuildAction">
@@ -1502,22 +1531,184 @@
     function renderPoolBuilds(builds) {
       const root = byId("poolBuildList");
       root.replaceChildren();
+      const selectedLanguage = byId("poolBuildOutputLanguage")?.value || "zh-CN";
+      const selectedZh = selectedLanguage.startsWith("zh");
       if (!builds.length) {
-        root.textContent = "暂无 Prompt 构建记录。";
+        root.textContent = selectedZh ? "暂无请求构建记录。" : "No prompt builds yet.";
         return;
       }
       for (const build of builds.slice(0, 8)) {
+        const buildLanguage = build.prompt_parse?.output_language || selectedLanguage;
+        const zh = String(buildLanguage).startsWith("zh");
+        const tr = (zhText, enText) => zh ? zhText : enText;
+        const statusText = (value) => {
+          const code = String(value || "");
+          const labels = {
+            queued: tr("排队中", "Queued"),
+            pending: tr("待开始", "Pending"),
+            parsing_prompt: tr("正在理解需求", "Parsing request"),
+            starting_discovery: tr("正在启动数据发现", "Starting discovery"),
+            discovering: tr("正在搜索候选", "Searching candidates"),
+            registering_pool: tr("正在注册评审池", "Registering review pool"),
+            pool_ready: tr("评审池已就绪", "Review pool ready"),
+            starting_review: tr("正在启动模型评审", "Starting model review"),
+            running: tr("进行中", "Running"),
+            completed: tr("已完成", "Completed"),
+            completed_with_errors: tr("已结束但存在失败", "Finished with errors"),
+            failed: tr("失败", "Failed"),
+            cancelled: tr("已取消", "Cancelled"),
+            not_requested: tr("未请求", "Not requested"),
+            starting: tr("正在启动", "Starting")
+          };
+          return labels[code] || code || tr("未知", "Unknown");
+        };
+        const progress = build.progress || {};
+        const reviewProgress = build.review_progress || {};
+        const reviewCounts = reviewProgress.progress || {};
+        const reviewState = reviewProgress.status || build.review_status || "pending";
+        const levelText = (value) => {
+          const code = String(value || "info");
+          return ({info: tr("信息", "info"), warning: tr("警告", "warning"), error: tr("错误", "error")})[code] || code;
+        };
         const row = document.createElement("div");
         row.className = "job-row";
         const title = document.createElement("strong");
-        title.textContent = `${build.build_id} · ${build.status || "未知"}`;
+        let headlineStatus = statusText(build.status);
+        if (["queued", "running"].includes(reviewState)) headlineStatus = tr("建池完成，专家评审进行中", "Pool ready, expert review running");
+        else if (reviewState === "completed") headlineStatus = tr("建池和专家评审均已完成", "Pool build and expert review complete");
+        else if (reviewState === "completed_with_errors") headlineStatus = tr("建池完成，专家评审存在失败", "Pool ready, expert review has failures");
+        else if (["failed", "cancelled"].includes(reviewState)) headlineStatus = tr("建池完成，专家评审未完成", "Pool ready, expert review incomplete");
+        title.textContent = `${build.build_id} · ${headlineStatus}`;
         const detail = document.createElement("div");
-        detail.textContent = `Discovery ${build.discovery_status || "待启动"} · Pool ${build.pool_id || "未就绪"} · Review ${build.review_job_id || build.review_status || "未请求"}${build.error ? ` · 错误 ${build.error}` : build.review_error ? ` · 评审错误 ${build.review_error}` : ""}`;
-        row.append(title, detail);
+        detail.textContent = `${tr("数据发现", "Discovery")} ${statusText(build.discovery_status || "pending")} · ${tr("评审池", "Pool")} ${build.pool_id || tr("未就绪", "not ready")} · ${tr("模型评审", "Review")} ${build.review_job_id ? `${build.review_job_id}（${statusText(reviewState)}）` : statusText(build.review_status || "not_requested")}${build.error ? ` · ${tr("错误", "Error")} ${build.error}` : build.review_error ? ` · ${tr("评审错误", "Review error")} ${build.review_error}` : ""}`;
+        const phaseKey = progress.phase || build.status || "queued";
+        const phaseIndexes = {
+          queued: 0,
+          parsing_prompt: 1,
+          starting_discovery: 2,
+          discovering: 2,
+          registering_pool: 3,
+          pool_ready: build.action === "build_only" ? 3 : 4,
+          starting_review: 4,
+          completed: 4
+        };
+        let currentIndex = phaseIndexes[phaseKey] ?? 0;
+        if (["queued", "running"].includes(reviewState)) currentIndex = 5;
+        const steps = [
+          [tr("提交目标", "Submit goal"), tr("已接收任务", "Request received")],
+          [tr("理解需求", "Understand request"), tr("生成英文检索词", "Create English search terms")],
+          [tr("搜索候选", "Search candidates"), tr("检索并筛选项目", "Find and filter projects")],
+          [tr("生成评审池", "Build review pool"), tr("校验并注册候选", "Validate and register candidates")],
+          [tr("启动模型评审", "Start model review"), tr("交接给异构专家", "Handoff to heterogeneous experts")],
+          [tr("形成专家共识", "Reach expert consensus"), tr("两票评审，必要时第三票", "Two reviews, with a third when needed")]
+        ];
+        const stepper = document.createElement("div");
+        stepper.className = "pool-build-steps";
+        stepper.setAttribute("aria-label", tr("一键建池流程", "One-prompt build workflow"));
+        for (const [index, step] of steps.entries()) {
+          const node = document.createElement("div");
+          node.className = "pool-build-step";
+          const reviewStartFailed = index === 4 && build.review_status === "failed";
+          const consensusFailed = index === 5 && ["failed", "cancelled", "completed_with_errors"].includes(reviewState);
+          const buildOnlyDone = build.action === "build_only" && build.pool_id && index <= 3;
+          const handoffDone = build.status === "completed" && index <= 4;
+          const consensusDone = reviewState === "completed" && index <= 5;
+          if (reviewStartFailed || consensusFailed) node.classList.add("error");
+          else if (consensusDone || handoffDone || buildOnlyDone || index < currentIndex) node.classList.add("complete");
+          else if (index === currentIndex) node.classList.add("current");
+          const stateText = node.classList.contains("error") ? tr("需要处理", "Needs attention") : node.classList.contains("complete") ? tr("已完成", "Complete") : node.classList.contains("current") ? tr("进行中", "In progress") : tr("待开始", "Pending");
+          node.innerHTML = `<strong>${index + 1}. ${step[0]}</strong>${step[1]} · ${stateText}`;
+          stepper.appendChild(node);
+        }
+        const now = document.createElement("div");
+        now.className = "pool-build-now";
+        if (build.review_status === "failed") {
+          now.textContent = tr("评审池已经保留，但模型评审启动失败；可以只重试评审交接，不会重新搜索。", "The review pool is preserved, but model review failed to start. Retry the handoff without repeating discovery.");
+        } else if (["queued", "running"].includes(reviewState)) {
+          now.textContent = tr(`异构模型专家正在评审：已完成 ${reviewCounts.done || 0} / ${reviewCounts.total || 0}，失败 ${reviewCounts.failed || 0}。`, `Heterogeneous model experts are reviewing: ${reviewCounts.done || 0} / ${reviewCounts.total || 0} complete, ${reviewCounts.failed || 0} failed.`);
+        } else if (reviewState === "completed") {
+          now.textContent = tr(`专家共识评审已完成：完成 ${reviewCounts.done || 0} / ${reviewCounts.total || 0}。`, `Expert consensus review is complete: ${reviewCounts.done || 0} / ${reviewCounts.total || 0} finished.`);
+        } else if (reviewState === "completed_with_errors") {
+          now.textContent = tr(`模型评审任务已结束，但有 ${reviewCounts.failed || 0} 个候选失败或未形成共识；请查看失败项并重试。`, `Model review finished with ${reviewCounts.failed || 0} failed or unresolved candidate(s). Inspect and retry those items.`);
+        } else if (["failed", "cancelled"].includes(reviewState)) {
+          now.textContent = tr("模型专家评审未完成，请在评审任务区查看错误并决定重试。", "Model-expert review did not complete. Check the review jobs section and decide whether to retry.");
+        } else if (build.status === "completed" && build.review_job_id) {
+          now.textContent = tr("评审池构建完成，模型评审任务已启动；专家共识仍在后台运行，请在评审任务区查看进度。", "The review pool is ready and the model-review job has started. Expert consensus is still running; follow it in the review jobs section.");
+        } else if (build.action === "build_only" && build.pool_id) {
+          now.textContent = tr("评审池已经生成；本次选择了“仅构建”，尚未启动模型评审。", "The review pool is ready. This build-only run has not started model review.");
+        } else {
+          now.textContent = progress.message || tr("系统正在处理当前步骤。", "The system is working on the current step.");
+        }
+        let percent = Math.max(0, Math.min(100, Number(progress.percent || 0)));
+        if (["queued", "running"].includes(reviewState)) {
+          const total = Math.max(0, Number(reviewCounts.total || 0));
+          const done = Math.max(0, Number(reviewCounts.done || 0));
+          percent = total > 0 ? 90 + Math.floor(10 * Math.min(1, done / total)) : 90;
+        } else if (reviewState === "completed") {
+          percent = 100;
+        } else if (reviewState === "completed_with_errors") {
+          const total = Math.max(0, Number(reviewCounts.total || 0));
+          const done = Math.max(0, Number(reviewCounts.done || 0));
+          percent = total > 0 ? Math.min(99, 90 + Math.floor(10 * Math.min(1, done / total))) : 99;
+        } else if (["failed", "cancelled"].includes(reviewState)) {
+          const total = Math.max(0, Number(reviewCounts.total || 0));
+          const processed = Math.max(0, Number(reviewCounts.done || 0) + Number(reviewCounts.failed || 0));
+          percent = total > 0 ? Math.min(99, 90 + Math.floor(10 * Math.min(1, processed / total))) : 90;
+        }
+        const bar = document.createElement("div");
+        bar.className = "progress-bar";
+        bar.setAttribute("role", "progressbar");
+        bar.setAttribute("aria-label", `${build.build_id} ${tr("构建进度", "build progress")}`);
+        bar.setAttribute("aria-valuemin", "0");
+        bar.setAttribute("aria-valuemax", "100");
+        bar.setAttribute("aria-valuenow", String(percent));
+        const fill = document.createElement("span");
+        fill.style.width = `${percent}%`;
+        bar.appendChild(fill);
+        const summary = document.createElement("div");
+        summary.className = "pool-build-summary";
+        const phase = document.createElement("div");
+        const displayedPhase = build.review_job_id && reviewProgress.status ? reviewProgress.status : (progress.phase || build.status || "queued");
+        phase.textContent = `${statusText(displayedPhase)} · ${percent}%${progress.message ? ` · ${progress.message}` : ""}`;
+        summary.appendChild(phase);
+        const parse = build.prompt_parse || {};
+        if (parse.status && parse.status !== "pending") {
+          const parseDetail = document.createElement("div");
+          const parserLabel = parse.parser === "llm" ? tr("大模型解析", "LLM parser") : parse.parser;
+          parseDetail.textContent = `${tr("请求解析", "Prompt parsing")}：${statusText(parse.status)}${parserLabel ? ` · ${parserLabel}` : ""}${parse.goal ? ` · ${parse.goal}` : ""}${parse.reasoning ? ` · ${parse.reasoning}` : ""}`;
+          summary.appendChild(parseDetail);
+        }
+        if (Array.isArray(parse.query_terms) && parse.query_terms.length) {
+          const terms = document.createElement("div");
+          terms.className = "pool-build-terms";
+          terms.lang = "en";
+          terms.dir = "ltr";
+          terms.textContent = `${tr("英文检索词", "English query terms")}: ${parse.query_terms.join(" · ")}`;
+          summary.appendChild(terms);
+        }
+        const counts = progress.counts || {};
+        const countRow = document.createElement("div");
+        countRow.className = "pool-build-counts";
+        countRow.textContent = `${tr("候选项目（检索阶段）", "Candidate projects (search stage)")} ${counts.candidate_projects_seen || 0} · ${tr("入选项目", "Selected projects")} ${counts.selected_projects || 0} · ${tr("入选文件", "Selected files")} ${counts.selected_files || 0}`;
+        summary.appendChild(countRow);
+        const logs = Array.isArray(progress.log_tail) ? progress.log_tail : [];
+        if (logs.length) {
+          const logList = document.createElement("ul");
+          logList.className = "pool-build-log";
+          logList.setAttribute("role", "log");
+          logList.setAttribute("aria-label", `${build.build_id} ${tr("构建日志", "build log")}`);
+          for (const entry of logs.slice(-8)) {
+            const item = document.createElement("li");
+            item.textContent = `${entry.ts || ""}${entry.level ? ` [${levelText(entry.level)}]` : ""} ${entry.message || ""}`.trim();
+            logList.appendChild(item);
+          }
+          summary.appendChild(logList);
+        }
+        row.append(title, detail, stepper, now, bar, summary);
         if (build.pool_id) {
           const open = document.createElement("button");
           open.type = "button";
-          open.textContent = "打开评审池";
+          open.textContent = tr("打开评审池", "Open review pool");
           open.addEventListener("click", () => { void openServerPool(build.pool_id); });
           row.appendChild(open);
         }
@@ -1532,29 +1723,33 @@
 
     async function refreshPoolBuilds() {
       if (!isDevMode()) return;
+      const zh = (byId("poolBuildOutputLanguage")?.value || "zh-CN").startsWith("zh");
       try {
         const payload = await apiRequest("/api/benchmark-review/builds");
-        if (!payload.ok) throw new Error(payload.error || "无法加载构建记录");
+        if (!payload.ok) throw new Error(payload.error || (zh ? "无法加载构建记录" : "Unable to load builds"));
         const builds = Array.isArray(payload.builds) ? payload.builds : [];
         renderPoolBuilds(builds);
-        const active = builds.some((build) => ["queued", "discovering"].includes(build.status));
+        const active = builds.some((build) => ["queued", "parsing_prompt", "starting_discovery", "discovering", "registering_pool"].includes(build.status) || ["queued", "running"].includes(build.review_progress?.status));
         stopPoolBuildPolling();
         if (active) poolBuildPollTimer = window.setTimeout(() => { void refreshPoolBuilds(); }, 2000);
-        byId("poolBuildStatus").textContent = builds.length ? `已加载 ${builds.length} 条构建记录。` : "暂无构建记录。";
+        byId("poolBuildStatus").textContent = builds.length ? (zh ? `已加载 ${builds.length} 条构建记录。` : `Loaded ${builds.length} build record(s).`) : (zh ? "暂无构建记录。" : "No build records yet.");
       } catch (error) {
         stopPoolBuildPolling();
-        byId("poolBuildStatus").textContent = `构建状态加载失败：${error.message}`;
+        byId("poolBuildStatus").textContent = zh ? `构建状态加载失败：${error.message}` : `Failed to load build status: ${error.message}`;
       }
     }
 
     async function startPoolBuild() {
       if (poolBuildBusy) return;
       const prompt = byId("poolBuildPrompt").value.trim();
+      const outputLanguage = byId("poolBuildOutputLanguage").value || "zh-CN";
+      const zh = outputLanguage.startsWith("zh");
       if (!prompt) {
-        byId("poolBuildStatus").textContent = "请输入评审任务 Prompt。";
+        byId("poolBuildStatus").textContent = zh ? "请输入评审任务。" : "Enter a review request.";
         return;
       }
       const action = byId("poolBuildAction").value || "build_and_review";
+      const scaleMode = byId("poolBuildScale").value || "auto";
       poolBuildBusy = true;
       byId("startPoolBuildButton").disabled = true;
       try {
@@ -1564,16 +1759,18 @@
           body: JSON.stringify({
             prompt,
             action,
+            scale_mode: scaleMode,
+            output_language: outputLanguage,
             preset_id: "default/v1",
             idempotency_key: (window.crypto && window.crypto.randomUUID) ? window.crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
             review: action === "build_and_review" ? { workers: 2 } : {}
           })
         });
-        if (!payload.ok || !payload.build) throw new Error(payload.error || "构建启动失败");
-        byId("poolBuildStatus").textContent = `已启动 ${payload.build.build_id}。`;
+        if (!payload.ok || !payload.build) throw new Error(payload.error || (zh ? "构建启动失败" : "Build failed to start"));
+        byId("poolBuildStatus").textContent = zh ? `已启动 ${payload.build.build_id}。` : `Started ${payload.build.build_id}.`;
         await refreshPoolBuilds();
       } catch (error) {
-        byId("poolBuildStatus").textContent = `构建启动失败：${error.message}`;
+        byId("poolBuildStatus").textContent = zh ? `构建启动失败：${error.message}` : `Failed to start build: ${error.message}`;
       } finally {
         poolBuildBusy = false;
         byId("startPoolBuildButton").disabled = false;
@@ -1590,11 +1787,62 @@
       };
     }
 
+    function jobLanguage(job) {
+      return String(job?.output_language || byId("poolBuildOutputLanguage")?.value || "zh-CN");
+    }
+
+    function jobText(job, zhText, enText) {
+      return jobLanguage(job).startsWith("zh") ? zhText : enText;
+    }
+
+    function localizedJobStatus(job, value) {
+      const code = String(value || "");
+      const labels = {
+        queued: jobText(job, "排队中", "Queued"),
+        running: jobText(job, "进行中", "Running"),
+        completed: jobText(job, "已完成", "Completed"),
+        completed_with_errors: jobText(job, "已结束但存在失败", "Finished with errors"),
+        failed: jobText(job, "失败", "Failed"),
+        cancelled: jobText(job, "已取消", "Cancelled"),
+        pending: jobText(job, "待开始", "Pending")
+      };
+      return labels[code] || code || jobText(job, "未知", "Unknown");
+    }
+
+    function localizedJobLogMessage(job, value) {
+      const text = String(value || "");
+      if (!jobLanguage(job).startsWith("zh") || /[\u3400-\u9fff]/.test(text)) return text;
+      const exact = {
+        "Consensus job queued.": "专家共识任务已排队。",
+        "Queued job cancelled.": "排队中的任务已取消。",
+        "Cancel requested.": "已请求取消任务。",
+        "No pending candidates to resume.": "没有待恢复的候选。",
+        "No failed candidates to retry.": "没有失败候选需要重试。",
+        "Recovered after restart; queued to resume.": "服务重启后已恢复，任务重新排队。",
+        "Recovered cancelled job after restart.": "服务重启后恢复了已取消任务。"
+      };
+      if (exact[text]) return exact[text];
+      let match = text.match(/^Starting consensus panel (.+)\.$/);
+      if (match) return `正在启动异构专家组：${match[1]}。`;
+      match = text.match(/^Consensus completed for (.+)\.$/);
+      if (match) return `候选 ${match[1]} 已完成专家共识。`;
+      match = text.match(/^Consensus failed for (.+):/);
+      if (match) return `候选 ${match[1]} 的专家共识失败，详细原因已记录。`;
+      match = text.match(/^Resuming (\d+) pending candidates\.$/);
+      if (match) return `正在恢复 ${match[1]} 个待处理候选。`;
+      match = text.match(/^Retrying (\d+) failed candidates\.$/);
+      if (match) return `正在重试 ${match[1]} 个失败候选。`;
+      match = text.match(/^Job (.+)\.$/);
+      if (match) return `任务状态：${localizedJobStatus(job, match[1])}。`;
+      return "模型评审进度已更新。";
+    }
+
     function renderJobs(jobs) {
       const root = byId("jobsList");
       root.replaceChildren();
       if (!jobs.length) {
-        root.textContent = activePoolId ? "当前评审池暂无 Job。" : "打开服务端池后可查看该池 Job。";
+        const zh = (byId("poolBuildOutputLanguage")?.value || "zh-CN").startsWith("zh");
+        root.textContent = activePoolId ? (zh ? "当前评审池暂无任务。" : "No jobs for this review pool.") : (zh ? "打开服务端评审池后可查看模型评审任务。" : "Open a server review pool to view model-review jobs.");
         return;
       }
       for (const job of jobs) {
@@ -1605,14 +1853,14 @@
         row.className = "job-row";
         row.dataset.jobId = job.job_id;
         row.setAttribute("aria-pressed", String(job.job_id === selectedJobId));
-        row.setAttribute("aria-label", `Job ${job.job_id}，状态 ${job.status}，进度 ${counts.done + counts.failed}/${counts.total}`);
+        row.setAttribute("aria-label", jobText(job, `任务 ${job.job_id}，状态 ${localizedJobStatus(job, job.status)}，进度 ${counts.done + counts.failed}/${counts.total}`, `Job ${job.job_id}, status ${localizedJobStatus(job, job.status)}, progress ${counts.done + counts.failed}/${counts.total}`));
         const title = document.createElement("div");
         title.className = "job-title";
-        title.textContent = `${job.job_id} · ${job.status || "未知"} · ${job.model || job.profile_id || "未知模型"}`;
+        title.textContent = `${job.job_id} · ${localizedJobStatus(job, job.status)} · ${job.model || job.profile_id || jobText(job, "自动异构专家组", "Automatic heterogeneous panel")}`;
         const bar = document.createElement("div");
         bar.className = "progress-bar";
         bar.setAttribute("role", "progressbar");
-        bar.setAttribute("aria-label", `${job.job_id} 进度`);
+        bar.setAttribute("aria-label", `${job.job_id} ${jobText(job, "进度", "progress")}`);
         bar.setAttribute("aria-valuemin", "0");
         bar.setAttribute("aria-valuemax", String(counts.total || 1));
         bar.setAttribute("aria-valuenow", String(counts.done + counts.failed));
@@ -1620,7 +1868,7 @@
         fill.style.width = `${percent}%`;
         bar.appendChild(fill);
         const summary = document.createElement("div");
-        summary.textContent = `完成 ${counts.done} · 失败 ${counts.failed} · 总数 ${counts.total} · 跳过/恢复 ${counts.skipped}${job.error ? ` · 错误 ${job.error}` : ""}`;
+        summary.textContent = jobText(job, `完成 ${counts.done} · 失败 ${counts.failed} · 总数 ${counts.total} · 跳过/恢复 ${counts.skipped}${job.error ? ` · 错误 ${job.error}` : ""}`, `Done ${counts.done} · Failed ${counts.failed} · Total ${counts.total} · Skipped/resumed ${counts.skipped}${job.error ? ` · Error ${job.error}` : ""}`);
         row.append(title, bar, summary);
         row.addEventListener("click", () => {
           selectedJobId = job.job_id;
@@ -1636,8 +1884,9 @@
       const detailRoot = byId("jobDetail");
       detailRoot.replaceChildren();
       if (!job) {
-        detailRoot.textContent = "请选择一个 Job 查看详情。";
-        byId("jobLog").textContent = "尚未选择 Job。";
+        const zh = (byId("poolBuildOutputLanguage")?.value || "zh-CN").startsWith("zh");
+        detailRoot.textContent = zh ? "请选择一个模型评审任务查看详情。" : "Select a model-review job to view details.";
+        byId("jobLog").textContent = zh ? "尚未选择任务。" : "No job selected.";
         byId("cancelJobButton").disabled = true;
         byId("resumeJobButton").disabled = true;
         byId("retryJobButton").disabled = true;
@@ -1645,29 +1894,37 @@
       }
       const counts = progressCounts(job);
       const summary = document.createElement("p");
-      summary.textContent = `状态：${job.status || "未知"}；完成 ${counts.done}，失败 ${counts.failed}，总数 ${counts.total}。${job.error ? `错误：${job.error}` : ""}`;
+      summary.textContent = jobText(job, `状态：${localizedJobStatus(job, job.status)}；完成 ${counts.done}，失败 ${counts.failed}，总数 ${counts.total}。${job.error ? `错误：${job.error}` : ""}`, `Status: ${localizedJobStatus(job, job.status)}; done ${counts.done}, failed ${counts.failed}, total ${counts.total}.${job.error ? ` Error: ${job.error}` : ""}`);
       detailRoot.appendChild(summary);
       const items = job.items && typeof job.items === "object" ? Object.entries(job.items) : [];
       if (items.length) {
         const statusCounts = {};
         items.forEach(([, status]) => { statusCounts[status] = (statusCounts[status] || 0) + 1; });
         const itemSummary = document.createElement("p");
-        itemSummary.textContent = `逐项状态：${Object.entries(statusCounts).map(([status, count]) => `${status} ${count}`).join(" · ")}`;
+        itemSummary.textContent = jobText(job, "逐项状态：", "Item status: ") + Object.entries(statusCounts).map(([status, count]) => `${localizedJobStatus(job, status)} ${count}`).join(" · ");
         const details = document.createElement("details");
         const disclosure = document.createElement("summary");
-        disclosure.textContent = "查看候选逐项状态";
+        disclosure.textContent = jobText(job, "查看候选逐项状态", "View candidate status details");
         const list = document.createElement("div");
         list.className = "job-items";
         items.forEach(([candidateId, status]) => {
           const line = document.createElement("div");
-          line.textContent = `${candidateId}：${status}`;
+          line.textContent = `${candidateId}：${localizedJobStatus(job, status)}`;
           list.appendChild(line);
         });
         details.append(disclosure, list);
         detailRoot.append(itemSummary, details);
       }
       const logs = Array.isArray(job.logs) ? job.logs : Array.isArray(job.log_tail) ? job.log_tail : [];
-      byId("jobLog").textContent = logs.map((log) => `${log.ts || ""} [${log.level || "info"}] ${log.message || ""}`).join("\n") || "无日志。";
+      byId("jobLog").textContent = logs.map((log) => {
+        const level = String(log.level || "info");
+        const levelLabel = jobLanguage(job).startsWith("zh") ? ({info: "信息", warning: "警告", error: "错误"}[level] || level) : level;
+        return `${log.ts || ""} [${levelLabel}] ${localizedJobLogMessage(job, log.message)}`;
+      }).join("\n") || jobText(job, "无日志。", "No logs.");
+      byId("cancelJobButton").textContent = jobText(job, "取消任务", "Cancel job");
+      byId("resumeJobButton").textContent = jobText(job, "恢复未完成", "Resume pending");
+      byId("retryJobButton").textContent = jobText(job, "重试失败", "Retry failed");
+      byId("refreshJobsButton").textContent = jobText(job, "刷新任务", "Refresh jobs");
       byId("cancelJobButton").disabled = jobActionBusy || !activeJobStatuses.has(job.status);
       const itemStatuses = job.items && typeof job.items === "object" ? Object.values(job.items) : [];
       byId("resumeJobButton").disabled = jobActionBusy || !terminalJobStatuses.has(job.status) || !itemStatuses.some((status) => status === "pending" || status === "failed");

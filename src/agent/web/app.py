@@ -98,6 +98,7 @@ from agent.web.expert_review.grading import (
 )
 from agent.web.expert_review.impact import compute_impact, load_json
 from agent.web.expert_review.jobs import ExpertJudgeJobManager, reset_jobs_for_tests
+from agent.web.expert_review.build_projection import attach_review_progress
 from agent.web.expert_review.pool_builds import ExpertPoolBuildManager
 from agent.web.llm_config_store import LLMConfigStore
 
@@ -1284,10 +1285,10 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
             body.get("labeling_strategy") or body.get("labeling") or "unknown"
         ),
         acquisition_mode=acquisition,
-        max_projects=_bounded_int(body.get("max_projects"), default=5, minimum=1, maximum=100),
-        max_files=_bounded_int(body.get("max_files"), default=50, minimum=1, maximum=2000),
-        max_candidate_projects=_bounded_int(body.get("max_candidate_projects"), default=50, minimum=1, maximum=300),
-        max_files_per_project=_bounded_int(body.get("max_files_per_project"), default=20, minimum=1, maximum=100),
+        max_projects=_bounded_int(body.get("max_projects"), default=5, minimum=1, maximum=300),
+        max_files=_bounded_int(body.get("max_files"), default=50, minimum=1, maximum=10000),
+        max_candidate_projects=_bounded_int(body.get("max_candidate_projects"), default=50, minimum=1, maximum=1000),
+        max_files_per_project=_bounded_int(body.get("max_files_per_project"), default=20, minimum=1, maximum=200),
         hard_constraint_fields=list(dict.fromkeys(hard_constraint_fields)),
         constraint_provenance=constraint_provenance,
     )
@@ -1433,6 +1434,118 @@ _DISCOVERY_TASK_TYPES = {
 _DISCOVERY_DIVERSITY_STRATEGIES = {"balanced", "high", "off"}
 _DISCOVERY_REPOSITORIES = {"pride", "massive", "iprox", "auto"}
 _DISCOVERY_GOALS = {"general", "ptm", "immunopeptidomics"}
+_POOL_BUILD_SCALE_PRESETS: dict[str, dict[str, int]] = {
+    "curated": {
+        "max_projects": 20,
+        "max_candidate_projects": 100,
+        "max_files": 500,
+        "max_files_per_project": 25,
+    },
+    "balanced": {
+        "max_projects": 75,
+        "max_candidate_projects": 300,
+        "max_files": 2000,
+        "max_files_per_project": 50,
+    },
+    "exhaustive": {
+        "max_projects": 200,
+        "max_candidate_projects": 600,
+        "max_files": 5000,
+        "max_files_per_project": 100,
+    },
+}
+
+
+def _normalise_pool_build_language(value: Any) -> str:
+    return "zh-CN" if _clean_ui_language(value) == "zh" else "en"
+
+
+def _normalise_pool_build_scale(value: Any, *, prompt: str = "", allow_auto: bool = True) -> str:
+    raw = _clean_text(value).casefold().replace("-", "_")
+    aliases = {
+        "selected": "curated",
+        "select": "curated",
+        "curated": "curated",
+        "pilot": "curated",
+        "精选": "curated",
+        "balanced": "balanced",
+        "balance": "balanced",
+        "均衡": "balanced",
+        "exhaustive": "exhaustive",
+        "comprehensive": "exhaustive",
+        "complete": "exhaustive",
+        "尽量搜全": "exhaustive",
+        "搜全": "exhaustive",
+        "auto": "auto",
+        "automatic": "auto",
+        "自动": "auto",
+    }
+    normalized = aliases.get(raw)
+    if normalized and (normalized != "auto" or allow_auto):
+        return normalized
+    text = _clean_text(prompt).casefold()
+    if any(marker in text for marker in ("越多越好", "尽可能多", "尽量搜全", "全部相关", "as many as possible", "exhaustive", "comprehensive")):
+        return "exhaustive"
+    if any(marker in text for marker in ("精选", "少量", "先验证", "pilot", "curated", "small set")):
+        return "curated"
+    if any(marker in text for marker in ("均衡", "balanced")):
+        return "balanced"
+    return "auto" if allow_auto else "balanced"
+
+
+def _english_discovery_query_terms(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return list(
+        dict.fromkeys(
+            term
+            for item in value
+            if (term := _clean_text(item))
+            and term.isascii()
+            and re.search(r"[A-Za-z]", term)
+        )
+    )
+
+
+def _pool_build_scale_warning(scale_mode: str, output_language: str) -> str | None:
+    if scale_mode != "exhaustive":
+        return None
+    if output_language == "zh-CN":
+        return "“尽量搜全”将在当前安全上限内检索，首版最多入选约 200 个项目。"
+    return "Exhaustive mode searches up to the current safety ceiling, capped at about 200 selected projects in v1."
+
+
+def _localize_prompt_parse_warning(value: Any, output_language: str) -> str:
+    text = _clean_text(value)
+    if not text:
+        return ""
+    if output_language == "zh-CN":
+        if _contains_cjk(text):
+            return text
+        patterns = (
+            (r"^Unsupported task_type '(.+)' was ignored\.$", r"不支持任务类型“\1”，已忽略。"),
+            (r"^Unsupported repository '(.+)' was ignored; using PRIDE\.$", r"不支持数据仓库“\1”，已改用 PRIDE。"),
+            (r"^Unsupported discovery target '(.+)' was ignored; using general\.$", r"不支持发现目标“\1”，已改用通用发现。"),
+            (r"^Acquisition '(.+)' is not supported in this DDA-first workflow; using dda\.$", r"当前 DDA 优先流程不支持采集模式“\1”，已改用 DDA。"),
+        )
+        for pattern, replacement in patterns:
+            if re.match(pattern, text):
+                return re.sub(pattern, replacement, text)
+        return "请求解析器报告了需要注意的条件。"
+    if _contains_cjk(text):
+        return "The prompt parser reported a condition that requires attention."
+    return text
+
+
+def _localize_prompt_parse_reasoning(value: Any, output_language: str) -> str:
+    text = _clean_text(value)
+    if not text:
+        return ""
+    if output_language == "zh-CN" and not _contains_cjk(text):
+        return "请求已解析，并生成英文仓库检索词。"
+    if output_language == "en" and _contains_cjk(text):
+        return "The request was parsed and English repository search terms were generated."
+    return text
 
 
 def _explicit_discovery_goal_overrides(prompt: str) -> dict[str, Any]:
@@ -1503,7 +1616,15 @@ def _normalise_discovery_goal_parse(raw: dict[str, Any], current: dict[str, Any]
         acquisition = "dda"
     canonical_species, taxon_ids = normalize_species_values(species_values)
     raw_query_terms = payload.get("query_terms") or current.get("query_terms") or []
-    query_terms = [_clean_text(item) for item in raw_query_terms if _clean_text(item)] if isinstance(raw_query_terms, list) else []
+    query_terms = _english_discovery_query_terms(raw_query_terms)
+    scale_mode = _normalise_pool_build_scale(
+        payload.get("scale_mode") or current.get("scale_mode"),
+        prompt=_clean_text(current.get("prompt")),
+        allow_auto=True,
+    )
+    output_language = _normalise_pool_build_language(
+        current.get("output_language") or payload.get("output_language")
+    )
 
     return {
         "fields": {
@@ -1511,7 +1632,7 @@ def _normalise_discovery_goal_parse(raw: dict[str, Any], current: dict[str, Any]
             "goal": goal,
             "ptm_type": ptm_type,
             "ptm_types": ptm_types,
-            "query_terms": list(dict.fromkeys([*query_terms, *general_query_terms_from_text(_clean_text(payload.get("prompt") or current.get("prompt") or ""))])),
+            "query_terms": query_terms,
             "species": species_values,
             "species_policy": species_policy,
             "canonical_species": canonical_species,
@@ -1520,12 +1641,15 @@ def _normalise_discovery_goal_parse(raw: dict[str, Any], current: dict[str, Any]
             "labeling_strategy": labeling_strategy,
             "acquisition_mode": acquisition,
             "task_type": task_type,
-            "max_projects": _bounded_int(payload.get("max_projects"), default=_bounded_int(current.get("max_projects"), default=5, minimum=1, maximum=100), minimum=1, maximum=100),
-            "max_files": _bounded_int(payload.get("max_files"), default=_bounded_int(current.get("max_files"), default=50, minimum=1, maximum=2000), minimum=1, maximum=2000),
-            "max_files_per_project": _bounded_int(payload.get("max_files_per_project"), default=_bounded_int(current.get("max_files_per_project"), default=20, minimum=1, maximum=100), minimum=1, maximum=100),
+            "max_projects": _bounded_int(payload.get("max_projects"), default=_bounded_int(current.get("max_projects"), default=5, minimum=1, maximum=300), minimum=1, maximum=300),
+            "max_files": _bounded_int(payload.get("max_files"), default=_bounded_int(current.get("max_files"), default=50, minimum=1, maximum=10000), minimum=1, maximum=10000),
+            "max_candidate_projects": _bounded_int(payload.get("max_candidate_projects"), default=_bounded_int(current.get("max_candidate_projects"), default=50, minimum=1, maximum=1000), minimum=1, maximum=1000),
+            "max_files_per_project": _bounded_int(payload.get("max_files_per_project"), default=_bounded_int(current.get("max_files_per_project"), default=20, minimum=1, maximum=200), minimum=1, maximum=200),
             "agentic_rounds": _bounded_int(payload.get("agentic_rounds"), default=_bounded_int(current.get("agentic_rounds"), default=1, minimum=1, maximum=2), minimum=1, maximum=2),
             "diversity_strategy": diversity_strategy,
-            "agentic": True,
+            "agentic": current.get("agentic") is True,
+            "scale_mode": scale_mode,
+            "output_language": output_language,
         },
         "warnings": warnings,
         "reasoning": _clean_text(raw.get("reasoning") or raw.get("rationale")),
@@ -1550,6 +1674,10 @@ def _discovery_goal_parse_system_prompt() -> str:
         "Supported task_type values: rt_prediction, fragment_intensity_prediction, psm_scoring, "
         "denovo, ptm_denovo, chimeric_interpretation, or empty string. "
         "Supported diversity_strategy values: balanced, high, off. "
+        "Supported scale_mode values: curated, balanced, exhaustive. Infer exhaustive when the user asks for as many relevant projects as possible. "
+        "All query_terms must be concise English phrases suitable for repository search even when the request is written in another language. "
+        "Warnings and reasoning must use the requested output language. "
+        "Do not enable agentic discovery; agentic execution is controlled only by explicit advanced settings. "
         "If the user asks for DIA/PRM/SRM/MRM, keep dda and add a warning."
     )
 
@@ -1563,10 +1691,13 @@ def _run_discovery_goal_parse(body: dict[str, Any]) -> dict[str, Any]:
     if client is None:
         raise ValueError("No discovery LLM API key found. Fill API Configuration or set DEEPSEEK_API_KEY.")
     current = body.get("current") if isinstance(body.get("current"), dict) else {}
+    output_language = _normalise_pool_build_language(current.get("output_language") or body.get("output_language"))
+    explanation_language = "Chinese" if output_language == "zh-CN" else "English"
     user_prompt = (
         "Parse this discovery request into a JSON object with fields, warnings, and reasoning.\n\n"
         f"Discovery request:\n{prompt}\n\n"
         f"Current UI fields:\n{json.dumps(current, ensure_ascii=False, indent=2)}\n\n"
+        f"Return warnings and reasoning in {explanation_language}. Always return query_terms in English.\n\n"
         "Expected JSON shape:\n"
         "{\n"
         '  "fields": {\n'
@@ -1575,14 +1706,12 @@ def _run_discovery_goal_parse(body: dict[str, Any]) -> dict[str, Any]:
         '    "ptm_type": "phospho",\n'
         '    "ptm_types": ["phospho", "acetyl"],\n'
         '    "query_terms": ["drug treatment DDA proteomics"],\n'
+        '    "scale_mode": "balanced",\n'
         '    "species": ["human"],\n'
         '    "species_policy": "open",\n'
         '    "labeling_strategy": "label_free",\n'
         '    "acquisition_mode": "dda",\n'
         '    "task_type": "rt_prediction",\n'
-        '    "max_projects": 5,\n'
-        '    "max_files": 50,\n'
-        '    "max_files_per_project": 20,\n'
         '    "agentic_rounds": 1,\n'
         '    "diversity_strategy": "high"\n'
         "  },\n"
@@ -1592,10 +1721,6 @@ def _run_discovery_goal_parse(body: dict[str, Any]) -> dict[str, Any]:
     )
     raw = client.complete_json(system_prompt=_discovery_goal_parse_system_prompt(), user_prompt=user_prompt)
     parsed = _normalise_discovery_goal_parse(raw, {**current, "prompt": prompt})
-    if parsed["fields"].get("goal") == "general":
-        parsed["fields"]["query_terms"] = list(
-            dict.fromkeys([*(parsed["fields"].get("query_terms") or []), *general_query_terms_from_text(prompt)])
-        )
     explicit_overrides = _explicit_discovery_goal_overrides(prompt)
     if explicit_overrides:
         parsed["fields"].update(explicit_overrides)
@@ -4311,6 +4436,168 @@ def _expert_job_manager() -> ExpertJudgeJobManager:
     )
 
 
+def _pool_build_explicit_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return _clean_text(value).casefold() in {"1", "true", "yes", "on"}
+
+
+def _prompt_parser_generation_identity(llm_config: Any) -> dict[str, Any] | None:
+    explicit = isinstance(llm_config, dict) and bool(llm_config)
+    raw = dict(llm_config) if explicit else {}
+    if not explicit:
+        saved, _source = _server_llm_config()
+        raw = dict(saved or {})
+    config, _error = _build_llm_config(raw)
+    if config is None:
+        return None
+    requested_model = _clean_text(raw.get("requested_model_id") or config.get("model"))
+    resolved_model = _clean_text(raw.get("resolved_model_id")) or None
+    model_family = _clean_text(raw.get("model_family") or requested_model) or None
+    verification = _clean_text(raw.get("identity_verification") or "unverified")
+    if explicit or verification not in {"provider_attested", "unverified"}:
+        verification = "unverified"
+    return {
+        "role": "prompt_parser",
+        "provider": _clean_text(raw.get("provider") or "openai_compatible"),
+        "requested_model_id": requested_model or None,
+        "resolved_model_id": resolved_model,
+        "model_family": model_family,
+        "endpoint_identity": _clean_text(raw.get("endpoint_identity") or config.get("base_url")) or None,
+        "identity_verification": verification,
+    }
+
+
+def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str, Any]:
+    original = dict(payload)
+    prompt = _clean_text(original.get("prompt"))
+    if not prompt:
+        raise ValueError("prompt_required")
+    output_language = _normalise_pool_build_language(original.get("output_language"))
+    explicit_scale = _normalise_pool_build_scale(
+        original.get("scale_mode"),
+        prompt=prompt,
+        allow_auto=True,
+    )
+    parser_current = {
+        key: value
+        for key, value in original.items()
+        if key != "llm_config"
+    }
+    try:
+        parsed = _run_discovery_goal_parse(
+            {
+                "prompt": prompt,
+                "output_language": output_language,
+                "llm_config": original.get("llm_config") if isinstance(original.get("llm_config"), dict) else {},
+                "current": parser_current,
+            }
+        )
+    except ValueError as exc:
+        no_llm = "No discovery LLM API key found" in str(exc)
+        if not no_llm:
+            raise
+        if is_immunopeptidomics_goal(prompt):
+            parsed = {
+                "parser": "ontology_fallback",
+                "fields": {
+                    "repository": "pride",
+                    "goal": "immunopeptidomics",
+                    "ptm_type": "unknown_ptm",
+                    "ptm_types": [],
+                    "query_terms": ["immunopeptidomics", "HLA ligandome", "MHC ligandome"],
+                    "scale_mode": _normalise_pool_build_scale("", prompt=prompt, allow_auto=False),
+                },
+                "warnings": [
+                    "未配置 Prompt 解析模型，已使用免疫肽领域降级解析。"
+                    if output_language == "zh-CN"
+                    else "No Prompt parser model was configured; the immunopeptidomics ontology fallback was used."
+                ],
+                "reasoning": (
+                    "根据已知免疫肽/HLA 语义生成英文仓库检索词。"
+                    if output_language == "zh-CN"
+                    else "Generated English repository terms from known immunopeptidomics/HLA semantics."
+                ),
+            }
+        elif _contains_cjk(prompt):
+            raise ValueError(
+                "prompt_parse_failed:中文或其他非英文请求需要配置 Prompt 解析模型，以生成英文仓库检索词。"
+                if output_language == "zh-CN"
+                else "prompt_parse_failed:A Prompt parser model is required to generate English repository terms for a non-English request."
+            ) from exc
+        else:
+            parsed = {
+                "parser": "deterministic_english_fallback",
+                "fields": {
+                    "repository": "pride",
+                    "goal": "general",
+                    "query_terms": _english_discovery_query_terms(general_query_terms_from_text(prompt)),
+                    "scale_mode": _normalise_pool_build_scale("", prompt=prompt, allow_auto=False),
+                },
+                "warnings": [],
+                "reasoning": (
+                    "未配置 Prompt 解析模型，已直接使用英文请求生成检索词。"
+                    if output_language == "zh-CN"
+                    else "No Prompt parser model was configured; repository terms were derived from the English request."
+                ),
+            }
+
+    parsed_fields = parsed.get("fields") if isinstance(parsed.get("fields"), dict) else {}
+    scale_mode = explicit_scale
+    if scale_mode == "auto":
+        scale_mode = _normalise_pool_build_scale(
+            parsed_fields.get("scale_mode"),
+            prompt=prompt,
+            allow_auto=False,
+        )
+    preset = _POOL_BUILD_SCALE_PRESETS[scale_mode]
+    explicit_query_terms = original.get("query_terms") if "query_terms" in original else None
+    query_terms = _english_discovery_query_terms(
+        explicit_query_terms if explicit_query_terms is not None else parsed_fields.get("query_terms")
+    )
+    goal = _clean_text(original.get("goal") or parsed_fields.get("goal") or "general").casefold()
+    if not query_terms and goal == "immunopeptidomics":
+        query_terms = ["immunopeptidomics", "HLA ligandome", "MHC ligandome"]
+    if not query_terms and not _contains_cjk(prompt):
+        query_terms = _english_discovery_query_terms(general_query_terms_from_text(prompt))
+    if not query_terms:
+        raise ValueError("prompt_parse_failed:no_english_query_terms")
+
+    request = {**parsed_fields, **original}
+    parser_identity = None
+    if str(parsed.get("parser") or "").casefold() == "llm":
+        parser_identity = _prompt_parser_generation_identity(original.get("llm_config"))
+    request.update(
+        {
+            "prompt": prompt,
+            "query_terms": query_terms,
+            "scale_mode": scale_mode,
+            "output_language": output_language,
+            "agentic": _pool_build_explicit_bool(original.get("agentic")),
+            "max_projects": _bounded_int(original.get("max_projects"), default=preset["max_projects"], minimum=1, maximum=300),
+            "max_candidate_projects": _bounded_int(original.get("max_candidate_projects"), default=preset["max_candidate_projects"], minimum=1, maximum=1000),
+            "max_files": _bounded_int(original.get("max_files"), default=preset["max_files"], minimum=1, maximum=10000),
+            "max_files_per_project": _bounded_int(original.get("max_files_per_project"), default=preset["max_files_per_project"], minimum=1, maximum=200),
+        }
+    )
+    if parser_identity is not None:
+        request["_generation_contributors"] = [parser_identity]
+    warnings = [
+        localized
+        for item in (parsed.get("warnings") or [])
+        if (localized := _localize_prompt_parse_warning(item, output_language))
+    ] if isinstance(parsed.get("warnings"), list) else []
+    scale_warning = _pool_build_scale_warning(scale_mode, output_language)
+    if scale_warning:
+        warnings.append(scale_warning)
+    return {
+        "request": request,
+        "parser": str(parsed.get("parser") or "llm"),
+        "warnings": list(dict.fromkeys(warnings)),
+        "reasoning": _localize_prompt_parse_reasoning(parsed.get("reasoning"), output_language),
+    }
+
+
 def _expert_pool_build_manager() -> ExpertPoolBuildManager:
     def start_discovery(payload: dict[str, Any]) -> dict[str, Any]:
         return asyncio.run(start_discovery_job(payload, background_tasks=None))
@@ -4345,6 +4632,8 @@ def _expert_pool_build_manager() -> ExpertPoolBuildManager:
             workers=int(review.get("workers") or 1),
             idempotency_key=_clean_text(review.get("idempotency_key"))
             or f"{pool_id}:model-expert-consensus",
+            output_language=_normalise_pool_build_language(review.get("output_language")),
+            scale_mode=_normalise_pool_build_scale(review.get("scale_mode") or "auto"),
         )
 
     return ExpertPoolBuildManager(
@@ -4353,6 +4642,7 @@ def _expert_pool_build_manager() -> ExpertPoolBuildManager:
         get_discovery=get_discovery,
         cancel_discovery=cancel_discovery,
         start_review=start_review,
+        prepare_discovery_request=_prepare_expert_pool_discovery_request,
     )
 
 
@@ -5085,6 +5375,8 @@ async def start_expert_judge_job(body: dict[str, Any], request: Request):
                 generator_identity=generator_identity,
                 workers=int(body.get("workers") or 1),
                 idempotency_key=_clean_text(body.get("idempotency_key")) or None,
+                output_language=_normalise_pool_build_language(body.get("output_language")),
+                scale_mode=_normalise_pool_build_scale(body.get("scale_mode") or "auto"),
             )
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
@@ -5163,7 +5455,9 @@ async def list_expert_pool_builds(request: Request):
         return {"ok": False, "error": "expert_review_disabled", "builds": []}
     if not _review_developer_allowed(request):
         return {"ok": False, "error": "developer_access_required", "builds": []}
-    return {"ok": True, "builds": _expert_pool_build_manager().list_builds()}
+    builds = _expert_pool_build_manager().list_builds()
+    jobs = _expert_job_manager().list_jobs() if any(build.get("review_job_id") for build in builds) else []
+    return {"ok": True, "builds": attach_review_progress(builds, jobs)}
 
 
 @app.post("/api/benchmark-review/builds")
@@ -5178,9 +5472,26 @@ async def start_expert_pool_build(body: dict[str, Any], request: Request):
         return {"ok": False, "error": "prompt_required"}
     advanced = body.get("advanced") if isinstance(body.get("advanced"), dict) else {}
     discovery = body.get("discovery") if isinstance(body.get("discovery"), dict) else {}
-    discovery_body = {**advanced, **discovery, "prompt": prompt}
+    output_language = _normalise_pool_build_language(
+        body.get("output_language") or body.get("ui_language") or discovery.get("output_language")
+    )
+    scale_mode = _normalise_pool_build_scale(
+        body.get("scale_mode") or discovery.get("scale_mode") or "auto",
+        prompt=prompt,
+        allow_auto=True,
+    )
+    discovery_body = {
+        **advanced,
+        **discovery,
+        "prompt": prompt,
+        "output_language": output_language,
+        "scale_mode": scale_mode,
+    }
     request_id = _clean_text(body.get("idempotency_key") or body.get("client_request_id")) or uuid.uuid4().hex
-    review = body.get("review") if isinstance(body.get("review"), dict) else {}
+    review = dict(body.get("review")) if isinstance(body.get("review"), dict) else {}
+    review.pop("generator_identity", None)
+    review["output_language"] = output_language
+    review["scale_mode"] = scale_mode
     try:
         build = _expert_pool_build_manager().start_build(
             discovery_request=discovery_body,
@@ -5207,7 +5518,9 @@ async def get_expert_pool_build(build_id: str, request: Request):
     build = _expert_pool_build_manager().get_build(build_id)
     if build is None:
         return {"ok": False, "error": "build_not_found"}
-    return {"ok": True, "build": build}
+    jobs = _expert_job_manager().list_jobs() if build.get("review_job_id") else []
+    enriched = attach_review_progress([build], jobs)
+    return {"ok": True, "build": enriched[0]}
 
 
 @app.post("/api/benchmark-review/builds/{build_id}/cancel")
@@ -6453,18 +6766,67 @@ def _discovery_job_public(job: dict[str, Any], *, detail: bool = False) -> dict[
     record = job.get("record")
     if record is not None and not detail:
         record = _slim_discovery_record(record)
+    body = job.get("body") if isinstance(job.get("body"), dict) else {}
+    output_language = _normalise_pool_build_language(job.get("output_language") or body.get("output_language"))
+    logs = []
+    for raw in job.get("logs") or []:
+        if not isinstance(raw, dict):
+            continue
+        entry = dict(raw)
+        entry["message"] = _localize_discovery_message(entry.get("message"), output_language)
+        logs.append(entry)
     return {
         "job_id": job.get("job_id"),
+        "idempotency_key": job.get("idempotency_key"),
         "status": job.get("status"),
         "created_at": job.get("created_at"),
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
         "cancel_requested": bool(job.get("cancel_requested")),
-        "logs": list(job.get("logs") or []),
+        "output_language": output_language,
+        "logs": logs,
         "record": record,
-        "error": job.get("error"),
+        "error": _localize_discovery_message(job.get("error"), output_language) if job.get("error") else None,
         "detail": "full" if detail else "summary",
     }
+
+
+def _localize_discovery_message(message: Any, output_language: str) -> str:
+    text = _redact_secrets(message).strip()
+    if output_language != "zh-CN" or not text or _contains_cjk(text):
+        return _localize_public_message(text, "en" if output_language == "en" else "zh", level="info")
+    exact = {
+        "Discovery job queued.": "数据发现任务已排队。",
+        "Discovery job started.": "数据发现任务已开始。",
+        "Discovery job completed.": "数据发现任务已完成。",
+        "Discovery job failed with retained audits.": "数据发现失败，已保留审计记录。",
+        "Discovery job cancelled.": "数据发现任务已取消。",
+        "Discovery cancelled.": "数据发现任务已取消。",
+        "Running diversity-aware selection.": "正在执行多样性选择。",
+    }
+    if text in exact:
+        return exact[text]
+    patterns = (
+        (r"^Searching PRIDE projects: (.+)$", r"正在检索 PRIDE 项目：\1"),
+        (r"^Project search returned (\d+) raw records so far\.$", r"项目检索目前返回 \1 条原始记录。"),
+        (r"^Deduped to (\d+) candidate project\(s\)\.$", r"去重后得到 \1 个候选项目。"),
+        (r"^Inspecting project (.+)\.$", r"正在检查项目 \1。"),
+        (r"^Selected (\d+) project\(s\), (\d+) file\(s\)\.$", r"已入选 \1 个项目、\2 个文件。"),
+        (r"^(.+): kept (\d+) file candidate\(s\)\.$", r"\1：保留 \2 个候选文件。"),
+        (r"^(.+): no usable acquisition/peaklist file candidates after filtering\.$", r"\1：过滤后没有可用的采集或峰表文件。"),
+    )
+    for pattern, replacement in patterns:
+        if re.match(pattern, text):
+            return re.sub(pattern, replacement, text)
+    if text.startswith("Observe:"):
+        return "观察：已记录当前数据发现状态。"
+    if text.startswith("Reason:"):
+        return "推理摘要：已根据当前证据更新检索决策。"
+    if text.startswith("Act:"):
+        return "执行：正在进行下一步受控数据发现操作。"
+    if "failed" in text.casefold() or "error" in text.casefold():
+        return "数据发现遇到错误，详细原因已记录。"
+    return "数据发现进度已更新。"
 
 
 def _discovery_jobs_dir() -> Path:
@@ -6496,7 +6858,32 @@ def _load_discovery_job(job_id: str) -> dict[str, Any] | None:
     payload.setdefault("cancel_requested", False)
     payload.setdefault("record", None)
     payload.setdefault("error", None)
+    payload.setdefault("output_language", "en")
+    payload.setdefault("idempotency_key", None)
     return payload
+
+
+def _find_discovery_job_by_idempotency_key(key: str) -> dict[str, Any] | None:
+    if not key:
+        return None
+    for job in _discovery_jobs.values():
+        if str(job.get("idempotency_key") or "") == key:
+            return job
+    jobs_dir = _discovery_jobs_dir()
+    if not jobs_dir.is_dir():
+        return None
+    for path in jobs_dir.glob("*.json"):
+        payload = _read_json_if_exists(path)
+        if not payload or str(payload.get("idempotency_key") or "") != key:
+            continue
+        job_id = _clean_text(payload.get("job_id"))
+        if not job_id:
+            continue
+        payload = _mark_interrupted_discovery_job(dict(payload))
+        _discovery_jobs[job_id] = payload
+        _persist_discovery_job(payload)
+        return payload
+    return None
 
 
 def _mark_interrupted_discovery_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -6744,20 +7131,26 @@ def _start_discovery_job_thread(job_id: str) -> None:
 
 @app.post("/api/discovery/jobs")
 async def start_discovery_job(body: dict[str, Any], background_tasks: BackgroundTasks = None):
-    job_id = safe_output_stem(f"discovery_job_{datetime.now(_APP_TZ).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}")
-    job = {
-        "job_id": job_id,
-        "status": "queued",
-        "created_at": _now_app_iso(),
-        "started_at": None,
-        "finished_at": None,
-        "cancel_requested": False,
-        "logs": [{"ts": _now_app_iso(), "level": "info", "message": "Discovery job queued."}],
-        "body": dict(body or {}),
-        "record": None,
-        "error": None,
-    }
+    request_key = _clean_text(body.get("idempotency_key"))
     with _discovery_jobs_lock:
+        existing = _find_discovery_job_by_idempotency_key(request_key)
+        if existing is not None:
+            return _discovery_job_public(existing)
+        job_id = safe_output_stem(f"discovery_job_{datetime.now(_APP_TZ).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}")
+        job = {
+            "job_id": job_id,
+            "idempotency_key": request_key or None,
+            "status": "queued",
+            "created_at": _now_app_iso(),
+            "started_at": None,
+            "finished_at": None,
+            "cancel_requested": False,
+            "output_language": _normalise_pool_build_language(body.get("output_language")),
+            "logs": [{"ts": _now_app_iso(), "level": "info", "message": "Discovery job queued."}],
+            "body": dict(body or {}),
+            "record": None,
+            "error": None,
+        }
         _discovery_jobs[job_id] = job
         _persist_discovery_job(job)
     if background_tasks is None:

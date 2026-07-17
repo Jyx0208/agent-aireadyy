@@ -75,6 +75,38 @@ def test_panel_selection_excludes_generator_family_and_same_resolved_model() -> 
     assert "alias-a" not in panel.primary_profile_ids
 
 
+def test_panel_excludes_prompt_parser_contributor_family() -> None:
+    profiles = [
+        _profile("parser-self", provider="openai", family="gpt", resolved="gpt-5.4"),
+        _profile("a", provider="anthropic", family="claude", resolved="claude-opus-4-8"),
+        _profile("b", provider="google", family="gemini", resolved="gemini-3-pro"),
+    ]
+    engine = ExpertConsensusEngine(lambda _profile, _candidate: None)
+    panel = engine.select_panel(
+        profiles,
+        CandidateGenerationIdentity.model_validate(
+            {
+                "model_family": "workflow-discovery",
+                "resolved_model_id": "workflow-discovery/v1",
+                "identity_verification": "verified",
+                "contributors": [
+                    {
+                        "role": "prompt_parser",
+                        "model_family": "gpt",
+                        "requested_model_id": "gpt-5.4",
+                        "identity_verification": "unverified",
+                    }
+                ],
+            }
+        ),
+    )
+
+    assert panel.primary_profile_ids == ["a", "b"]
+    assert "parser-self" in panel.excluded_profile_ids
+    assert panel.formal_independence is False
+    assert "unverified_generator_identity" in panel.independence_reasons
+
+
 def test_panel_requires_two_distinct_model_families() -> None:
     engine = ExpertConsensusEngine(lambda _profile, _candidate: None)
     profiles = [

@@ -18,6 +18,44 @@ from agent.web.expert_review.pool_registry import ExpertPoolRegistry, strip_pool
 _BUILDS_LOCK = threading.RLock()
 _RUNNING_BUILD_IDS: set[str] = set()
 _TERMINAL_DISCOVERY_STATUSES = {"completed", "failed", "cancelled"}
+_PROGRESS_PERCENT = {
+    "queued": 0,
+    "parsing_prompt": 10,
+    "starting_discovery": 15,
+    "discovering": 25,
+    "registering_pool": 70,
+    "pool_ready": 80,
+    "starting_review": 90,
+    "completed": 100,
+    "failed": 100,
+    "cancelled": 100,
+}
+_PROGRESS_MESSAGES = {
+    "en": {
+        "queued": "Build queued.",
+        "parsing_prompt": "Understanding the request and preparing repository search terms.",
+        "starting_discovery": "Starting repository discovery.",
+        "discovering": "Searching repositories and inspecting candidate projects.",
+        "registering_pool": "Validating candidates and registering the review pool.",
+        "pool_ready": "Review pool is ready.",
+        "starting_review": "Starting the heterogeneous model-expert review.",
+        "completed": "Pool build and review handoff completed.",
+        "failed": "Pool build failed.",
+        "cancelled": "Pool build cancelled.",
+    },
+    "zh": {
+        "queued": "构建任务已排队。",
+        "parsing_prompt": "正在理解需求并生成仓库检索词。",
+        "starting_discovery": "正在启动数据发现。",
+        "discovering": "正在检索仓库并检查候选项目。",
+        "registering_pool": "正在校验候选并注册评审池。",
+        "pool_ready": "评审池已就绪。",
+        "starting_review": "正在启动异构模型专家评审。",
+        "completed": "评审池构建和评审交接已完成。",
+        "failed": "评审池构建失败。",
+        "cancelled": "评审池构建已取消。",
+    },
+}
 
 
 def _utc_now() -> str:
@@ -60,6 +98,14 @@ def _safe_error(value: Any) -> str:
     return text
 
 
+def _nonnegative_int(value: Any, *, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return max(0, int(default))
+    return max(0, parsed)
+
+
 class ExpertPoolBuildManager:
     """Durable orchestration from a discovery job to a registered review pool.
 
@@ -76,6 +122,7 @@ class ExpertPoolBuildManager:
         get_discovery: Callable[[str], Mapping[str, Any] | None],
         cancel_discovery: Callable[[str], Mapping[str, Any] | None],
         start_review: Callable[[str, dict[str, Any]], Mapping[str, Any]] | None = None,
+        prepare_discovery_request: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None,
         poll_interval: float = 0.05,
     ) -> None:
         self.registry = registry
@@ -83,6 +130,7 @@ class ExpertPoolBuildManager:
         self.get_discovery = get_discovery
         self.cancel_discovery = cancel_discovery
         self.start_review = start_review
+        self.prepare_discovery_request = prepare_discovery_request
         self.poll_interval = max(0.001, float(poll_interval))
         # Request credentials may be required to launch discovery, but must never
         # be persisted with the durable build checkpoint.  The entry exists only
@@ -129,6 +177,7 @@ class ExpertPoolBuildManager:
             if request_key:
                 existing = self._find_by_idempotency_key(request_key)
                 if existing is not None:
+                    self._resume_if_needed(existing)
                     return self._public(existing)
             build_id = f"pool_build_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
             record = {
@@ -152,6 +201,20 @@ class ExpertPoolBuildManager:
                 "cancel_requested": False,
                 "discovery_request": _safe_value(dict(discovery_request)),
                 "review": _safe_value(dict(review or {})),
+                "prompt_parse": {
+                    "status": "pending",
+                    "parser": None,
+                    "goal": None,
+                    "query_terms": [],
+                    "scale_mode": str(discovery_request.get("scale_mode") or "").strip() or None,
+                    "output_language": str(discovery_request.get("output_language") or "").strip() or None,
+                    "warnings": [],
+                    "reasoning": "",
+                },
+                "progress": self._progress_payload(
+                    discovery_request,
+                    phase="queued",
+                ),
             }
             self._persist(record)
             self._transient_discovery_requests[build_id] = dict(discovery_request)
@@ -192,7 +255,13 @@ class ExpertPoolBuildManager:
         return self.get_build(build_id)
 
     def _resume_if_needed(self, record: Mapping[str, Any]) -> None:
-        if str(record.get("status") or "") in {"queued", "discovering"}:
+        if str(record.get("status") or "") in {
+            "queued",
+            "parsing_prompt",
+            "starting_discovery",
+            "discovering",
+            "registering_pool",
+        }:
             self._start_worker(str(record.get("build_id") or ""))
 
     def _start_worker(self, build_id: str) -> None:
@@ -212,6 +281,11 @@ class ExpertPoolBuildManager:
     def _run_worker(self, build_id: str) -> None:
         try:
             self._run(build_id)
+        except OSError:
+            # Keep the last durable checkpoint resumable. Downstream start calls
+            # use deterministic idempotency keys, so replay will recover the same
+            # Discovery resource rather than creating duplicate work.
+            return
         finally:
             with _BUILDS_LOCK:
                 _RUNNING_BUILD_IDS.discard(build_id)
@@ -219,33 +293,84 @@ class ExpertPoolBuildManager:
     def _run(self, build_id: str) -> None:
         with _BUILDS_LOCK:
             record = self._load(build_id)
-            if record is None or record.get("cancel_requested"):
+            if record is None:
+                self._transient_discovery_requests.pop(build_id, None)
+                return
+            if record.get("cancel_requested"):
+                record["status"] = "cancelled"
+                record["progress"] = self._progress_payload(
+                    record.get("discovery_request") or {},
+                    phase="cancelled",
+                    counts=self._progress_counts(record.get("progress")),
+                    log_tail=self._progress_logs(record.get("progress")),
+                )
+                record["finished_at"] = _utc_now()
+                record["updated_at"] = _utc_now()
+                self._persist(record)
                 self._transient_discovery_requests.pop(build_id, None)
                 return
             discovery_job_id = str(record.get("discovery_job_id") or "")
-            if not discovery_job_id:
-                # Prefer the one-process request while it exists so callers can
-                # supply a request-scoped LLM credential without it ever reaching
-                # the checkpoint.  After restart only the redacted request remains.
-                discovery_request = self._transient_discovery_requests.get(
-                    build_id,
-                    dict(record.get("discovery_request") or {}),
-                )
-                try:
-                    started = self.start_discovery(dict(discovery_request))
-                    discovery_job_id = str(started.get("job_id") or "")
-                    if not discovery_job_id:
-                        raise ValueError("discovery_start_returned_no_job_id")
-                except Exception as exc:
+        if not discovery_job_id:
+            # Prompt preparation and Discovery startup may call remote models or
+            # providers. Never hold the process-wide build lock across those calls.
+            discovery_request = self._prepare_request(build_id)
+            if discovery_request is None:
+                return
+            with _BUILDS_LOCK:
+                record = self._load(build_id)
+                if record is None:
                     self._transient_discovery_requests.pop(build_id, None)
-                    self._fail(record, f"discovery_start_failed:{exc}")
                     return
+                if record.get("cancel_requested"):
+                    record["status"] = "cancelled"
+                    record["progress"] = self._progress_payload(
+                        record.get("discovery_request") or {},
+                        phase="cancelled",
+                        counts=self._progress_counts(record.get("progress")),
+                        log_tail=self._progress_logs(record.get("progress")),
+                    )
+                    record["finished_at"] = _utc_now()
+                    record["updated_at"] = _utc_now()
+                    self._persist(record)
+                    self._transient_discovery_requests.pop(build_id, None)
+                    return
+            # Prefer the one-process request while it exists so callers can
+            # supply a request-scoped LLM credential without it ever reaching
+            # the checkpoint. After restart only the redacted request remains.
+            try:
+                started = self.start_discovery(dict(discovery_request))
+                discovery_job_id = str(started.get("job_id") or "")
+                if not discovery_job_id:
+                    raise ValueError("discovery_start_returned_no_job_id")
+            except Exception as exc:
                 self._transient_discovery_requests.pop(build_id, None)
-                record["discovery_job_id"] = discovery_job_id
-                record["discovery_status"] = str(started.get("status") or "queued")
-                record["status"] = "discovering"
-                record["updated_at"] = _utc_now()
-                self._persist(record)
+                self._fail(record, f"discovery_start_failed:{exc}")
+                return
+            self._transient_discovery_requests.pop(build_id, None)
+            cancel_started_discovery = False
+            with _BUILDS_LOCK:
+                record = self._load(build_id)
+                if record is None:
+                    cancel_started_discovery = True
+                else:
+                    record["discovery_job_id"] = discovery_job_id
+                    record["discovery_status"] = str(started.get("status") or "queued")
+                    cancel_started_discovery = bool(record.get("cancel_requested"))
+                    record["status"] = "cancelled" if cancel_started_discovery else "discovering"
+                    record["progress"] = self._progress_payload(
+                        record.get("discovery_request") or {},
+                        phase="cancelled" if cancel_started_discovery else "discovering",
+                    )
+                    if cancel_started_discovery:
+                        record["finished_at"] = _utc_now()
+                    record["updated_at"] = _utc_now()
+                    self._persist(record)
+            if cancel_started_discovery:
+                try:
+                    self.cancel_discovery(discovery_job_id)
+                except Exception:
+                    pass
+                return
         while True:
             with _BUILDS_LOCK:
                 record = self._load(build_id)
@@ -253,6 +378,12 @@ class ExpertPoolBuildManager:
                     return
                 if record.get("cancel_requested"):
                     record["status"] = "cancelled"
+                    record["progress"] = self._progress_payload(
+                        record.get("discovery_request") or {},
+                        phase="cancelled",
+                        counts=self._progress_counts(record.get("progress")),
+                        log_tail=self._progress_logs(record.get("progress")),
+                    )
                     record["finished_at"] = _utc_now()
                     record["updated_at"] = _utc_now()
                     self._persist(record)
@@ -268,22 +399,136 @@ class ExpertPoolBuildManager:
                 record = self._load(build_id)
                 if record is None:
                     return
-                record["discovery_status"] = status or None
-                record["updated_at"] = _utc_now()
-                self._persist(record)
+                progress = self._discovery_progress(record, discovery)
+                changed = (
+                    record.get("discovery_status") != (status or None)
+                    or record.get("progress") != progress
+                )
+                if changed:
+                    record["discovery_status"] = status or None
+                    record["progress"] = progress
+                    record["updated_at"] = _utc_now()
+                    self._persist(record)
             if status not in _TERMINAL_DISCOVERY_STATUSES:
                 time.sleep(self.poll_interval)
                 continue
             if status != "completed":
                 self._fail(record, f"discovery_{status or 'failed'}")
                 return
+            with _BUILDS_LOCK:
+                record = self._load(build_id) or record
+                record["status"] = "registering_pool"
+                record["progress"] = self._progress_payload(
+                    record.get("discovery_request") or {},
+                    phase="registering_pool",
+                    counts=self._progress_counts(record.get("progress")),
+                    log_tail=self._progress_logs(record.get("progress")),
+                )
+                record["updated_at"] = _utc_now()
+                self._persist(record)
             self._register_pool(record, discovery)
             return
+
+    def _prepare_request(self, build_id: str) -> dict[str, Any] | None:
+        with _BUILDS_LOCK:
+            record = self._load(build_id)
+            if record is None:
+                return None
+            transient = self._transient_discovery_requests.get(build_id)
+            request = dict(transient or record.get("discovery_request") or {})
+            prompt_parse = record.get("prompt_parse") if isinstance(record.get("prompt_parse"), Mapping) else {}
+            if prompt_parse.get("status") == "completed":
+                return request
+            record["status"] = "parsing_prompt"
+            record["prompt_parse"] = {
+                **dict(prompt_parse),
+                "status": "running",
+            }
+            record["progress"] = self._progress_payload(request, phase="parsing_prompt")
+            record["updated_at"] = _utc_now()
+            self._persist(record)
+
+        if self.prepare_discovery_request is None:
+            prepared = {
+                "request": request,
+                "parser": "passthrough",
+                "warnings": [],
+                "reasoning": "",
+            }
+        else:
+            try:
+                prepared = self.prepare_discovery_request(dict(request))
+            except Exception as exc:
+                with _BUILDS_LOCK:
+                    record = self._load(build_id)
+                    if record is not None:
+                        record["prompt_parse"] = {
+                            **dict(record.get("prompt_parse") or {}),
+                            "status": "failed",
+                        }
+                        record["updated_at"] = _utc_now()
+                        self._persist(record)
+                        self._fail(record, f"prompt_parse_failed:{exc}")
+                return None
+        if not isinstance(prepared, Mapping):
+            with _BUILDS_LOCK:
+                record = self._load(build_id)
+                if record is not None:
+                    record["prompt_parse"] = {
+                        **dict(record.get("prompt_parse") or {}),
+                        "status": "failed",
+                    }
+                    self._fail(record, "prompt_parse_failed:prepare_result_must_be_object")
+            return None
+        prepared_request = prepared.get("request")
+        if not isinstance(prepared_request, Mapping):
+            with _BUILDS_LOCK:
+                record = self._load(build_id)
+                if record is not None:
+                    record["prompt_parse"] = {
+                        **dict(record.get("prompt_parse") or {}),
+                        "status": "failed",
+                    }
+                    self._fail(record, "prompt_parse_failed:prepared_request_must_be_object")
+            return None
+        prepared_request = dict(prepared_request)
+        prepared_request.setdefault("prompt", request.get("prompt"))
+        # The downstream Discovery resource owns the exactly-once boundary for
+        # the external start call. A resumed build must reuse the same job even
+        # if this manager crashed before checkpointing the returned job ID.
+        prepared_request["idempotency_key"] = f"{build_id}:discovery"
+        warnings = prepared.get("warnings") if isinstance(prepared.get("warnings"), list) else []
+        query_terms = prepared_request.get("query_terms")
+        query_terms = [str(item) for item in query_terms if str(item).strip()] if isinstance(query_terms, list) else []
+        with _BUILDS_LOCK:
+            record = self._load(build_id)
+            if record is None:
+                return None
+            record["discovery_request"] = _safe_value(prepared_request)
+            self._transient_discovery_requests[build_id] = prepared_request
+            record["prompt_parse"] = {
+                "status": "completed",
+                "parser": str(prepared.get("parser") or "unknown"),
+                "goal": str(prepared_request.get("goal") or "") or None,
+                "query_terms": _safe_value(query_terms),
+                "scale_mode": str(prepared_request.get("scale_mode") or "").strip() or None,
+                "output_language": str(prepared_request.get("output_language") or "").strip() or None,
+                "warnings": _safe_value(warnings),
+                "reasoning": _safe_error(prepared.get("reasoning") or ""),
+            }
+            record["status"] = "starting_discovery"
+            record["progress"] = self._progress_payload(
+                prepared_request,
+                phase="starting_discovery",
+            )
+            record["updated_at"] = _utc_now()
+            self._persist(record)
+        return prepared_request
 
     def _register_pool(self, record: dict[str, Any], discovery: Mapping[str, Any]) -> None:
         with _BUILDS_LOCK:
             record = self._load(str(record.get("build_id") or "")) or record
-            if record.get("pool_id"):
+            if record.get("pool_id") or record.get("cancel_requested"):
                 return
             try:
                 discovery_record = discovery.get("record") if isinstance(discovery.get("record"), Mapping) else discovery
@@ -295,10 +540,13 @@ class ExpertPoolBuildManager:
                     else {}
                 )
                 review = dict(record.get("review") or {})
-                if record.get("action") == "build_and_review" and not isinstance(
-                    review.get("generator_identity"), Mapping
-                ):
-                    review["generator_identity"] = self._candidate_generation_identity(discovery_record)
+                if record.get("action") == "build_and_review":
+                    # Candidate-generation identity is server evidence.  Never
+                    # trust a caller-supplied value to bypass family conflicts.
+                    review["generator_identity"] = self._candidate_generation_identity(
+                        discovery_record,
+                        discovery_request=discovery_request,
+                    )
                     record["review"] = review
                 supplied_pool = discovery_record.get("pool")
                 if isinstance(supplied_pool, Mapping):
@@ -329,6 +577,14 @@ class ExpertPoolBuildManager:
             # This is the durable boundary.  Review handoff failures must not rebuild it.
             record["pool_id"] = pool_record["pool_id"]
             record["status"] = "pool_ready"
+            record["progress"] = self._progress_payload(
+                record.get("discovery_request") or {},
+                phase="pool_ready",
+                counts=self._progress_counts(record.get("progress")),
+                log_tail=self._progress_logs(record.get("progress")),
+            )
+            if record.get("action") == "build_only":
+                record["progress"]["percent"] = 100
             record["updated_at"] = _utc_now()
             self._persist(record)
         if record.get("action") == "build_and_review":
@@ -349,6 +605,12 @@ class ExpertPoolBuildManager:
                 return
             # Persist intent before the external call so normal replay never duplicates it.
             record["review_status"] = "starting"
+            record["progress"] = self._progress_payload(
+                record.get("discovery_request") or {},
+                phase="starting_review",
+                counts=self._progress_counts(record.get("progress")),
+                log_tail=self._progress_logs(record.get("progress")),
+            )
             record["review_start_attempts"] = int(record.get("review_start_attempts") or 0) + 1
             record["updated_at"] = _utc_now()
             self._persist(record)
@@ -366,6 +628,13 @@ class ExpertPoolBuildManager:
                     record["status"] = "pool_ready"
                     record["review_status"] = "failed"
                     record["review_error"] = _safe_error(exc)
+                    record["progress"] = self._progress_payload(
+                        record.get("discovery_request") or {},
+                        phase="pool_ready",
+                        message=self._localized_message(record, "pool_ready") + " " + _safe_error(exc),
+                        counts=self._progress_counts(record.get("progress")),
+                        log_tail=self._progress_logs(record.get("progress")),
+                    )
                     record["updated_at"] = _utc_now()
                     self._persist(record)
             return
@@ -375,6 +644,12 @@ class ExpertPoolBuildManager:
                 record["review_job_id"] = review_job_id
                 record["review_status"] = str(started.get("status") or "queued")
                 record["status"] = "completed"
+                record["progress"] = self._progress_payload(
+                    record.get("discovery_request") or {},
+                    phase="completed",
+                    counts=self._progress_counts(record.get("progress")),
+                    log_tail=self._progress_logs(record.get("progress")),
+                )
                 record["finished_at"] = _utc_now()
                 record["updated_at"] = _utc_now()
                 self._persist(record)
@@ -429,14 +704,28 @@ class ExpertPoolBuildManager:
         return dict(sanitized)
 
     @staticmethod
-    def _candidate_generation_identity(discovery_record: Mapping[str, Any]) -> dict[str, Any]:
+    def _candidate_generation_identity(
+        discovery_record: Mapping[str, Any],
+        *,
+        discovery_request: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        raw_contributors = (
+            discovery_request.get("_generation_contributors")
+            if isinstance(discovery_request, Mapping)
+            else []
+        )
+        contributors = [
+            _safe_value(dict(item))
+            for item in (raw_contributors or [])
+            if isinstance(item, Mapping)
+        ]
         runtime = str(discovery_record.get("runtime") or "workflow").strip().lower()
         summary = discovery_record.get("summary")
         summary = summary if isinstance(summary, Mapping) else {}
         agentic = summary.get("agentic")
         agentic = agentic if isinstance(agentic, Mapping) else {}
         if runtime == "workflow" and agentic.get("enabled") is not True:
-            return {
+            identity = {
                 "provider": "local",
                 "requested_model_id": "workflow-discovery/v1",
                 "resolved_model_id": "workflow-discovery/v1",
@@ -445,6 +734,9 @@ class ExpertPoolBuildManager:
                 "endpoint_identity": "local:workflow-discovery",
                 "identity_verification": "verified",
             }
+            if contributors:
+                identity["contributors"] = contributors
+            return identity
         agent = discovery_record.get("agent")
         agent = agent if isinstance(agent, Mapping) else {}
         model = str(
@@ -454,7 +746,7 @@ class ExpertPoolBuildManager:
             or agentic.get("model")
             or ""
         ).strip()
-        return {
+        identity = {
             "provider": str(agent.get("provider") or "openai_compatible"),
             "requested_model_id": str(agent.get("requested_model_id") or model) or None,
             "resolved_model_id": str(agent.get("resolved_model_id") or "") or None,
@@ -463,11 +755,36 @@ class ExpertPoolBuildManager:
             "endpoint_identity": str(agent.get("endpoint_identity") or "") or None,
             "identity_verification": str(agent.get("identity_verification") or "unverified"),
         }
+        if contributors:
+            identity["contributors"] = contributors
+        return identity
 
     def _fail(self, record: dict[str, Any], error: str) -> None:
         with _BUILDS_LOCK:
-            record["status"] = "failed"
+            latest = self._load(str(record.get("build_id") or ""))
+            if latest is not None:
+                record = latest
+            if str(error).startswith("prompt_parse_failed"):
+                prompt_parse = record.get("prompt_parse")
+                prompt_parse = prompt_parse if isinstance(prompt_parse, Mapping) else {}
+                record["prompt_parse"] = {
+                    **dict(prompt_parse),
+                    "status": "failed",
+                }
+            if record.get("cancel_requested"):
+                record["status"] = "cancelled"
+                phase = "cancelled"
+            else:
+                record["status"] = "failed"
+                phase = "failed"
             record["error"] = _safe_error(error)
+            record["progress"] = self._progress_payload(
+                record.get("discovery_request") or {},
+                phase=phase,
+                message=self._localized_message(record, phase) + " " + _safe_error(error),
+                counts=self._progress_counts(record.get("progress")),
+                log_tail=self._progress_logs(record.get("progress")),
+            )
             record["finished_at"] = _utc_now()
             record["updated_at"] = _utc_now()
             self._persist(record)
@@ -492,7 +809,14 @@ class ExpertPoolBuildManager:
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
             temporary.write_text(json.dumps(_safe_value(record), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            os.replace(temporary, path)
+            for attempt in range(4):
+                try:
+                    os.replace(temporary, path)
+                    break
+                except PermissionError:
+                    if attempt >= 3:
+                        raise
+                    time.sleep(0.01 * (2**attempt))
         finally:
             try:
                 temporary.unlink(missing_ok=True)
@@ -514,3 +838,81 @@ class ExpertPoolBuildManager:
         payload.pop("discovery_request", None)
         payload.pop("review", None)
         return payload
+
+    @staticmethod
+    def _progress_counts(progress: Any) -> dict[str, int]:
+        counts = progress.get("counts") if isinstance(progress, Mapping) else {}
+        counts = counts if isinstance(counts, Mapping) else {}
+        return {
+            "candidate_projects_seen": _nonnegative_int(counts.get("candidate_projects_seen")),
+            "selected_projects": _nonnegative_int(counts.get("selected_projects")),
+            "selected_files": _nonnegative_int(counts.get("selected_files")),
+        }
+
+    @staticmethod
+    def _progress_logs(progress: Any) -> list[dict[str, Any]]:
+        logs = progress.get("log_tail") if isinstance(progress, Mapping) else []
+        return [dict(item) for item in logs if isinstance(item, Mapping)][-20:]
+
+    @classmethod
+    def _localized_message(cls, record_or_request: Mapping[str, Any], phase: str) -> str:
+        request = record_or_request.get("discovery_request")
+        if isinstance(request, Mapping):
+            language = str(request.get("output_language") or "")
+        else:
+            language = str(record_or_request.get("output_language") or "")
+        locale = "zh" if language.casefold().startswith("zh") else "en"
+        return _PROGRESS_MESSAGES[locale].get(phase, phase)
+
+    @classmethod
+    def _progress_payload(
+        cls,
+        request: Mapping[str, Any],
+        *,
+        phase: str,
+        message: str | None = None,
+        counts: Mapping[str, Any] | None = None,
+        log_tail: list[Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        normalized_counts = {
+            "candidate_projects_seen": _nonnegative_int((counts or {}).get("candidate_projects_seen")),
+            "selected_projects": _nonnegative_int((counts or {}).get("selected_projects")),
+            "selected_files": _nonnegative_int((counts or {}).get("selected_files")),
+        }
+        normalized_logs = [
+            _safe_value(dict(item))
+            for item in (log_tail or [])
+            if isinstance(item, Mapping)
+        ][-20:]
+        return {
+            "phase": phase,
+            "percent": int(_PROGRESS_PERCENT.get(phase, 0)),
+            "message": message or cls._localized_message(request, phase),
+            "counts": normalized_counts,
+            "log_tail": normalized_logs,
+        }
+
+    @classmethod
+    def _discovery_progress(
+        cls,
+        record: Mapping[str, Any],
+        discovery: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        discovery_record = discovery.get("record") if isinstance(discovery.get("record"), Mapping) else {}
+        summary = discovery_record.get("summary") if isinstance(discovery_record.get("summary"), Mapping) else {}
+        previous = record.get("progress") if isinstance(record.get("progress"), Mapping) else {}
+        counts = {
+            "candidate_projects_seen": _nonnegative_int(summary.get("candidate_projects_seen")),
+            "selected_projects": _nonnegative_int(summary.get("selected_projects")),
+            "selected_files": _nonnegative_int(summary.get("selected_files")),
+        }
+        if not any(counts.values()):
+            counts = cls._progress_counts(previous)
+        raw_logs = discovery.get("logs") if isinstance(discovery.get("logs"), list) else []
+        logs = [dict(item) for item in raw_logs if isinstance(item, Mapping)] or cls._progress_logs(previous)
+        return cls._progress_payload(
+            record.get("discovery_request") or {},
+            phase="discovering",
+            counts=counts,
+            log_tail=logs,
+        )

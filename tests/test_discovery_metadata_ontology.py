@@ -282,6 +282,15 @@ def test_immunopeptide_ontology_normalizes_hla_ligandome_context() -> None:
     assert class_ii.hla_classes == ("class_ii",)
 
 
+def test_immunopeptide_ontology_recognizes_chinese_discovery_prompt() -> None:
+    prompt = "寻找免疫肽相关公开数据，越多越好"
+
+    assert is_immunopeptidomics_goal(prompt)
+    result = interpret_immunopeptide_metadata(prompt)
+    assert result.scope == "immunopeptidomics"
+    assert result.confidence >= 0.4
+
+
 def test_query_builder_uses_immunopeptide_terms_without_default_phospho() -> None:
     request = DatasetRequest(
         goal="immunopeptidomics",

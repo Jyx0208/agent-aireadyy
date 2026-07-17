@@ -111,6 +111,7 @@ def test_model_expert_runner_blinds_other_reviews_and_generator_identity() -> No
             "machine_reviews": [{"grade": 1}],
             "model_expert_judgments": [{"final_grade": 0}],
             "model_expert_consensus": {"consensus_grade": 0},
+            "_output_language": "zh-CN",
         },
     )
 
@@ -128,6 +129,8 @@ def test_model_expert_runner_blinds_other_reviews_and_generator_identity() -> No
         "machine_reviews",
         "model_expert_judgments",
         "model_expert_consensus",
+        "_output_language",
     ):
         assert hidden not in visible
     assert "hard_gate_outcome" in captured["system"]
+    assert "Simplified Chinese" in captured["system"]

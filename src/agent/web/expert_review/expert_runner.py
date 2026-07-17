@@ -149,9 +149,11 @@ class ModelExpertRunner:
         config = dict(self.resolve_profile(profile.profile_id))
         self._validate_profile_snapshot(profile, config)
         judge = self.judge_factory(profile, config)
+        output_language = str(candidate.get("_output_language") or "en")
         visible = blind_candidate_view(candidate, mode="expert")
+        visible.pop("_output_language", None)
         assessment = ModelExpertAssessment.model_validate(
-            judge(_SYSTEM_PROMPT, json.dumps(visible, ensure_ascii=False, sort_keys=True))
+            judge(_system_prompt(output_language), json.dumps(visible, ensure_ascii=False, sort_keys=True))
         )
         resolved_model_id = str(getattr(judge, "resolved_model_id", "") or "") or None
         if resolved_model_id:
@@ -253,3 +255,14 @@ Return only the required structured object with:
 - investigation_status: not_needed, completed, partial, failed, or insufficient_evidence.
 - evidence_conflict, summary, evidence_refs, and missing_information.
 """.strip()
+
+
+def _system_prompt(output_language: str) -> str:
+    if str(output_language).casefold().startswith("zh"):
+        language_instruction = (
+            "Write summary and missing_information in Simplified Chinese. "
+            "Keep schema keys, enum values, model identifiers, URLs, and evidence references unchanged."
+        )
+    else:
+        language_instruction = "Write summary and missing_information in English."
+    return f"{_SYSTEM_PROMPT}\n{language_instruction}"

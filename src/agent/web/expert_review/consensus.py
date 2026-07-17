@@ -62,6 +62,16 @@ class ExpertModelProfile(JsonModel):
         )
 
 
+class GenerationModelContributor(JsonModel):
+    provider: str | None = None
+    requested_model_id: str | None = None
+    resolved_model_id: str | None = None
+    model_family: str | None = None
+    endpoint_identity: str | None = None
+    identity_verification: IdentityVerification = "unverified"
+    role: str | None = None
+
+
 class CandidateGenerationIdentity(JsonModel):
     provider: str | None = None
     requested_model_id: str | None = None
@@ -70,6 +80,7 @@ class CandidateGenerationIdentity(JsonModel):
     runtime: str | None = None
     endpoint_identity: str | None = None
     identity_verification: IdentityVerification = "unverified"
+    contributors: list[GenerationModelContributor] = Field(default_factory=list)
 
 
 class ExpertJudgment(JsonModel):
@@ -136,15 +147,11 @@ class ExpertConsensusEngine:
         )
         excluded: list[str] = []
         eligible: list[ExpertModelProfile] = []
-        generator_family = _normalized(generator.model_family)
-        generator_resolved = _normalized(generator.resolved_model_id)
+        generator_families, generator_resolved_ids = _generator_identity_sets(generator)
         for profile in enabled:
             if (
-                (generator_family and _normalized(profile.model_family) == generator_family)
-                or (
-                    generator_resolved
-                    and _normalized(profile.resolved_model_id) == generator_resolved
-                )
+                _normalized(profile.model_family) in generator_families
+                or _normalized(profile.resolved_model_id) in generator_resolved_ids
             ):
                 excluded.append(profile.profile_id)
                 continue
@@ -170,7 +177,11 @@ class ExpertConsensusEngine:
         third = sorted(remaining, key=lambda profile: _third_sort_key(profile, primary))[0] if remaining else None
 
         reasons: list[str] = []
-        if generator.identity_verification != "verified" or not generator_family:
+        generator_identities = [generator, *generator.contributors]
+        if any(
+            identity.identity_verification != "verified" or not _normalized(identity.model_family)
+            for identity in generator_identities
+        ):
             reasons.append("unverified_generator_identity")
         if any(profile.identity_verification != "verified" or not profile.resolved_model_id for profile in primary):
             reasons.append("unverified_expert_identity")
@@ -398,14 +409,32 @@ def _unique(values: Sequence[str]) -> list[str]:
     return list(dict.fromkeys(str(value) for value in values if str(value).strip()))
 
 
+def _generator_identity_sets(generator: CandidateGenerationIdentity) -> tuple[set[str], set[str]]:
+    identities = [generator, *generator.contributors]
+    families = {
+        normalized
+        for identity in identities
+        if (normalized := _normalized(identity.model_family))
+    }
+    resolved = {
+        normalized
+        for identity in identities
+        if (normalized := _normalized(identity.resolved_model_id))
+    }
+    return families, resolved
+
+
 def _judgment_independence(
     judgments: Sequence[ExpertJudgment],
     generator: CandidateGenerationIdentity,
 ) -> tuple[bool, list[str]]:
     reasons: list[str] = []
-    generator_family = _normalized(generator.model_family)
-    generator_resolved = _normalized(generator.resolved_model_id)
-    if generator.identity_verification != "verified" or not generator_family:
+    generator_families, generator_resolved_ids = _generator_identity_sets(generator)
+    generator_identities = [generator, *generator.contributors]
+    if any(
+        identity.identity_verification != "verified" or not _normalized(identity.model_family)
+        for identity in generator_identities
+    ):
         reasons.append("unverified_generator_identity")
     profiles = [judgment.profile for judgment in judgments]
     if any(profile.identity_verification != "verified" or not profile.resolved_model_id for profile in profiles):
@@ -418,7 +447,7 @@ def _judgment_independence(
     resolved = [_normalized(profile.resolved_model_id) for profile in profiles]
     if len(set(families)) != len(families) or len(set(resolved)) != len(resolved):
         reasons.append("expert_identity_conflict")
-    if generator_family in families or (generator_resolved and generator_resolved in resolved):
+    if generator_families.intersection(families) or generator_resolved_ids.intersection(resolved):
         reasons.append("generator_expert_identity_conflict")
     return not reasons, _unique(reasons)
 

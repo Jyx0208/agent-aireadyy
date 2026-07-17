@@ -197,6 +197,8 @@ def test_consensus_job_selects_heterogeneous_panel_and_persists_model_only_resul
         pool_id=record["pool_id"],
         generator_identity={"model_family": "gpt", "identity_verification": "verified"},
         idempotency_key="same-consensus-request",
+        output_language="zh-CN",
+        scale_mode="exhaustive",
     )
     replay = manager.start_consensus_job(
         pool_id=record["pool_id"],
@@ -215,6 +217,8 @@ def test_consensus_job_selects_heterogeneous_panel_and_persists_model_only_resul
     assert final is not None
     assert final["status"] == "completed"
     assert final["job_type"] == "model_expert_consensus"
+    assert final["output_language"] == "zh-CN"
+    assert final["scale_mode"] == "exhaustive"
     assert final["profile_ids"] == ["claude", "gemini", "grok"]
     assert sorted(calls) == ["claude", "gemini", "grok"]
     assert "api_key" not in str(final)

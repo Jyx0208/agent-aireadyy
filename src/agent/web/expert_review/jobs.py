@@ -76,6 +76,8 @@ def _public_job(job: dict[str, Any], *, detail: bool = False) -> dict[str, Any]:
         "created_at": job.get("created_at"),
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
+        "output_language": job.get("output_language") or "en",
+        "scale_mode": job.get("scale_mode") or "auto",
         "output_reviewed_path": job.get("output_reviewed_path"),
         "log_tail": (job.get("logs") or [])[-20:],
     }
@@ -237,6 +239,8 @@ class ExpertJudgeJobManager:
         generator_identity: Mapping[str, Any] | None = None,
         workers: int = 1,
         idempotency_key: str | None = None,
+        output_language: str = "en",
+        scale_mode: str = "auto",
     ) -> dict[str, Any]:
         document = self.registry.load_pool_document(pool_id, prefer_reviewed=True)
         if document is None:
@@ -265,6 +269,9 @@ class ExpertJudgeJobManager:
         profile_ids = panel.primary_profile_ids + (
             [panel.third_profile_id] if panel.third_profile_id else []
         )
+        normalized_scale = str(scale_mode or "auto").strip().casefold()
+        if normalized_scale not in {"auto", "curated", "balanced", "exhaustive"}:
+            normalized_scale = "auto"
         job = {
             "job_id": job_id,
             "job_type": "model_expert_consensus",
@@ -288,6 +295,8 @@ class ExpertJudgeJobManager:
             "started_at": None,
             "finished_at": None,
             "workers": max(1, int(workers)),
+            "output_language": "zh-CN" if str(output_language).casefold().startswith("zh") else "en",
+            "scale_mode": normalized_scale,
             "output_reviewed_path": None,
             "consensus_summary": {},
         }
@@ -620,7 +629,9 @@ class ExpertJudgeJobManager:
                 cached = judgments.get(key)
             if cached is not None:
                 return ExpertJudgment.model_validate(cached)
-            judgment = ExpertJudgment.model_validate(self.expert_runner(profile, candidate))
+            candidate_for_review = dict(candidate)
+            candidate_for_review["_output_language"] = str(job.get("output_language") or "en")
+            judgment = ExpertJudgment.model_validate(self.expert_runner(profile, candidate_for_review))
             payload = judgment.model_dump(mode="json")
             with judgment_lock:
                 judgments[key] = payload
