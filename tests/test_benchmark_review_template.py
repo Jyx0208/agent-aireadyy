@@ -20,6 +20,16 @@ def test_benchmark_review_template_supports_blind_scoring_and_export() -> None:
     assert 'id="serverPoolSelect"' in html
     assert 'id="openServerPoolButton"' in html
     assert 'id="importServerButton"' in html
+    assert 'id="saveWorkspaceArchiveButton"' in html
+    assert 'id="workspaceArchiveFile"' in html
+    assert "保存工作池 ZIP" in html
+    assert "导入工作池 ZIP" in html
+    assert "/api/expert-review/workspaces/import" in html
+    assert "/workspace.zip" in html
+    assert "不包含 API Key" in html
+    assert "function flushWorkspaceDrafts()" in html
+    assert "仍有评分草稿未写入服务端" in html
+    assert "reviewMode.value = restoredMode" in html
     assert 'id="reviewMode"' in html
     assert "/api/expert-review/pools" in html
     assert "project_accession" not in html

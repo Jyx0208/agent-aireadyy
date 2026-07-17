@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -91,6 +94,123 @@ def test_expert_review_pool_api_import_and_list(tmp_path: Path, monkeypatch) -> 
     )
     assert developer.status_code == 200
     assert developer.json()["candidates"][0]["machine_reviews"]
+
+
+def test_expert_review_workspace_zip_round_trip(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "expert_review"
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_DIR", str(root))
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ENABLED", "1")
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", "1")
+    client = TestClient(web_app.app)
+    pool = {
+        "schema_version": "discovery-judgment-pool-reviewed/v2",
+        "label": "portable-pool",
+        "candidates": [
+            {
+                "candidate_id": "cand-zip",
+                "scenario_id": "s",
+                "variant_id": "v",
+                "project_title": "Portable",
+                "grade": 2,
+                "machine_review_runs": [{"model": "model-a", "grade": 2}],
+            }
+        ],
+    }
+    imported = client.post("/api/expert-review/pools/import", json={"pool": pool, "label": "portable-pool"}).json()
+    pool_id = imported["pool"]["pool_id"]
+    pool_dir = root / pool_id
+    blinded = json.loads((pool_dir / "pool.blinded.json").read_text(encoding="utf-8"))
+    blinded["candidates"][0]["project_description"] = "original blind description"
+    (pool_dir / "pool.blinded.json").write_text(json.dumps(blinded), encoding="utf-8")
+    registry_record = json.loads((pool_dir / "registry.json").read_text(encoding="utf-8"))
+    registry_record["created_at"] = "2025-01-02T03:04:05Z"
+    registry_record["tags"] = ["portable", "reviewed"]
+    (pool_dir / "registry.json").write_text(json.dumps(registry_record), encoding="utf-8")
+    (pool_dir / "private").mkdir(exist_ok=True)
+    (pool_dir / "private" / "judgment.key.json").write_text(
+        json.dumps({"candidates": [{"candidate_id": "cand-zip", "project_accession": "PXDZIP"}]}),
+        encoding="utf-8",
+    )
+    (pool_dir / "jobs").mkdir(exist_ok=True)
+    (pool_dir / "jobs" / "judge_zip.json").write_text(
+        json.dumps({"job_id": "judge_zip", "pool_id": pool_id, "status": "queued", "items": {"cand-zip": "running"}, "logs": [{"level": "error", "message": "provider rejected xai-1234567890"}], "api_key": "sk-secret"}),
+        encoding="utf-8",
+    )
+
+    exported = client.post(
+        f"/api/expert-review/pools/{pool_id}/workspace.zip",
+        json={"workspace": {"candidate_id": "cand-zip", "completion_filter": "graded", "score_filter": "2"}},
+    )
+    assert exported.status_code == 200
+    assert exported.headers["content-type"].startswith("application/zip")
+    assert b"sk-secret" not in exported.content
+    assert b"xai-1234567890" not in exported.content
+    with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+        manifest = json.loads(archive.read("workspace.json"))
+        assert manifest["schema_version"] == "benchmark-review-workspace/v1"
+        assert manifest["workspace"]["candidate_id"] == "cand-zip"
+        assert "api_key" not in archive.read("pool/jobs/judge_zip.json").decode("utf-8")
+
+    restored = client.post(
+        "/api/expert-review/workspaces/import",
+        content=exported.content,
+        headers={"Content-Type": "application/zip"},
+    ).json()
+    assert restored["ok"] is True
+    assert restored["pool"]["pool_id"] != pool_id
+    assert restored["workspace"]["candidate_id"] == "cand-zip"
+    assert restored["restored_jobs"] == 1
+    restored_id = restored["pool"]["pool_id"]
+    assert restored["pool"]["created_at"] == "2025-01-02T03:04:05Z"
+    assert restored["pool"]["tags"] == ["portable", "reviewed"]
+    restored_pool = client.get(f"/api/expert-review/pools/{restored_id}/candidates", params={"mode": "developer"}).json()
+    assert restored_pool["candidates"][0]["grade"] == 2
+    restored_blind = json.loads((root / restored_id / "pool.blinded.json").read_text(encoding="utf-8"))
+    assert restored_blind["candidates"][0]["project_description"] == "original blind description"
+    restored_jobs = list((root / restored_id / "jobs").glob("*.json"))
+    assert len(restored_jobs) == 1
+    restored_job = json.loads(restored_jobs[0].read_text(encoding="utf-8"))
+    assert restored_job["pool_id"] == restored_id
+    assert restored_job["status"] == "cancelled"
+    assert restored_job["items"]["cand-zip"] == "pending"
+    assert "manual_resume" in restored_job["error"]
+    assert "api_key" not in restored_job
+
+
+def test_expert_review_workspace_zip_rejects_traversal(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_DIR", str(tmp_path / "expert_review"))
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ENABLED", "1")
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", "1")
+    client = TestClient(web_app.app)
+    data = io.BytesIO()
+    with zipfile.ZipFile(data, "w") as archive:
+        archive.writestr("../escape.json", "{}")
+    response = client.post(
+        "/api/expert-review/workspaces/import",
+        content=data.getvalue(),
+        headers={"Content-Type": "application/zip"},
+    ).json()
+    assert response == {"ok": False, "error": "workspace_unsafe_path"}
+
+    double_slash = io.BytesIO()
+    with zipfile.ZipFile(double_slash, "w") as archive:
+        archive.writestr("pool/jobs//escape.json", "{}")
+    response = client.post(
+        "/api/expert-review/workspaces/import",
+        content=double_slash.getvalue(),
+        headers={"Content-Type": "application/zip"},
+    ).json()
+    assert response == {"ok": False, "error": "workspace_unsafe_path"}
+
+    drive_path = io.BytesIO()
+    with zipfile.ZipFile(drive_path, "w") as archive:
+        archive.writestr("pool/jobs/C:/escape.json", "{}")
+    response = client.post(
+        "/api/expert-review/workspaces/import",
+        content=drive_path.getvalue(),
+        headers={"Content-Type": "application/zip"},
+    ).json()
+    assert response == {"ok": False, "error": "workspace_unsafe_path"}
 
 
 def test_expert_review_grade_export_and_impact_forbidden_for_expert(tmp_path: Path, monkeypatch) -> None:

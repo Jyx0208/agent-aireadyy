@@ -100,6 +100,12 @@ from agent.web.expert_review.impact import compute_impact, load_json
 from agent.web.expert_review.jobs import MAX_EXPERT_JOB_WORKERS, ExpertJudgeJobManager, reset_jobs_for_tests
 from agent.web.expert_review.build_projection import attach_review_progress
 from agent.web.expert_review.pool_builds import ExpertPoolBuildManager
+from agent.web.expert_review.workspace_archive import (
+    MAX_WORKSPACE_ARCHIVE_BYTES,
+    WorkspaceArchiveError,
+    export_workspace_archive,
+    import_workspace_archive,
+)
 from agent.web.llm_config_store import LLMConfigStore
 
 
@@ -5393,6 +5399,68 @@ async def export_expert_review_pool(pool_id: str, request: Request, body: dict[s
         return {"ok": False, "error": "reviewer_id_required"}
     exported = apply_human_grades_for_export(document, reviewer_id=reviewer_id)
     return {"ok": True, "pool": exported}
+
+
+@app.post("/api/expert-review/pools/{pool_id}/workspace.zip")
+async def export_expert_review_workspace(
+    pool_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    body: dict[str, Any] | None = None,
+):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    try:
+        path, _manifest = export_workspace_archive(
+            _expert_pool_registry(),
+            pool_id,
+            workspace_state=(body or {}).get("workspace"),
+        )
+    except WorkspaceArchiveError as exc:
+        return {"ok": False, "error": str(exc)}
+    background_tasks.add_task(path.unlink, missing_ok=True)
+    return FileResponse(
+        path=str(path),
+        filename=path.name,
+        media_type="application/zip",
+    )
+
+
+@app.post("/api/expert-review/workspaces/import")
+async def import_expert_review_workspace(request: Request):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_WORKSPACE_ARCHIVE_BYTES:
+                return {"ok": False, "error": "workspace_archive_too_large"}
+        except ValueError:
+            return {"ok": False, "error": "content_length_invalid"}
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_WORKSPACE_ARCHIVE_BYTES:
+            return {"ok": False, "error": "workspace_archive_too_large"}
+        chunks.append(chunk)
+    try:
+        record, workspace, restored_jobs = import_workspace_archive(
+            _expert_pool_registry(),
+            b"".join(chunks),
+        )
+    except WorkspaceArchiveError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "pool": record,
+        "workspace": workspace,
+        "restored_jobs": restored_jobs,
+    }
 
 
 @app.post("/api/expert-review/impact/session")

@@ -282,6 +282,17 @@
           <button id="forgetWorkspaceButton" type="button" disabled>忘记记录</button>
         </div>
       </div>
+      <div class="workspace-memory" id="workspaceArchivePanel">
+        <div>
+          <strong>工作池备份与迁移</strong>
+          <div class="workspace-memory-copy">保存为 ZIP 后可在另一台机器或下次会话导入；包含候选池、评分、模型结果、Job 状态与日志，不包含 API Key。</div>
+        </div>
+        <div class="workspace-memory-actions">
+          <button id="saveWorkspaceArchiveButton" type="button" disabled>保存工作池 ZIP</button>
+          <input id="workspaceArchiveFile" type="file" accept="application/zip,.zip">
+          <label class="file-button" id="workspaceArchiveFileButton" for="workspaceArchiveFile" role="button" tabindex="0">导入工作池 ZIP</label>
+        </div>
+      </div>
       <section class="tool-section developer-tools hidden" id="poolBuildPanel">
         <h3>从 Prompt 一键构建评审池</h3>
         <p class="help">输入目标后，系统依次理解需求、检索候选、生成评审池并启动异构模型评审。每条记录会明确显示当前步骤；“建池完成”不等于“模型共识已经评完”。</p>
@@ -616,6 +627,7 @@
     let poolBuildBusy = false;
     let poolBuildPollTimer = null;
     let poolBuilderConfigBusy = false;
+    let workspaceArchiveBusy = false;
     const terminalPoolReloads = new Set();
 
     const byId = (id) => document.getElementById(id);
@@ -627,6 +639,8 @@
     const serverPoolSelect = byId("serverPoolSelect");
     const openServerPoolButton = byId("openServerPoolButton");
     const importServerButton = byId("importServerButton");
+    const saveWorkspaceArchiveButton = byId("saveWorkspaceArchiveButton");
+    const workspaceArchiveFile = byId("workspaceArchiveFile");
     const reviewMode = byId("reviewMode");
     const developerToken = byId("developerToken");
 
@@ -745,6 +759,137 @@
       }
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
       return payload;
+    }
+
+    function updateWorkspaceArchiveControls() {
+      const allowed = developerAllowed && !workspaceArchiveBusy;
+      saveWorkspaceArchiveButton.disabled = !allowed || poolSource !== "server" || !activePoolId;
+      workspaceArchiveFile.disabled = !allowed;
+      byId("workspaceArchiveFileButton").setAttribute("aria-disabled", String(!allowed));
+      byId("workspaceArchiveFileButton").title = allowed ? "导入完整工作池 ZIP" : "请先启用开发者模式";
+    }
+
+    function workspaceRequestHeaders(extra = {}) {
+      const headers = new Headers(extra);
+      const token = developerToken.value.trim();
+      if (token) headers.set("X-Expert-Review-Token", token);
+      return headers;
+    }
+
+    async function responseError(response, fallback) {
+      try {
+        const payload = await response.json();
+        return payload && payload.error || fallback;
+      } catch (_error) {
+        return fallback;
+      }
+    }
+
+    async function saveWorkspaceArchive() {
+      if (!activePoolId || poolSource !== "server" || workspaceArchiveBusy) return;
+      const draftsSaved = await flushWorkspaceDrafts();
+      if (!draftsSaved) return;
+      workspaceArchiveBusy = true;
+      updateWorkspaceArchiveControls();
+      clearReviewError();
+      setReviewStatus("正在打包工作池、评分和 Job 日志…");
+      try {
+        const response = await fetch(`/api/expert-review/pools/${encodeURIComponent(activePoolId)}/workspace.zip`, {
+          method: "POST",
+          headers: workspaceRequestHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ workspace: workspaceSnapshot() })
+        });
+        if (!response.ok || !String(response.headers.get("content-type") || "").includes("application/zip")) {
+          throw new Error(await responseError(response, `HTTP ${response.status}`));
+        }
+        const blob = await response.blob();
+        const disposition = response.headers.get("content-disposition") || "";
+        const matched = disposition.match(/filename\*?=(?:UTF-8''|\")?([^\";]+)/i);
+        const filename = matched ? decodeURIComponent(matched[1].replace(/^\"|\"$/g, "")) : `benchmark-review-${activePoolId}.zip`;
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = filename;
+        link.click();
+        URL.revokeObjectURL(link.href);
+        setReviewStatus(`工作池 ZIP 已保存：${filename}`, "success");
+      } catch (error) {
+        setReviewStatus(`保存工作池失败：${error.message}`, "error", true);
+      } finally {
+        workspaceArchiveBusy = false;
+        updateWorkspaceArchiveControls();
+      }
+    }
+
+    async function flushWorkspaceDrafts() {
+      const pendingSaved = await flushPendingNotes();
+      if (!pendingSaved) return false;
+      if (!pool || poolSource !== "server") return true;
+      const unsaved = (pool.candidates || []).filter((candidate) => candidate.__unsaved);
+      for (const candidate of unsaved) {
+        if (!isGraded(candidate)) {
+          setReviewStatus(`候选 ${candidate.candidate_id || "未命名"} 只有未提交备注、尚未评分；请完成评分后再保存工作池。`, "error", true);
+          return false;
+        }
+        const saved = await persistCandidate(candidate, { reason: "工作池备份前草稿" });
+        if (!saved) return false;
+      }
+      await saveQueue;
+      if ((pool.candidates || []).some((candidate) => candidate.__unsaved)) {
+        setReviewStatus("仍有评分草稿未写入服务端，已取消工作池导出。", "error", true);
+        return false;
+      }
+      return true;
+    }
+
+    async function importWorkspaceArchive(file) {
+      if (!file || workspaceArchiveBusy) return;
+      if (!developerAllowed) {
+        setReviewStatus("导入完整工作池需要开发者模式。", "error", true);
+        return;
+      }
+      if (file.size > 256 * 1024 * 1024) {
+        setReviewStatus("工作池 ZIP 超过 256 MB 安全上限。", "error", true);
+        return;
+      }
+      workspaceArchiveBusy = true;
+      updateWorkspaceArchiveControls();
+      clearReviewError();
+      setReviewStatus(`正在导入工作池 ${file.name}…`);
+      try {
+        const response = await fetch("/api/expert-review/workspaces/import", {
+          method: "POST",
+          headers: workspaceRequestHeaders({ "Content-Type": "application/zip", "X-Workspace-Filename": file.name }),
+          body: file
+        });
+        const payload = await response.json().catch(() => null);
+        if (!response.ok || !payload || !payload.ok || !payload.pool) {
+          throw new Error(payload && payload.error || `HTTP ${response.status}`);
+        }
+        await refreshRegistry();
+        const poolId = payload.pool.pool_id;
+        serverPoolSelect.value = poolId;
+        const restoredWorkspace = {
+          ...(payload.workspace || {}),
+          source: "server",
+          pool_id: poolId,
+          pool_identity: `server:${poolId}`,
+        };
+        const restoredMode = restoredWorkspace.desired_mode;
+        if (["expert", "developer", "test"].includes(restoredMode) && (restoredMode === "expert" || developerAllowed)) {
+          reviewMode.value = restoredMode;
+          updateUrlMode(restoredMode);
+          updateModeChrome();
+        }
+        const opened = await openServerPool(poolId, restoredWorkspace.candidate_id || null, restoredWorkspace);
+        if (!opened) throw new Error("工作池已导入，但自动打开失败");
+        setReviewStatus(`已导入工作池 ${payload.pool.label || poolId}；恢复 ${payload.restored_jobs || 0} 个 Job。`, "success");
+      } catch (error) {
+        setReviewStatus(`导入工作池失败：${error.message}`, "error", true);
+      } finally {
+        workspaceArchiveFile.value = "";
+        workspaceArchiveBusy = false;
+        updateWorkspaceArchiveControls();
+      }
     }
 
     function setPoolBuilderConfigStatus(message, kind = "info") {
@@ -1594,6 +1739,7 @@
         null;
       currentIndex = 0;
       importServerButton.disabled = poolSource !== "local" || !registryEnabled;
+      updateWorkspaceArchiveControls();
       exportButton.disabled = false;
       setPoolMeta();
       applyFilter(preferred, false);
@@ -1623,12 +1769,14 @@
           updateModeChrome();
         }
         importServerButton.disabled = poolSource !== "local" || !registryEnabled || !developerAllowed || importBusy;
+        updateWorkspaceArchiveControls();
         return true;
       } catch (error) {
         registryEnabled = false;
         developerAllowed = false;
         if (currentMode() !== "expert") reviewMode.value = "expert";
         updateModeChrome(`无法验证开发者权限，已使用专家盲评：${error.message}`);
+        updateWorkspaceArchiveControls();
         return false;
       }
     }
@@ -2947,6 +3095,11 @@
     serverPoolSelect.addEventListener("change", () => { openServerPoolButton.disabled = !serverPoolSelect.value; });
     openServerPoolButton.addEventListener("click", () => { void openServerPool(); });
     importServerButton.addEventListener("click", () => { void importCurrentPool(); });
+    saveWorkspaceArchiveButton.addEventListener("click", () => { void saveWorkspaceArchive(); });
+    workspaceArchiveFile.addEventListener("change", () => {
+      const file = workspaceArchiveFile.files && workspaceArchiveFile.files[0];
+      if (file) void importWorkspaceArchive(file);
+    });
 
     reviewMode.addEventListener("change", async () => {
       await flushPendingNotes();
@@ -3012,6 +3165,12 @@
         byId("modeBanner").textContent = "开发者令牌验证成功。请选择开发者或测试模式。";
         await refreshRegistry();
         if (currentMode() !== "expert") await Promise.all([loadPoolBuilderConfig(), refreshProfiles(), refreshJobs()]);
+      }
+    });
+    byId("workspaceArchiveFileButton").addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        if (!workspaceArchiveFile.disabled) workspaceArchiveFile.click();
       }
     });
     byId("restoreWorkspaceButton").addEventListener("click", () => { void restoreRecentWorkspace(); });
