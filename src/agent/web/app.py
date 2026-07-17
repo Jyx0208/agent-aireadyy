@@ -5558,6 +5558,21 @@ async def get_expert_judge_job(job_id: str, request: Request, detail: int = 0):
     return {"ok": True, "job": job}
 
 
+@app.delete("/api/expert-review/jobs/{job_id}")
+async def delete_expert_judge_job(job_id: str, request: Request):
+    if not expert_review_enabled():
+        return {"ok": False, "error": "expert_review_disabled"}
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    try:
+        job = _expert_job_manager().delete_job(job_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    if job is None:
+        return {"ok": False, "error": "job_not_found"}
+    return {"ok": True, "deleted": True, "job": job}
+
+
 @app.post("/api/expert-review/jobs/{job_id}/cancel")
 async def cancel_expert_judge_job(job_id: str, request: Request):
     if not expert_review_enabled():

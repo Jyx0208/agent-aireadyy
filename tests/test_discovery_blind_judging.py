@@ -62,6 +62,8 @@ def test_four_matching_votes_are_high_confidence() -> None:
 
 
 def test_reviewed_pool_records_provisional_source_and_votes() -> None:
+    started: list[str] = []
+
     def judge(_system: str, _user: str) -> Mapping[str, Any]:
         return {"grade": 2, "reason": "Useful with a metadata gap."}
 
@@ -69,8 +71,10 @@ def test_reviewed_pool_records_provisional_source_and_votes() -> None:
         {"candidates": [_candidate()]},
         judge,
         model_name="judge-model",
+        on_start=started.append,
     )
 
+    assert started == ["candidate_abc"]
     assert reviewed["judgment_source"] == "provisional_same_family"
     assert reviewed["review_summary"]["formal_replacement_evidence"] is False
     assert reviewed["candidates"][0]["grade"] == 2

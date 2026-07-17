@@ -325,6 +325,35 @@ class ExpertJudgeJobManager:
             self._persist_job(job)
             return _public_job(job)
 
+    def delete_job(self, job_id: str) -> dict[str, Any] | None:
+        if (
+            not job_id.startswith(("judge_", "consensus_"))
+            or any(not (character.isalnum() or character in {"_", "-"}) for character in job_id)
+        ):
+            return None
+        with _JOBS_LOCK:
+            job = _JOBS.get(job_id) or self._load_job(job_id)
+            if job is None:
+                return None
+            status = str(job.get("status") or "")
+            if status == "running":
+                raise ValueError("job_running_cancel_before_delete")
+            pool_id = str(job.get("pool_id") or "")
+            if not pool_id:
+                raise ValueError("job_pool_id_missing")
+            jobs_dir = self.registry.root / pool_id / "jobs"
+            for suffix in (
+                ".json",
+                ".progress.jsonl",
+                ".consensus.progress.jsonl",
+                ".judgments.progress.jsonl",
+                ".reviewed.json",
+            ):
+                (jobs_dir / f"{job_id}{suffix}").unlink(missing_ok=True)
+            _JOBS.pop(job_id, None)
+            _WORKER_THREADS.pop(job_id, None)
+            return {"job_id": job_id, "pool_id": pool_id, "status": status}
+
     def resume_job(self, job_id: str) -> dict[str, Any] | None:
         with _JOBS_LOCK:
             job = _JOBS.get(job_id) or self._load_job(job_id)
@@ -483,6 +512,15 @@ class ExpertJudgeJobManager:
                 with progress_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps({"candidate_id": cid, "candidate": candidate}, ensure_ascii=False) + "\n")
 
+            def on_start(candidate_id: str) -> None:
+                cid = str(candidate_id or "")
+                with _JOBS_LOCK:
+                    current = _JOBS.get(job_id)
+                    if current is None:
+                        return
+                    current.setdefault("items", {})[cid] = "running"
+                    self._persist_job(current)
+
             def on_error(candidate_id: str, exc: Exception) -> None:
                 cid = str(candidate_id or "")
                 message = redact_text(str(exc))
@@ -515,6 +553,7 @@ class ExpertJudgeJobManager:
                     judgment_source=job.get("judgment_source") or "provisional_same_family",
                     workers=int(job.get("workers") or 1),
                     existing_reviews=existing,
+                    on_start=on_start,
                     on_review=on_review,
                     on_error=on_error,
                 )
@@ -661,6 +700,11 @@ class ExpertJudgeJobManager:
                 if current.get("cancel_requested"):
                     break
             try:
+                with _JOBS_LOCK:
+                    current = _JOBS.get(job_id)
+                    if current is not None:
+                        current.setdefault("items", {})[candidate_id] = "running"
+                        self._persist_job(current)
                 result = engine.review_candidate(candidate, panel)
                 results[candidate_id] = result.model_dump(mode="json")
                 with progress_path.open("a", encoding="utf-8") as handle:

@@ -316,7 +316,7 @@
         <button type="button" data-queue="all" aria-pressed="true">全部</button>
         <button type="button" data-queue="ungraded" aria-pressed="false">未评分</button>
         <button type="button" data-queue="low_confidence" class="dev-only" aria-pressed="false">低置信</button>
-        <button type="button" data-queue="vote_disagreement" class="dev-only" aria-pressed="false">投票分歧</button>
+        <button type="button" data-queue="vote_disagreement" class="dev-only" aria-pressed="false">内部复核分歧</button>
         <button type="button" data-queue="hard_constraint_conflicts" class="dev-only" aria-pressed="false">硬约束冲突</button>
       </div>
       <section class="review-shell">
@@ -334,6 +334,8 @@
                   <h2 id="projectTitle" tabindex="-1"></h2>
                   <div class="candidate-index" id="candidateIndex"></div>
                 </div>
+                <div class="pool-meta dev-only hidden" id="candidateMachineStatus" role="status" aria-live="polite"></div>
+                <button class="dev-only hidden" id="candidateMachineTraceButton" type="button">查看机器评审轨迹（仅开发者）</button>
                 <div class="description" id="projectDescription"></div>
                 <dl class="metadata" id="metadata"></dl>
                 <div class="grade-label">相关性评分</div>
@@ -348,7 +350,7 @@
                   <textarea id="reviewNotes"></textarea>
                 </div>
               </article>
-              <aside class="side-rail hidden" id="machineRail">
+              <aside class="side-rail hidden" id="machineRail" tabindex="-1">
                 <h3>机器评审轨迹（仅开发者）</h3>
                 <div id="machineSummary" class="pool-meta"></div>
                 <div id="machineVotes"></div>
@@ -477,7 +479,9 @@
           <button id="cancelJobButton" type="button" disabled>取消选中</button>
           <button id="resumeJobButton" type="button" disabled>恢复未完成</button>
           <button id="retryJobButton" type="button" disabled>重试失败</button>
+          <button id="deleteJobButton" type="button" disabled>删除任务</button>
         </div>
+        <div class="status" id="jobLiveStatus" role="status" aria-live="polite">实时监控已停止。</div>
         <div class="status" id="jobStatus" role="status" aria-live="polite"></div>
       </section>
 
@@ -520,7 +524,9 @@
     let reviewerContext = "";
     let selectedJobId = null;
     let selectedJobDetail = null;
+    let activeJobSummary = null;
     let jobPollTimer = null;
+    let lastJobRefreshAt = null;
     let jobsRequestInFlight = false;
     let jobActionBusy = false;
     let importBusy = false;
@@ -961,6 +967,8 @@
       byId("poolBuilderConfigPanel").classList.toggle("hidden", !dev);
       byId("poolBuildPanel").classList.toggle("hidden", !dev);
       byId("machineRail").classList.toggle("hidden", !dev || !currentCandidate());
+      byId("candidateMachineStatus").classList.toggle("hidden", !dev || !currentCandidate());
+      byId("candidateMachineTraceButton").classList.toggle("hidden", !dev || !currentCandidate());
       byId("impactPanel").classList.toggle("hidden", currentMode() !== "test" || !developerAllowed);
       if (!dev) stopJobPolling();
       const banner = byId("modeBanner");
@@ -977,6 +985,9 @@
       byId("projectTitle").textContent = "";
       byId("projectDescription").textContent = "";
       byId("candidateIndex").textContent = "";
+      byId("candidateMachineStatus").textContent = "";
+      byId("candidateMachineStatus").classList.add("hidden");
+      byId("candidateMachineTraceButton").classList.add("hidden");
       byId("metadata").replaceChildren();
       byId("reviewNotes").value = "";
       byId("machineSummary").textContent = "";
@@ -1000,37 +1011,137 @@
       byId("clearButton").disabled = disabled || noCandidate || reviewerMissing || savingCount > 0;
     }
 
-    function renderMachineRail(candidate) {
-      if (!isDevMode() || !candidate) return;
+    function machineReviewProjection(candidate) {
+      if (!candidate || typeof candidate !== "object") {
+        return { votes: [], runs: [], expertJudgments: [], consensus: null, hasHistory: false };
+      }
       const rawVotes = candidate.machine_reviews;
       const votes = Array.isArray(rawVotes) ? rawVotes : rawVotes ? [rawVotes] : [];
-      byId("machineSummary").textContent = votes.length
-        ? `置信度：${candidate.judgment_confidence || candidate.confidence || "未知"} · 当前累计 ${votes.length} 票`
-        : "当前候选没有机器票。";
+      const runs = Array.isArray(candidate.machine_review_runs) ? candidate.machine_review_runs : candidate.machine_review_runs ? [candidate.machine_review_runs] : [];
+      const consensus = candidate.model_expert_consensus && typeof candidate.model_expert_consensus === "object" ? candidate.model_expert_consensus : null;
+      const allExpertJudgments = Array.isArray(candidate.model_expert_judgments) ? candidate.model_expert_judgments : [];
+      const currentJudgmentIds = new Set(Array.isArray(consensus && consensus.judgment_ids) ? consensus.judgment_ids.map(String) : []);
+      const expertJudgments = currentJudgmentIds.size
+        ? allExpertJudgments.filter((judgment) => currentJudgmentIds.has(String(judgment && judgment.judgment_id || "")))
+        : [...new Map(allExpertJudgments.map((judgment) => [String(judgment && judgment.profile && judgment.profile.profile_id || judgment && judgment.judgment_id || ""), judgment])).values()];
+      return {
+        votes,
+        runs,
+        expertJudgments,
+        consensus,
+        hasHistory: Boolean(votes.length || runs.length || expertJudgments.length || consensus),
+      };
+    }
+
+    function renderMachineRail(candidate) {
+      if (!isDevMode() || !candidate) return;
+      const { votes, runs, expertJudgments, consensus } = machineReviewProjection(candidate);
+      const roundsByRun = runs.map((run, index) => {
+        const recorded = Array.isArray(run && run.votes) ? run.votes : [];
+        if (recorded.length) return recorded;
+        if (votes.length && (runs.length === 1 || index === runs.length - 1)) return votes;
+        return [];
+      });
+      const runRounds = roundsByRun.reduce((total, rounds) => total + rounds.length, 0);
+      byId("machineSummary").textContent = expertJudgments.length
+        ? `独立专家最终票 ${expertJudgments.length} 票 · 每位专家只计 1 票 · 共识结果 ${text(consensus && consensus.consensus_grade)} · 状态 ${text(consensus && consensus.status)}`
+        : runs.length
+          ? runs.length === 1
+            ? `专家最终票 1 票 · 最终 ${text(runs[0] && runs[0].grade)} 分 · ${runRounds ? `同模型内部复核 ${runRounds} 轮（仅作稳定性审计）` : "内部复核轮次未记录"}`
+            : `历史模型任务 ${runs.length} 次 · 每次只产生 1 个最终结论 · ${runRounds ? `内部复核共 ${runRounds} 轮` : "内部复核轮次未记录"}，不自动算作独立专家票`
+        : votes.length
+          ? `旧记录：模型身份未记录/不可验证 · ${votes.length} 个内部复核轮次 · 最终只计 1 个专家结果`
+          : "当前候选没有机器评审记录。";
       const votesRoot = byId("machineVotes");
       votesRoot.replaceChildren();
-      votes.forEach((vote, index) => {
+      expertJudgments.forEach((judgment, index) => {
         const item = document.createElement("div");
         item.className = "vote-item";
-        const evidence = asTextList(vote && vote.supporting_evidence).join("；") || "无";
-        const conflicts = asTextList(vote && vote.constraint_conflicts).join("；") || "无";
-        item.textContent = `票 ${index + 1} · 分数 ${text(vote && vote.grade)} · 模型 ${text(vote && (vote.model || vote.review_model))} · 理由 ${text(vote && vote.reason)} · 证据 ${evidence} · 冲突 ${conflicts}`;
+        const profile = judgment && judgment.profile && typeof judgment.profile === "object" ? judgment.profile : {};
+        const model = profile.resolved_model_id || profile.requested_model_id || profile.model_family || "未记录";
+        item.textContent = `专家最终票 ${index + 1} · Profile ${text(profile.profile_id)} · 模型 ${text(model)} · 最终分 ${text(judgment && judgment.final_grade)} · 置信度 ${text(judgment && judgment.confidence)} · 硬约束 ${text(judgment && judgment.hard_gate_outcome)} · 结论 ${text(judgment && judgment.summary)}`;
         votesRoot.appendChild(item);
       });
       const runsRoot = byId("machineRuns");
       runsRoot.replaceChildren();
-      const runs = Array.isArray(candidate.machine_review_runs) ? candidate.machine_review_runs : candidate.machine_review_runs ? [candidate.machine_review_runs] : [];
       if (runs.length) {
-        const heading = document.createElement("h3");
-        heading.textContent = "累计运行";
-        runsRoot.appendChild(heading);
         runs.forEach((run, index) => {
+          const group = document.createElement("div");
+          group.className = "run-item";
+          const runVotes = roundsByRun[index] || [];
+          const heading = document.createElement("strong");
+          heading.textContent = `模型任务 ${index + 1} 最终结论 · 1 票 · 分数 ${text(run && run.grade)} · Job ${text(run && (run.job_id || run.run_id))} · Profile ${text(run && run.profile_id)} · 模型 ${text(run && run.model)} · ${runVotes.length ? `内部复核 ${runVotes.length} 轮` : "内部复核轮次未记录"}`;
+          group.appendChild(heading);
+          const rounds = runVotes.length ? runVotes : (run && run.grade != null ? [run] : []);
+          rounds.forEach((vote, roundIndex) => {
+            const item = document.createElement("div");
+            item.className = "vote-item";
+            const evidence = asTextList(vote && vote.supporting_evidence).join("；") || "无";
+            const conflicts = asTextList(vote && vote.constraint_conflicts).join("；") || "无";
+            item.textContent = `复核轮次 ${roundIndex + 1} · 分数 ${text(vote && vote.grade)} · 理由 ${text(vote && vote.reason)} · 证据 ${evidence} · 冲突 ${conflicts}`;
+            group.appendChild(item);
+          });
+          runsRoot.appendChild(group);
+        });
+      } else {
+        votes.forEach((vote, index) => {
           const item = document.createElement("div");
-          item.className = "run-item";
-          item.textContent = `运行 ${index + 1} · Job ${text(run && (run.job_id || run.run_id))} · 模型 ${text(run && (run.model || run.profile_id))} · 状态 ${text(run && run.status)} · 时间 ${formatDate(run && (run.finished_at || run.created_at || run.updated_at))}`;
-          runsRoot.appendChild(item);
+          item.className = "vote-item";
+          const evidence = asTextList(vote && vote.supporting_evidence).join("；") || "无";
+          const conflicts = asTextList(vote && vote.constraint_conflicts).join("；") || "无";
+          item.textContent = `旧记录复核轮次 ${index + 1} · 分数 ${text(vote && vote.grade)} · 理由 ${text(vote && vote.reason)} · 证据 ${evidence} · 冲突 ${conflicts}`;
+          votesRoot.appendChild(item);
         });
       }
+    }
+
+    function renderCandidateMachineStatus(candidate) {
+      const root = byId("candidateMachineStatus");
+      const traceButton = byId("candidateMachineTraceButton");
+      const visibleForDeveloper = isDevMode() && Boolean(candidate);
+      root.classList.toggle("hidden", !visibleForDeveloper);
+      traceButton.classList.toggle("hidden", !visibleForDeveloper);
+      if (!visibleForDeveloper) {
+        root.textContent = "";
+        return;
+      }
+      const job = selectedJobDetail && activeJobStatuses.has(selectedJobDetail.status)
+        ? selectedJobDetail
+        : activeJobSummary || selectedJobDetail;
+      const counts = job ? progressCounts(job) : { done: 0, failed: 0, total: 0 };
+      const refreshLabel = lastJobRefreshAt ? ` · 上次刷新 ${jobRefreshClock(lastJobRefreshAt)}` : "";
+      const itemStatus = job && job.items && typeof job.items === "object"
+        ? String(job.items[candidate.candidate_id] || "")
+        : "";
+      if (job && job.status === "queued") {
+        root.textContent = `机器评审排队中 · 任务 ${job.job_id} 等待启动 · ${counts.done}/${counts.total} 个候选${refreshLabel}`;
+        return;
+      }
+      if (job && job.status === "running") {
+        if (itemStatus === "done") root.textContent = `机器已评审 · 任务 ${job.job_id} 当前进度 ${counts.done}/${counts.total} 个候选${refreshLabel}`;
+        else if (itemStatus === "failed") root.textContent = `机器评审失败 · 任务 ${job.job_id} 当前进度 ${counts.done}/${counts.total} 个候选${refreshLabel}`;
+        else if (itemStatus === "running") root.textContent = `机器正在评审当前候选 · 任务 ${job.job_id} 当前进度 ${counts.done}/${counts.total} 个候选 · 每 2 秒更新${refreshLabel}`;
+        else root.textContent = `当前候选等待机器评审 · 任务 ${job.job_id} 当前进度 ${counts.done}/${counts.total} 个候选 · 每 2 秒更新${refreshLabel}`;
+        return;
+      }
+      if (job && itemStatus === "done") {
+        root.textContent = `机器已评审 · 当前模型任务进度 ${counts.done}/${counts.total} 个候选${refreshLabel}`;
+        return;
+      }
+      if (job && itemStatus === "failed") {
+        root.textContent = `机器评审失败 · 任务 ${job.job_id} 已结束${refreshLabel}`;
+        return;
+      }
+      if (job && itemStatus === "pending" && terminalJobStatuses.has(job.status)) {
+        root.textContent = job.status === "cancelled"
+          ? `当前候选未评审 · 任务 ${job.job_id} 已取消${refreshLabel}`
+          : `当前候选未完成评审 · 任务 ${job.job_id} 状态 ${localizedJobStatus(job, job.status)}${refreshLabel}`;
+        return;
+      }
+      const hasHistoricalMachineReview = machineReviewProjection(candidate).hasHistory;
+      root.textContent = hasHistoricalMachineReview
+        ? "机器已评审 · 当前展示为历史模型任务/复核轮次记录"
+        : "尚未开始机器评审";
     }
 
     function render({ focusHeading = false } = {}) {
@@ -1082,6 +1193,7 @@
       }
       byId("machineRail").classList.toggle("hidden", !isDevMode());
       renderMachineRail(candidate);
+      renderCandidateMachineStatus(candidate);
       setReviewControlsDisabled(false);
       if (focusHeading) requestAnimationFrame(() => byId("projectTitle").focus());
     }
@@ -1089,9 +1201,12 @@
     function resetPoolDependentDeveloperState() {
       selectedJobId = null;
       selectedJobDetail = null;
+      activeJobSummary = null;
+      lastJobRefreshAt = null;
       byId("jobLog").textContent = "尚未选择 Job。";
       byId("jobDetail").textContent = "请选择一个 Job 查看详情。";
       byId("jobsList").replaceChildren();
+      byId("jobLiveStatus").textContent = "实时监控已停止。";
       setJobStatus("");
       impactGeneration += 1;
       byId("impactKeyPath").value = "";
@@ -2098,6 +2213,7 @@
 
     function renderJobDetail(job) {
       selectedJobDetail = job || null;
+      renderCandidateMachineStatus(currentCandidate());
       const detailRoot = byId("jobDetail");
       detailRoot.replaceChildren();
       if (!job) {
@@ -2107,6 +2223,8 @@
         byId("cancelJobButton").disabled = true;
         byId("resumeJobButton").disabled = true;
         byId("retryJobButton").disabled = true;
+        byId("deleteJobButton").disabled = true;
+        byId("deleteJobButton").title = "";
         return;
       }
       const counts = progressCounts(job);
@@ -2133,19 +2251,51 @@
         detailRoot.append(itemSummary, details);
       }
       const logs = Array.isArray(job.logs) ? job.logs : Array.isArray(job.log_tail) ? job.log_tail : [];
-      byId("jobLog").textContent = logs.map((log) => {
+      const jobLog = byId("jobLog");
+      jobLog.textContent = logs.map((log) => {
         const level = String(log.level || "info");
         const levelLabel = jobLanguage(job).startsWith("zh") ? ({info: "信息", warning: "警告", error: "错误"}[level] || level) : level;
         return `${log.ts || ""} [${levelLabel}] ${localizedJobLogMessage(job, log.message)}`;
       }).join("\n") || jobText(job, "无日志。", "No logs.");
+      jobLog.scrollTop = jobLog.scrollHeight;
       byId("cancelJobButton").textContent = jobText(job, "取消任务", "Cancel job");
       byId("resumeJobButton").textContent = jobText(job, "恢复未完成", "Resume pending");
       byId("retryJobButton").textContent = jobText(job, "重试失败", "Retry failed");
+      byId("deleteJobButton").textContent = jobText(job, "删除任务", "Delete job");
       byId("refreshJobsButton").textContent = jobText(job, "刷新任务", "Refresh jobs");
       byId("cancelJobButton").disabled = jobActionBusy || !activeJobStatuses.has(job.status);
       const itemStatuses = job.items && typeof job.items === "object" ? Object.values(job.items) : [];
       byId("resumeJobButton").disabled = jobActionBusy || !terminalJobStatuses.has(job.status) || !itemStatuses.some((status) => status === "pending" || status === "failed");
       byId("retryJobButton").disabled = jobActionBusy || activeJobStatuses.has(job.status) || counts.failed <= 0;
+      const deletionBlocked = job.status === "running";
+      byId("deleteJobButton").disabled = jobActionBusy || deletionBlocked;
+      byId("deleteJobButton").title = deletionBlocked
+        ? jobText(job, "任务运行中，请先取消任务，待其停止后再删除。", "Cancel the running job before deleting it.")
+        : jobText(job, "删除此专家评审任务及其任务记录。", "Delete this expert-review job and its records.");
+      if (deletionBlocked) {
+        const deleteHint = document.createElement("p");
+        deleteHint.textContent = jobText(job, "任务正在运行，删除功能已禁用；请先取消任务。", "This job is running. Cancel it before deletion.");
+        detailRoot.appendChild(deleteHint);
+      }
+    }
+
+    function jobRefreshClock(value = new Date()) {
+      return value.toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    }
+
+    function updateJobLiveStatus(job, refreshedAt = new Date()) {
+      const root = byId("jobLiveStatus");
+      lastJobRefreshAt = refreshedAt;
+      const clock = jobRefreshClock(refreshedAt);
+      if (job && activeJobStatuses.has(job.status)) {
+        root.textContent = `实时监控中 · 每 2 秒更新 · 上次刷新 ${clock}`;
+        root.classList.remove("error");
+        renderCandidateMachineStatus(currentCandidate());
+        return;
+      }
+      root.textContent = `实时监控已停止 · 最后刷新 ${clock}`;
+      root.classList.remove("error");
+      renderCandidateMachineStatus(currentCandidate());
     }
 
     async function refreshSelectedJobDetail() {
@@ -2159,6 +2309,7 @@
         if (selectedJobId !== requestedJobId) return null;
         if (!payload.ok || !payload.job) throw new Error(payload.error || "无法加载 Job 详情");
         renderJobDetail(payload.job);
+        updateJobLiveStatus(payload.job);
         return payload.job;
       } catch (error) {
         setJobStatus(`Job 详情加载失败：${error.message}`, true);
@@ -2177,7 +2328,7 @@
       jobPollTimer = window.setTimeout(() => { void refreshJobs({ fromPoll: true }); }, 2000);
     }
 
-    async function refreshJobs({ fromPoll = false } = {}) {
+    async function refreshJobs({ fromPoll = false, autoSelectActive = true } = {}) {
       if (!isDevMode() || jobsRequestInFlight) return;
       jobsRequestInFlight = true;
       if (!fromPoll) byId("refreshJobsButton").disabled = true;
@@ -2188,7 +2339,8 @@
         if (activePoolId !== requestedPoolId) return;
         if (!payload.ok) throw new Error(payload.error || "无法加载 Jobs");
         const jobs = Array.isArray(payload.jobs) ? payload.jobs : [];
-        if (!selectedJobId && jobs.some((job) => activeJobStatuses.has(job.status))) selectedJobId = jobs.find((job) => activeJobStatuses.has(job.status)).job_id;
+        activeJobSummary = jobs.find((job) => activeJobStatuses.has(job.status)) || null;
+        if (autoSelectActive && !selectedJobId && jobs.some((job) => activeJobStatuses.has(job.status))) selectedJobId = jobs.find((job) => activeJobStatuses.has(job.status)).job_id;
         if (selectedJobId && !jobs.some((job) => job.job_id === selectedJobId)) selectedJobId = null;
         renderJobs(jobs);
         const detail = selectedJobId ? await refreshSelectedJobDetail() : null;
@@ -2205,6 +2357,7 @@
         const anyActive = jobs.some((job) => activeJobStatuses.has(job.status)) || Boolean(detail && activeJobStatuses.has(detail.status));
         if (anyActive) scheduleJobPolling();
         else stopJobPolling();
+        updateJobLiveStatus(detail || jobs.find((job) => job.job_id === selectedJobId) || activeJobSummary || null);
         setJobStatus(jobs.length ? `已加载 ${jobs.length} 个 Job。` : "暂无 Job。");
       } catch (error) {
         stopJobPolling();
@@ -2263,6 +2416,34 @@
         if (payload.job && activeJobStatuses.has(payload.job.status)) scheduleJobPolling();
       } catch (error) {
         setJobStatus(`${action === "cancel" ? "取消" : action === "resume" ? "恢复" : "重试"}失败：${error.message}`, true);
+      } finally {
+        jobActionBusy = false;
+        renderJobDetail(selectedJobDetail);
+      }
+    }
+
+    async function deleteSelectedJob() {
+      if (!selectedJobId || jobActionBusy) return;
+      const jobId = selectedJobId;
+      if (selectedJobDetail && selectedJobDetail.status === "running") {
+        setJobStatus("任务正在运行，请先取消任务，待其停止后再删除。", true);
+        return;
+      }
+      if (!window.confirm(`确定删除专家评审任务 ${jobId}？只删除任务记录和该任务专属文件，不删除候选池及已写入的共享评审结果。`)) return;
+      jobActionBusy = true;
+      renderJobDetail(selectedJobDetail);
+      try {
+        const payload = await apiRequest(`/api/expert-review/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" });
+        if (!payload.ok) throw new Error(payload.error || "删除失败");
+        selectedJobId = null;
+        selectedJobDetail = null;
+        lastJobStatuses.delete(jobId);
+        terminalPoolReloads.delete(jobId);
+        renderJobDetail(null);
+        setJobStatus(`已删除专家评审任务 ${jobId}。`);
+        await refreshJobs({ autoSelectActive: false });
+      } catch (error) {
+        setJobStatus(`删除任务失败：${error.message}`, true);
       } finally {
         jobActionBusy = false;
         renderJobDetail(selectedJobDetail);
@@ -2444,6 +2625,14 @@
     byId("cancelJobButton").addEventListener("click", () => { void runJobAction("cancel"); });
     byId("resumeJobButton").addEventListener("click", () => { void runJobAction("resume"); });
     byId("retryJobButton").addEventListener("click", () => { void runJobAction("retry-failed"); });
+    byId("deleteJobButton").addEventListener("click", () => { void deleteSelectedJob(); });
+    byId("candidateMachineTraceButton").addEventListener("click", () => {
+      if (!isDevMode()) return;
+      const rail = byId("machineRail");
+      rail.classList.remove("hidden");
+      rail.scrollIntoView({ behavior: "smooth", block: "start" });
+      rail.focus();
+    });
     byId("poolBuilderFetchModelsButton").addEventListener("click", () => { void fetchPoolBuilderModels(); });
     byId("poolBuilderCheckButton").addEventListener("click", () => { void checkPoolBuilderConnection(); });
     byId("poolBuilderSaveButton").addEventListener("click", () => { void savePoolBuilderConfig(); });

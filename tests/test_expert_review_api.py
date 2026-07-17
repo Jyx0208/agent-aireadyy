@@ -802,6 +802,41 @@ def test_consensus_job_api_does_not_require_single_profile(tmp_path: Path, monke
     assert captured["scale_mode"] == "auto"
 
 
+def test_delete_expert_job_api_requires_developer_and_reports_running_or_missing(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ENABLED", "1")
+    monkeypatch.delenv("AGENT_EXPERT_REVIEW_DEVELOPER_TOKEN", raising=False)
+    monkeypatch.delenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", raising=False)
+    calls: list[str] = []
+
+    class _Jobs:
+        def delete_job(self, job_id: str):
+            calls.append(job_id)
+            if job_id == "running-job":
+                raise ValueError("job_running_cancel_before_delete")
+            if job_id == "missing-job":
+                return None
+            return {"job_id": job_id, "pool_id": "pool-1", "status": "completed"}
+
+    monkeypatch.setattr(web_app, "_expert_job_manager", lambda: _Jobs())
+    client = TestClient(web_app.app)
+
+    forbidden = client.delete("/api/expert-review/jobs/completed-job").json()
+    assert forbidden == {"ok": False, "error": "developer_access_required"}
+    assert calls == []
+
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", "1")
+    deleted = client.delete("/api/expert-review/jobs/completed-job").json()
+    assert deleted == {
+        "ok": True,
+        "deleted": True,
+        "job": {"job_id": "completed-job", "pool_id": "pool-1", "status": "completed"},
+    }
+    running = client.delete("/api/expert-review/jobs/running-job").json()
+    assert running == {"ok": False, "error": "job_running_cancel_before_delete"}
+    missing = client.delete("/api/expert-review/jobs/missing-job").json()
+    assert missing == {"ok": False, "error": "job_not_found"}
+
+
 def test_benchmark_template_has_developer_surfaces() -> None:
     html = Path("src/agent/web/templates/benchmark_review.html").read_text(encoding="utf-8")
     assert 'id="machineRail"' in html

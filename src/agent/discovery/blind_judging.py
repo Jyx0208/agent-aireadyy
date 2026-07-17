@@ -49,6 +49,7 @@ class BlindCandidateJudgment(JsonModel):
 JudgeCall = Callable[[str, str], Mapping[str, Any]]
 ReviewCallback = Callable[[dict[str, Any]], None]
 ReviewErrorCallback = Callable[[str, Exception], None]
+ReviewStartCallback = Callable[[str], None]
 JUDGING_RUBRIC_VERSION = "adaptive-blind-judge/v2"
 
 
@@ -69,6 +70,7 @@ def judge_blinded_pool(
     judgment_source: JudgmentSource = "provisional_same_family",
     workers: int = 1,
     existing_reviews: Mapping[str, Mapping[str, Any]] | None = None,
+    on_start: ReviewStartCallback | None = None,
     on_review: ReviewCallback | None = None,
     on_error: ReviewErrorCallback | None = None,
 ) -> dict[str, Any]:
@@ -99,16 +101,21 @@ def judge_blinded_pool(
             raise exc
         on_error(str(candidate.get("candidate_id") or ""), exc)
 
+    def review_candidate(candidate: Mapping[str, Any]) -> BlindCandidateJudgment:
+        if on_start is not None:
+            on_start(str(candidate.get("candidate_id") or ""))
+        return judge_candidate(candidate, judge)
+
     if workers == 1:
         for candidate in pending:
             try:
-                store_result(candidate, judge_candidate(candidate, judge))
+                store_result(candidate, review_candidate(candidate))
             except Exception as exc:
                 handle_error(candidate, exc)
     else:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(judge_candidate, candidate, judge): candidate
+                executor.submit(review_candidate, candidate): candidate
                 for candidate in pending
             }
             for future in as_completed(futures):

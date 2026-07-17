@@ -74,6 +74,43 @@ def test_benchmark_review_template_has_repair_contract_markers() -> None:
     assert "模型评审任务已结束" in html
     assert "localizedJobStatus" in html
     assert "localizedJobLogMessage" in html
+    assert 'id="deleteJobButton"' in html
+    assert 'id="jobLiveStatus"' in html
+    assert "function deleteSelectedJob()" in html
+    assert 'method: "DELETE"' in html
+    assert "只删除任务记录和该任务专属文件，不删除候选池及已写入的共享评审结果" in html
+    assert "任务正在运行，请先取消任务" in html
+    assert "实时监控中 · 每 2 秒更新 · 上次刷新" in html
+    assert "实时监控已停止 · 最后刷新" in html
+    assert "jobLog.scrollTop = jobLog.scrollHeight" in html
+    assert "selectedJobId = null" in html
+    assert "await refreshJobs({ autoSelectActive: false })" in html
+    assert 'id="candidateMachineStatus"' in html
+    assert 'id="candidateMachineTraceButton"' in html
+    assert "查看机器评审轨迹（仅开发者）" in html
+    assert "function renderCandidateMachineStatus(candidate)" in html
+    assert "function machineReviewProjection(candidate)" in html
+    assert "机器正在评审当前候选" in html
+    assert "当前候选等待机器评审" in html
+    assert "机器评审失败" in html
+    assert "当前候选未评审" in html
+    assert "当前候选未完成评审" in html
+    assert "机器评审排队中" in html
+    assert 'const deletionBlocked = job.status === "running"' in html
+    assert 'selectedJobDetail.status === "running"' in html
+    assert "当前展示为历史模型任务/复核轮次记录" in html
+    assert "专家最终票 1 票 · 最终 ${text(runs[0] && runs[0].grade)} 分" in html
+    assert "每位专家只计 1 票" in html
+    assert "currentJudgmentIds.has" in html
+    assert "同模型内部复核 ${runRounds} 轮（仅作稳定性审计）" in html
+    assert "内部复核轮次未记录" in html
+    assert "不自动算作独立专家票" in html
+    assert "模型任务 ${index + 1} 最终结论 · 1 票" in html
+    assert "旧记录：模型身份未记录/不可验证" in html
+    assert "复核轮次 ${roundIndex + 1}" in html
+    assert "当前累计 ${votes.length} 票" not in html
+    assert "activeJobSummary || selectedJobDetail" in html
+    assert "|| activeJobSummary || null" in html
     assert "/api/benchmark-review/builds" in html
     assert "build_and_review" in html
     assert 'id="profileProviderInput"' in html

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping
+
+import pytest
 
 from agent.web.expert_review.consensus import ExpertJudgment, ExpertModelProfile
 from agent.web.expert_review.jobs import ExpertJudgeJobManager, reset_jobs_for_tests
@@ -115,6 +118,152 @@ def test_job_manager_runs_with_mock_judge(tmp_path: Path) -> None:
     assert any(item["job_id"] == job["job_id"] for item in listed)
     for item in listed:
         assert "api_key" not in item
+
+
+def test_job_manager_deletes_queued_and_terminal_job_artifacts_without_deleting_pool(tmp_path: Path) -> None:
+    reset_jobs_for_tests()
+    registry = ExpertPoolRegistry(tmp_path / "expert_review")
+    record = registry.import_pool(
+        {
+            "schema_version": "discovery-judgment-pool-blinded/v2",
+            "candidates": [{"candidate_id": "c1", "project_title": "Visible"}],
+        },
+        label="delete-jobs",
+    )
+
+    manager = ExpertJudgeJobManager(
+        registry,
+        resolve_profile=lambda _profile_id: {
+            "api_key": "secret-key",
+            "base_url": "https://example.com/v1",
+            "model": "mock-model",
+            "timeout": "30",
+        },
+        max_running=0,
+    )
+
+    for target_status in ("queued", "cancelled", "failed"):
+        job = manager.start_job(pool_id=record["pool_id"], profile_id="default", workers=1)
+        assert job["status"] == "queued"
+        if target_status == "cancelled":
+            cancelled = manager.cancel_job(job["job_id"])
+            assert cancelled is not None
+            assert cancelled["status"] == "cancelled"
+        elif target_status == "failed":
+            manager._finish(job["job_id"], status="failed", error="test failure")
+
+        jobs_dir = registry.root / record["pool_id"] / "jobs"
+        artifact_suffixes = (
+            ".progress.jsonl",
+            ".consensus.progress.jsonl",
+            ".judgments.progress.jsonl",
+            ".reviewed.json",
+        )
+        artifacts = [jobs_dir / f"{job['job_id']}{suffix}" for suffix in artifact_suffixes]
+        for artifact in artifacts:
+            artifact.write_text("artifact\n", encoding="utf-8")
+        shared_reviewed = registry.root / record["pool_id"] / "pool.reviewed.json"
+        shared_reviewed.write_text("{}\n", encoding="utf-8")
+
+        deleted = manager.delete_job(job["job_id"])
+
+        assert deleted == {
+            "job_id": job["job_id"],
+            "pool_id": record["pool_id"],
+            "status": target_status,
+        }
+        assert manager.get_job(job["job_id"]) is None
+        assert not (jobs_dir / f"{job['job_id']}.json").exists()
+        assert all(not artifact.exists() for artifact in artifacts)
+        assert shared_reviewed.exists()
+        assert registry.get_pool(record["pool_id"]) is not None
+
+        manager.max_running = 1
+        manager._kick()
+        assert manager.get_job(job["job_id"]) is None
+        manager.max_running = 0
+
+
+def test_job_manager_rejects_deleting_running_job(tmp_path: Path) -> None:
+    reset_jobs_for_tests()
+    registry = ExpertPoolRegistry(tmp_path / "expert_review")
+    record = registry.import_pool(
+        {
+            "schema_version": "discovery-judgment-pool-blinded/v2",
+            "candidates": [{"candidate_id": "c1", "project_title": "Visible"}],
+        },
+        label="running-delete",
+    )
+    release = threading.Event()
+
+    def blocking_judge(_system_prompt: str, _user_prompt: str) -> dict[str, Any]:
+        release.wait(timeout=5)
+        return {
+            "grade": 2,
+            "reason": "ok",
+            "supporting_evidence": ["e"],
+            "constraint_conflicts": [],
+        }
+
+    manager = ExpertJudgeJobManager(
+        registry,
+        resolve_profile=lambda _profile_id: {
+            "api_key": "secret-key",
+            "base_url": "https://example.com/v1",
+            "model": "mock-model",
+            "timeout": "30",
+        },
+        judge_factory=lambda **_kwargs: blocking_judge,
+        max_running=1,
+    )
+    job = manager.start_job(pool_id=record["pool_id"], profile_id="default", workers=1)
+    assert job["status"] == "running"
+    deadline = time.time() + 5
+    detail = None
+    while time.time() < deadline:
+        detail = manager.get_job(job["job_id"], detail=True)
+        if detail and detail.get("items", {}).get("c1") == "running":
+            break
+        time.sleep(0.01)
+    assert detail is not None
+    assert detail["items"]["c1"] == "running"
+
+    with pytest.raises(ValueError, match="job_running_cancel_before_delete"):
+        manager.delete_job(job["job_id"])
+
+    manager.cancel_job(job["job_id"])
+    release.set()
+    deadline = time.time() + 5
+    final = None
+    while time.time() < deadline:
+        final = manager.get_job(job["job_id"])
+        if final and final["status"] in {"cancelled", "completed", "completed_with_errors", "failed"}:
+            break
+        time.sleep(0.01)
+    assert final is not None
+    assert final["status"] == "cancelled"
+
+
+def test_job_manager_rejects_delete_path_traversal_without_touching_pool(tmp_path: Path) -> None:
+    reset_jobs_for_tests()
+    registry = ExpertPoolRegistry(tmp_path / "expert_review")
+    record = registry.import_pool(
+        {
+            "schema_version": "discovery-judgment-pool-blinded/v2",
+            "candidates": [{"candidate_id": "c1", "project_title": "Visible"}],
+        },
+        label="delete-path-safety",
+    )
+    shared_reviewed = registry.root / record["pool_id"] / "pool.reviewed.json"
+    shared_reviewed.write_text('{"pool_id":"' + record["pool_id"] + '"}\n', encoding="utf-8")
+    manager = ExpertJudgeJobManager(
+        registry,
+        resolve_profile=lambda _profile_id: {},
+        max_running=0,
+    )
+
+    assert manager.delete_job(r"..\pool.reviewed") is None
+    assert shared_reviewed.exists()
 
 
 def test_consensus_job_selects_heterogeneous_panel_and_persists_model_only_results(tmp_path: Path) -> None:
