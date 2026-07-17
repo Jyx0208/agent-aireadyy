@@ -5530,9 +5530,13 @@ async def discovery_calibration_status(request: Request):
 async def preview_discovery_calibration(request: Request):
     if not _review_developer_allowed(request):
         return {"ok": False, "error": "developer_access_required"}
-    from agent.discovery.calibration import fit_scoring_calibration
+    from agent.discovery.calibration import DiscoveryCalibrationStore, fit_scoring_calibration
 
-    return {"ok": True, "preview": fit_scoring_calibration(_discovery_calibration_candidates())}
+    return {
+        "ok": True,
+        "preview": fit_scoring_calibration(_discovery_calibration_candidates()),
+        "active": DiscoveryCalibrationStore().load_active(),
+    }
 
 
 @app.post("/api/expert-review/calibration/activate")

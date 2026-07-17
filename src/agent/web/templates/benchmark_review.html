@@ -143,7 +143,27 @@
     .calibration-flow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 10px 0; }
     .calibration-step { border: 1px solid var(--line); border-radius: 7px; background: #f8fafb; padding: 10px; line-height: 1.45; }
     .calibration-step strong { display: block; margin-bottom: 4px; }
-    .calibration-weights { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 6px; margin-top: 8px; font-size: 12px; }
+    .calibration-step.current { border-color: var(--accent); background: var(--accent-soft); }
+    .calibration-step.complete { border-color: #8fc8aa; background: #eef8f2; }
+    .calibration-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 10px 0; }
+    .calibration-metric { padding: 10px 0; border-bottom: 1px solid var(--line); }
+    .calibration-metric strong { display: block; margin-top: 3px; font-size: 18px; }
+    .calibration-progress { height: 9px; margin-top: 8px; overflow: hidden; border-radius: 99px; background: #e8ecef; }
+    .calibration-progress span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s ease; }
+    .calibration-visuals { display: grid; grid-template-columns: minmax(240px, .8fr) minmax(320px, 1.2fr); gap: 16px; margin: 12px 0; }
+    .calibration-visuals > * { min-width: 0; }
+    .calibration-visuals h4 { margin: 0 0 8px; font-size: 13px; }
+    .grade-distribution, .calibration-weights { display: grid; gap: 7px; }
+    .grade-row, .weight-row { display: grid; grid-template-columns: minmax(82px, auto) minmax(80px, 1fr) auto; gap: 8px; align-items: center; font-size: 12px; }
+    .grade-track, .weight-track { height: 9px; overflow: hidden; border-radius: 99px; background: #e8ecef; }
+    .grade-track span, .weight-track span { display: block; height: 100%; background: var(--accent); }
+    .weight-track.active span { background: var(--muted); opacity: .55; }
+    .weight-pair { display: grid; gap: 3px; }
+    .calibration-trace { width: 100%; height: 120px; overflow: visible; }
+    .calibration-trace .axis { stroke: var(--line); stroke-width: 1; }
+    .calibration-trace .baseline { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 3; }
+    .calibration-trace .fit-line { fill: none; stroke: var(--accent); stroke-width: 2; }
+    .calibration-trace text { fill: var(--muted); font-size: 10px; }
     .jobs-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; align-items: end; margin: 14px 0 10px; }
     .job-row { width: 100%; display: block; border: 0; border-top: 1px solid var(--line); border-radius: 0; text-align: left; padding: 10px 4px; min-height: 0; }
     .job-row[aria-pressed="true"] { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); padding-left: 10px; }
@@ -184,8 +204,9 @@
     }
     @media (max-width: 520px) {
       .header-inner, main { width: min(100% - 20px, 1180px); }
-      .token-row, .profile-grid, .advanced-grid, .calibration-flow, .jobs-controls, .metadata, .grades { grid-template-columns: 1fr; }
+      .token-row, .profile-grid, .advanced-grid, .calibration-flow, .calibration-metrics, .calibration-visuals, .jobs-controls, .metadata, .grades { grid-template-columns: 1fr; }
       .profile-grid .full, .jobs-controls .primary { grid-column: auto; }
+      .weight-row { grid-template-columns: 1fr; gap: 4px; }
       .candidate-head, .navigation { flex-direction: column; }
       .navigation-group, .job-actions, .profile-actions { width: 100%; }
       .navigation-group button, .job-actions button, .profile-actions button { flex: 1 1 140px; }
@@ -580,9 +601,18 @@
         <h3>3. 评分学习（实验）</h3>
         <p class="help">把每个项目在同一任务下的最终 0–3 分作为一个标签，学习项目级元数据变量的非负归一化权重。至少 30 个正式标签且分数有差异后才能激活；只计入“构建并评审”形成的正式模型共识或明确人工确认，单模型诊断不计入，模型共识也不是人工金标准。</p>
         <div class="calibration-flow">
-          <div class="calibration-step"><strong>① 积累标签</strong><span id="calibrationLabelCount">正在统计…</span></div>
-          <div class="calibration-step"><strong>② 生成校准预览</strong><span>比较实验权重与等权基线，不立即改变 Discovery。</span></div>
-          <div class="calibration-step"><strong>③ 激活版本</strong><span>只影响后续 Discovery 软排序；原始项目分和硬约束继续保留。</span></div>
+          <div class="calibration-step" id="calibrationStepLabels"><strong>① 积累标签</strong><span id="calibrationLabelCount">正在统计…</span></div>
+          <div class="calibration-step" id="calibrationStepPreview"><strong>② 生成校准预览</strong><span>比较实验权重与等权基线，不立即改变 Discovery。</span></div>
+          <div class="calibration-step" id="calibrationStepActivate"><strong>③ 激活版本</strong><span>只影响后续 Discovery 软排序；原始项目分和硬约束继续保留。</span></div>
+        </div>
+        <div class="calibration-metrics">
+          <div class="calibration-metric"><span>正式标签进度</span><strong id="calibrationProgressValue">0 / 30</strong><div class="calibration-progress" role="progressbar" aria-label="正式标签进度" aria-valuemin="0" aria-valuemax="30" aria-valuenow="0" id="calibrationProgress"><span></span></div></div>
+          <div class="calibration-metric"><span>校准 MAE / 等权 MAE</span><strong id="calibrationMaeValue">—</strong></div>
+          <div class="calibration-metric"><span>当前激活版本</span><strong id="calibrationVersionValue">未激活</strong></div>
+        </div>
+        <div class="calibration-visuals">
+          <div><h4>0–3 分标签分布</h4><div class="grade-distribution" id="calibrationGradeDistribution"></div></div>
+          <div><h4>拟合误差变化（越低越好）</h4><svg class="calibration-trace" id="calibrationTraceChart" viewBox="0 0 420 120" role="img" aria-label="校准拟合误差变化"></svg></div>
         </div>
         <div class="profile-actions">
           <button id="refreshCalibrationButton" type="button">刷新学习状态</button>
@@ -590,6 +620,7 @@
           <button id="activateCalibrationButton" type="button" class="primary" disabled>激活实验权重</button>
         </div>
         <div class="status" id="calibrationStatus" role="status" aria-live="polite"></div>
+        <h4>项目变量权重：预览值与当前激活值</h4>
         <div class="calibration-weights" id="calibrationWeights"></div>
       </section>
 
@@ -2144,16 +2175,151 @@
       semantic_metadata_confidence: "语义元数据置信度"
     };
 
-    function renderCalibration(payload) {
+    function setCalibrationStep(id, state) {
+      const node = byId(id);
+      node.classList.toggle("current", state === "current");
+      node.classList.toggle("complete", state === "complete");
+    }
+
+    function renderCalibrationGrades(preview) {
+      const root = byId("calibrationGradeDistribution");
+      root.replaceChildren();
+      const distribution = preview.grade_distribution || {};
+      const counts = [0, 1, 2, 3].map((grade) => Number(distribution[String(grade)] || 0));
+      const maximum = Math.max(1, ...counts);
+      counts.forEach((count, grade) => {
+        const row = document.createElement("div");
+        row.className = "grade-row";
+        const label = document.createElement("span");
+        label.textContent = `${grade} 分`;
+        const track = document.createElement("div");
+        track.className = "grade-track";
+        track.setAttribute("aria-label", `${grade} 分标签 ${count} 个`);
+        const bar = document.createElement("span");
+        bar.style.width = `${count / maximum * 100}%`;
+        track.appendChild(bar);
+        const value = document.createElement("strong");
+        value.textContent = String(count);
+        row.append(label, track, value);
+        root.appendChild(row);
+      });
+    }
+
+    function renderCalibrationTrace(preview, previewReady = true) {
+      const svg = byId("calibrationTraceChart");
+      svg.replaceChildren();
+      const trace = Array.isArray(preview.optimization_trace) ? preview.optimization_trace : [];
+      if (!previewReady || !Number(preview.sample_count || 0) || trace.length < 2) {
+        const empty = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        empty.setAttribute("x", "210");
+        empty.setAttribute("y", "62");
+        empty.setAttribute("text-anchor", "middle");
+        empty.textContent = previewReady ? "积累正式标签后显示拟合轨迹" : "点击生成校准预览后显示拟合轨迹";
+        svg.appendChild(empty);
+        return;
+      }
+      const width = 420;
+      const height = 120;
+      const left = 34;
+      const right = 10;
+      const top = 10;
+      const bottom = 24;
+      const plotWidth = width - left - right;
+      const plotHeight = height - top - bottom;
+      const maxIteration = Math.max(1, ...trace.map((item) => Number(item.iteration || 0)));
+      const baseline = Number(preview.metrics && preview.metrics.equal_weight_mae || 0);
+      const maxMae = Math.max(0.01, baseline, ...trace.map((item) => Number(item.mae || 0)));
+      const x = (iteration) => left + Number(iteration || 0) / maxIteration * plotWidth;
+      const y = (mae) => top + (1 - Number(mae || 0) / maxMae) * plotHeight;
+      const axisX = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      axisX.setAttribute("class", "axis");
+      axisX.setAttribute("x1", String(left)); axisX.setAttribute("x2", String(width - right));
+      axisX.setAttribute("y1", String(height - bottom)); axisX.setAttribute("y2", String(height - bottom));
+      const axisY = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      axisY.setAttribute("class", "axis");
+      axisY.setAttribute("x1", String(left)); axisY.setAttribute("x2", String(left));
+      axisY.setAttribute("y1", String(top)); axisY.setAttribute("y2", String(height - bottom));
+      const baselineLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      baselineLine.setAttribute("class", "baseline");
+      baselineLine.setAttribute("x1", String(left)); baselineLine.setAttribute("x2", String(width - right));
+      baselineLine.setAttribute("y1", String(y(baseline))); baselineLine.setAttribute("y2", String(y(baseline)));
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+      line.setAttribute("class", "fit-line");
+      line.setAttribute("points", trace.map((item) => `${x(item.iteration).toFixed(1)},${y(item.mae).toFixed(1)}`).join(" "));
+      const startLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      startLabel.setAttribute("x", String(left)); startLabel.setAttribute("y", "116"); startLabel.textContent = "0";
+      const endLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      endLabel.setAttribute("x", String(width - right)); endLabel.setAttribute("y", "116"); endLabel.setAttribute("text-anchor", "end"); endLabel.textContent = String(maxIteration);
+      const baselineLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      baselineLabel.setAttribute("x", String(width - right)); baselineLabel.setAttribute("y", String(Math.max(10, y(baseline) - 4))); baselineLabel.setAttribute("text-anchor", "end"); baselineLabel.textContent = `等权 ${baseline.toFixed(3)}`;
+      svg.append(axisX, axisY, baselineLine, line, startLabel, endLabel, baselineLabel);
+    }
+
+    function renderCalibrationWeights(preview, active) {
+      const root = byId("calibrationWeights");
+      root.replaceChildren();
+      const previewWeights = preview.weights || {};
+      const activeWeights = active && active.weights || {};
+      const maximum = Math.max(0.01, ...Object.values(previewWeights).map(Number), ...Object.values(activeWeights).map(Number));
+      Object.entries(previewWeights).forEach(([name, weight]) => {
+        const previewWeight = Number(weight || 0);
+        const activeWeight = activeWeights[name] === undefined ? null : Number(activeWeights[name] || 0);
+        const row = document.createElement("div");
+        row.className = "weight-row";
+        const label = document.createElement("span");
+        label.textContent = calibrationFeatureLabels[name] || name;
+        const pair = document.createElement("div");
+        pair.className = "weight-pair";
+        if (activeWeight !== null) {
+          const activeTrack = document.createElement("div");
+          activeTrack.className = "weight-track active";
+          activeTrack.setAttribute("aria-label", `当前激活权重 ${(activeWeight * 100).toFixed(1)}%`);
+          const activeBar = document.createElement("span");
+          activeBar.style.width = `${activeWeight / maximum * 100}%`;
+          activeTrack.appendChild(activeBar);
+          pair.appendChild(activeTrack);
+        }
+        const previewTrack = document.createElement("div");
+        previewTrack.className = "weight-track";
+        previewTrack.setAttribute("aria-label", `预览权重 ${(previewWeight * 100).toFixed(1)}%`);
+        const previewBar = document.createElement("span");
+        previewBar.style.width = `${previewWeight / maximum * 100}%`;
+        previewTrack.appendChild(previewBar);
+        pair.appendChild(previewTrack);
+        const value = document.createElement("span");
+        value.textContent = activeWeight === null
+          ? `预览 ${(previewWeight * 100).toFixed(1)}%`
+          : `激活 ${(activeWeight * 100).toFixed(1)}% → 预览 ${(previewWeight * 100).toFixed(1)}%`;
+        row.append(label, pair, value);
+        root.appendChild(row);
+      });
+    }
+
+    function renderCalibration(payload, { previewReady = true } = {}) {
       const preview = payload && payload.preview ? payload.preview : payload || {};
       const active = payload && payload.active ? payload.active : null;
-      calibrationPreview = preview;
+      calibrationPreview = previewReady ? preview : null;
       const sampleCount = Number(preview.sample_count || 0);
+      const minimumCount = Number(preview.minimum_sample_count || 30);
       const sourceText = Object.entries(preview.label_sources || {}).map(([source, count]) => `${source} ${count}`).join("，") || "暂无正式标签";
       byId("calibrationLabelCount").textContent = `${sampleCount} 个正式标签（${sourceText}）`;
-      byId("activateCalibrationButton").disabled = !preview.eligible;
+      byId("activateCalibrationButton").disabled = !previewReady || !preview.eligible;
+      byId("calibrationProgressValue").textContent = `${sampleCount} / ${minimumCount}`;
+      const progress = byId("calibrationProgress");
+      progress.setAttribute("aria-valuemax", String(minimumCount));
+      progress.setAttribute("aria-valuenow", String(Math.min(sampleCount, minimumCount)));
+      progress.querySelector("span").style.width = `${Math.min(100, sampleCount / Math.max(1, minimumCount) * 100)}%`;
+      const mae = Number(preview.metrics && preview.metrics.mae);
+      const equalMae = Number(preview.metrics && preview.metrics.equal_weight_mae);
+      byId("calibrationMaeValue").textContent = previewReady && sampleCount && Number.isFinite(mae) && Number.isFinite(equalMae) ? `${mae.toFixed(3)} / ${equalMae.toFixed(3)}` : previewReady ? "—" : "点击生成预览";
+      byId("calibrationVersionValue").textContent = active && active.version_id || "未激活";
+      setCalibrationStep("calibrationStepLabels", sampleCount >= minimumCount ? "complete" : "current");
+      setCalibrationStep("calibrationStepPreview", previewReady && preview.eligible ? "complete" : sampleCount >= minimumCount ? "current" : "pending");
+      setCalibrationStep("calibrationStepActivate", active && active.version_id ? "complete" : previewReady && preview.eligible ? "current" : "pending");
       const warnings = new Set(preview.warnings || []);
-      const reason = warnings.has("minimum_30_labels_required")
+      const reason = !previewReady && sampleCount >= minimumCount
+        ? "标签已满足，请点击“生成校准预览”。"
+        : warnings.has("minimum_30_labels_required")
         ? `还差 ${Math.max(0, Number(preview.minimum_sample_count || 30) - sampleCount)} 个正式标签。`
         : warnings.has("at_least_two_grade_levels_required")
           ? "现有标签分数没有差异，暂时无法学习权重。"
@@ -2162,14 +2328,10 @@
       byId("calibrationStatus").textContent = `${reason} ${activeText} 激活只影响后续 Discovery 软排序；模型共识不是人工金标准。`;
       byId("calibrationStatus").classList.toggle("error", !preview.eligible);
       byId("calibrationStatus").classList.toggle("success", Boolean(preview.eligible));
-      const root = byId("calibrationWeights");
-      root.replaceChildren();
-      Object.entries(preview.weights || {}).forEach(([name, weight]) => {
-        const item = document.createElement("div");
-        item.className = "calibration-step";
-        item.textContent = `${calibrationFeatureLabels[name] || name}：${(Number(weight) * 100).toFixed(1)}%`;
-        root.appendChild(item);
-      });
+      renderCalibrationGrades(preview);
+      renderCalibrationTrace(preview, previewReady);
+      if (previewReady) renderCalibrationWeights(preview, active);
+      else byId("calibrationWeights").textContent = "生成校准预览后显示当前权重与新权重的变化。";
     }
 
     async function refreshCalibration() {
@@ -2177,7 +2339,7 @@
       try {
         const payload = await apiRequest("/api/expert-review/calibration/status");
         if (!payload.ok) throw new Error(payload.error || "无法读取评分学习状态");
-        renderCalibration(payload);
+        renderCalibration(payload, { previewReady: false });
       } catch (error) {
         byId("calibrationStatus").textContent = `读取评分学习状态失败：${error.message}`;
         byId("calibrationStatus").classList.add("error");

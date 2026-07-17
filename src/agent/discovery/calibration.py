@@ -181,11 +181,12 @@ def fit_scoring_calibration(candidates: Sequence[Mapping[str, Any]]) -> dict[str
     equal_mae = _mae(rows, equal)
     best = equal
     best_mae = equal_mae
+    optimization_trace = [{"iteration": 0, "mae": round(equal_mae, 6)}]
     if rows and len(grade_counts) >= 2:
         weights = list(equal)
         learning_rate = 0.08
         prior_strength = 0.035
-        for _ in range(600):
+        for iteration in range(600):
             gradient = [0.0] * len(weights)
             for features, target in rows:
                 error = sum(weight * value for weight, value in zip(weights, features)) - target
@@ -194,9 +195,22 @@ def fit_scoring_calibration(candidates: Sequence[Mapping[str, Any]]) -> dict[str
             for index in range(len(weights)):
                 gradient[index] += prior_strength * (weights[index] - equal[index])
             weights = _project_simplex([weight - learning_rate * grad for weight, grad in zip(weights, gradient)])
+            if (iteration + 1) % 50 == 0:
+                optimization_trace.append(
+                    {"iteration": iteration + 1, "mae": round(_mae(rows, weights), 6)}
+                )
         fitted_mae = _mae(rows, weights)
         if fitted_mae <= best_mae:
             best, best_mae = weights, fitted_mae
+            selected_strategy = "fitted_weights"
+        else:
+            optimization_trace = [
+                {"iteration": 0, "mae": round(equal_mae, 6)},
+                {"iteration": 600, "mae": round(equal_mae, 6)},
+            ]
+            selected_strategy = "equal_weight_baseline"
+    else:
+        selected_strategy = "equal_weight_baseline"
 
     eligible = not warnings
     preview_id = hashlib.sha256(
@@ -219,6 +233,8 @@ def fit_scoring_calibration(candidates: Sequence[Mapping[str, Any]]) -> dict[str
             "mae": round(best_mae, 6),
             "equal_weight_mae": round(equal_mae, 6),
         },
+        "optimization_trace": optimization_trace,
+        "selected_strategy": selected_strategy,
         "warnings": warnings,
         "excluded_features": ["selected_file_count", "file_count"],
         "quantity_policy": "Portfolio-level quantity preferences never reduce an individual project's suitability score.",

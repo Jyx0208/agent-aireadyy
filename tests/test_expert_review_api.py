@@ -21,6 +21,22 @@ def test_developer_mode_requires_token_by_default(tmp_path: Path, monkeypatch) -
     assert client.get("/api/llm/profiles").json()["error"] == "developer_access_required"
 
 
+def test_calibration_preview_preserves_active_version(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_DIR", str(tmp_path / "expert_review"))
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", "1")
+    calibration_path = tmp_path / "calibration.active.json"
+    calibration_path.write_text(
+        json.dumps({"version_id": "cal-test", "weights": {"heuristic_relevance": 1.0}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_DISCOVERY_CALIBRATION_PATH", str(calibration_path))
+
+    response = TestClient(web_app.app).post("/api/expert-review/calibration/preview").json()
+
+    assert response["ok"] is True
+    assert response["active"]["version_id"] == "cal-test"
+
+
 def test_benchmark_review_template_supports_registry_shell() -> None:
     html = Path("src/agent/web/templates/benchmark_review.html").read_text(encoding="utf-8")
     assert 'id="serverPoolSelect"' in html

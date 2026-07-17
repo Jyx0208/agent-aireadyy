@@ -44,6 +44,10 @@ def test_calibration_fits_interpretable_weights_without_portfolio_file_count() -
     assert "selected_file_count" not in report["weights"]
     assert abs(sum(report["weights"].values()) - 1.0) < 1e-6
     assert report["metrics"]["mae"] <= report["metrics"]["equal_weight_mae"]
+    assert report["optimization_trace"][0]["iteration"] == 0
+    assert report["optimization_trace"][-1]["iteration"] == 600
+    assert report["optimization_trace"][-1]["mae"] == report["metrics"]["mae"]
+    assert report["selected_strategy"] in {"fitted_weights", "equal_weight_baseline"}
 
 
 def test_calibration_requires_enough_resolved_labels() -> None:

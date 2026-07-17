@@ -230,6 +230,14 @@ def test_benchmark_review_template_simplifies_model_setup_and_exposes_calibratio
     assert "至少 30 个" in html
     assert "/api/expert-review/calibration/preview" in html
     assert "/api/expert-review/calibration/activate" in html
+    assert 'id="calibrationProgress"' in html
+    assert 'id="calibrationGradeDistribution"' in html
+    assert 'id="calibrationTraceChart"' in html
+    assert "optimization_trace" in html
+    assert "renderCalibrationWeights" in html
+    assert "预览值与当前激活值" in html
+    assert "previewReady: false" in html
+    assert "点击生成校准预览后显示拟合轨迹" in html
     assert "或手填模型" in html
     assert 'id="poolBuilderApiKeyInput"' in html
     assert 'id="poolBuilderTimeoutInput"' in html
