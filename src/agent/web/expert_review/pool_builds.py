@@ -89,12 +89,30 @@ def _safe_id(value: str) -> str:
 
 def _safe_error(value: Any) -> str:
     text = str(value or "")
+    normalized = text.casefold()
+    if "prompt_parse_failed" in normalized and any(
+        marker in normalized
+        for marker in (
+            "401",
+            "403",
+            "authorization required",
+            "unauthorized",
+            "authentication failed",
+            "invalid api key",
+        )
+    ):
+        return (
+            "prompt_parse_failed:评审池构建模型认证失败。"
+            "请在“评审池构建模型配置”中更新 API Key，或更换提供商和模型后重试。"
+        )
     text = re.sub(
         r"(?i)((?:api[_ -]?key|authorization|access[_ -]?token|refresh[_ -]?token|token|password|client[_ -]?secret|secret)\s*[:=]\s*)(?:bearer\s+)?\S+",
         r"\1[redacted]",
         text,
     )
     text = re.sub(r"sk-[A-Za-z0-9_-]{6,}", "[redacted-api-key]", text)
+    text = re.sub(r"(?i)for more information check:\s*https?://\S+", "", text)
+    text = re.sub(r"https?://\S+", "[provider endpoint]", text, flags=re.IGNORECASE)
     return text
 
 

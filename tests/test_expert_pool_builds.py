@@ -67,6 +67,26 @@ def _completed_discovery(job_id: str) -> dict[str, Any]:
     }
 
 
+def test_public_build_sanitizes_legacy_prompt_parser_auth_errors() -> None:
+    public = ExpertPoolBuildManager._public(
+        {
+            "build_id": "legacy-build",
+            "status": "failed",
+            "error": (
+                "prompt_parse_failed:Client error '401 Authorization Required' for url "
+                "'https://api.deepseek.com/chat/completions' For more information check: "
+                "https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/401"
+            ),
+        }
+    )
+
+    message = str(public["error"])
+    assert "评审池构建模型配置" in message
+    assert "API Key" in message
+    assert "401" not in message
+    assert "api.deepseek.com" not in message
+
+
 def test_pool_build_registers_once_and_idempotent_replay_hides_secrets(tmp_path: Path) -> None:
     registry = ExpertPoolRegistry(tmp_path / "expert_review")
     starts: list[dict[str, Any]] = []

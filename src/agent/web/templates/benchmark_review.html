@@ -173,6 +173,46 @@
     </div>
   </header>
   <main>
+    <section class="stage developer-tools hidden" id="poolBuilderConfigPanel" aria-labelledby="poolBuilderConfigHeading">
+      <div class="stage-heading">
+        <span class="stage-number">00</span>
+        <h2 id="poolBuilderConfigHeading">0. 评审池构建模型配置（先配置一次）</h2>
+        <p>这套模型用于理解 Prompt、生成英文检索词，并在 agentic Discovery 中承担建池推理；它和下方的专家评审 Profile 分开配置。</p>
+      </div>
+      <p class="help">当前建池解析器使用 OpenAI-compatible 调用协议。选择自定义提供商时，请填写对应的 OpenAI-compatible Base URL。</p>
+      <div class="profile-grid">
+        <div class="field">
+          <label for="poolBuilderProviderInput">提供商</label>
+          <select id="poolBuilderProviderInput">
+            <option value="openai_compatible">OpenAI-compatible / 自定义</option>
+            <option value="openai">OpenAI</option>
+            <option value="google">Google（OpenAI-compatible endpoint）</option>
+            <option value="xai">xAI</option>
+            <option value="deepseek">DeepSeek</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="poolBuilderBaseUrlInput">Base URL</label>
+          <input id="poolBuilderBaseUrlInput" type="text" placeholder="https://api.openai.com/v1">
+        </div>
+        <div class="field">
+          <label for="poolBuilderModelInput">模型</label>
+          <input id="poolBuilderModelInput" type="text" placeholder="gpt-5 / deepseek-chat / grok">
+        </div>
+        <div class="field">
+          <label for="poolBuilderApiKeyInput">API Key</label>
+          <input id="poolBuilderApiKeyInput" type="password" autocomplete="off" placeholder="API Key 留空时保留现有值">
+        </div>
+        <div class="field">
+          <label for="poolBuilderTimeoutInput">Timeout 秒</label>
+          <input id="poolBuilderTimeoutInput" type="number" min="1" value="120">
+        </div>
+      </div>
+      <div class="profile-actions">
+        <button id="poolBuilderSaveButton" type="button" class="primary">保存建池模型配置</button>
+      </div>
+      <div class="status" id="poolBuilderConfigStatus" role="status" aria-live="polite">正在读取建池模型配置…</div>
+    </section>
     <section class="stage" aria-labelledby="workspaceHeading">
       <div class="stage-heading">
         <span class="stage-number">01</span>
@@ -492,6 +532,7 @@
     let lastJobStatuses = new Map();
     let poolBuildBusy = false;
     let poolBuildPollTimer = null;
+    let poolBuilderConfigBusy = false;
     const terminalPoolReloads = new Set();
 
     const byId = (id) => document.getElementById(id);
@@ -567,6 +608,85 @@
       }
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
       return payload;
+    }
+
+    function setPoolBuilderConfigStatus(message, kind = "info") {
+      const root = byId("poolBuilderConfigStatus");
+      root.textContent = message || "";
+      root.classList.toggle("error", kind === "error");
+      root.classList.toggle("success", kind === "success");
+    }
+
+    function setPoolBuilderConfigBusy(busy) {
+      poolBuilderConfigBusy = busy;
+      byId("poolBuilderSaveButton").disabled = busy;
+    }
+
+    function applyPoolBuilderConfig(payload, fallback = {}) {
+      const responseConfig = payload && payload.profile && typeof payload.profile === "object"
+        ? payload.profile
+        : payload && payload.config && typeof payload.config === "object"
+          ? payload.config
+          : payload || {};
+      const config = {
+        provider: String(responseConfig.provider || fallback.provider || "openai_compatible"),
+        base_url: String(responseConfig.base_url || fallback.base_url || ""),
+        model: String(responseConfig.model || fallback.model || ""),
+        timeout: Number(responseConfig.timeout || fallback.timeout || 120)
+      };
+      const supportedProviders = new Set(["openai_compatible", "openai", "google", "xai", "deepseek"]);
+      byId("poolBuilderProviderInput").value = supportedProviders.has(config.provider) ? config.provider : "openai_compatible";
+      byId("poolBuilderBaseUrlInput").value = config.base_url;
+      byId("poolBuilderModelInput").value = config.model;
+      byId("poolBuilderTimeoutInput").value = String(config.timeout > 0 ? config.timeout : 120);
+      byId("poolBuilderApiKeyInput").value = "";
+      const explicitlyUnconfigured = payload && (payload.configured === false || responseConfig.configured === false);
+      const configured = !explicitlyUnconfigured && Boolean(config.provider && config.model && (payload && payload.ok !== false));
+      if (configured) setPoolBuilderConfigStatus(`已配置：${config.provider} · ${config.model}`, "success");
+      else setPoolBuilderConfigStatus("尚未配置。请先填写并保存评审池构建模型配置。", "error");
+      return config;
+    }
+
+    async function loadPoolBuilderConfig() {
+      if (!isDevMode()) return;
+      setPoolBuilderConfigStatus("正在读取建池模型配置…");
+      try {
+        const payload = await apiRequest("/api/benchmark-review/build-llm-config");
+        if (!payload.ok) throw new Error(payload.error || "无法读取建池模型配置");
+        applyPoolBuilderConfig(payload);
+      } catch (error) {
+        setPoolBuilderConfigStatus(`读取建池模型配置失败：${error.message}`, "error");
+      }
+    }
+
+    async function savePoolBuilderConfig() {
+      if (poolBuilderConfigBusy) return;
+      const provider = byId("poolBuilderProviderInput").value || "openai_compatible";
+      const baseUrl = byId("poolBuilderBaseUrlInput").value.trim();
+      const model = byId("poolBuilderModelInput").value.trim();
+      const apiKey = byId("poolBuilderApiKeyInput").value.trim();
+      const timeout = Number(byId("poolBuilderTimeoutInput").value || 120);
+      if (!baseUrl || !model || !Number.isFinite(timeout) || timeout <= 0) {
+        setPoolBuilderConfigStatus("请填写 Base URL、模型和有效的 Timeout。", "error");
+        return;
+      }
+      const config = { provider, base_url: baseUrl, model, timeout };
+      if (apiKey) config.api_key = apiKey;
+      setPoolBuilderConfigBusy(true);
+      setPoolBuilderConfigStatus("正在保存建池模型配置…");
+      try {
+        const payload = await apiRequest("/api/benchmark-review/build-llm-config", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(config)
+        });
+        if (!payload.ok) throw new Error(payload.error || "保存失败");
+        applyPoolBuilderConfig(payload, config);
+      } catch (error) {
+        setPoolBuilderConfigStatus(`保存建池模型配置失败：${error.message}`, "error");
+      } finally {
+        setPoolBuilderConfigBusy(false);
+      }
     }
 
     function setReviewStatus(message, kind = "info", sticky = false) {
@@ -742,6 +862,7 @@
       const dev = isDevMode();
       document.querySelectorAll(".dev-only").forEach((element) => element.classList.toggle("hidden", !dev));
       byId("developerTools").classList.toggle("hidden", !dev);
+      byId("poolBuilderConfigPanel").classList.toggle("hidden", !dev);
       byId("poolBuildPanel").classList.toggle("hidden", !dev);
       byId("machineRail").classList.toggle("hidden", !dev || !currentCandidate());
       byId("impactPanel").classList.toggle("hidden", currentMode() !== "test" || !developerAllowed);
@@ -2180,7 +2301,7 @@
       if (activePoolId) await openServerPool(activePoolId, preferred);
       else if (pool) applyFilter(preferred, false);
       if (isDevMode()) {
-        await Promise.all([refreshProfiles(), refreshJobs()]);
+        await Promise.all([loadPoolBuilderConfig(), refreshProfiles(), refreshJobs()]);
       }
     });
 
@@ -2205,7 +2326,7 @@
       if (allowed && developerAllowed) {
         byId("modeBanner").textContent = "开发者令牌验证成功。请选择开发者或测试模式。";
         await refreshRegistry();
-        if (currentMode() !== "expert") await Promise.all([refreshProfiles(), refreshJobs()]);
+        if (currentMode() !== "expert") await Promise.all([loadPoolBuilderConfig(), refreshProfiles(), refreshJobs()]);
       }
     });
 
@@ -2227,6 +2348,7 @@
     byId("cancelJobButton").addEventListener("click", () => { void runJobAction("cancel"); });
     byId("resumeJobButton").addEventListener("click", () => { void runJobAction("resume"); });
     byId("retryJobButton").addEventListener("click", () => { void runJobAction("retry-failed"); });
+    byId("poolBuilderSaveButton").addEventListener("click", () => { void savePoolBuilderConfig(); });
     byId("startPoolBuildButton").addEventListener("click", () => { void startPoolBuild(); });
     byId("refreshPoolBuildsButton").addEventListener("click", () => { void refreshPoolBuilds(); });
     byId("poolBuildAction").addEventListener("change", () => {
@@ -2249,7 +2371,7 @@
     updateModeChrome();
     void (async () => {
       await refreshRegistry();
-      if (isDevMode()) await Promise.all([refreshProfiles(), refreshJobs(), refreshPoolBuilds()]);
+      if (isDevMode()) await Promise.all([loadPoolBuilderConfig(), refreshProfiles(), refreshJobs(), refreshPoolBuilds()]);
     })();
   </script>
 </body>

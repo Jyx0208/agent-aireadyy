@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agent.web import app as web_app
@@ -240,6 +241,67 @@ def test_pool_build_api_requires_only_prompt_and_defaults_to_review(tmp_path: Pa
     assert captured["idempotency_key"] == "request-1"
 
 
+def test_pool_build_llm_config_api_persists_separately_from_expert_profiles(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ENABLED", "1")
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", "1")
+    monkeypatch.setenv("AGENT_POOL_BUILD_LLM_CONFIG_PATH", str(tmp_path / "pool_builder_llm.json"))
+    monkeypatch.setenv("AGENT_LLM_CONFIG_PATH", str(tmp_path / "expert_profiles.json"))
+    client = TestClient(web_app.app)
+
+    saved = client.put(
+        "/api/benchmark-review/build-llm-config",
+        json={
+            "provider": "google",
+            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+            "model": "gemini-3-pro",
+            "api_key": "pool-builder-secret",
+            "timeout": "90",
+        },
+    ).json()
+
+    assert saved["ok"] is True
+    assert saved["configured"] is True
+    assert saved["profile"]["id"] == "pool-builder"
+    assert saved["profile"]["provider"] == "google"
+    assert saved["profile"]["model"] == "gemini-3-pro"
+    assert saved["profile"]["api_key_set"] is True
+    assert "api_key" not in saved["profile"]
+    assert web_app._llm_config_store().list_profiles(include_secrets=False) == []
+
+    loaded = client.get("/api/benchmark-review/build-llm-config").json()
+    assert loaded["ok"] is True
+    assert loaded["profile"]["model"] == "gemini-3-pro"
+    assert "api_key" not in loaded["profile"]
+
+    updated = client.put(
+        "/api/benchmark-review/build-llm-config",
+        json={
+            "provider": "google",
+            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+            "model": "gemini-3.1-pro",
+            "timeout": "120",
+        },
+    ).json()
+    assert updated["ok"] is True
+    assert updated["profile"]["model"] == "gemini-3.1-pro"
+    assert updated["profile"]["api_key_set"] is True
+
+    unsupported = client.put(
+        "/api/benchmark-review/build-llm-config",
+        json={
+            "provider": "anthropic",
+            "base_url": "https://api.anthropic.com",
+            "model": "claude-opus",
+            "api_key": "not-used",
+            "timeout": "120",
+        },
+    ).json()
+    assert unsupported == {
+        "ok": False,
+        "error": "pool_build_provider_requires_openai_compatible_protocol",
+    }
+
+
 def test_pool_build_api_propagates_scale_and_language_without_trusting_generator_identity(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AGENT_EXPERT_REVIEW_DIR", str(tmp_path / "expert_review"))
     monkeypatch.setenv("AGENT_EXPERT_REVIEW_ENABLED", "1")
@@ -272,6 +334,168 @@ def test_pool_build_api_propagates_scale_and_language_without_trusting_generator
     assert captured["discovery_request"]["output_language"] == "zh-CN"
     assert captured["discovery_request"]["scale_mode"] == "exhaustive"
     assert captured["review"] == {"output_language": "zh-CN", "scale_mode": "exhaustive"}
+
+
+def test_pool_build_prompt_preparation_uses_dedicated_builder_config(monkeypatch) -> None:
+    captured: dict = {}
+
+    class _Store:
+        def get_profile(self, profile_id: str, *, include_secrets: bool = False):
+            assert profile_id == "pool-builder"
+            assert include_secrets is True
+            return {
+                "id": "pool-builder",
+                "label": "Pool builder",
+                "api_key": "parser-secret",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+                "model": "gemini-3-pro",
+                "timeout": "90",
+                "provider": "google",
+                "requested_model_id": "gemini-3-pro",
+                "model_family": "gemini",
+                "endpoint_identity": "google:primary",
+                "identity_verification": "provider_attested",
+            }
+
+    def parse(payload: dict) -> dict:
+        captured.update(payload)
+        return {
+            "parser": "llm",
+            "fields": {"goal": "general", "query_terms": ["human DDA proteomics"]},
+            "warnings": [],
+            "reasoning": "parsed",
+        }
+
+    monkeypatch.setattr(web_app, "_pool_build_llm_config_store", lambda: _Store())
+    monkeypatch.setattr(web_app, "_run_discovery_goal_parse", parse)
+    prepared = web_app._prepare_expert_pool_discovery_request(
+        {
+            "prompt": "寻找人类 DDA 蛋白质组",
+            "output_language": "zh-CN",
+        }
+    )
+
+    assert captured["llm_config"]["model"] == "gemini-3-pro"
+    assert captured["llm_config"]["api_key"] == "parser-secret"
+    assert prepared["request"]["pool_builder_profile_id"] == "pool-builder"
+    assert prepared["request"]["_generation_contributors"][0]["model_family"] == "gemini"
+
+
+def test_pool_build_does_not_silently_use_general_default_llm(monkeypatch) -> None:
+    class _Store:
+        def get_profile(self, _profile_id: str, *, include_secrets: bool = False):
+            return None
+
+    monkeypatch.setattr(web_app, "_pool_build_llm_config_store", lambda: _Store())
+    monkeypatch.setattr(
+        web_app,
+        "_server_llm_config",
+        lambda: (_ for _ in ()).throw(AssertionError("general default must not be used")),
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        web_app._prepare_expert_pool_discovery_request(
+            {
+                "prompt": "寻找人类 DDA 蛋白质组",
+                "output_language": "zh-CN",
+                "llm_config": {
+                    "api_key": "forged-request-key",
+                    "base_url": "https://api.deepseek.com",
+                    "model": "deepseek-chat",
+                    "timeout": "120",
+                },
+            }
+        )
+
+    assert "评审池构建模型配置" in str(exc_info.value)
+
+
+def test_pool_build_strips_request_supplied_model_identity_and_credentials(monkeypatch) -> None:
+    class _Store:
+        def get_profile(self, _profile_id: str, *, include_secrets: bool = False):
+            return None
+
+    monkeypatch.setattr(web_app, "_pool_build_llm_config_store", lambda: _Store())
+    prepared = web_app._prepare_expert_pool_discovery_request(
+        {
+            "prompt": "Find human DDA proteomics projects",
+            "query_terms": ["human DDA proteomics"],
+            "llm_config": {
+                "api_key": "forged-request-key",
+                "base_url": "https://api.deepseek.com",
+                "model": "deepseek-chat",
+                "timeout": "120",
+            },
+            "_generation_contributors": [
+                {"model_family": "forged-family", "identity_verification": "verified"}
+            ],
+            "pool_builder_profile_id": "forged-profile",
+        }
+    )
+
+    request = prepared["request"]
+    assert prepared["parser"] == "deterministic_english_fallback"
+    assert "llm_config" not in request
+    assert "_generation_contributors" not in request
+    assert "pool_builder_profile_id" not in request
+
+
+def test_pool_build_strict_llm_config_never_borrows_global_api_key(monkeypatch) -> None:
+    monkeypatch.setattr(
+        web_app,
+        "_server_llm_config",
+        lambda: (_ for _ in ()).throw(AssertionError("global config must not be read")),
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        web_app._agentic_discovery_planner(
+            {
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+                "model": "gemini-3-pro",
+                "timeout": "120",
+            },
+            allow_server_default=False,
+        )
+
+    assert "API Key" in str(exc_info.value)
+
+
+def test_pool_build_parser_auth_failure_is_actionable_and_hides_raw_url(monkeypatch) -> None:
+    class _Store:
+        def get_profile(self, _profile_id: str, *, include_secrets: bool = False):
+            return {
+                "id": "deepseek-parser",
+                "api_key": "expired-key",
+                "base_url": "https://api.deepseek.com",
+                "model": "deepseek-chat",
+                "timeout": "90",
+                "provider": "deepseek",
+                "model_family": "deepseek",
+                "identity_verification": "unverified",
+            }
+
+    monkeypatch.setattr(web_app, "_pool_build_llm_config_store", lambda: _Store())
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_goal_parse",
+        lambda _payload: (_ for _ in ()).throw(
+            RuntimeError("Client error '401 Authorization Required' for url 'https://api.deepseek.com/chat/completions'")
+        ),
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        web_app._prepare_expert_pool_discovery_request(
+            {
+                "prompt": "寻找人类 DDA 蛋白质组",
+                "output_language": "zh-CN",
+            }
+        )
+
+    message = str(exc_info.value)
+    assert "评审池构建模型" in message
+    assert "API Key" in message
+    assert "401" not in message
+    assert "api.deepseek.com" not in message
 
 
 def test_pool_build_prompt_preparation_uses_english_terms_scale_preset_and_explicit_agentic_only(monkeypatch) -> None:

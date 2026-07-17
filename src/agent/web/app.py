@@ -1687,7 +1687,10 @@ def _run_discovery_goal_parse(body: dict[str, Any]) -> dict[str, Any]:
     if not prompt:
         raise ValueError("Please enter a discovery request.")
     llm_config = body.get("llm_config") if isinstance(body.get("llm_config"), dict) else {}
-    client = _discovery_llm_client(llm_config)
+    client = _discovery_llm_client(
+        llm_config,
+        allow_server_default=body.get("allow_server_default") is not False,
+    )
     if client is None:
         raise ValueError("No discovery LLM API key found. Fill API Configuration or set DEEPSEEK_API_KEY.")
     current = body.get("current") if isinstance(body.get("current"), dict) else {}
@@ -2596,7 +2599,10 @@ def _run_web_discovery(
         _report("Starting LLM agentic discovery planning.")
         try:
             web_llm_config = body.get("llm_config") if isinstance(body.get("llm_config"), dict) else {}
-            planner = _agentic_discovery_planner(web_llm_config)
+            planner = _agentic_discovery_planner(
+                web_llm_config,
+                allow_server_default=not bool(body.get("_require_explicit_llm_config")),
+            )
         except Exception as exc:
             planner = None
             agentic_fallback = {
@@ -4343,6 +4349,23 @@ def _llm_config_store() -> LLMConfigStore:
     return LLMConfigStore(os.getenv("AGENT_LLM_CONFIG_PATH") or ".agent_secrets/llm_config.json")
 
 
+_POOL_BUILD_LLM_PROFILE_ID = "pool-builder"
+_POOL_BUILD_LLM_PROVIDERS = {
+    "openai_compatible",
+    "openai",
+    "google",
+    "xai",
+    "deepseek",
+}
+
+
+def _pool_build_llm_config_store() -> LLMConfigStore:
+    return LLMConfigStore(
+        os.getenv("AGENT_POOL_BUILD_LLM_CONFIG_PATH")
+        or ".agent_secrets/pool_build_llm_config.json"
+    )
+
+
 def _server_llm_config() -> tuple[dict[str, str] | None, str]:
     saved = _llm_config_store().load()
     if saved is not None:
@@ -4448,7 +4471,19 @@ def _prompt_parser_generation_identity(llm_config: Any) -> dict[str, Any] | None
     if not explicit:
         saved, _source = _server_llm_config()
         raw = dict(saved or {})
-    config, _error = _build_llm_config(raw)
+    complete_explicit_config = explicit and all(
+        _clean_text(raw.get(field))
+        for field in ("api_key", "base_url", "model", "timeout")
+    )
+    if complete_explicit_config:
+        config = {
+            "api_key": _clean_text(raw.get("api_key")),
+            "base_url": _clean_text(raw.get("base_url")).rstrip("/"),
+            "model": _clean_text(raw.get("model")),
+            "timeout": _clean_text(raw.get("timeout")),
+        }
+    else:
+        config, _error = _build_llm_config(raw)
     if config is None:
         return None
     requested_model = _clean_text(raw.get("requested_model_id") or config.get("model"))
@@ -4468,6 +4503,68 @@ def _prompt_parser_generation_identity(llm_config: Any) -> dict[str, Any] | None
     }
 
 
+def _prompt_parser_failure_message(
+    exc: Exception,
+    *,
+    profile_id: str,
+    output_language: str,
+) -> str:
+    raw_message = _strip_ansi(exc)
+    status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+    normalized = raw_message.casefold()
+    authentication_failed = status_code in {401, 403} or any(
+        marker in normalized
+        for marker in (
+            "401",
+            "403",
+            "authorization required",
+            "unauthorized",
+            "authentication failed",
+            "invalid api key",
+        )
+    )
+    profile_label = profile_id or "default"
+    if authentication_failed:
+        if output_language == "zh-CN":
+            if profile_id == _POOL_BUILD_LLM_PROFILE_ID:
+                return (
+                    "评审池构建模型认证失败。"
+                    "请在“评审池构建模型配置”中更新 API Key，或更换提供商和模型后重试。"
+                )
+            return (
+                f'Prompt 解析模型 Profile“{profile_label}”认证失败。'
+                "请更新该 Profile 的 API Key，或选择另一个建池模型后重试。"
+            )
+        if profile_id == _POOL_BUILD_LLM_PROFILE_ID:
+            return (
+                "The review-pool builder model failed authentication. "
+                "Update its API Key or change provider/model in Review-pool Builder Model Configuration, then retry."
+            )
+        return (
+            f'Prompt parser Profile "{profile_label}" failed authentication. '
+            "Update its API Key or select another pool-building model and retry."
+        )
+
+    safe_detail = _redact_secrets(raw_message)
+    safe_detail = re.sub(r"https?://\S+", "[provider endpoint]", safe_detail, flags=re.IGNORECASE)
+    safe_detail = safe_detail[:300].strip()
+    if output_language == "zh-CN":
+        if profile_id == _POOL_BUILD_LLM_PROFILE_ID:
+            return (
+                "评审池构建模型调用失败。请检查“评审池构建模型配置”中的提供商、模型、"
+                f"Base URL 和网络设置后重试。{safe_detail}"
+            )
+        prefix = f'Prompt 解析模型 Profile“{profile_label}”调用失败。'
+        return f"{prefix}请检查该 Profile 的模型、Base URL 和网络配置后重试。{safe_detail}"
+    if profile_id == _POOL_BUILD_LLM_PROFILE_ID:
+        return (
+            "The review-pool builder model failed. Check its provider, model, Base URL, and network settings "
+            f"in Review-pool Builder Model Configuration, then retry. {safe_detail}"
+        )
+    prefix = f'Prompt parser Profile "{profile_label}" failed. '
+    return f"{prefix}Check its model, Base URL, and network settings, then retry. {safe_detail}"
+
+
 def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str, Any]:
     original = dict(payload)
     prompt = _clean_text(original.get("prompt"))
@@ -4479,24 +4576,47 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
         prompt=prompt,
         allow_auto=True,
     )
-    parser_current = {
+    selected_profile = _pool_build_llm_config_store().get_profile(
+        _POOL_BUILD_LLM_PROFILE_ID,
+        include_secrets=True,
+    )
+    parser_profile_id = _POOL_BUILD_LLM_PROFILE_ID if selected_profile else ""
+    parser_config = dict(selected_profile) if selected_profile else {}
+    untrusted_internal_fields = {
+        "llm_config",
+        "_generation_contributors",
+        "pool_builder_profile_id",
+        "_require_explicit_llm_config",
+    }
+    public_original = {
         key: value
         for key, value in original.items()
-        if key != "llm_config"
+        if key not in untrusted_internal_fields
+    }
+    parser_current = {
+        key: value
+        for key, value in public_original.items()
     }
     try:
         parsed = _run_discovery_goal_parse(
             {
                 "prompt": prompt,
                 "output_language": output_language,
-                "llm_config": original.get("llm_config") if isinstance(original.get("llm_config"), dict) else {},
+                "llm_config": parser_config,
+                "allow_server_default": False,
                 "current": parser_current,
             }
         )
-    except ValueError as exc:
+    except Exception as exc:
         no_llm = "No discovery LLM API key found" in str(exc)
         if not no_llm:
-            raise
+            raise ValueError(
+                _prompt_parser_failure_message(
+                    exc,
+                    profile_id=parser_profile_id,
+                    output_language=output_language,
+                )
+            ) from exc
         if is_immunopeptidomics_goal(prompt):
             parsed = {
                 "parser": "ontology_fallback",
@@ -4509,9 +4629,9 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
                     "scale_mode": _normalise_pool_build_scale("", prompt=prompt, allow_auto=False),
                 },
                 "warnings": [
-                    "未配置 Prompt 解析模型，已使用免疫肽领域降级解析。"
+                    "未配置评审池构建模型，已使用免疫肽领域降级解析。"
                     if output_language == "zh-CN"
-                    else "No Prompt parser model was configured; the immunopeptidomics ontology fallback was used."
+                    else "No review-pool builder model was configured; the immunopeptidomics ontology fallback was used."
                 ],
                 "reasoning": (
                     "根据已知免疫肽/HLA 语义生成英文仓库检索词。"
@@ -4521,9 +4641,9 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
             }
         elif _contains_cjk(prompt):
             raise ValueError(
-                "prompt_parse_failed:中文或其他非英文请求需要配置 Prompt 解析模型，以生成英文仓库检索词。"
+                "prompt_parse_failed:请先填写并保存“评审池构建模型配置”，以便把中文或其他非英文请求转换为英文仓库检索词。"
                 if output_language == "zh-CN"
-                else "prompt_parse_failed:A Prompt parser model is required to generate English repository terms for a non-English request."
+                else "prompt_parse_failed:Configure the review-pool builder model before converting a non-English request into English repository terms."
             ) from exc
         else:
             parsed = {
@@ -4536,9 +4656,9 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
                 },
                 "warnings": [],
                 "reasoning": (
-                    "未配置 Prompt 解析模型，已直接使用英文请求生成检索词。"
+                    "未配置评审池构建模型，已直接使用英文请求生成检索词。"
                     if output_language == "zh-CN"
-                    else "No Prompt parser model was configured; repository terms were derived from the English request."
+                    else "No review-pool builder model was configured; repository terms were derived from the English request."
                 ),
             }
 
@@ -4563,10 +4683,13 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
     if not query_terms:
         raise ValueError("prompt_parse_failed:no_english_query_terms")
 
-    request = {**parsed_fields, **original}
+    request = {**parsed_fields, **public_original}
+    if selected_profile:
+        request["pool_builder_profile_id"] = parser_profile_id
+        request["llm_config"] = parser_config
     parser_identity = None
     if str(parsed.get("parser") or "").casefold() == "llm":
-        parser_identity = _prompt_parser_generation_identity(original.get("llm_config"))
+        parser_identity = _prompt_parser_generation_identity(parser_config)
     request.update(
         {
             "prompt": prompt,
@@ -4574,6 +4697,7 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
             "scale_mode": scale_mode,
             "output_language": output_language,
             "agentic": _pool_build_explicit_bool(original.get("agentic")),
+            "_require_explicit_llm_config": True,
             "max_projects": _bounded_int(original.get("max_projects"), default=preset["max_projects"], minimum=1, maximum=300),
             "max_candidate_projects": _bounded_int(original.get("max_candidate_projects"), default=preset["max_candidate_projects"], minimum=1, maximum=1000),
             "max_files": _bounded_int(original.get("max_files"), default=preset["max_files"], minimum=1, maximum=10000),
@@ -4686,8 +4810,12 @@ def _load_impact_bundle(session: Mapping[str, Any]) -> tuple[dict[str, Any] | No
     return key_payload, runs
 
 
-def _build_llm_config(llm_config: dict[str, Any]) -> tuple[dict[str, str] | None, str | None]:
-    server_config, _ = _server_llm_config()
+def _build_llm_config(
+    llm_config: dict[str, Any],
+    *,
+    allow_server_default: bool = True,
+) -> tuple[dict[str, str] | None, str | None]:
+    server_config, _ = _server_llm_config() if allow_server_default else (None, "disabled")
     fallback = server_config or {}
     api_key = _clean_text(llm_config.get("api_key")) or fallback.get("api_key", "")
     if not api_key:
@@ -4705,8 +4833,17 @@ def _build_llm_config(llm_config: dict[str, Any]) -> tuple[dict[str, str] | None
     return {"api_key": api_key, "base_url": base_url.rstrip("/"), "model": model, "timeout": timeout}, None
 
 
-def _discovery_llm_client(llm_config: dict[str, Any]):
-    config, config_error = _build_llm_config(llm_config)
+def _discovery_llm_client(
+    llm_config: dict[str, Any],
+    *,
+    allow_server_default: bool = True,
+):
+    if not llm_config and not allow_server_default:
+        return None
+    config, config_error = _build_llm_config(
+        llm_config,
+        allow_server_default=allow_server_default,
+    )
     if config is not None:
         return OpenAICompatibleDiscoveryLLM(
             api_key=config["api_key"],
@@ -4719,8 +4856,17 @@ def _discovery_llm_client(llm_config: dict[str, Any]):
     return default_discovery_llm_client()
 
 
-def _agentic_discovery_planner(llm_config: dict[str, Any]) -> AgenticDiscoveryPlanner | None:
-    config, config_error = _build_llm_config(llm_config)
+def _agentic_discovery_planner(
+    llm_config: dict[str, Any],
+    *,
+    allow_server_default: bool = True,
+) -> AgenticDiscoveryPlanner | None:
+    if not llm_config and not allow_server_default:
+        return None
+    config, config_error = _build_llm_config(
+        llm_config,
+        allow_server_default=allow_server_default,
+    )
     if config is not None:
         return AgenticDiscoveryPlanner(
             OpenAICompatibleDiscoveryLLM(
@@ -5446,6 +5592,59 @@ async def retry_expert_judge_job(job_id: str, request: Request):
     if job is None:
         return {"ok": False, "error": "job_not_found"}
     return {"ok": True, "job": job}
+
+
+@app.get("/api/benchmark-review/build-llm-config")
+async def get_pool_build_llm_config(request: Request):
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    profile = _pool_build_llm_config_store().get_profile(
+        _POOL_BUILD_LLM_PROFILE_ID,
+        include_secrets=False,
+    )
+    return {
+        "ok": True,
+        "configured": profile is not None,
+        "profile": profile,
+    }
+
+
+@app.put("/api/benchmark-review/build-llm-config")
+async def save_pool_build_llm_config(body: dict[str, Any], request: Request):
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    payload = body.get("profile", body)
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "profile payload must be an object"}
+    model = _clean_text(payload.get("model"))
+    base_url = _clean_text(payload.get("base_url"))
+    provider = _clean_text(payload.get("provider") or "openai_compatible").casefold()
+    if provider not in _POOL_BUILD_LLM_PROVIDERS:
+        return {"ok": False, "error": "pool_build_provider_requires_openai_compatible_protocol"}
+    profile_payload = {
+        **payload,
+        "id": _POOL_BUILD_LLM_PROFILE_ID,
+        "label": "评审池构建模型",
+        "provider": provider,
+        "requested_model_id": model,
+        "model_family": _clean_text(payload.get("model_family") or model),
+        "endpoint_identity": _clean_text(payload.get("endpoint_identity") or base_url),
+        "routing_profile_id": _POOL_BUILD_LLM_PROFILE_ID,
+        "identity_verification": "unverified",
+        "enabled": False,
+    }
+    try:
+        profile = _pool_build_llm_config_store().upsert_profile(
+            profile_payload,
+            make_default=True,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "configured": True,
+        "profile": profile,
+    }
 
 
 @app.get("/api/benchmark-review/builds")
