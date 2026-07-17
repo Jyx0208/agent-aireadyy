@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import threading
 import uuid
@@ -26,11 +27,22 @@ _JOBS_LOCK = threading.RLock()
 _JOBS: dict[str, dict[str, Any]] = {}
 _RUNNING = 0
 _MAX_RUNNING = 2
+MAX_EXPERT_JOB_WORKERS = 8
 _WORKER_THREADS: dict[str, threading.Thread] = {}
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _normalise_job_workers(value: Any, *, default: int) -> int:
+    try:
+        workers = int(default if value is None else value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("workers_must_be_integer") from exc
+    if not 1 <= workers <= MAX_EXPERT_JOB_WORKERS:
+        raise ValueError(f"workers_out_of_range:1-{MAX_EXPERT_JOB_WORKERS}")
+    return workers
 
 
 def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
@@ -78,6 +90,7 @@ def _public_job(job: dict[str, Any], *, detail: bool = False) -> dict[str, Any]:
         "finished_at": job.get("finished_at"),
         "output_language": job.get("output_language") or "en",
         "scale_mode": job.get("scale_mode") or "auto",
+        "workers": int(job.get("workers") or 1),
         "output_reviewed_path": job.get("output_reviewed_path"),
         "log_tail": (job.get("logs") or [])[-20:],
     }
@@ -221,7 +234,7 @@ class ExpertJudgeJobManager:
             "created_at": _utc_now(),
             "started_at": None,
             "finished_at": None,
-            "workers": max(1, int(workers)),
+            "workers": _normalise_job_workers(workers, default=2),
             "output_reviewed_path": None,
             "api_key": secrets["api_key"],
             "timeout": secrets.get("timeout") or "120",
@@ -294,7 +307,7 @@ class ExpertJudgeJobManager:
             "created_at": _utc_now(),
             "started_at": None,
             "finished_at": None,
-            "workers": max(1, int(workers)),
+            "workers": _normalise_job_workers(workers, default=2),
             "output_language": "zh-CN" if str(output_language).casefold().startswith("zh") else "en",
             "scale_mode": normalized_scale,
             "output_reviewed_path": None,
@@ -354,7 +367,7 @@ class ExpertJudgeJobManager:
             _WORKER_THREADS.pop(job_id, None)
             return {"job_id": job_id, "pool_id": pool_id, "status": status}
 
-    def resume_job(self, job_id: str) -> dict[str, Any] | None:
+    def resume_job(self, job_id: str, *, workers: int | None = None) -> dict[str, Any] | None:
         with _JOBS_LOCK:
             job = _JOBS.get(job_id) or self._load_job(job_id)
             if job is None:
@@ -370,6 +383,9 @@ class ExpertJudgeJobManager:
                 return _public_job(job)
             for cid in pending:
                 job.setdefault("items", {})[cid] = "pending"
+            if workers is not None:
+                job["workers"] = _normalise_job_workers(workers, default=int(job.get("workers") or 2))
+            job["run_targets"] = pending
             job["failed_ids"] = []
             job["progress"]["failed"] = 0
             job["status"] = "queued"
@@ -382,7 +398,7 @@ class ExpertJudgeJobManager:
         self._kick()
         return _public_job(job)
 
-    def retry_failed(self, job_id: str) -> dict[str, Any] | None:
+    def retry_failed(self, job_id: str, *, workers: int | None = None) -> dict[str, Any] | None:
         with _JOBS_LOCK:
             job = _JOBS.get(job_id) or self._load_job(job_id)
             if job is None:
@@ -398,6 +414,9 @@ class ExpertJudgeJobManager:
                 return _public_job(job)
             for cid in failed_ids:
                 job.setdefault("items", {})[cid] = "pending"
+            if workers is not None:
+                job["workers"] = _normalise_job_workers(workers, default=int(job.get("workers") or 2))
+            job["run_targets"] = failed_ids
             job["failed_ids"] = []
             job["progress"]["failed"] = 0
             job["status"] = "queued"
@@ -471,6 +490,17 @@ class ExpertJudgeJobManager:
             if document is None:
                 self._finish(job_id, status="failed", error="pool_not_found")
                 return
+            run_targets = {str(candidate_id) for candidate_id in (job.get("run_targets") or []) if str(candidate_id)}
+            if run_targets:
+                document = {
+                    **document,
+                    "candidates": [
+                        candidate
+                        for candidate in (document.get("candidates") or [])
+                        if isinstance(candidate, Mapping)
+                        and str(candidate.get("candidate_id") or "") in run_targets
+                    ],
+                }
             progress_path = self._job_dir(pool_id) / f"{job_id}.progress.jsonl"
             existing = self._load_progress(progress_path)
             with _JOBS_LOCK:
@@ -622,10 +652,18 @@ class ExpertJudgeJobManager:
             with _JOBS_LOCK:
                 current = _JOBS.get(job_id) or {}
                 failed = int((current.get("progress") or {}).get("failed") or 0)
+                pending = sum(
+                    1 for status in (current.get("items") or {}).values() if status in {"pending", "running"}
+                )
+            issues = failed + pending
             self._finish(
                 job_id,
-                status="completed_with_errors" if failed else "completed",
-                error=f"{failed} candidate(s) failed" if failed else None,
+                status="completed_with_errors" if issues else "completed",
+                error=(
+                    f"{failed} candidate(s) failed; {pending} candidate(s) pending"
+                    if issues
+                    else None
+                ),
             )
         finally:
             with _JOBS_LOCK:
@@ -649,6 +687,7 @@ class ExpertJudgeJobManager:
         results = self._load_consensus_progress(progress_path)
         judgments = self._load_judgment_progress(judgment_path)
         judgment_lock = threading.Lock()
+        result_lock = threading.Lock()
         with _JOBS_LOCK:
             current = _JOBS.get(job_id)
             if current is None:
@@ -689,16 +728,22 @@ class ExpertJudgeJobManager:
             return judgment
 
         engine = ExpertConsensusEngine(checkpointed_runner)
-        for candidate in document.get("candidates") or []:
-            if not isinstance(candidate, Mapping):
-                continue
+        run_targets = {str(candidate_id) for candidate_id in (job.get("run_targets") or []) if str(candidate_id)}
+        candidates = [
+            candidate
+            for candidate in (document.get("candidates") or [])
+            if isinstance(candidate, Mapping)
+            and str(candidate.get("candidate_id") or "")
+            and str(candidate.get("candidate_id") or "") not in results
+            and (not run_targets or str(candidate.get("candidate_id") or "") in run_targets)
+        ]
+
+        def process_candidate(candidate: Mapping[str, Any]) -> None:
             candidate_id = str(candidate.get("candidate_id") or "")
-            if not candidate_id or candidate_id in results:
-                continue
             with _JOBS_LOCK:
                 current = _JOBS.get(job_id) or {}
                 if current.get("cancel_requested"):
-                    break
+                    return
             try:
                 with _JOBS_LOCK:
                     current = _JOBS.get(job_id)
@@ -706,15 +751,17 @@ class ExpertJudgeJobManager:
                         current.setdefault("items", {})[candidate_id] = "running"
                         self._persist_job(current)
                 result = engine.review_candidate(candidate, panel)
-                results[candidate_id] = result.model_dump(mode="json")
-                with progress_path.open("a", encoding="utf-8") as handle:
-                    handle.write(
-                        json.dumps(
-                            {"candidate_id": candidate_id, "result": results[candidate_id]},
-                            ensure_ascii=False,
+                payload = result.model_dump(mode="json")
+                with result_lock:
+                    results[candidate_id] = payload
+                    with progress_path.open("a", encoding="utf-8") as handle:
+                        handle.write(
+                            json.dumps(
+                                {"candidate_id": candidate_id, "result": payload},
+                                ensure_ascii=False,
+                            )
+                            + "\n"
                         )
-                        + "\n"
-                    )
                 with _JOBS_LOCK:
                     current = _JOBS.get(job_id)
                     if current is not None:
@@ -737,6 +784,16 @@ class ExpertJudgeJobManager:
                         self._append_log(current, "error", f"Consensus failed for {candidate_id}: {message}")
                         self._persist_job(current)
 
+        workers = min(_normalise_job_workers(job.get("workers"), default=1), max(1, len(candidates)))
+        if workers == 1:
+            for candidate in candidates:
+                process_candidate(candidate)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(process_candidate, candidate) for candidate in candidates]
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+
         if results:
             def merge_results(existing_doc: dict[str, Any]) -> dict[str, Any]:
                 return merge_model_expert_results(existing_doc, results, job_id=job_id)
@@ -754,13 +811,21 @@ class ExpertJudgeJobManager:
             current = _JOBS.get(job_id) or {}
             cancelled = bool(current.get("cancel_requested"))
             failed = int((current.get("progress") or {}).get("failed") or 0)
+            pending = sum(
+                1 for status in (current.get("items") or {}).values() if status in {"pending", "running"}
+            )
         if cancelled:
             self._finish(job_id, status="cancelled", error=None)
         else:
+            issues = failed + pending
             self._finish(
                 job_id,
-                status="completed_with_errors" if failed else "completed",
-                error=f"{failed} candidate(s) failed" if failed else None,
+                status="completed_with_errors" if issues else "completed",
+                error=(
+                    f"{failed} candidate(s) failed; {pending} candidate(s) pending"
+                    if issues
+                    else None
+                ),
             )
 
     def _snapshot_reviewed(self, pool_id: str, job_id: str, pool: dict[str, Any]) -> Path:
@@ -777,6 +842,7 @@ class ExpertJudgeJobManager:
             job["status"] = status
             job["finished_at"] = _utc_now()
             job["error"] = error
+            job.pop("run_targets", None)
             # strip secret before final persist public copy
             self._append_log(job, "info" if status in {"completed", "completed_with_errors"} else "error", f"Job {status}.")
             self._persist_job(job)

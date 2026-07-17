@@ -44,6 +44,11 @@ def test_benchmark_review_template_has_repair_contract_markers() -> None:
     assert "未回退到客户端副本" in html
     assert 'id="profileEditorSelect"' in html
     assert 'id="profileSelect"' in html
+    assert 'id="jobWorkersInput"' in html
+    assert 'id="poolBuildWorkers"' in html
+    assert 'workers: selectedJobWorkers()' in html
+    assert 'body: JSON.stringify({ workers: selectedJobWorkers() })' in html
+    assert 'workers: selectedPoolBuildWorkers()' in html
     assert "developer_allowed" in html
     assert 'id="poolBuildPanel"' in html
     assert 'id="poolBuildPrompt"' in html

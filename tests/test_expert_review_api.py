@@ -837,6 +837,26 @@ def test_delete_expert_job_api_requires_developer_and_reports_running_or_missing
     assert missing == {"ok": False, "error": "job_not_found"}
 
 
+def test_retry_expert_job_api_accepts_worker_override(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ENABLED", "1")
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", "1")
+    captured: dict[str, Any] = {}
+
+    class _Jobs:
+        def retry_failed(self, job_id: str, *, workers: int | None = None):
+            captured.update(job_id=job_id, workers=workers)
+            return {"job_id": job_id, "status": "queued", "workers": workers}
+
+    monkeypatch.setattr(web_app, "_expert_job_manager", lambda: _Jobs())
+    client = TestClient(web_app.app)
+
+    response = client.post("/api/expert-review/jobs/job-1/retry-failed", json={"workers": 6}).json()
+
+    assert response["ok"] is True
+    assert captured == {"job_id": "job-1", "workers": 6}
+    assert response["job"]["workers"] == 6
+
+
 def test_benchmark_template_has_developer_surfaces() -> None:
     html = Path("src/agent/web/templates/benchmark_review.html").read_text(encoding="utf-8")
     assert 'id="machineRail"' in html

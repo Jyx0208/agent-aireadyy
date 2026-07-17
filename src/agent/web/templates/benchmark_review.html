@@ -313,6 +313,10 @@
               <option value="build_only">仅构建评审池</option>
             </select>
           </div>
+          <div class="field">
+            <label for="poolBuildWorkers">模型评审并行数</label>
+            <input id="poolBuildWorkers" type="number" min="1" max="8" value="4">
+          </div>
           <button id="startPoolBuildButton" class="primary" type="button">构建并评审</button>
           <button id="refreshPoolBuildsButton" type="button">刷新构建状态</button>
         </div>
@@ -521,6 +525,10 @@
             <label for="profileSelect">用于本 Job 的专家 Profile</label>
             <select id="profileSelect"><option value="">加载中…</option></select>
           </div>
+          <div class="field">
+            <label for="jobWorkersInput">并行候选数</label>
+            <input id="jobWorkersInput" type="number" min="1" max="8" value="4">
+          </div>
           <label><input id="independentModel" type="checkbox"> 独立模型族（provisional_independent_model）</label>
           <button id="startJobButton" type="button" class="primary">启动 Agent 专家 Job</button>
         </div>
@@ -673,6 +681,16 @@
 
     function currentMode() { return reviewMode.value || "expert"; }
     function isDevMode() { return currentMode() !== "expert" && developerAllowed; }
+    function selectedWorkers(inputId) {
+      const input = byId(inputId);
+      const maximum = Math.max(1, Number(input.max || 8));
+      const parsed = Number(input.value || 4);
+      const workers = Math.min(maximum, Math.max(1, Number.isFinite(parsed) ? Math.floor(parsed) : 4));
+      input.value = String(workers);
+      return workers;
+    }
+    function selectedJobWorkers() { return selectedWorkers("jobWorkersInput"); }
+    function selectedPoolBuildWorkers() { return selectedWorkers("poolBuildWorkers"); }
     function isTerminalJob(status) { return terminalJobStatuses.has(String(status || "")); }
     function currentCandidate() {
       if (!pool || !visible.length || currentIndex < 0 || currentIndex >= visible.length) return null;
@@ -1588,6 +1606,13 @@
         const payload = await apiRequest("/api/expert-review/status");
         registryEnabled = Boolean(payload && payload.enabled !== false && payload.ok !== false);
         developerAllowed = Boolean(payload && payload.developer_allowed);
+        const maxWorkers = Number(payload && payload.max_job_workers || 8);
+        if (Number.isInteger(maxWorkers) && maxWorkers > 0) {
+          for (const inputId of ["jobWorkersInput", "poolBuildWorkers"]) {
+            byId(inputId).max = String(maxWorkers);
+            selectedWorkers(inputId);
+          }
+        }
         const requested = currentMode();
         if (requested !== "expert" && !developerAllowed) {
           reviewMode.value = "expert";
@@ -2444,7 +2469,7 @@
             output_language: outputLanguage,
             preset_id: "default/v1",
             idempotency_key: (window.crypto && window.crypto.randomUUID) ? window.crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
-            review: action === "build_and_review" ? { workers: 2 } : {}
+            review: action === "build_and_review" ? { workers: selectedPoolBuildWorkers() } : {}
           })
         });
         if (!payload.ok || !payload.build) throw new Error(payload.error || (zh ? "构建启动失败" : "Build failed to start"));
@@ -2537,7 +2562,7 @@
         row.setAttribute("aria-label", jobText(job, `任务 ${job.job_id}，状态 ${localizedJobStatus(job, job.status)}，进度 ${counts.done + counts.failed}/${counts.total}`, `Job ${job.job_id}, status ${localizedJobStatus(job, job.status)}, progress ${counts.done + counts.failed}/${counts.total}`));
         const title = document.createElement("div");
         title.className = "job-title";
-        title.textContent = `${job.job_id} · ${localizedJobStatus(job, job.status)} · ${job.model || job.profile_id || jobText(job, "自动异构专家组", "Automatic heterogeneous panel")}`;
+        title.textContent = `${job.job_id} · ${localizedJobStatus(job, job.status)} · ${job.model || job.profile_id || jobText(job, "自动异构专家组", "Automatic heterogeneous panel")} · ${jobText(job, "并行", "workers")} ${job.workers || 1}`;
         const bar = document.createElement("div");
         bar.className = "progress-bar";
         bar.setAttribute("role", "progressbar");
@@ -2578,7 +2603,7 @@
       }
       const counts = progressCounts(job);
       const summary = document.createElement("p");
-      summary.textContent = jobText(job, `状态：${localizedJobStatus(job, job.status)}；完成 ${counts.done}，失败 ${counts.failed}，总数 ${counts.total}。${job.error ? `错误：${job.error}` : ""}`, `Status: ${localizedJobStatus(job, job.status)}; done ${counts.done}, failed ${counts.failed}, total ${counts.total}.${job.error ? ` Error: ${job.error}` : ""}`);
+      summary.textContent = jobText(job, `状态：${localizedJobStatus(job, job.status)}；并行 ${job.workers || 1}；完成 ${counts.done}，失败 ${counts.failed}，总数 ${counts.total}。${job.error ? `错误：${job.error}` : ""}`, `Status: ${localizedJobStatus(job, job.status)}; workers ${job.workers || 1}; done ${counts.done}, failed ${counts.failed}, total ${counts.total}.${job.error ? ` Error: ${job.error}` : ""}`);
       detailRoot.appendChild(summary);
       const items = job.items && typeof job.items === "object" ? Object.entries(job.items) : [];
       if (items.length) {
@@ -2737,7 +2762,7 @@
             profile_id: profileId,
             independent_model: byId("independentModel").checked,
             mode: currentMode(),
-            workers: 2
+            workers: selectedJobWorkers()
           })
         });
         if (!payload.ok || !payload.job) throw new Error(payload.error || "启动失败");
@@ -2757,7 +2782,14 @@
       jobActionBusy = true;
       renderJobDetail(selectedJobDetail);
       try {
-        const payload = await apiRequest(`/api/expert-review/jobs/${encodeURIComponent(selectedJobId)}/${action}`, { method: "POST" });
+        const requestOptions = action === "cancel"
+          ? { method: "POST" }
+          : {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ workers: selectedJobWorkers() }),
+            };
+        const payload = await apiRequest(`/api/expert-review/jobs/${encodeURIComponent(selectedJobId)}/${action}`, requestOptions);
         if (!payload.ok) throw new Error(payload.error || "操作失败");
         renderJobDetail(payload.job || selectedJobDetail);
         setJobStatus(action === "cancel" ? "已提交取消请求。" : action === "resume" ? "已恢复未完成候选。" : "已提交失败项重试。" );

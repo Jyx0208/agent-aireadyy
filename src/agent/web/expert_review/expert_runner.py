@@ -5,7 +5,7 @@ import json
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from agent.models import JsonModel
 from agent.web.expert_review.consensus import (
@@ -15,7 +15,11 @@ from agent.web.expert_review.consensus import (
     InvestigationStatus,
     JudgmentConfidence,
 )
-from agent.web.expert_review.openai_judge import redact_text
+from agent.web.expert_review.openai_judge import (
+    parse_json_object_response,
+    redact_text,
+    validation_error_diagnostic,
+)
 from agent.web.expert_review.pool_registry import blind_candidate_view
 
 
@@ -102,26 +106,60 @@ class OpenAISdkExpertJudge:
 
     def __call__(self, system_prompt: str, user_prompt: str) -> Mapping[str, Any]:
         schema = ModelExpertAssessment.model_json_schema()
+        json_schema_enabled = True
+
         def call() -> Mapping[str, Any]:
-            response = self._client.chat.completions.create(
-                    model=self.model,
-                    temperature=0,
-                    messages=[
+            nonlocal json_schema_enabled
+            last_transport_error: Exception | None = None
+            modes = (True, False) if json_schema_enabled else (False,)
+            for use_json_schema in modes:
+                kwargs: dict[str, Any] = {
+                    "model": self.model,
+                    "temperature": 0,
+                    "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    response_format={
+                }
+                if use_json_schema:
+                    kwargs["response_format"] = {
                         "type": "json_schema",
                         "json_schema": {
                             "name": "model_expert_assessment",
                             "strict": True,
                             "schema": schema,
                         },
-                    },
-            )
-            self.resolved_model_id = str(getattr(response, "model", "") or "") or None
-            content = response.choices[0].message.content or "{}"
-            return ModelExpertAssessment.model_validate_json(content).model_dump(mode="json")
+                    }
+                try:
+                    response = self._client.chat.completions.create(**kwargs)
+                except json.JSONDecodeError as exc:
+                    last_transport_error = ValueError("judge_transport_invalid_json; stage=transport")
+                    if use_json_schema:
+                        json_schema_enabled = False
+                        continue
+                    raise last_transport_error from exc
+                except Exception as exc:
+                    text = str(exc).lower()
+                    unsupported_schema = use_json_schema and any(
+                        marker in text
+                        for marker in ("response_format", "json schema", "unsupported", "unknown parameter")
+                    )
+                    if unsupported_schema:
+                        json_schema_enabled = False
+                        last_transport_error = exc
+                        continue
+                    raise
+                self.resolved_model_id = str(getattr(response, "model", "") or "") or None
+                content = response.choices[0].message.content
+                payload = parse_json_object_response(content)
+                try:
+                    assessment = ModelExpertAssessment.model_validate(payload)
+                except ValidationError as exc:
+                    raise ValueError(validation_error_diagnostic(exc)) from exc
+                return assessment.model_dump(mode="json")
+            if last_transport_error is not None:
+                raise last_transport_error
+            raise ValueError("judge_transport_failed")
 
         return _retry_call(call)
 

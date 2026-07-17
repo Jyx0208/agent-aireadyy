@@ -5,10 +5,13 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from agent.web.expert_review.consensus import ExpertModelProfile
 from agent.web.expert_review.expert_runner import (
     AnthropicSdkExpertJudge,
     ModelExpertRunner,
+    OpenAISdkExpertJudge,
 )
 
 
@@ -60,6 +63,21 @@ class _AnthropicClient:
         self.messages = _AnthropicMessages()
 
 
+class _OpenAICompletions:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+    def create(self, **_kwargs):
+        message = type("Message", (), {"content": self.content})()
+        choice = type("Choice", (), {"message": message})()
+        return type("Response", (), {"choices": [choice], "model": "grok-4.5"})()
+
+
+class _OpenAIClient:
+    def __init__(self, content: str) -> None:
+        self.chat = type("Chat", (), {"completions": _OpenAICompletions(content)})()
+
+
 def test_anthropic_adapter_uses_official_streaming_adaptive_structured_output() -> None:
     client = _AnthropicClient()
     judge = AnthropicSdkExpertJudge(api_key="secret", client=client)
@@ -74,6 +92,73 @@ def test_anthropic_adapter_uses_official_streaming_adaptive_structured_output() 
     assert kwargs["messages"] == [{"role": "user", "content": "user"}]
     assert kwargs["system"] == "system"
     assert judge.resolved_model_id == "claude-opus-4-8-20260701"
+
+
+def test_openai_compatible_expert_accepts_fenced_json(monkeypatch) -> None:
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    client = _OpenAIClient(f"```json\n{_assessment_json()}\n```")
+    judge = OpenAISdkExpertJudge(
+        api_key="secret",
+        base_url="https://example.test/v1",
+        model="grok-4.5",
+        client=client,
+    )
+
+    payload = judge("system", "user")
+
+    assert payload["final_grade"] == 3
+    assert judge.resolved_model_id == "grok-4.5"
+
+
+def test_openai_compatible_expert_falls_back_after_schema_transport_failure() -> None:
+    class SchemaTransportFailureCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if "response_format" in kwargs:
+                raise json.JSONDecodeError("Expecting value", "", 0)
+            message = type("Message", (), {"content": _assessment_json()})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Response", (), {"choices": [choice], "model": "grok-4.5"})()
+
+    completions = SchemaTransportFailureCompletions()
+    client = type(
+        "SchemaFallbackClient",
+        (),
+        {"chat": type("Chat", (), {"completions": completions})()},
+    )()
+    judge = OpenAISdkExpertJudge(
+        api_key="secret",
+        base_url="https://proxy.example/v1",
+        model="grok-4.5",
+        client=client,
+    )
+
+    payload = judge("system", "user")
+
+    assert payload["final_grade"] == 3
+    assert len(completions.calls) == 2
+    assert "response_format" in completions.calls[0]
+    assert "response_format" not in completions.calls[1]
+
+
+def test_openai_compatible_expert_does_not_leak_invalid_response_values(monkeypatch) -> None:
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    content = '{"hard_gate_outcome": "PRIVATE_RAW_RESPONSE"}'
+    judge = OpenAISdkExpertJudge(
+        api_key="secret",
+        base_url="https://example.test/v1",
+        model="grok-4.5",
+        client=_OpenAIClient(content),
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        judge("system", "user")
+
+    assert "judge_response_schema_invalid" in str(error.value)
+    assert "PRIVATE_RAW_RESPONSE" not in str(error.value)
 
 
 def test_model_expert_runner_blinds_other_reviews_and_generator_identity() -> None:

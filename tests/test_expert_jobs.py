@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -19,19 +20,22 @@ class _FakeChoice:
 
 
 class _FakeCompletions:
+    def __init__(self, content: str | None = None) -> None:
+        self.content = content
+
     def create(self, **kwargs):  # noqa: ANN003
-        content = '{"grade": 2, "reason": "ok", "supporting_evidence": ["e"], "constraint_conflicts": []}'
+        content = self.content or '{"grade": 2, "reason": "ok", "supporting_evidence": ["e"], "constraint_conflicts": []}'
         return type("R", (), {"choices": [_FakeChoice(content)]})()
 
 
 class _FakeChat:
-    def __init__(self) -> None:
-        self.completions = _FakeCompletions()
+    def __init__(self, content: str | None = None) -> None:
+        self.completions = _FakeCompletions(content)
 
 
 class _FakeClient:
-    def __init__(self) -> None:
-        self.chat = _FakeChat()
+    def __init__(self, content: str | None = None) -> None:
+        self.chat = _FakeChat(content)
 
 
 def test_redact_text_hides_keys() -> None:
@@ -39,6 +43,8 @@ def test_redact_text_hides_keys() -> None:
     redacted = redact_text("Authorization: Bearer secret-token-value")
     assert "secret-token-value" not in redacted
     assert "Bearer ***" in redacted
+    json_redacted = redact_text('{"api_key":"SUPERSECRET"}')
+    assert "SUPERSECRET" not in json_redacted
 
 
 def test_openai_sdk_judge_parses_json() -> None:
@@ -50,6 +56,162 @@ def test_openai_sdk_judge_parses_json() -> None:
     )
     payload = judge("system", "user")
     assert payload["grade"] == 2
+
+
+def test_openai_sdk_judge_accepts_fenced_json() -> None:
+    content = """```json
+{"grade": 2, "reason": "ok", "supporting_evidence": ["e"], "constraint_conflicts": []}
+```"""
+    judge = OpenAISdkJudge(
+        api_key="k",
+        base_url="https://example.com/v1",
+        model="grok-4.5",
+        client=_FakeClient(content),
+    )
+
+    payload = judge("system", "user")
+
+    assert payload["grade"] == 2
+
+
+def test_openai_sdk_judge_reports_non_json_response_shape(monkeypatch) -> None:
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    judge = OpenAISdkJudge(
+        api_key="k",
+        base_url="https://example.com/v1",
+        model="grok-4.5",
+        client=_FakeClient("upstream proxy returned a non-JSON response"),
+    )
+
+    with pytest.raises(RuntimeError, match=r"judge_response_invalid_json; shape=text; length=43"):
+        judge("system", "user")
+
+
+def test_openai_sdk_judge_reports_empty_content(monkeypatch) -> None:
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    judge = OpenAISdkJudge(
+        api_key="k",
+        base_url="https://example.com/v1",
+        model="grok-4.5",
+        client=_FakeClient("   "),
+    )
+
+    with pytest.raises(RuntimeError, match="judge_response_empty"):
+        judge("system", "user")
+
+
+def test_openai_sdk_judge_distinguishes_transport_json_failure(monkeypatch) -> None:
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    class TransportFailureCompletions:
+        def create(self, **_kwargs):
+            raise json.JSONDecodeError("Expecting value", "", 0)
+
+    client = type(
+        "TransportFailureClient",
+        (),
+        {"chat": type("Chat", (), {"completions": TransportFailureCompletions()})()},
+    )()
+    judge = OpenAISdkJudge(
+        api_key="k",
+        base_url="https://proxy.example/v1",
+        model="grok-4.5",
+        client=client,
+    )
+
+    with pytest.raises(RuntimeError, match="judge_transport_invalid_json"):
+        judge("system", "user")
+
+
+def test_openai_sdk_judge_falls_back_when_json_mode_transport_is_invalid() -> None:
+    class JsonModeTransportFailureCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if "response_format" in kwargs:
+                raise json.JSONDecodeError("Expecting value", "", 0)
+            content = '{"grade": 2, "reason": "ok", "supporting_evidence": ["e"], "constraint_conflicts": []}'
+            return type("R", (), {"choices": [_FakeChoice(content)]})()
+
+    completions = JsonModeTransportFailureCompletions()
+    client = type(
+        "JsonModeFallbackClient",
+        (),
+        {"chat": type("Chat", (), {"completions": completions})()},
+    )()
+    judge = OpenAISdkJudge(
+        api_key="k",
+        base_url="https://proxy.example/v1",
+        model="grok-4.5",
+        client=client,
+    )
+
+    payload = judge("system", "user")
+
+    assert payload["grade"] == 2
+    assert len(completions.calls) == 2
+    assert "response_format" in completions.calls[0]
+    assert "response_format" not in completions.calls[1]
+
+
+def test_openai_sdk_judge_does_not_leak_invalid_response_values(monkeypatch) -> None:
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    content = '{"grade": "PRIVATE_RAW_RESPONSE"}'
+    judge = OpenAISdkJudge(
+        api_key="k",
+        base_url="https://example.com/v1",
+        model="grok-4.5",
+        client=_FakeClient(content),
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        judge("system", "user")
+
+    assert "judge_response_schema_invalid" in str(error.value)
+    assert "PRIVATE_RAW_RESPONSE" not in str(error.value)
+
+
+def test_openai_sdk_judge_rejects_multiple_json_objects(monkeypatch) -> None:
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    content = """Example:
+{"grade": 0, "reason": "example", "supporting_evidence": [], "constraint_conflicts": []}
+Final:
+{"grade": 3, "reason": "final", "supporting_evidence": ["e"], "constraint_conflicts": []}
+"""
+    judge = OpenAISdkJudge(
+        api_key="k",
+        base_url="https://example.com/v1",
+        model="grok-4.5",
+        client=_FakeClient(content),
+    )
+
+    with pytest.raises(RuntimeError, match="judge_response_ambiguous_json; objects=2"):
+        judge("system", "user")
+
+
+def test_job_manager_rejects_excessive_candidate_workers(tmp_path: Path) -> None:
+    reset_jobs_for_tests()
+    registry = ExpertPoolRegistry(tmp_path / "expert_review")
+    record = registry.import_pool(
+        {
+            "schema_version": "discovery-judgment-pool-blinded/v2",
+            "candidates": [{"candidate_id": "c1", "project_title": "Visible"}],
+        },
+        label="worker-limit",
+    )
+    manager = ExpertJudgeJobManager(
+        registry,
+        resolve_profile=lambda _profile_id: {
+            "api_key": "secret",
+            "base_url": "https://example.com/v1",
+            "model": "grok-4.5",
+        },
+    )
+
+    with pytest.raises(ValueError, match="workers_out_of_range:1-8"):
+        manager.start_job(pool_id=record["pool_id"], profile_id="grok", workers=9)
 
 
 def test_job_manager_runs_with_mock_judge(tmp_path: Path) -> None:
@@ -449,7 +611,7 @@ def test_consensus_retry_reuses_checkpointed_primary_judgments(tmp_path: Path) -
     assert failed is not None
     assert failed["status"] == "completed_with_errors"
 
-    manager.retry_failed(job["job_id"])
+    manager.retry_failed(job["job_id"], workers=4)
     deadline = time.time() + 10
     while time.time() < deadline:
         completed = manager.get_job(job["job_id"], detail=True)
@@ -458,4 +620,156 @@ def test_consensus_retry_reuses_checkpointed_primary_judgments(tmp_path: Path) -
         time.sleep(0.05)
     assert completed is not None
     assert completed["status"] == "completed"
+    assert completed["workers"] == 4
     assert calls == {"a": 1, "b": 1, "c": 2}
+
+
+def test_consensus_job_parallelises_candidates(tmp_path: Path) -> None:
+    reset_jobs_for_tests()
+    registry = ExpertPoolRegistry(tmp_path / "expert_review")
+    record = registry.import_pool(
+        {
+            "schema_version": "discovery-judgment-pool-blinded/v2",
+            "candidates": [
+                {"candidate_id": f"c{index}", "project_title": f"Visible {index}"}
+                for index in range(3)
+            ],
+        },
+        label="parallel-consensus",
+    )
+    profiles = [
+        {
+            "id": profile_id,
+            "provider": provider,
+            "requested_model_id": model,
+            "resolved_model_id": model,
+            "model_family": family,
+            "endpoint_identity": f"{provider}:primary",
+            "routing_profile_id": profile_id,
+            "identity_verification": "verified",
+            "enabled": True,
+        }
+        for profile_id, provider, family, model in (
+            ("a", "anthropic", "claude", "claude-opus-4-8"),
+            ("b", "google", "gemini", "gemini-3-pro"),
+            ("c", "xai", "grok", "grok-4.1"),
+        )
+    ]
+    active = 0
+    max_active = 0
+    active_lock = threading.Lock()
+
+    def run(profile: ExpertModelProfile, candidate: Mapping[str, Any]) -> ExpertJudgment:
+        nonlocal active, max_active
+        with active_lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.03)
+            return ExpertJudgment(
+                judgment_id=f"{candidate['candidate_id']}:{profile.profile_id}",
+                candidate_id=str(candidate["candidate_id"]),
+                profile=profile,
+                hard_gate_outcome="pass",
+                final_grade=2,
+                confidence="high",
+                investigation_status="completed",
+                summary="result",
+            )
+        finally:
+            with active_lock:
+                active -= 1
+
+    manager = ExpertJudgeJobManager(
+        registry,
+        resolve_profile=lambda _profile_id: {},
+        list_profiles=lambda: profiles,
+        expert_runner=run,
+        max_running=1,
+    )
+    job = manager.start_consensus_job(
+        pool_id=record["pool_id"],
+        generator_identity={"model_family": "gpt", "identity_verification": "verified"},
+        workers=3,
+    )
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        completed = manager.get_job(job["job_id"], detail=True)
+        if completed and completed["status"] == "completed":
+            break
+        time.sleep(0.05)
+
+    assert completed is not None
+    assert completed["status"] == "completed"
+    assert completed["workers"] == 3
+    assert max_active >= 2
+
+
+def test_retry_failed_does_not_run_cancelled_pending_candidates(tmp_path: Path) -> None:
+    reset_jobs_for_tests()
+    registry = ExpertPoolRegistry(tmp_path / "expert_review")
+    record = registry.import_pool(
+        {
+            "schema_version": "discovery-judgment-pool-blinded/v2",
+            "candidates": [
+                {"candidate_id": "failed", "project_title": "Failed"},
+                {"candidate_id": "pending", "project_title": "Pending"},
+                {"candidate_id": "done", "project_title": "Done"},
+            ],
+        },
+        label="retry-targets",
+    )
+    profile = {
+        "api_key": "secret",
+        "base_url": "https://example.com/v1",
+        "model": "grok-4.5",
+        "timeout": "120",
+    }
+    calls: list[str] = []
+
+    def judge_factory(**_kwargs):
+        def judge(_system_prompt: str, user_prompt: str) -> dict[str, Any]:
+            calls.append(str(json.loads(user_prompt)["candidate_id"]))
+            return {"grade": 2, "reason": "ok", "supporting_evidence": ["e"], "constraint_conflicts": []}
+
+        return judge
+
+    manager = ExpertJudgeJobManager(
+        registry,
+        resolve_profile=lambda _profile_id: profile,
+        judge_factory=judge_factory,
+        max_running=1,
+    )
+    manager._kick = lambda: None  # type: ignore[method-assign]
+    job = manager.start_job(pool_id=record["pool_id"], profile_id="grok", workers=2)
+    job_path = tmp_path / "expert_review" / record["pool_id"] / "jobs" / f"{job['job_id']}.json"
+    stored = json.loads(job_path.read_text(encoding="utf-8"))
+    stored.update(
+        status="cancelled",
+        items={"failed": "failed", "pending": "pending", "done": "done"},
+        failed_ids=["failed"],
+        progress={"total": 3, "done": 1, "failed": 1, "skipped_resume": 0},
+    )
+    job_path.write_text(json.dumps(stored), encoding="utf-8")
+    reset_jobs_for_tests()
+    manager = ExpertJudgeJobManager(
+        registry,
+        resolve_profile=lambda _profile_id: profile,
+        judge_factory=judge_factory,
+        max_running=1,
+    )
+
+    manager.retry_failed(job["job_id"], workers=2)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        completed = manager.get_job(job["job_id"], detail=True)
+        if completed and completed["status"] in {"completed", "completed_with_errors"}:
+            break
+        time.sleep(0.05)
+
+    assert completed is not None
+    assert completed["status"] == "completed_with_errors"
+    assert set(calls) == {"failed"}
+    assert completed["items"]["failed"] == "done"
+    assert completed["items"]["pending"] == "pending"

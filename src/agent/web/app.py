@@ -97,7 +97,7 @@ from agent.web.expert_review.grading import (
     queue_bucket,
 )
 from agent.web.expert_review.impact import compute_impact, load_json
-from agent.web.expert_review.jobs import ExpertJudgeJobManager, reset_jobs_for_tests
+from agent.web.expert_review.jobs import MAX_EXPERT_JOB_WORKERS, ExpertJudgeJobManager, reset_jobs_for_tests
 from agent.web.expert_review.build_projection import attach_review_progress
 from agent.web.expert_review.pool_builds import ExpertPoolBuildManager
 from agent.web.llm_config_store import LLMConfigStore
@@ -5212,6 +5212,7 @@ async def expert_review_status(request: Request):
         "ok": True,
         "enabled": expert_review_enabled(),
         "developer_allowed": _review_developer_allowed(request),
+        "max_job_workers": MAX_EXPERT_JOB_WORKERS,
     }
 
 
@@ -5586,24 +5587,34 @@ async def cancel_expert_judge_job(job_id: str, request: Request):
 
 
 @app.post("/api/expert-review/jobs/{job_id}/resume")
-async def resume_expert_judge_job(job_id: str, request: Request):
+async def resume_expert_judge_job(job_id: str, request: Request, body: dict[str, Any] | None = None):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
     if not _review_developer_allowed(request):
         return {"ok": False, "error": "developer_access_required"}
-    job = _expert_job_manager().resume_job(job_id)
+    try:
+        raw_workers = body.get("workers") if isinstance(body, dict) else None
+        workers = None if raw_workers is None or raw_workers == "" else raw_workers
+        job = _expert_job_manager().resume_job(job_id, workers=workers)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     if job is None:
         return {"ok": False, "error": "job_not_found"}
     return {"ok": True, "job": job}
 
 
 @app.post("/api/expert-review/jobs/{job_id}/retry-failed")
-async def retry_expert_judge_job(job_id: str, request: Request):
+async def retry_expert_judge_job(job_id: str, request: Request, body: dict[str, Any] | None = None):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
     if not _review_developer_allowed(request):
         return {"ok": False, "error": "developer_access_required"}
-    job = _expert_job_manager().retry_failed(job_id)
+    try:
+        raw_workers = body.get("workers") if isinstance(body, dict) else None
+        workers = None if raw_workers is None or raw_workers == "" else raw_workers
+        job = _expert_job_manager().retry_failed(job_id, workers=workers)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     if job is None:
         return {"ok": False, "error": "job_not_found"}
     return {"ok": True, "job": job}
