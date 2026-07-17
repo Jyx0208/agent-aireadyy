@@ -219,6 +219,15 @@ class ExpertPoolBuildManager:
                     "discovery_round": 0,
                     "max_discovery_rounds": None,
                     "candidate_count": 0,
+                    "project_judgments": {
+                        "evidence_stage": "search",
+                        "assessed_projects": 0,
+                        "qualified_projects": 0,
+                        "qualified_target": _nonnegative_int(discovery_request.get("max_projects")),
+                        "investigate_projects": 0,
+                        "rejected_projects": 0,
+                        "grade_counts": {"0": 0, "1": 0, "2": 0, "3": 0, "unknown": 0},
+                    },
                     "stop_reason": None,
                     "search_stop_reason": None,
                 },
@@ -999,6 +1008,8 @@ class ExpertPoolBuildManager:
         search_round = _nonnegative_int(previous.get("search_round"))
         discovery_round = _nonnegative_int(previous.get("discovery_round"))
         candidate_count = _nonnegative_int(previous.get("candidate_count"))
+        project_judgments = previous.get("project_judgments")
+        project_judgments = dict(project_judgments) if isinstance(project_judgments, Mapping) else {}
         current_event = str(previous.get("current_event") or "").strip() or None
         stop_reason = str(agent.get("stop_reason") or previous.get("stop_reason") or "").strip() or None
         search_stop_reason = str(
@@ -1019,6 +1030,10 @@ class ExpertPoolBuildManager:
                 observation = payload.get("observation")
                 observation = observation if isinstance(observation, Mapping) else {}
                 candidate_count = max(candidate_count, _nonnegative_int(observation.get("candidate_count")))
+            if event_type == "project_judgments_recorded":
+                judgment_summary = payload.get("project_judgment_summary")
+                if isinstance(judgment_summary, Mapping):
+                    project_judgments = dict(judgment_summary)
             round_index = payload.get("round_index")
             if round_index is None:
                 observation = payload.get("observation")
@@ -1044,6 +1059,19 @@ class ExpertPoolBuildManager:
         budget = agent.get("budget")
         budget = budget if isinstance(budget, Mapping) else {}
         max_rounds = _nonnegative_int(budget.get("max_discovery_rounds")) or None
+        agent_judgments = agent.get("project_judgment_summary")
+        if isinstance(agent_judgments, Mapping):
+            project_judgments = dict(agent_judgments)
+        if not project_judgments:
+            project_judgments = {
+                "evidence_stage": "search",
+                "assessed_projects": 0,
+                "qualified_projects": 0,
+                "qualified_target": _nonnegative_int(request.get("max_projects")),
+                "investigate_projects": 0,
+                "rejected_projects": 0,
+                "grade_counts": {"0": 0, "1": 0, "2": 0, "3": 0, "unknown": 0},
+            }
 
         status = str(agent.get("status") or discovery.get("status") or previous.get("status") or "").strip() or None
         if status == "failed" and stop_reason is None:
@@ -1061,6 +1089,7 @@ class ExpertPoolBuildManager:
                     "candidate_search_completed": "planning",
                     "candidate_inspection_started": "inspecting",
                     "candidate_inspection_completed": "evaluating",
+                    "project_judgments_recorded": "evaluating",
                     "round_value_evaluated": "evaluating",
                     "manifest_selected": "finalizing",
                     "dynamic_search_stopped": "evaluating",
@@ -1074,6 +1103,7 @@ class ExpertPoolBuildManager:
             "discovery_round": discovery_round,
             "max_discovery_rounds": max_rounds,
             "candidate_count": candidate_count,
+            "project_judgments": project_judgments,
             "current_event": current_event,
             "stop_reason": stop_reason,
             "search_stop_reason": search_stop_reason,

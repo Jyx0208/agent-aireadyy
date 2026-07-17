@@ -163,6 +163,38 @@ def test_search_state_accumulates_new_candidates_across_actions(tmp_path: Path) 
     assert restored.candidate_accessions == ["PXD000001", "PXD000002"]
 
 
+def test_candidate_pool_retains_the_request_scale_instead_of_a_fixed_300(tmp_path: Path) -> None:
+    projects = [
+        _project(f"PXD{index:06d}", f"Human sensory neuron project {index}")
+        for index in range(1, 351)
+    ]
+    request = _request().model_copy(update={"max_candidate_projects": 400})
+    search_results = {
+        f"seed-{chunk}": projects[chunk * 100 : (chunk + 1) * 100]
+        for chunk in range(4)
+    }
+    environment = PrideDiscoverySearchEnvironment(
+        request=request,
+        prompt="Find as many relevant human sensory neuron projects as possible.",
+        client=_FakePrideClient(search_results),
+        state_path=tmp_path / "candidate_state.json",
+    )
+
+    observation = environment.search(
+        CandidateSearchAction(
+            queries=[
+                RepositoryQuery(query=f"seed-{chunk}", depth=100)
+                for chunk in range(4)
+            ],
+            candidate_limit=400,
+            rationale="Exercise the configured candidate-pool scale.",
+        )
+    )
+
+    assert observation.candidate_count == 350
+    assert len(environment.candidate_accessions) == 350
+
+
 def test_inspection_only_fetches_agent_selected_candidates(tmp_path: Path) -> None:
     first = _project("PXD000001", "Human sensory neuron chemotherapy neuropathy")
     second = _project("PXD000002", "Human neuron proteomics")

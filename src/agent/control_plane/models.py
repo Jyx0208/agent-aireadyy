@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
+from agent.discovery.project_judgment import ProjectJudgmentInput
 from agent.models import JsonModel
 
 
@@ -39,8 +40,18 @@ def minimum_high_relevance_inspections(
     return min(
         int(high_relevance_candidate_count),
         max(1, int(max_projects) * 2),
-        10,
     )
+
+
+def recommended_inspection_rounds(
+    target_projects: int,
+    *,
+    batch_size: int = 25,
+    max_rounds: int = 8,
+) -> int:
+    target = max(1, int(target_projects))
+    batch = max(1, int(batch_size))
+    return min(max(1, int(max_rounds)), (target + batch - 1) // batch)
 
 
 class AgentBudget(JsonModel):
@@ -255,6 +266,9 @@ class AgentRunRecord(JsonModel):
     search_stopped: bool = False
     search_stop_reason: str | None = None
     latest_metrics: RoundMetrics | None = None
+    project_judgments: dict[str, ProjectJudgmentInput] = Field(default_factory=dict)
+    qualified_project_count: int = Field(default=0, ge=0)
+    qualified_no_gain_count: int = Field(default=0, ge=0)
     consecutive_zero_yield: int = 0
     search_recovery_required: bool = False
     search_recovery_attempts: int = 0

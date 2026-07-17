@@ -54,7 +54,7 @@ class RepositoryQuery(JsonModel):
 
 class CandidateSearchAction(JsonModel):
     queries: list[RepositoryQuery] = Field(min_length=1, max_length=40)
-    candidate_limit: int = Field(default=50, ge=1, le=300)
+    candidate_limit: int = Field(default=50, ge=1, le=1000)
     rationale: str = Field(min_length=1, max_length=2000)
 
     @model_validator(mode="after")
@@ -273,8 +273,12 @@ class PrideDiscoverySearchEnvironment:
             )
 
         ranked = self._ranked_records()
-        if len(ranked) > 300:
-            retained = {accession for accession, _record, _preview in ranked[:300]}
+        retention_limit = max(1, int(self.request.max_candidate_projects))
+        if len(ranked) > retention_limit:
+            retained = {
+                accession
+                for accession, _record, _preview in ranked[:retention_limit]
+            }
             self._records = {
                 accession: record
                 for accession, record in self._records.items()
@@ -288,7 +292,7 @@ class PrideDiscoverySearchEnvironment:
                     if accession in retained
                 },
             )
-            ranked = ranked[:300]
+            ranked = ranked[:retention_limit]
         self._search_counter += 1
         self._latest_search_id = f"search_{self._search_counter:04d}"
         previews = [preview for _accession, _record, preview in ranked[: action.candidate_limit]]

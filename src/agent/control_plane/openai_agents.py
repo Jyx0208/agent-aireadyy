@@ -36,6 +36,7 @@ from agent.control_plane.sdk_runtime import (
 )
 from agent.discovery.memory import DiscoveryMemory
 from agent.discovery.models import DatasetManifest, DatasetRequest
+from agent.discovery.project_judgment import ProjectJudgmentInput, summarize_project_judgments
 from agent.discovery.query_builder import build_pride_queries
 from agent.discovery.search_environment import (
     CandidateInspectionAction,
@@ -157,6 +158,23 @@ def inspect_repository_candidates(
     """
     wrapper.context.raise_if_cancelled()
     return wrapper.context.service.inspect_repository_candidates(action).model_dump_json()
+
+
+def submit_project_judgments(
+    wrapper: RunContextWrapper[DiscoveryAgentContext],
+    judgments: list[ProjectJudgmentInput],
+) -> str:
+    """Persist the Agent's latest 0-3 judgment for each candidate project.
+
+    Args:
+        judgments: Latest project judgments. Search evidence may only produce provisional or
+            investigation results; inspection evidence is required for an evidence-backed include.
+    """
+    wrapper.context.raise_if_cancelled()
+    return json.dumps(
+        wrapper.context.service.record_project_judgments(judgments),
+        ensure_ascii=False,
+    )
 
 
 def get_discovery_state(wrapper: RunContextWrapper[DiscoveryAgentContext]) -> str:
@@ -298,6 +316,7 @@ def run_openai_agents_discovery(
                 sdk["function_tool"](request_search_budget),
                 sdk["function_tool"](search_repository_candidates_with_grant),
                 sdk["function_tool"](inspect_repository_candidates),
+                sdk["function_tool"](submit_project_judgments),
                 sdk["function_tool"](get_discovery_state),
                 sdk["function_tool"](select_discovery_manifest),
             ]
@@ -310,6 +329,7 @@ def run_openai_agents_discovery(
             tools = [
                 sdk["function_tool"](search_repository_candidates),
                 sdk["function_tool"](inspect_repository_candidates),
+                sdk["function_tool"](submit_project_judgments),
                 sdk["function_tool"](get_discovery_state),
                 sdk["function_tool"](select_discovery_manifest),
             ]
@@ -735,11 +755,23 @@ def _quality_first_discovery_instructions(
         + budget_protocol
         + "Capabilities: candidate search observations report query-level yield, duplicates, compact "
         "previews, matched intent terms, semantic coverage, and unresolved terms. "
+        f"For candidate_limit, request enough previews to cover the {request.max_projects} project "
+        f"target, without exceeding the configured {request.max_candidate_projects} candidate-pool ceiling. "
+        "Candidate preview project_score/confidence fields are legacy retrieval heuristics used only "
+        "to order inspection work; never copy or mechanically map them into the 0-3 project judgment. "
         "inspect_repository_candidates accepts only accessions from the latest persisted search and "
         "returns a validated manifest observation with per-project assessments. "
         "The inspection observation reports inspected_candidate_count, "
         "minimum_high_relevance_inspections, and selection_ready. When selection_ready is false, "
         "inspect another relevance-coherent batch from the persisted search before finalizing. "
+        "After every candidate search, call submit_project_judgments for the promising previews. "
+        "Search-only evidence may assign a provisional 0-3 estimate, but weak evidence must use a "
+        "null grade, low confidence, and investigate with explicit missing_information instead of "
+        "forcing a low score. After project/file/SDRF inspection, call submit_project_judgments again "
+        "for the same accessions so the inspection judgment replaces the provisional judgment. "
+        "Keep hard_gate, grade, and confidence separate. Grade 0 means clearly unsuitable, grade 1 "
+        "means weakly relevant, grade 2 means usable with limitations, and grade 3 means highly suitable. "
+        "Only inspection-stage, evidence_backed, hard_gate pass projects graded 2 or 3 may be included. "
         "select_discovery_manifest finalizes round_index=0 for the merged pool or a positive "
         "inspection round and can retain only explicitly chosen inspected project_accessions. "
         "Search strategy: use precise phrases or distinctive biological concepts when they improve "
@@ -752,13 +784,17 @@ def _quality_first_discovery_instructions(
         "off-topic candidate pool. Inspect small relevance-coherent batches, compare the returned "
         "project assessments, and exclude projects whose species, labeling, acquisition, evidence, "
         "or semantic match conflicts with the goal. "
-        "Stopping: finalize when semantic coverage and inspected evidence are sufficient. Stop after "
-        "repeated no-gain actions or hard-limit exhaustion. Continue when an unresolved high-value gap "
-        "has a novel, evidence-backed strategy. "
+        "Stopping: use get_discovery_state and the qualified project count. Continue searching or "
+        "inspecting while the qualified project target has not been reached and a materially different "
+        "strategy remains within the safety budget. Finalize when the target is reached, repeated actions "
+        "add no qualified projects, or a hard limit is exhausted. Portfolio quantity language such as "
+        "'as many as possible' applies to the final set's qualified project count; never lower one valid "
+        "project's grade merely because that project has few files or samples. "
         "Hard boundaries: preserve every field listed in hard_constraint_fields and the task type. "
         "Fields marked default or absent are unresolved assumptions rather than user constraints; use "
         "the prompt and repository evidence to explore them, and report remaining uncertainty. Never "
-        "fabricate evidence or labels. Downloads, "
+        "fabricate evidence or labels. Write judgment explanations and public summaries in the same "
+        "language as the user's goal, while keeping repository query terms in English. Downloads, "
         "shell commands, downstream workflows, and training are outside this run. "
         f"Task type: {task_type or 'not specified'}. "
         f"Hard constraint fields: {json.dumps(request.hard_constraint_fields, ensure_ascii=False)}. "
@@ -851,6 +887,10 @@ def _write_run_outputs(
         **selected_files,
     }
     budget_audit = _budget_audit(store, run)
+    project_judgment_summary = summarize_project_judgments(
+        run.project_judgments,
+        target_project_count=int((run.request or {}).get("max_projects") or 1),
+    )
     summary = {
         "schema_version": "openai-agents-discovery/v2",
         "status": run.status,
@@ -867,6 +907,12 @@ def _write_run_outputs(
         "dynamic_limits": run.dynamic_limits.model_dump(mode="json"),
         "dynamic_usage": run.dynamic_usage.model_dump(mode="json"),
         "latest_metrics": run.latest_metrics.model_dump(mode="json") if run.latest_metrics else None,
+        "project_judgment_summary": project_judgment_summary,
+        "project_judgments": {
+            accession: judgment.model_dump(mode="json")
+            for accession, judgment in run.project_judgments.items()
+        },
+        "qualified_no_gain_count": run.qualified_no_gain_count,
         "budget_audit": budget_audit,
         "tool_call_count": run.tool_call_count,
         "discovery_round_count": run.discovery_round_count,

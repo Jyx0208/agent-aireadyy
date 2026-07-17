@@ -578,6 +578,49 @@ def test_pool_build_exposes_pre_sdk_failure_stop_reason() -> None:
     assert execution["stop_reason"] == "openai_agents_sdk_unavailable"
 
 
+def test_pool_build_projects_the_latest_project_judgment_summary() -> None:
+    execution = ExpertPoolBuildManager._discovery_execution(
+        {"discovery_request": {"runtime": "openai_agents", "max_projects": 20}},
+        {
+            "status": "running",
+            "logs": [
+                {
+                    "type": "project_judgments_recorded",
+                    "payload": {
+                        "project_judgment_summary": {
+                            "evidence_stage": "search",
+                            "assessed_projects": 1,
+                            "qualified_projects": 0,
+                            "qualified_target": 20,
+                            "investigate_projects": 1,
+                            "rejected_projects": 0,
+                            "grade_counts": {"0": 0, "1": 0, "2": 0, "3": 0, "unknown": 1},
+                        }
+                    },
+                },
+                {
+                    "type": "project_judgments_recorded",
+                    "payload": {
+                        "project_judgment_summary": {
+                            "evidence_stage": "inspection",
+                            "assessed_projects": 1,
+                            "qualified_projects": 1,
+                            "qualified_target": 20,
+                            "investigate_projects": 0,
+                            "rejected_projects": 0,
+                            "grade_counts": {"0": 0, "1": 0, "2": 1, "3": 0, "unknown": 0},
+                        }
+                    },
+                },
+            ],
+        },
+    )
+
+    assert execution["project_judgments"]["evidence_stage"] == "inspection"
+    assert execution["project_judgments"]["qualified_projects"] == 1
+    assert execution["project_judgments"]["grade_counts"]["2"] == 1
+
+
 def test_agentic_workflow_generator_identity_remains_unverified() -> None:
     identity = ExpertPoolBuildManager._candidate_generation_identity(
         {

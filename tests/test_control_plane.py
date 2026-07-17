@@ -19,10 +19,12 @@ from agent.control_plane.models import (
     DynamicBudgetLimits,
     OpenAIAgentsDiscoveryResult,
     SearchProposalInput,
+    recommended_inspection_rounds,
 )
 from agent.control_plane.policy import evaluate_tool_policy
 from agent.control_plane.store import AgentRunStore, tool_idempotency_key
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
+from agent.discovery.project_judgment import ProjectJudgmentInput
 from agent.discovery.search_environment import (
     CandidateInspectionAction,
     CandidateInspectionResult,
@@ -43,6 +45,26 @@ def _run(run_id: str = "run_001") -> AgentRunRecord:
             max_discovery_rounds=3,
             max_expensive_actions=1,
         ),
+    )
+
+
+def _inspection_judgment(
+    accession: str,
+    *,
+    grade: int,
+    include: bool,
+) -> ProjectJudgmentInput:
+    return ProjectJudgmentInput(
+        project_accession=accession,
+        grade=grade,
+        status="evidence_backed" if include or grade > 0 else "rejected",
+        hard_gate="pass" if grade > 0 else "fail",
+        confidence=0.9,
+        decision="include" if include else "exclude",
+        next_action="include_in_manifest" if include else "exclude_project",
+        explanation="Inspection evidence supports this project-level decision.",
+        target_file_count=1,
+        evidence_stage="inspection",
     )
 
 
@@ -72,6 +94,12 @@ def test_model_usage_is_persisted_and_accumulated(tmp_path: Path):
     persisted = store.load_run("model_usage")
     assert persisted is not None
     assert persisted.model_total_tokens == 250
+
+
+def test_inspection_round_budget_scales_with_the_project_target() -> None:
+    assert recommended_inspection_rounds(20) == 1
+    assert recommended_inspection_rounds(75) == 3
+    assert recommended_inspection_rounds(200) == 8
 
 
 def _dynamic_discovery_service(
@@ -242,7 +270,6 @@ def test_quality_first_search_and_inspection_are_separate_control_plane_actions(
             rationale="The preview covers the cell model.",
         )
     )
-
     persisted = store.load_run(run.run_id)
     assert persisted is not None
     assert search.semantic_coverage == 0.5
@@ -287,6 +314,15 @@ def test_agent_can_filter_inspected_projects_during_final_selection(tmp_path: Pa
             rationale="Inspect both candidates before retaining only relevant evidence.",
         )
     )
+    service.record_project_judgments(
+        [
+            _inspection_judgment("PXD_GOOD", grade=3, include=True),
+            _inspection_judgment("PXD_OFFTOPIC", grade=0, include=False),
+        ]
+    )
+    persisted = store.load_run(run.run_id)
+    assert persisted is not None
+    store.save_run(persisted.model_copy(update={"search_stopped": True}))
 
     selection = service.select_discovery_manifest(
         1,
@@ -340,7 +376,12 @@ def test_candidate_pool_preserves_agent_choices_until_final_selection(tmp_path: 
     assert persisted_run is not None
     pool_path = Path(persisted_run.candidate_pool_manifest_path or "")
     pool = DatasetManifest.model_validate_json(pool_path.read_text(encoding="utf-8"))
-    premature = service.select_discovery_manifest(0, "Let deterministic ranking decide.", [])
+    service.record_project_judgments(
+        [
+            _inspection_judgment("PXD_HIGH_SCORE", grade=1, include=False),
+            _inspection_judgment("PXD_AGENT_CHOICE", grade=3, include=True),
+        ]
+    )
     selected = service.select_discovery_manifest(
         0,
         "The second project is more relevant to the visible request.",
@@ -351,10 +392,6 @@ def test_candidate_pool_preserves_agent_choices_until_final_selection(tmp_path: 
         "PXD_HIGH_SCORE",
         "PXD_AGENT_CHOICE",
     }
-    assert premature["status"] == "blocked"
-    assert premature["blockers"] == [
-        "explicit_project_selection_required_for_candidate_pool"
-    ]
     assert selected["selected_project_accessions"] == ["PXD_AGENT_CHOICE"]
 
 
@@ -415,6 +452,14 @@ def test_selection_waits_for_minimum_high_relevance_inspection_coverage(tmp_path
     )
     assert second_inspection.inspected_candidate_count == 4
     assert second_inspection.selection_ready is True
+    service.record_project_judgments(
+        [
+            _inspection_judgment("PXD_FIRST", grade=3, include=True),
+            _inspection_judgment("PXD_SECOND", grade=2, include=True),
+            _inspection_judgment("PXD_THIRD", grade=1, include=False),
+            _inspection_judgment("PXD_FOURTH", grade=0, include=False),
+        ]
+    )
     selected = service.select_discovery_manifest(
         0,
         "All high-relevance candidates were inspected before final selection.",

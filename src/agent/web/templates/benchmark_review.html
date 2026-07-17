@@ -2870,6 +2870,35 @@
           agentRow.appendChild(chip);
         }
         summary.appendChild(agentRow);
+        const judgment = progress.project_judgments || {};
+        if (progress.runtime && judgment.grade_counts) {
+          const grades = judgment.grade_counts || {};
+          const judgmentRow = document.createElement("div");
+          judgmentRow.className = "pool-build-agent-state";
+          const stage = judgment.evidence_stage === "inspection"
+            ? tr("检查复判", "inspection update")
+            : tr("搜索预判", "search estimate");
+          const judgmentFacts = [
+            `${tr("项目判断", "Project judgments")} · ${stage}`,
+            `${tr("合格", "Qualified")} ${judgment.qualified_projects || 0} / ${judgment.qualified_target || 0}`,
+            `${tr("待补证", "Investigate")} ${judgment.investigate_projects || 0}`,
+            `${tr("已排除", "Rejected")} ${judgment.rejected_projects || 0}`,
+            `0:${grades["0"] || 0} · 1:${grades["1"] || 0} · 2:${grades["2"] || 0} · 3:${grades["3"] || 0} · ${tr("证据不足", "unknown")}:${grades.unknown || 0}`
+          ];
+          for (const text of judgmentFacts) {
+            const chip = document.createElement("span");
+            chip.textContent = text;
+            judgmentRow.appendChild(chip);
+          }
+          summary.appendChild(judgmentRow);
+          const judgmentHelp = document.createElement("div");
+          judgmentHelp.className = "pool-build-hint";
+          judgmentHelp.textContent = tr(
+            "证据不足表示 Agent 正在继续调查，不等于项目被打成低分。",
+            "Insufficient evidence means the Agent is still investigating; it is not a low score."
+          );
+          summary.appendChild(judgmentHelp);
+        }
         const stopReasonLabels = {
           manifest_selected: tr("已选择最佳候选集", "best candidate set selected"),
           user_cancelled: tr("用户取消", "cancelled by user"),

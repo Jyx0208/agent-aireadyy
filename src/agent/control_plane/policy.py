@@ -9,6 +9,7 @@ TOOL_RISKS: dict[str, ToolRisk] = {
     "search_repository_datasets": "read_only",
     "search_repository_candidates": "read_only",
     "inspect_repository_candidates": "read_only",
+    "submit_project_judgments": "bounded_write",
     "get_discovery_state": "read_only",
     "select_discovery_manifest": "bounded_write",
     "assess_task_readiness": "read_only",

@@ -22,6 +22,11 @@ from agent.discovery.diversity import diversity_summary, select_diverse_items, v
 from agent.discovery.manifest import write_dataset_manifest
 from agent.discovery.memory import DiscoveryMemory
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
+from agent.discovery.project_judgment import (
+    ProjectJudgmentInput,
+    is_qualified_project_judgment,
+    summarize_project_judgments,
+)
 from agent.discovery.repository_discovery import discover_repository_dataset
 from agent.discovery.query_builder import classify_pride_query_strategy
 from agent.discovery.search_environment import (
@@ -923,6 +928,145 @@ class DiscoveryToolService:
             )
             return observation
 
+    def record_project_judgments(
+        self,
+        judgments: list[ProjectJudgmentInput],
+    ) -> dict[str, Any]:
+        run = self._require_run()
+        policy = evaluate_tool_policy("submit_project_judgments", run)
+        if policy.outcome != "allow":
+            return {"status": "blocked", "blockers": [policy.reason]}
+        if not judgments:
+            return {"status": "blocked", "blockers": ["project_judgments_required"]}
+
+        accessions = [item.project_accession for item in judgments]
+        if len(accessions) != len(set(accessions)):
+            return {"status": "blocked", "blockers": ["duplicate_project_judgment"]}
+        inspected = {item.upper() for item in run.inspected_candidate_accessions}
+        invalid_backed = [
+            item.project_accession
+            for item in judgments
+            if item.evidence_stage == "inspection"
+            and item.project_accession not in inspected
+        ]
+        if invalid_backed:
+            return {
+                "status": "blocked",
+                "blockers": [
+                    "project_not_inspected:" + ",".join(sorted(invalid_backed))
+                ],
+            }
+        known_accessions = getattr(self.search_environment, "candidate_accessions", None)
+        if isinstance(known_accessions, list) and known_accessions:
+            known = {str(item).upper() for item in known_accessions}
+            unknown = sorted(accession for accession in accessions if accession not in known)
+            if unknown:
+                return {
+                    "status": "blocked",
+                    "blockers": ["project_outside_candidate_pool:" + ",".join(unknown)],
+                }
+        merged = dict(run.project_judgments)
+        for judgment in judgments:
+            previous = merged.get(judgment.project_accession)
+            if (
+                previous is not None
+                and previous.evidence_stage == "inspection"
+                and judgment.evidence_stage == "search"
+            ):
+                return {
+                    "status": "blocked",
+                    "blockers": [
+                        "project_judgment_stage_regression:" + judgment.project_accession
+                    ],
+                }
+
+        arguments = {"judgments": [item.model_dump(mode="json") for item in judgments]}
+        tool_call, claimed = self.store.claim_tool_call(
+            run_id=self.run_id,
+            tool_name="submit_project_judgments",
+            arguments=arguments,
+        )
+        if not claimed and tool_call.output:
+            return dict(tool_call.output)
+        if not claimed:
+            return {
+                "status": "blocked",
+                "blockers": ["identical_tool_call_already_in_progress"],
+            }
+
+        previous_summary = summarize_project_judgments(
+            merged,
+            target_project_count=self.request.max_projects,
+        )
+        updated_count = sum(item.project_accession in merged for item in judgments)
+        created_count = len(judgments) - updated_count
+        for judgment in judgments:
+            merged[judgment.project_accession] = judgment
+        summary = summarize_project_judgments(
+            merged,
+            target_project_count=self.request.max_projects,
+        )
+        previous_qualified = int(previous_summary["qualified_projects"])
+        qualified_count = int(summary["qualified_projects"])
+        submitted_inspection = any(item.evidence_stage == "inspection" for item in judgments)
+        qualified_no_gain_count = (
+            0
+            if qualified_count > previous_qualified
+            else run.qualified_no_gain_count + 1
+            if submitted_inspection
+            else run.qualified_no_gain_count
+        )
+        latest_metrics = run.latest_metrics
+        if latest_metrics is not None:
+            latest_metrics = latest_metrics.model_copy(
+                update={
+                    "counts": {
+                        **latest_metrics.counts,
+                        "assessed_projects": int(summary["assessed_projects"]),
+                        "qualified_projects": qualified_count,
+                        "investigate_projects": int(summary["investigate_projects"]),
+                        "rejected_projects": int(summary["rejected_projects"]),
+                    },
+                    "deltas": {
+                        **latest_metrics.deltas,
+                        "qualified_projects": qualified_count - previous_qualified,
+                    },
+                    "no_gain_streak": qualified_no_gain_count,
+                }
+            )
+        run = self.store.save_run(
+            run.model_copy(
+                update={
+                    "project_judgments": merged,
+                    "qualified_project_count": qualified_count,
+                    "qualified_no_gain_count": qualified_no_gain_count,
+                    "latest_metrics": latest_metrics,
+                    "tool_call_count": run.tool_call_count + 1,
+                }
+            )
+        )
+        payload = {
+            "status": "completed",
+            "project_accessions": accessions,
+            "created_count": created_count,
+            "updated_count": updated_count,
+            "recorded_count": len(judgments),
+            "qualified_project_count": summary["qualified_projects"],
+            "target_project_count": summary["qualified_target"],
+            "quality_target_reached": summary["quality_target_reached"],
+            "project_judgment_summary": summary,
+        }
+        self.store.complete_tool_call(tool_call.idempotency_key, payload)
+        self.store.append_event(
+            self.run_id,
+            "project_judgments_recorded",
+            {
+                **payload,
+                "judgments": [item.model_dump(mode="json") for item in judgments],
+            },
+        )
+        return payload
+
     def select_discovery_manifest(
         self,
         round_index: int,
@@ -975,6 +1119,49 @@ class DiscoveryToolService:
             return self._selection_rejected(round_index, "manifest_round_not_found")
 
         manifest = _load_manifest(manifest_path)
+        judgment_gate_enabled = bool(run.project_judgments) or self.search_environment is not None
+        eligible_accessions = {
+            accession
+            for accession, judgment in run.project_judgments.items()
+            if is_qualified_project_judgment(judgment)
+        }
+        if judgment_gate_enabled:
+            ineligible = sorted(
+                accession
+                for accession in selected_accessions
+                if accession not in eligible_accessions
+            )
+            if ineligible:
+                return self._selection_rejected(
+                    round_index,
+                    "project_judgment_not_eligible:" + ",".join(ineligible),
+                )
+            if not selected_accessions:
+                selected_accessions = sorted(
+                    accession
+                    for accession in eligible_accessions
+                    if any(
+                        project.project_accession.upper() == accession
+                        for project in manifest.projects
+                    )
+                )
+            if not selected_accessions:
+                return self._selection_rejected(
+                    round_index,
+                    "no_evidence_backed_grade_2_or_3_projects",
+                )
+
+            target_reached = len(eligible_accessions) >= self.request.max_projects
+            can_continue = (
+                not run.search_stopped
+                and run.discovery_round_count < run.budget.max_discovery_rounds
+                and run.qualified_no_gain_count < 2
+            )
+            if self.search_environment is not None and not target_reached and can_continue:
+                return self._selection_rejected(
+                    round_index,
+                    "qualified_project_target_requires_more_search",
+                )
         candidate_count = len(manifest.projects)
         if (
             not selected_accessions
@@ -1042,6 +1229,24 @@ class DiscoveryToolService:
                 request=self.request,
                 run_id=self.run_id,
             )
+        if judgment_gate_enabled:
+            judgment_summary = summarize_project_judgments(
+                run.project_judgments,
+                target_project_count=self.request.max_projects,
+            )
+            manifest = manifest.model_copy(
+                update={
+                    "summary": {
+                        **manifest.summary,
+                        "project_judgment_summary": judgment_summary,
+                        "project_judgments": {
+                            accession: run.project_judgments[accession].model_dump(mode="json")
+                            for accession in selected_accessions
+                            if accession in run.project_judgments
+                        },
+                    }
+                }
+            )
         selected_files = _selected_file_count(manifest)
         if selected_files <= 0:
             payload = {
@@ -1089,24 +1294,72 @@ class DiscoveryToolService:
         run = self._require_run()
         if run.selected_round_index is not None:
             return run
+        eligible_accessions = {
+            accession
+            for accession, judgment in run.project_judgments.items()
+            if is_qualified_project_judgment(judgment)
+        }
+
+        def eligible_manifest(manifest: DatasetManifest) -> DatasetManifest | None:
+            if not run.project_judgments:
+                return manifest
+            projects = [
+                project
+                for project in manifest.projects
+                if project.project_accession.upper() in eligible_accessions
+            ]
+            files = [
+                file
+                for file in manifest.files
+                if file.project_accession.upper() in eligible_accessions
+            ]
+            if not projects or not files:
+                return None
+            filtered = _merge_discovery_manifests(
+                [manifest.model_copy(update={"projects": projects, "files": files})],
+                request=self.request,
+                run_id=self.run_id,
+            )
+            return filtered.model_copy(
+                update={
+                    "summary": {
+                        **filtered.summary,
+                        "project_judgment_summary": summarize_project_judgments(
+                            run.project_judgments,
+                            target_project_count=self.request.max_projects,
+                        ),
+                        "project_judgments": {
+                            accession: run.project_judgments[accession].model_dump(mode="json")
+                            for accession in sorted(eligible_accessions)
+                            if accession in run.project_judgments
+                        },
+                    }
+                }
+            )
+
         candidates: list[tuple[tuple[int, int, int, float], int, Path, DatasetManifest]] = []
         if run.candidate_pool_manifest_path:
             path = Path(run.candidate_pool_manifest_path)
             if path.exists():
-                manifest = _load_manifest(path)
-                candidates.append((_manifest_rank(manifest), 0, path, manifest))
+                manifest = eligible_manifest(_load_manifest(path))
+                if manifest is not None:
+                    candidates.append((_manifest_rank(manifest), 0, path, manifest))
         for name, reference in run.artifacts.items():
             if not name.startswith("discovery_round_"):
                 continue
             path = Path(reference.path)
             if not path.exists():
                 continue
-            manifest = _load_manifest(path)
-            candidates.append((_manifest_rank(manifest), int(name.rsplit("_", 1)[-1]), path, manifest))
+            manifest = eligible_manifest(_load_manifest(path))
+            if manifest is not None:
+                candidates.append((_manifest_rank(manifest), int(name.rsplit("_", 1)[-1]), path, manifest))
         candidates = [item for item in candidates if _selected_file_count(item[3]) > 0]
         if not candidates:
             return run
         _, round_index, path, manifest = max(candidates, key=lambda item: item[0])
+        if run.project_judgments:
+            paths = write_dataset_manifest(manifest, self.output_dir / "final_selection")
+            path = paths["dataset_manifest_json"]
         rationale = "Deterministic fallback selected the highest-ranked persisted candidate manifest."
         _, warnings = _recommend_next_action(manifest.summary, _selected_file_count(manifest))
         run = self.store.save_run(
@@ -1162,6 +1415,11 @@ class DiscoveryToolService:
 
     @staticmethod
     def _state_summary(run: AgentRunRecord) -> dict[str, Any]:
+        target_project_count = int((run.request or {}).get("max_projects") or 1)
+        judgment_summary = summarize_project_judgments(
+            run.project_judgments,
+            target_project_count=target_project_count,
+        )
         return {
             "run_id": run.run_id,
             "status": run.status,
@@ -1198,6 +1456,15 @@ class DiscoveryToolService:
             "search_stopped": run.search_stopped,
             "search_stop_reason": run.search_stop_reason,
             "latest_metrics": run.latest_metrics.model_dump(mode="json") if run.latest_metrics else None,
+            "project_judgments": {
+                accession: judgment.model_dump(mode="json")
+                for accession, judgment in run.project_judgments.items()
+            },
+            "project_judgment_summary": judgment_summary,
+            "qualified_project_count": judgment_summary["qualified_projects"],
+            "target_project_count": judgment_summary["qualified_target"],
+            "quality_target_reached": judgment_summary["quality_target_reached"],
+            "qualified_no_gain_count": run.qualified_no_gain_count,
             "consecutive_zero_yield": run.consecutive_zero_yield,
             "search_recovery_required": run.search_recovery_required,
             "search_recovery_attempts": run.search_recovery_attempts,

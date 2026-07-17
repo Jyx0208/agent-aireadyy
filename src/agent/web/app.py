@@ -43,7 +43,12 @@ from agent.ai_ready.model_informed_discovery import (
 from agent.ai_ready.model_loop import run_dataset_model_loop
 from agent.ai_ready.real_smoke import run_ai_ready_real_smoke
 from agent.ai_ready.validation import validate_ai_ready_build
-from agent.control_plane.models import AgentBudget, AgentEvent, DynamicBudgetLimits
+from agent.control_plane.models import (
+    AgentBudget,
+    AgentEvent,
+    DynamicBudgetLimits,
+    recommended_inspection_rounds,
+)
 from agent.discovery.runner import run_agents_discovery
 from agent.discovery.agentic import AgenticDiscoveryPlanner, OpenAICompatibleDiscoveryLLM, default_agentic_discovery_planner, default_discovery_llm_client
 from agent.discovery.agentic_runner import run_agentic_discovery
@@ -1154,11 +1159,21 @@ def _agent_discovery_configuration(
     mode = _clean_text(os.getenv("AGENT_DISCOVERY_MODE") or "multi_agent").lower()
     if mode not in {"single_agent", "multi_agent"}:
         mode = "single_agent"
+    target_projects = _bounded_int(
+        body.get("max_projects"),
+        default=20,
+        minimum=1,
+        maximum=300,
+    )
+    target_inspection_rounds = recommended_inspection_rounds(target_projects)
     budget = AgentBudget(
         max_turns=_bounded_int(os.getenv("AGENT_MAX_MODEL_TURNS"), default=50, minimum=1, maximum=50),
         max_tool_calls=_bounded_int(os.getenv("AGENT_MAX_TOOL_CALLS"), default=100, minimum=1, maximum=100),
         max_discovery_rounds=_bounded_int(
-            os.getenv("AGENT_MAX_DISCOVERY_ROUNDS"), default=3, minimum=1, maximum=3
+            os.getenv("AGENT_MAX_DISCOVERY_ROUNDS"),
+            default=target_inspection_rounds,
+            minimum=1,
+            maximum=8,
         ),
     )
     limits = DynamicBudgetLimits(
