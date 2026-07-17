@@ -196,7 +196,11 @@
           <input id="poolBuilderBaseUrlInput" type="text" placeholder="https://api.openai.com/v1">
         </div>
         <div class="field">
-          <label for="poolBuilderModelInput">模型</label>
+          <label for="poolBuilderModelSelect">可用模型</label>
+          <select id="poolBuilderModelSelect"><option value="">先拉取可用模型</option></select>
+        </div>
+        <div class="field">
+          <label for="poolBuilderModelInput">或手填模型</label>
           <input id="poolBuilderModelInput" type="text" placeholder="gpt-5 / deepseek-chat / grok">
         </div>
         <div class="field">
@@ -209,6 +213,8 @@
         </div>
       </div>
       <div class="profile-actions">
+        <button id="poolBuilderFetchModelsButton" type="button">一键拉取可用模型</button>
+        <button id="poolBuilderCheckButton" type="button">测试 API 连接</button>
         <button id="poolBuilderSaveButton" type="button" class="primary">保存建池模型配置</button>
       </div>
       <div class="status" id="poolBuilderConfigStatus" role="status" aria-live="polite">正在读取建池模型配置…</div>
@@ -617,9 +623,49 @@
       root.classList.toggle("success", kind === "success");
     }
 
+    const poolBuilderErrorMessages = {
+      pool_build_api_key_or_saved_config_required: "请填写 API Key，或先保存一套可复用的建池模型配置。",
+      api_key_required_for_new_base_url: "Base URL 已改变，请填写该接口对应的 API Key。",
+      pool_build_base_url_required: "请填写建池模型的 Base URL。",
+      pool_build_model_required: "请选择或手填建池模型。",
+      pool_build_provider_requires_openai_compatible_protocol: "当前提供商必须使用 OpenAI-compatible API 协议和 Base URL。"
+    };
+
+    function poolBuilderErrorMessage(error) {
+      const raw = String(error && error.message ? error.message : error || "未知错误");
+      return poolBuilderErrorMessages[raw] || raw;
+    }
+
     function setPoolBuilderConfigBusy(busy) {
       poolBuilderConfigBusy = busy;
+      byId("poolBuilderFetchModelsButton").disabled = busy;
+      byId("poolBuilderCheckButton").disabled = busy;
       byId("poolBuilderSaveButton").disabled = busy;
+    }
+
+    function setPoolBuilderModelOptions(models, selected = "", complete = false) {
+      const select = byId("poolBuilderModelSelect");
+      const uniqueModels = [...new Set((models || []).map((model) => String(model || "").trim()).filter(Boolean))];
+      setOptions(select, uniqueModels.map((model) => ({ value: model, label: model })), uniqueModels.length ? null : "先拉取可用模型");
+      if (selected && uniqueModels.includes(selected)) select.value = selected;
+      else if (uniqueModels.length) select.value = uniqueModels[0];
+      select.dataset.modelListLoaded = complete ? "true" : "false";
+      select.title = complete ? "已拉取当前接口返回的可用模型" : "仅显示当前已保存模型；尚未拉取完整列表";
+    }
+
+    function selectedPoolBuilderModel() {
+      return byId("poolBuilderModelInput").value.trim() || byId("poolBuilderModelSelect").value || "";
+    }
+
+    function collectPoolBuilderConfig() {
+      const provider = byId("poolBuilderProviderInput").value || "openai_compatible";
+      const baseUrl = byId("poolBuilderBaseUrlInput").value.trim();
+      const model = selectedPoolBuilderModel();
+      const apiKey = byId("poolBuilderApiKeyInput").value.trim();
+      const timeout = Number(byId("poolBuilderTimeoutInput").value || 120);
+      const config = { provider, base_url: baseUrl, model, timeout };
+      if (apiKey) config.api_key = apiKey;
+      return config;
     }
 
     function applyPoolBuilderConfig(payload, fallback = {}) {
@@ -637,6 +683,7 @@
       const supportedProviders = new Set(["openai_compatible", "openai", "google", "xai", "deepseek"]);
       byId("poolBuilderProviderInput").value = supportedProviders.has(config.provider) ? config.provider : "openai_compatible";
       byId("poolBuilderBaseUrlInput").value = config.base_url;
+      setPoolBuilderModelOptions(config.model ? [config.model] : [], config.model, false);
       byId("poolBuilderModelInput").value = config.model;
       byId("poolBuilderTimeoutInput").value = String(config.timeout > 0 ? config.timeout : 120);
       byId("poolBuilderApiKeyInput").value = "";
@@ -655,23 +702,17 @@
         if (!payload.ok) throw new Error(payload.error || "无法读取建池模型配置");
         applyPoolBuilderConfig(payload);
       } catch (error) {
-        setPoolBuilderConfigStatus(`读取建池模型配置失败：${error.message}`, "error");
+        setPoolBuilderConfigStatus(`读取建池模型配置失败：${poolBuilderErrorMessage(error)}`, "error");
       }
     }
 
     async function savePoolBuilderConfig() {
       if (poolBuilderConfigBusy) return;
-      const provider = byId("poolBuilderProviderInput").value || "openai_compatible";
-      const baseUrl = byId("poolBuilderBaseUrlInput").value.trim();
-      const model = byId("poolBuilderModelInput").value.trim();
-      const apiKey = byId("poolBuilderApiKeyInput").value.trim();
-      const timeout = Number(byId("poolBuilderTimeoutInput").value || 120);
-      if (!baseUrl || !model || !Number.isFinite(timeout) || timeout <= 0) {
+      const config = collectPoolBuilderConfig();
+      if (!config.base_url || !config.model || !Number.isFinite(config.timeout) || config.timeout <= 0) {
         setPoolBuilderConfigStatus("请填写 Base URL、模型和有效的 Timeout。", "error");
         return;
       }
-      const config = { provider, base_url: baseUrl, model, timeout };
-      if (apiKey) config.api_key = apiKey;
       setPoolBuilderConfigBusy(true);
       setPoolBuilderConfigStatus("正在保存建池模型配置…");
       try {
@@ -683,7 +724,62 @@
         if (!payload.ok) throw new Error(payload.error || "保存失败");
         applyPoolBuilderConfig(payload, config);
       } catch (error) {
-        setPoolBuilderConfigStatus(`保存建池模型配置失败：${error.message}`, "error");
+        setPoolBuilderConfigStatus(`保存建池模型配置失败：${poolBuilderErrorMessage(error)}`, "error");
+      } finally {
+        setPoolBuilderConfigBusy(false);
+      }
+    }
+
+    async function fetchPoolBuilderModels() {
+      if (poolBuilderConfigBusy) return;
+      const config = collectPoolBuilderConfig();
+      if (!config.base_url || !Number.isFinite(config.timeout) || config.timeout <= 0) {
+        setPoolBuilderConfigStatus("请先填写 Base URL 和有效的 Timeout。", "error");
+        return;
+      }
+      const manualModel = byId("poolBuilderModelInput").value.trim();
+      setPoolBuilderConfigBusy(true);
+      setPoolBuilderConfigStatus("正在拉取可用模型…");
+      try {
+        const payload = await apiRequest("/api/benchmark-review/build-llm-config/models", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(config)
+        });
+        if (!payload.ok) throw new Error(payload.error || "拉取失败");
+        const models = Array.isArray(payload.models) ? payload.models : [];
+        const selected = String(payload.selected || config.model || "").trim();
+        setPoolBuilderModelOptions(models, selected, true);
+        const selectedModel = byId("poolBuilderModelSelect").value;
+        if (!manualModel && selectedModel) byId("poolBuilderModelInput").value = selectedModel;
+        if (models.length) setPoolBuilderConfigStatus(`已拉取 ${models.length} 个可用模型，当前选择：${selectedModel}。`, "success");
+        else setPoolBuilderConfigStatus("接口未返回可用模型，请手填模型名。", "error");
+      } catch (error) {
+        setPoolBuilderConfigStatus(`拉取可用模型失败：${poolBuilderErrorMessage(error)}`, "error");
+      } finally {
+        setPoolBuilderConfigBusy(false);
+      }
+    }
+
+    async function checkPoolBuilderConnection() {
+      if (poolBuilderConfigBusy) return;
+      const config = collectPoolBuilderConfig();
+      if (!config.base_url || !config.model || !Number.isFinite(config.timeout) || config.timeout <= 0) {
+        setPoolBuilderConfigStatus("请先填写 Base URL、模型和有效的 Timeout。", "error");
+        return;
+      }
+      setPoolBuilderConfigBusy(true);
+      setPoolBuilderConfigStatus("正在测试 API 连接…");
+      try {
+        const payload = await apiRequest("/api/benchmark-review/build-llm-config/check", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(config)
+        });
+        if (!payload.ok) throw new Error(payload.error || payload.message || "连接失败");
+        setPoolBuilderConfigStatus(`API 连接测试成功：${payload.message || "连接正常"}`, "success");
+      } catch (error) {
+        setPoolBuilderConfigStatus(`API 连接测试失败：${poolBuilderErrorMessage(error)}`, "error");
       } finally {
         setPoolBuilderConfigBusy(false);
       }
@@ -2348,7 +2444,12 @@
     byId("cancelJobButton").addEventListener("click", () => { void runJobAction("cancel"); });
     byId("resumeJobButton").addEventListener("click", () => { void runJobAction("resume"); });
     byId("retryJobButton").addEventListener("click", () => { void runJobAction("retry-failed"); });
+    byId("poolBuilderFetchModelsButton").addEventListener("click", () => { void fetchPoolBuilderModels(); });
+    byId("poolBuilderCheckButton").addEventListener("click", () => { void checkPoolBuilderConnection(); });
     byId("poolBuilderSaveButton").addEventListener("click", () => { void savePoolBuilderConfig(); });
+    byId("poolBuilderModelSelect").addEventListener("change", () => {
+      if (byId("poolBuilderModelSelect").value) byId("poolBuilderModelInput").value = byId("poolBuilderModelSelect").value;
+    });
     byId("startPoolBuildButton").addEventListener("click", () => { void startPoolBuild(); });
     byId("refreshPoolBuildsButton").addEventListener("click", () => { void refreshPoolBuilds(); });
     byId("poolBuildAction").addEventListener("change", () => {

@@ -95,9 +95,16 @@ def test_benchmark_review_template_has_independent_pool_builder_llm_config() -> 
     assert "0. 评审池构建模型配置（先配置一次）" in html
     assert 'id="poolBuilderProviderInput"' in html
     assert 'id="poolBuilderBaseUrlInput"' in html
+    assert 'id="poolBuilderModelSelect"' in html
+    assert "先拉取可用模型" in html
     assert 'id="poolBuilderModelInput"' in html
+    assert "或手填模型" in html
     assert 'id="poolBuilderApiKeyInput"' in html
     assert 'id="poolBuilderTimeoutInput"' in html
+    assert 'id="poolBuilderFetchModelsButton"' in html
+    assert "一键拉取可用模型" in html
+    assert 'id="poolBuilderCheckButton"' in html
+    assert "测试 API 连接" in html
     assert 'id="poolBuilderSaveButton"' in html
     assert 'id="poolBuilderConfigStatus"' in html
     assert '<option value="openai_compatible">' in html
@@ -109,9 +116,30 @@ def test_benchmark_review_template_has_independent_pool_builder_llm_config() -> 
     assert "OpenAI-compatible Base URL" in html
     assert "理解 Prompt、生成英文检索词" in html
     assert "/api/benchmark-review/build-llm-config" in html
+    assert "/api/benchmark-review/build-llm-config/models" in html
+    assert "/api/benchmark-review/build-llm-config/check" in html
     assert 'method: "PUT"' in html
-    assert "const config = { provider, base_url: baseUrl, model, timeout };" in html
+    assert "function selectedPoolBuilderModel()" in html
+    assert 'byId("poolBuilderModelInput").value.trim() || byId("poolBuilderModelSelect").value' in html
+    assert "function collectPoolBuilderConfig()" in html
     assert "if (apiKey) config.api_key = apiKey;" in html
+    assert 'byId("poolBuilderFetchModelsButton").disabled = busy' in html
+    assert 'byId("poolBuilderCheckButton").disabled = busy' in html
+    assert 'byId("poolBuilderSaveButton").disabled = busy' in html
+    assert 'select.dataset.modelListLoaded = complete ? "true" : "false"' in html
+    assert "setPoolBuilderModelOptions(config.model ? [config.model] : [], config.model, false)" in html
+    assert "setPoolBuilderModelOptions(models, selected, true)" in html
+    assert "if (!manualModel && selectedModel)" in html
+    assert "已拉取 ${models.length} 个可用模型" in html
+    assert "API 连接测试成功" in html
+    assert "API 连接测试失败" in html
+    assert "function poolBuilderErrorMessage(error)" in html
+    assert "请填写 API Key，或先保存一套可复用的建池模型配置。" in html
+    assert "Base URL 已改变，请填写该接口对应的 API Key。" in html
+    assert "请填写建池模型的 Base URL。" in html
+    assert "请选择或手填建池模型。" in html
+    assert "当前提供商必须使用 OpenAI-compatible API 协议和 Base URL。" in html
+    assert "${poolBuilderErrorMessage(error)}" in html
     assert "payload.profile" in html
     assert "API Key 留空时保留现有值" in html
     assert "已配置：${config.provider} · ${config.model}" in html

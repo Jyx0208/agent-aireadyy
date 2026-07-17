@@ -286,6 +286,20 @@ def test_pool_build_llm_config_api_persists_separately_from_expert_profiles(tmp_
     assert updated["profile"]["model"] == "gemini-3.1-pro"
     assert updated["profile"]["api_key_set"] is True
 
+    changed_base_without_key = client.put(
+        "/api/benchmark-review/build-llm-config",
+        json={
+            "provider": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "model": "gpt-5",
+            "timeout": "120",
+        },
+    ).json()
+    assert changed_base_without_key == {
+        "ok": False,
+        "error": "api_key_required_for_new_base_url",
+    }
+
     unsupported = client.put(
         "/api/benchmark-review/build-llm-config",
         json={
@@ -300,6 +314,112 @@ def test_pool_build_llm_config_api_persists_separately_from_expert_profiles(tmp_
         "ok": False,
         "error": "pool_build_provider_requires_openai_compatible_protocol",
     }
+
+
+def test_pool_build_llm_models_and_check_use_dedicated_saved_secret(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", "1")
+    monkeypatch.setenv("AGENT_POOL_BUILD_LLM_CONFIG_PATH", str(tmp_path / "pool_builder_llm.json"))
+    captured: dict[str, dict] = {}
+
+    async def fetch_models(config: dict[str, str]) -> list[str]:
+        captured["models"] = dict(config)
+        return ["gemini-3-pro", "gemini-3-flash", "gemini-3-pro"]
+
+    async def check_connection(config: dict[str, str]) -> tuple[bool, str]:
+        captured["check"] = dict(config)
+        return True, "API 连接成功"
+
+    monkeypatch.setattr(web_app, "_fetch_llm_models", fetch_models)
+    monkeypatch.setattr(web_app, "_run_llm_check", check_connection)
+    client = TestClient(web_app.app)
+    saved = client.put(
+        "/api/benchmark-review/build-llm-config",
+        json={
+            "provider": "google",
+            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+            "model": "gemini-3-pro",
+            "api_key": "pool-builder-secret",
+            "timeout": "90",
+        },
+    ).json()
+    assert saved["ok"] is True
+
+    models = client.post(
+        "/api/benchmark-review/build-llm-config/models",
+        json={
+            "provider": "google",
+            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+            "model": "gemini-3-flash",
+            "timeout": "90",
+        },
+    ).json()
+    assert models == {
+        "ok": True,
+        "models": ["gemini-3-pro", "gemini-3-flash"],
+        "selected": "gemini-3-flash",
+    }
+    assert captured["models"]["api_key"] == "pool-builder-secret"
+    assert captured["models"]["model"] == "gemini-3-flash"
+
+    checked = client.post(
+        "/api/benchmark-review/build-llm-config/check",
+        json={
+            "provider": "google",
+            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+            "model": "gemini-3-flash",
+            "timeout": "90",
+        },
+    ).json()
+    assert checked == {"ok": True, "message": "API 连接成功"}
+    assert captured["check"]["api_key"] == "pool-builder-secret"
+    assert captured["check"]["model"] == "gemini-3-flash"
+
+    changed_base = client.post(
+        "/api/benchmark-review/build-llm-config/models",
+        json={
+            "provider": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "timeout": "90",
+        },
+    ).json()
+    assert changed_base == {
+        "ok": False,
+        "error": "api_key_required_for_new_base_url",
+        "models": [],
+    }
+
+
+def test_pool_build_llm_check_accepts_unsaved_explicit_key_and_reports_failure(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", "1")
+    monkeypatch.setenv("AGENT_POOL_BUILD_LLM_CONFIG_PATH", str(tmp_path / "pool_builder_llm.json"))
+    captured: dict = {}
+
+    async def check_connection(config: dict[str, str]) -> tuple[bool, str]:
+        captured.update(config)
+        return False, f"provider echoed {config['api_key']} at https://api.deepseek.com/chat/completions"
+
+    monkeypatch.setattr(web_app, "_run_llm_check", check_connection)
+    response = TestClient(web_app.app).post(
+        "/api/benchmark-review/build-llm-config/check",
+        json={
+            "provider": "deepseek",
+            "base_url": "https://api.deepseek.com",
+            "model": "deepseek-chat",
+            "api_key": "new-unsaved-key",
+            "timeout": "60",
+        },
+    ).json()
+
+    assert response == {
+        "ok": False,
+        "error": "provider echoed [redacted-api-key] at [provider endpoint]",
+        "message": "provider echoed [redacted-api-key] at [provider endpoint]",
+    }
+    assert captured["api_key"] == "new-unsaved-key"
+    assert web_app._pool_build_llm_config_store().get_profile(
+        "pool-builder",
+        include_secrets=False,
+    ) is None
 
 
 def test_pool_build_api_propagates_scale_and_language_without_trusting_generator_identity(tmp_path: Path, monkeypatch) -> None:

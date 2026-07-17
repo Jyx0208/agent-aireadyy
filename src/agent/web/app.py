@@ -5621,6 +5621,12 @@ async def save_pool_build_llm_config(body: dict[str, Any], request: Request):
     provider = _clean_text(payload.get("provider") or "openai_compatible").casefold()
     if provider not in _POOL_BUILD_LLM_PROVIDERS:
         return {"ok": False, "error": "pool_build_provider_requires_openai_compatible_protocol"}
+    existing = _pool_build_llm_config_store().get_profile_secrets(_POOL_BUILD_LLM_PROFILE_ID)
+    explicit_key = _clean_text(payload.get("api_key"))
+    if existing is not None and not explicit_key:
+        existing_base = _clean_text(existing.get("base_url")).rstrip("/")
+        if base_url.rstrip("/") != existing_base:
+            return {"ok": False, "error": "api_key_required_for_new_base_url"}
     profile_payload = {
         **payload,
         "id": _POOL_BUILD_LLM_PROFILE_ID,
@@ -5645,6 +5651,113 @@ async def save_pool_build_llm_config(body: dict[str, Any], request: Request):
         "configured": True,
         "profile": profile,
     }
+
+
+def _pool_build_llm_operation_config(
+    body: Mapping[str, Any],
+    *,
+    require_model: bool,
+) -> tuple[dict[str, str] | None, str | None, str]:
+    payload = body.get("config", body)
+    if not isinstance(payload, Mapping):
+        return None, "pool_build_llm_config_must_be_object", ""
+    provider = _clean_text(payload.get("provider") or "openai_compatible").casefold()
+    if provider not in _POOL_BUILD_LLM_PROVIDERS:
+        return None, "pool_build_provider_requires_openai_compatible_protocol", ""
+
+    saved = _pool_build_llm_config_store().get_profile_secrets(_POOL_BUILD_LLM_PROFILE_ID)
+    explicit_key = _clean_text(payload.get("api_key"))
+    explicit_base = _clean_text(payload.get("base_url")).rstrip("/")
+    supplied = {
+        key: value
+        for key, value in payload.items()
+        if key in {"api_key", "base_url", "model", "timeout"}
+        and _clean_text(value)
+    }
+    if explicit_key:
+        merged = {**(saved or {}), **supplied, "api_key": explicit_key}
+    elif saved is not None:
+        saved_base = _clean_text(saved.get("base_url")).rstrip("/")
+        if explicit_base and explicit_base != saved_base:
+            return None, "api_key_required_for_new_base_url", ""
+        merged = {
+            **saved,
+            **{
+                key: value
+                for key, value in supplied.items()
+                if key in {"model", "timeout"}
+            },
+        }
+    else:
+        return None, "pool_build_api_key_or_saved_config_required", ""
+
+    base_url = _clean_text(merged.get("base_url")).rstrip("/")
+    selected_model = _clean_text(merged.get("model"))
+    if not base_url:
+        return None, "pool_build_base_url_required", selected_model
+    if require_model and not selected_model:
+        return None, "pool_build_model_required", selected_model
+    merged["base_url"] = base_url
+    merged["model"] = selected_model or "__model_discovery__"
+    config, error = _build_llm_config(dict(merged), allow_server_default=False)
+    return config, error, selected_model
+
+
+def _safe_pool_build_llm_operation_message(message: Any, *, api_key: str) -> str:
+    safe = _redact_secrets(message)
+    if api_key:
+        safe = safe.replace(api_key, "[redacted-api-key]")
+    safe = re.sub(r"https?://\S+", "[provider endpoint]", safe, flags=re.IGNORECASE)
+    return safe[:500].strip()
+
+
+@app.post("/api/benchmark-review/build-llm-config/models")
+async def list_pool_build_llm_models(body: dict[str, Any], request: Request):
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required", "models": []}
+    config, error, selected_model = _pool_build_llm_operation_config(
+        body,
+        require_model=False,
+    )
+    if error or config is None:
+        return {"ok": False, "error": error, "models": []}
+    try:
+        models = await _fetch_llm_models(config)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": _safe_pool_build_llm_operation_message(
+                _llm_check_error(exc),
+                api_key=config["api_key"],
+            ),
+            "models": [],
+        }
+    models = list(dict.fromkeys(model for model in models if model != "__model_discovery__"))
+    return {
+        "ok": True,
+        "models": models,
+        "selected": selected_model if selected_model in models else (models[0] if models else ""),
+    }
+
+
+@app.post("/api/benchmark-review/build-llm-config/check")
+async def check_pool_build_llm_config(body: dict[str, Any], request: Request):
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    config, error, _selected_model = _pool_build_llm_operation_config(
+        body,
+        require_model=True,
+    )
+    if error or config is None:
+        return {"ok": False, "error": error}
+    ok, message = await _run_llm_check(config)
+    message = _safe_pool_build_llm_operation_message(
+        message,
+        api_key=config["api_key"],
+    )
+    if not ok:
+        return {"ok": False, "error": message, "message": message}
+    return {"ok": True, "message": message}
 
 
 @app.get("/api/benchmark-review/builds")
