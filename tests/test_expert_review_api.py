@@ -369,6 +369,8 @@ def test_pool_build_api_requires_only_prompt_and_defaults_to_review(tmp_path: Pa
         "prompt": "Find human DDA proteomics",
         "output_language": "en",
         "scale_mode": "auto",
+        "runtime": "openai_agents",
+        "source": "remote",
     }
     assert captured["action"] == "build_and_review"
     assert captured["label"] is None
@@ -577,6 +579,7 @@ def test_pool_build_api_propagates_scale_and_language_without_trusting_generator
             "action": "build_only",
             "output_language": "zh",
             "scale_mode": "exhaustive",
+            "discovery": {"source": "local", "runtime": "workflow"},
             "review": {
                 "generator_identity": {
                     "model_family": "forged-family",
@@ -589,6 +592,8 @@ def test_pool_build_api_propagates_scale_and_language_without_trusting_generator
     assert response["ok"] is True
     assert captured["discovery_request"]["output_language"] == "zh-CN"
     assert captured["discovery_request"]["scale_mode"] == "exhaustive"
+    assert captured["discovery_request"]["runtime"] == "openai_agents"
+    assert captured["discovery_request"]["source"] == "remote"
     assert captured["review"] == {"output_language": "zh-CN", "scale_mode": "exhaustive"}
 
 
@@ -831,6 +836,7 @@ def test_pool_build_explicit_scale_and_agentic_override_parser(monkeypatch) -> N
             "prompt": "Find a balanced human DDA set",
             "scale_mode": "balanced",
             "agentic": True,
+            "source": "local",
             "output_language": "en",
         }
     )
@@ -840,6 +846,8 @@ def test_pool_build_explicit_scale_and_agentic_override_parser(monkeypatch) -> N
     assert request["max_projects"] == 75
     assert request["max_candidate_projects"] == 300
     assert request["agentic"] is True
+    assert request["runtime"] == "openai_agents"
+    assert request["source"] == "remote"
 
 
 def test_pool_build_localizes_common_discovery_logs_but_keeps_search_terms_english() -> None:

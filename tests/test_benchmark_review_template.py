@@ -33,7 +33,7 @@ def test_benchmark_review_template_supports_blind_scoring_and_export() -> None:
     assert 'id="reviewMode"' in html
     assert "/api/expert-review/pools" in html
     assert "project_accession" not in html
-    assert "openai_agents" not in html
+    assert "OpenAI Agents SDK Discovery Agent" in html
 
 
 def test_benchmark_review_template_has_repair_contract_markers() -> None:
@@ -258,6 +258,11 @@ def test_benchmark_review_template_simplifies_model_setup_and_exposes_calibratio
     assert "/api/benchmark-review/build-llm-config" in html
     assert "/api/benchmark-review/build-llm-config/models" in html
     assert "/api/benchmark-review/build-llm-config/check" in html
+    assert "OpenAI Agents SDK Discovery Agent" in html
+    assert "progress.runtime" in html
+    assert "search_round" in html
+    assert "candidate_count" in html
+    assert "stop_reason" in html
     assert 'method: "PUT"' in html
     assert "function selectedPoolBuilderModel()" in html
     assert 'byId("poolBuilderModelInput").value.trim() || byId("poolBuilderModelSelect").value' in html

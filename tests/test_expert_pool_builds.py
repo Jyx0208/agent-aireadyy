@@ -463,7 +463,29 @@ def test_pool_build_exposes_live_discovery_progress(tmp_path: Path) -> None:
                     {
                         "ts": "2026-07-16T13:00:00Z",
                         "level": "info",
+                        "type": "candidate_search_completed",
+                        "source_sequence": 8,
                         "message": "Project search returned 7 raw records so far.",
+                        "payload": {
+                            "observation": {
+                                "candidate_count": 7,
+                                "new_candidate_count": 7,
+                            }
+                        },
+                    },
+                    {
+                        "ts": "2026-07-16T13:00:01Z",
+                        "level": "info",
+                        "type": "candidate_inspection_completed",
+                        "source_sequence": 9,
+                        "message": "Inspection round 2 completed.",
+                        "payload": {
+                            "round_index": 2,
+                            "observation": {
+                                "selected_projects": 2,
+                                "selected_files": 11,
+                            },
+                        },
                     }
                 ],
                 "record": {
@@ -486,7 +508,16 @@ def test_pool_build_exposes_live_discovery_progress(tmp_path: Path) -> None:
             "candidate_projects_seen": 7,
             "selected_projects": 1,
             "selected_files": 2,
+            "agent_runtime": {
+                "runtime": "openai_agents",
+                "mode": "quality",
+                "discovery_rounds": 2,
+                "candidate_searches": 1,
+                "stop_reason": "manifest_selected",
+            },
         }
+        completed["record"]["runtime"] = "openai_agents"
+        completed["record"]["agent"] = completed["record"]["summary"]["agent_runtime"]
         return completed
 
     manager = ExpertPoolBuildManager(
@@ -514,13 +545,37 @@ def test_pool_build_exposes_live_discovery_progress(tmp_path: Path) -> None:
         "selected_projects": 2,
         "selected_files": 11,
     }
-    assert live["progress"]["log_tail"][-1]["message"] == "Project search returned 7 raw records so far."
+    assert live["progress"]["runtime"] == "openai_agents"
+    assert live["progress"]["current_stage"] == "evaluating"
+    assert live["progress"]["search_round"] == 1
+    assert live["progress"]["discovery_round"] == 2
+    assert live["progress"]["stop_reason"] is None
+    assert live["progress"]["log_tail"][-1]["message"] == "Inspection round 2 completed."
 
     release_discovery.set()
     completed = _wait(manager, started["build_id"], {"pool_ready"})
     assert completed["progress"]["phase"] == "pool_ready"
     assert completed["progress"]["percent"] == 100
     assert completed["progress"]["counts"]["selected_projects"] == 1
+    assert completed["progress"]["runtime"] == "openai_agents"
+    assert completed["progress"]["discovery_round"] == 2
+    assert completed["progress"]["stop_reason"] == "manifest_selected"
+
+
+def test_pool_build_exposes_pre_sdk_failure_stop_reason() -> None:
+    execution = ExpertPoolBuildManager._discovery_execution(
+        {"discovery_request": {"runtime": "openai_agents"}},
+        {
+            "status": "failed",
+            "error": "openai_agents_sdk_unavailable",
+            "logs": [],
+            "record": None,
+        },
+    )
+
+    assert execution["runtime"] == "openai_agents"
+    assert execution["current_stage"] == "failed"
+    assert execution["stop_reason"] == "openai_agents_sdk_unavailable"
 
 
 def test_agentic_workflow_generator_identity_remains_unverified() -> None:

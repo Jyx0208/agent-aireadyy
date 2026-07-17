@@ -210,6 +210,18 @@ class ExpertPoolBuildManager:
                 "finished_at": None,
                 "discovery_job_id": None,
                 "discovery_status": None,
+                "discovery_execution": {
+                    "runtime": str(discovery_request.get("runtime") or "").strip() or None,
+                    "mode": None,
+                    "status": "queued",
+                    "current_stage": "agent_starting",
+                    "search_round": 0,
+                    "discovery_round": 0,
+                    "max_discovery_rounds": None,
+                    "candidate_count": 0,
+                    "stop_reason": None,
+                    "search_stop_reason": None,
+                },
                 "pool_id": None,
                 "review_job_id": None,
                 "review_status": "not_requested" if action == "build_only" else "pending",
@@ -417,13 +429,16 @@ class ExpertPoolBuildManager:
                 record = self._load(build_id)
                 if record is None:
                     return
-                progress = self._discovery_progress(record, discovery)
+                execution = self._discovery_execution(record, discovery)
+                progress = self._discovery_progress(record, discovery, execution=execution)
                 changed = (
                     record.get("discovery_status") != (status or None)
                     or record.get("progress") != progress
+                    or record.get("discovery_execution") != execution
                 )
                 if changed:
                     record["discovery_status"] = status or None
+                    record["discovery_execution"] = execution
                     record["progress"] = progress
                     record["updated_at"] = _utc_now()
                     self._persist(record)
@@ -855,6 +870,10 @@ class ExpertPoolBuildManager:
         payload = _safe_value(record)
         payload.pop("discovery_request", None)
         payload.pop("review", None)
+        execution = payload.pop("discovery_execution", None)
+        if isinstance(execution, Mapping):
+            progress = payload.get("progress") if isinstance(payload.get("progress"), Mapping) else {}
+            payload["progress"] = {**dict(progress), **dict(execution)}
         return payload
 
     @staticmethod
@@ -915,6 +934,8 @@ class ExpertPoolBuildManager:
         cls,
         record: Mapping[str, Any],
         discovery: Mapping[str, Any],
+        *,
+        execution: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         discovery_record = discovery.get("record") if isinstance(discovery.get("record"), Mapping) else {}
         summary = discovery_record.get("summary") if isinstance(discovery_record.get("summary"), Mapping) else {}
@@ -926,6 +947,11 @@ class ExpertPoolBuildManager:
         }
         if not any(counts.values()):
             counts = cls._progress_counts(previous)
+        if execution is not None:
+            counts["candidate_projects_seen"] = max(
+                counts["candidate_projects_seen"],
+                _nonnegative_int(execution.get("candidate_count")),
+            )
         raw_logs = discovery.get("logs") if isinstance(discovery.get("logs"), list) else []
         logs = [dict(item) for item in raw_logs if isinstance(item, Mapping)] or cls._progress_logs(previous)
         return cls._progress_payload(
@@ -934,3 +960,121 @@ class ExpertPoolBuildManager:
             counts=counts,
             log_tail=logs,
         )
+
+    @classmethod
+    def _discovery_execution(
+        cls,
+        record: Mapping[str, Any],
+        discovery: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        previous = record.get("discovery_execution")
+        previous = previous if isinstance(previous, Mapping) else {}
+        request = record.get("discovery_request")
+        request = request if isinstance(request, Mapping) else {}
+        discovery_record = discovery.get("record")
+        discovery_record = discovery_record if isinstance(discovery_record, Mapping) else {}
+        summary = discovery_record.get("summary")
+        summary = summary if isinstance(summary, Mapping) else {}
+        agent = discovery_record.get("agent")
+        if not isinstance(agent, Mapping):
+            agent = summary.get("agent_runtime")
+        agent = agent if isinstance(agent, Mapping) else {}
+        logs = [item for item in (discovery.get("logs") or []) if isinstance(item, Mapping)]
+        event_types = {str(item.get("type") or "").strip() for item in logs}
+
+        runtime = str(
+            agent.get("runtime")
+            or discovery_record.get("runtime")
+            or previous.get("runtime")
+            or request.get("runtime")
+            or ""
+        ).strip() or None
+        if runtime is None and any(
+            event_type.startswith(("sdk_", "candidate_search_", "candidate_inspection_"))
+            or event_type in {"round_value_evaluated", "dynamic_search_stopped", "manifest_selected"}
+            for event_type in event_types
+        ):
+            runtime = "openai_agents"
+        mode = str(agent.get("mode") or previous.get("mode") or "").strip() or None
+        search_round = _nonnegative_int(previous.get("search_round"))
+        discovery_round = _nonnegative_int(previous.get("discovery_round"))
+        candidate_count = _nonnegative_int(previous.get("candidate_count"))
+        current_event = str(previous.get("current_event") or "").strip() or None
+        stop_reason = str(agent.get("stop_reason") or previous.get("stop_reason") or "").strip() or None
+        search_stop_reason = str(
+            agent.get("search_stop_reason") or previous.get("search_stop_reason") or ""
+        ).strip() or None
+
+        search_sequences: set[str] = set()
+        for index, entry in enumerate(logs):
+            event_type = str(entry.get("type") or "").strip()
+            if not event_type:
+                continue
+            current_event = event_type
+            payload = entry.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            if event_type == "candidate_search_completed":
+                sequence = str(entry.get("source_sequence") or entry.get("sequence") or index)
+                search_sequences.add(sequence)
+                observation = payload.get("observation")
+                observation = observation if isinstance(observation, Mapping) else {}
+                candidate_count = max(candidate_count, _nonnegative_int(observation.get("candidate_count")))
+            round_index = payload.get("round_index")
+            if round_index is None:
+                observation = payload.get("observation")
+                if isinstance(observation, Mapping):
+                    round_index = observation.get("round_index")
+            discovery_round = max(discovery_round, _nonnegative_int(round_index))
+            if event_type == "dynamic_search_stopped":
+                search_stop_reason = str(payload.get("reason") or "").strip() or search_stop_reason
+            if event_type in {"run_completed", "run_blocked", "run_cancelled", "run_failed"}:
+                stop_reason = str(payload.get("reason") or payload.get("error") or "").strip() or stop_reason
+
+        search_round = max(search_round, len(search_sequences), _nonnegative_int(agent.get("candidate_searches")))
+        discovery_round = max(discovery_round, _nonnegative_int(agent.get("discovery_rounds")))
+        latest_metrics = agent.get("latest_metrics")
+        latest_metrics = latest_metrics if isinstance(latest_metrics, Mapping) else {}
+        metric_counts = latest_metrics.get("counts")
+        metric_counts = metric_counts if isinstance(metric_counts, Mapping) else {}
+        candidate_count = max(
+            candidate_count,
+            _nonnegative_int(metric_counts.get("candidate_projects")),
+            _nonnegative_int(summary.get("candidate_projects_seen")),
+        )
+        budget = agent.get("budget")
+        budget = budget if isinstance(budget, Mapping) else {}
+        max_rounds = _nonnegative_int(budget.get("max_discovery_rounds")) or None
+
+        status = str(agent.get("status") or discovery.get("status") or previous.get("status") or "").strip() or None
+        if status == "failed" and stop_reason is None:
+            stop_reason = str(discovery.get("error") or "discovery_failed").strip() or "discovery_failed"
+        elif status == "cancelled" and stop_reason is None:
+            stop_reason = "user_cancelled"
+        terminal_stage = {"completed": "completed", "failed": "failed", "cancelled": "cancelled", "blocked": "failed"}
+        current_stage = terminal_stage.get(str(status or "").lower())
+        if current_stage is None:
+            if status == "queued":
+                current_stage = "agent_starting"
+            else:
+                current_stage = {
+                    "candidate_search_started": "searching",
+                    "candidate_search_completed": "planning",
+                    "candidate_inspection_started": "inspecting",
+                    "candidate_inspection_completed": "evaluating",
+                    "round_value_evaluated": "evaluating",
+                    "manifest_selected": "finalizing",
+                    "dynamic_search_stopped": "evaluating",
+                }.get(str(current_event or ""), "planning" if runtime == "openai_agents" else "agent_starting")
+        return {
+            "runtime": runtime,
+            "mode": mode,
+            "status": status,
+            "current_stage": current_stage,
+            "search_round": search_round,
+            "discovery_round": discovery_round,
+            "max_discovery_rounds": max_rounds,
+            "candidate_count": candidate_count,
+            "current_event": current_event,
+            "stop_reason": stop_reason,
+            "search_stop_reason": search_stop_reason,
+        }

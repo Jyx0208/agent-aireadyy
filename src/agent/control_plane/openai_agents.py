@@ -894,6 +894,7 @@ def _write_run_outputs(
         "warnings": run.warnings,
         "blockers": run.blockers,
         "stop_reason": run.stop_reason,
+        "search_stop_reason": run.search_stop_reason,
         "final_output": run.final_output,
         "files": files,
     }

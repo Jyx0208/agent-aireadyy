@@ -2412,7 +2412,10 @@ def _run_web_discovery(
         if not prompt:
             raise ValueError("Discovery request is required for OpenAI Agents mode.")
         web_llm_config = body.get("llm_config") if isinstance(body.get("llm_config"), dict) else {}
-        agent_llm_config, config_error = _build_llm_config(web_llm_config)
+        agent_llm_config, config_error = _build_llm_config(
+            web_llm_config,
+            allow_server_default=not bool(body.get("_require_explicit_llm_config")),
+        )
         if config_error or agent_llm_config is None:
             raise ValueError(config_error or "Invalid LLM configuration.")
         discovery_id = safe_output_stem(
@@ -2501,6 +2504,7 @@ def _run_web_discovery(
             "quality_budget_tier": _clean_text(budget_audit.get("quality_budget_tier")),
             "tool_calls": int(control_summary.get("tool_call_count") or 0),
             "stop_reason": _clean_text(control_summary.get("stop_reason") or result.status),
+            "search_stop_reason": _clean_text(control_summary.get("search_stop_reason")),
             "final_output": result.final_output,
             "warnings": list(result.warnings),
             "blockers": list(result.blockers),
@@ -4742,6 +4746,8 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
             "query_terms": query_terms,
             "scale_mode": scale_mode,
             "output_language": output_language,
+            "runtime": "openai_agents",
+            "source": "remote",
             "agentic": _pool_build_explicit_bool(original.get("agentic")),
             "_require_explicit_llm_config": True,
             "max_projects": _bounded_int(original.get("max_projects"), default=preset["max_projects"], minimum=1, maximum=300),
@@ -5987,6 +5993,8 @@ async def start_expert_pool_build(body: dict[str, Any], request: Request):
         "prompt": prompt,
         "output_language": output_language,
         "scale_mode": scale_mode,
+        "runtime": "openai_agents",
+        "source": "remote",
     }
     request_id = _clean_text(body.get("idempotency_key") or body.get("client_request_id")) or uuid.uuid4().hex
     review = dict(body.get("review")) if isinstance(body.get("review"), dict) else {}

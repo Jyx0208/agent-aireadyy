@@ -216,6 +216,7 @@ class AgentEvent(JsonModel):
 class AgentRunRecord(JsonModel):
     schema_version: str = "agent-control/v1"
     run_id: str
+    project_id: str | None = None
     runtime: str = "openai_agents"
     workflow: str
     status: AgentRunStatus = "created"

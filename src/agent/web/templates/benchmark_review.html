@@ -172,6 +172,9 @@
     .progress-bar > span { display: block; height: 100%; background: var(--accent); width: 0; transition: width .2s ease; }
     .pool-build-summary { display: grid; gap: 5px; margin-top: 6px; color: var(--muted); }
     .pool-build-now { margin: 8px 0; padding: 9px 11px; border-left: 3px solid var(--accent); background: var(--accent-soft); color: var(--text); font-weight: 600; }
+    .pool-build-agent-state { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+    .pool-build-agent-state span { padding: 4px 8px; border: 1px solid var(--line); border-radius: 999px; background: #f8fafb; font-size: 12px; }
+    .pool-build-stop { margin-top: 7px; color: var(--muted); font-size: 12px; line-height: 1.45; }
     .pool-build-steps { display: grid; grid-template-columns: repeat(6, minmax(105px, 1fr)); gap: 6px; margin: 10px 0 8px; }
     .pool-build-step { position: relative; min-height: 54px; padding: 8px 9px; border: 1px solid var(--line); border-radius: 7px; background: #f8fafb; color: var(--muted); font-size: 12px; line-height: 1.35; }
     .pool-build-step strong { display: block; margin-bottom: 2px; color: inherit; font-size: 13px; }
@@ -325,6 +328,7 @@
       <section class="tool-section developer-tools hidden" id="poolBuildPanel">
         <h3>从 Prompt 一键构建评审池</h3>
         <p class="help">输入目标后，系统依次理解需求、检索候选、生成评审池并启动异构模型评审。每条记录会明确显示当前步骤；“建池完成”不等于“模型共识已经评完”。</p>
+        <p class="help"><strong>实际 Discovery 模式：</strong>OpenAI Agents SDK Discovery Agent。Agent 会自主执行多轮搜索、候选检查和停止判断；本入口不再默认运行 Workflow 或中立建池。</p>
         <div class="field">
           <label for="poolBuildPrompt">评审任务 Prompt</label>
           <textarea id="poolBuildPrompt" placeholder="例如：寻找适用于人类 DDA 蛋白质组分析、包含原始数据和搜索结果的公开项目"></textarea>
@@ -2831,6 +2835,64 @@
           summary.appendChild(terms);
         }
         const counts = progress.counts || {};
+        const discoveryIsActive = ["queued", "parsing_prompt", "starting_discovery", "discovering"].includes(build.status);
+        const runtimeLabel = progress.runtime === "openai_agents"
+          ? `OpenAI Agents SDK${progress.mode ? ` · ${progress.mode}` : ""}`
+          : progress.runtime || (discoveryIsActive
+            ? tr("等待 Agent 启动", "Waiting for Agent start")
+            : tr("旧记录未保存运行模式", "Legacy record: runtime not recorded"));
+        const stageLabel = ({
+          agent_starting: tr("正在启动 Agent", "Starting Agent"),
+          planning: tr("Agent 正在规划下一步", "Agent planning next action"),
+          searching: tr("正在搜索候选", "Searching candidates"),
+          inspecting: tr("正在检查候选项目", "Inspecting candidates"),
+          evaluating: tr("正在评估本轮结果", "Evaluating round"),
+          finalizing: tr("正在选择最终候选集", "Selecting final candidate set"),
+          completed: tr("Discovery 已完成", "Discovery completed"),
+          failed: tr("Discovery 失败", "Discovery failed"),
+          cancelled: tr("Discovery 已取消", "Discovery cancelled")
+        })[progress.current_stage] || statusText(build.discovery_status || "pending");
+        const agentRow = document.createElement("div");
+        agentRow.className = "pool-build-agent-state";
+        const inspectionRound = progress.max_discovery_rounds
+          ? `${progress.discovery_round || 0} / ${progress.max_discovery_rounds}`
+          : String(progress.discovery_round || 0);
+        const agentFacts = [`${tr("实际模式", "Runtime")} ${runtimeLabel}`];
+        if (progress.runtime) agentFacts.push(
+          `${tr("搜索批次", "Search batches")} ${progress.search_round || 0}`,
+          `${tr("候选检查轮次", "Inspection rounds")} ${inspectionRound}`,
+          `${tr("累计候选", "Cumulative candidates")} ${progress.candidate_count || counts.candidate_projects_seen || 0}`,
+          `${tr("当前", "Current")} ${stageLabel}`
+        );
+        for (const text of agentFacts) {
+          const chip = document.createElement("span");
+          chip.textContent = text;
+          agentRow.appendChild(chip);
+        }
+        summary.appendChild(agentRow);
+        const stopReasonLabels = {
+          manifest_selected: tr("已选择最佳候选集", "best candidate set selected"),
+          user_cancelled: tr("用户取消", "cancelled by user"),
+          agents_sdk_run_failed: tr("Agents SDK 运行失败", "Agents SDK run failed"),
+          agent_did_not_call_discovery_tool: tr("Agent 未调用 Discovery 工具", "Agent did not call a Discovery tool"),
+          waiting_for_tool_approval: tr("等待工具授权", "waiting for tool approval"),
+          no_selected_files_after_agent_rounds: tr("多轮搜索后仍无可用文件", "no usable files after Agent rounds"),
+          search_recovery_incomplete: tr("搜索恢复未完成", "search recovery incomplete"),
+          hard_elapsed_time_limit: tr("达到安全时间上限", "safe time limit reached"),
+          hard_repository_request_limit: tr("达到仓库请求安全上限", "repository request safety limit reached"),
+          hard_query_unit_limit: tr("达到查询预算安全上限", "query budget safety limit reached"),
+          discovery_round_budget_exhausted: tr("达到候选检查轮次上限", "inspection-round budget exhausted"),
+          budget_agent_stop: tr("Budget Agent 判断继续搜索收益不足", "Budget Agent stopped low-value searching")
+        };
+        if (progress.stop_reason || progress.search_stop_reason) {
+          const stop = document.createElement("div");
+          stop.className = "pool-build-stop";
+          const parts = [];
+          if (progress.stop_reason) parts.push(`${tr("停止原因", "Stop reason")}：${stopReasonLabels[progress.stop_reason] || progress.stop_reason}`);
+          if (progress.search_stop_reason) parts.push(`${tr("搜索停止原因", "Search stop reason")}：${stopReasonLabels[progress.search_stop_reason] || progress.search_stop_reason}`);
+          stop.textContent = parts.join(" · ");
+          summary.appendChild(stop);
+        }
         const countRow = document.createElement("div");
         countRow.className = "pool-build-counts";
         countRow.textContent = `${tr("候选项目（检索阶段）", "Candidate projects (search stage)")} ${counts.candidate_projects_seen || 0} · ${tr("入选项目", "Selected projects")} ${counts.selected_projects || 0} · ${tr("入选文件", "Selected files")} ${counts.selected_files || 0}`;
