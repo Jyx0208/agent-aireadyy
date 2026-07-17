@@ -67,8 +67,15 @@
     .toolbar { display: grid; grid-template-columns: auto minmax(160px, .8fr) minmax(190px, 1fr) auto; gap: 10px; align-items: end; }
     .pool-meta { color: var(--muted); font-size: 13px; min-height: 20px; padding-top: 8px; line-height: 1.5; }
     .mode-banner { color: var(--ink); font-weight: 600; }
-    .queue-bar { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+    .review-filter-panel { display: grid; gap: 9px; margin: 12px 0 16px; padding: 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+    .filter-row { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 10px; align-items: center; }
+    .filter-label { color: var(--muted); font-size: 12px; font-weight: 650; }
+    .queue-bar { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; }
     .queue-bar button[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); }
+    .score-filter button[data-score="0"] { border-left: 4px solid var(--danger); }
+    .score-filter button[data-score="1"] { border-left: 4px solid var(--blue); }
+    .score-filter button[data-score="2"] { border-left: 4px solid var(--warning); }
+    .score-filter button[data-score="3"] { border-left: 4px solid var(--success); }
     .field { display: grid; gap: 5px; min-width: 0; }
     label { color: var(--muted); font-size: 13px; }
     .file-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
@@ -146,6 +153,7 @@
     @media (max-width: 800px) {
       .header-inner { align-items: flex-start; flex-direction: column; padding: 13px 0; }
       .registry-bar, .toolbar, .layout-split, .impact-inputs { grid-template-columns: 1fr; }
+      .filter-row { grid-template-columns: 1fr; gap: 5px; }
       .side-rail { position: static; max-height: 68vh; }
       .jobs-controls { grid-template-columns: 1fr 1fr; }
       .jobs-controls .primary { grid-column: 1 / -1; }
@@ -314,13 +322,34 @@
         <h2 id="reviewHeading">评审候选</h2>
         <p>按问题或优先级队列逐项评分。</p>
       </div>
-      <div class="queue-bar" id="queueBar" aria-label="优先级队列">
-        <button type="button" data-queue="all" aria-pressed="true">全部</button>
-        <button type="button" data-queue="ungraded" aria-pressed="false">未评分</button>
-        <button type="button" data-queue="graded" aria-pressed="false">已评分</button>
-        <button type="button" data-queue="low_confidence" class="dev-only" aria-pressed="false">低置信</button>
-        <button type="button" data-queue="vote_disagreement" class="dev-only" aria-pressed="false">内部复核分歧</button>
-        <button type="button" data-queue="hard_constraint_conflicts" class="dev-only" aria-pressed="false">硬约束冲突</button>
+      <div class="review-filter-panel" aria-label="候选结果筛选">
+        <div class="filter-row">
+          <span class="filter-label">完成状态</span>
+          <div class="queue-bar" id="queueBar" aria-label="完成状态">
+            <button type="button" data-queue="all" aria-pressed="true">全部</button>
+            <button type="button" data-queue="ungraded" aria-pressed="false">待评分</button>
+            <button type="button" data-queue="graded" aria-pressed="false">已完成</button>
+          </div>
+        </div>
+        <div class="filter-row">
+          <span class="filter-label">最终分数</span>
+          <div class="queue-bar score-filter" id="scoreFilterBar" aria-label="最终分数">
+            <button type="button" data-score="all" aria-pressed="true">全部分数</button>
+            <button type="button" data-score="0" aria-pressed="false">0 分</button>
+            <button type="button" data-score="1" aria-pressed="false">1 分</button>
+            <button type="button" data-score="2" aria-pressed="false">2 分</button>
+            <button type="button" data-score="3" aria-pressed="false">3 分</button>
+          </div>
+        </div>
+        <div class="filter-row dev-only hidden" id="reviewFlagFilterRow">
+          <span class="filter-label">复核标记</span>
+          <div class="queue-bar" id="reviewFlagFilterBar" aria-label="复核标记">
+            <button type="button" data-flag="all" aria-pressed="true">全部标记</button>
+            <button type="button" data-flag="low_confidence" aria-pressed="false">低置信</button>
+            <button type="button" data-flag="vote_disagreement" aria-pressed="false">内部复核分歧</button>
+            <button type="button" data-flag="hard_constraint_conflicts" aria-pressed="false">硬约束冲突</button>
+          </div>
+        </div>
       </div>
       <section class="review-shell">
         <div class="empty" id="emptyState">请选择 judgment_pool.blinded.json，或从上方打开已登记评审池。开发者配置 API 不需要先打开池。</div>
@@ -526,6 +555,8 @@
     let registryEnabled = true;
     let developerAllowed = false;
     let activeQueue = "all";
+    let activeScoreFilter = "all";
+    let activeReviewFlag = "all";
     let reviewerContext = "";
     let selectedJobId = null;
     let selectedJobDetail = null;
@@ -882,16 +913,16 @@
       return `local:${fileName || "pool"}:${(hash >>> 0).toString(16)}`;
     }
 
-    function queueOf(candidate) {
-      if (!isGraded(candidate)) return "ungraded";
-      if (!isDevMode()) return "graded";
-      const votes = Array.isArray(candidate.machine_reviews) ? candidate.machine_reviews : candidate.machine_reviews ? [candidate.machine_reviews] : [];
+    function reviewFlags(candidate) {
+      if (!isGraded(candidate) || !isDevMode()) return [];
+      const { votes } = machineReviewProjection(candidate);
+      const flags = [];
       const conflicts = votes.flatMap((vote) => asTextList(vote && vote.constraint_conflicts));
-      if (conflicts.length) return "hard_constraint_conflicts";
+      if (conflicts.length) flags.push("hard_constraint_conflicts");
       const grades = [...new Set(votes.map((vote) => Number(vote && vote.grade)).filter(Number.isInteger))];
-      if (grades.length >= 2 && Math.max(...grades) - Math.min(...grades) >= 2) return "vote_disagreement";
-      if ((candidate.judgment_confidence || candidate.confidence) === "low") return "low_confidence";
-      return "graded";
+      if (grades.length >= 2 && Math.max(...grades) - Math.min(...grades) >= 2) flags.push("vote_disagreement");
+      if ((candidate.judgment_confidence || candidate.confidence) === "low") flags.push("low_confidence");
+      return flags;
     }
 
     function setActiveQueue(queue) {
@@ -899,20 +930,56 @@
       document.querySelectorAll("#queueBar button").forEach((button) => {
         button.setAttribute("aria-pressed", String(button.dataset.queue === queue));
       });
+      if (queue !== "graded") {
+        setActiveScoreFilter("all");
+        setActiveReviewFlag("all");
+      }
+    }
+
+    function setActiveScoreFilter(score) {
+      activeScoreFilter = String(score || "all");
+      document.querySelectorAll("#scoreFilterBar button").forEach((button) => {
+        button.setAttribute("aria-pressed", String(button.dataset.score === activeScoreFilter));
+      });
+    }
+
+    function setActiveReviewFlag(flag) {
+      activeReviewFlag = String(flag || "all");
+      document.querySelectorAll("#reviewFlagFilterBar button").forEach((button) => {
+        button.setAttribute("aria-pressed", String(button.dataset.flag === activeReviewFlag));
+      });
     }
 
     function updateQueueCounts() {
-      const candidates = pool && Array.isArray(pool.candidates) ? pool.candidates : [];
+      const candidates = pool && Array.isArray(pool.candidates)
+        ? pool.candidates.filter((candidate) => taskFilter.value === "all" || taskKey(candidate) === taskFilter.value)
+        : [];
       const gradedCount = candidates.filter(isGraded).length;
       const labels = {
         all: `全部 ${candidates.length}`,
-        ungraded: `未评分 ${candidates.length - gradedCount}`,
-        graded: `已评分 ${gradedCount}`,
+        ungraded: `待评分 ${candidates.length - gradedCount}`,
+        graded: `已完成 ${gradedCount}`,
       };
       for (const [queue, label] of Object.entries(labels)) {
         const button = document.querySelector(`#queueBar button[data-queue="${queue}"]`);
         if (button) button.textContent = label;
       }
+      const scoreCounts = new Map([0, 1, 2, 3].map((score) => [score, candidates.filter((candidate) => candidate.grade === score).length]));
+      document.querySelectorAll("#scoreFilterBar button").forEach((button) => {
+        const score = button.dataset.score;
+        button.textContent = score === "all" ? `全部分数 ${gradedCount}` : `${score} 分 ${scoreCounts.get(Number(score)) || 0}`;
+      });
+      const flagLabels = {
+        all: "全部标记",
+        low_confidence: "低置信",
+        vote_disagreement: "内部复核分歧",
+        hard_constraint_conflicts: "硬约束冲突",
+      };
+      document.querySelectorAll("#reviewFlagFilterBar button").forEach((button) => {
+        const flag = button.dataset.flag;
+        const count = flag === "all" ? gradedCount : candidates.filter((candidate) => reviewFlags(candidate).includes(flag)).length;
+        button.textContent = `${flagLabels[flag] || flag} ${count}`;
+      });
     }
 
     function rebuildFilter() {
@@ -933,9 +1000,11 @@
       const previousCandidate = preferredCandidateId || (currentCandidate() && currentCandidate().candidate_id);
       visible = (pool.candidates || []).filter((candidate) => {
         const taskMatches = taskFilter.value === "all" || taskKey(candidate) === taskFilter.value;
-        const queueMatches = activeQueue === "all"
-          || (activeQueue === "graded" ? isGraded(candidate) : queueOf(candidate) === activeQueue);
-        return taskMatches && queueMatches;
+        const completionMatches = activeQueue === "all"
+          || (activeQueue === "graded" ? isGraded(candidate) : !isGraded(candidate));
+        const scoreMatches = activeScoreFilter === "all" || candidate.grade === Number(activeScoreFilter);
+        const flagMatches = activeReviewFlag === "all" || reviewFlags(candidate).includes(activeReviewFlag);
+        return taskMatches && completionMatches && scoreMatches && flagMatches;
       });
       const preservedIndex = previousCandidate ? visible.findIndex((candidate) => candidate.candidate_id === previousCandidate) : -1;
       if (preservedIndex >= 0) currentIndex = preservedIndex;
@@ -2510,9 +2579,10 @@
       saveState(reviewerId.value.trim());
       render();
       const saved = await persistCandidate(candidate, { reason: "评分" });
-      if (activeQueue === "ungraded") applyFilter(null, true);
+      const filteredResultView = activeQueue === "ungraded" || activeScoreFilter !== "all" || activeReviewFlag !== "all";
+      if (filteredResultView) applyFilter(null, true);
       else render({ focusHeading: false });
-      if (!saved && activeQueue === "ungraded") setReviewStatus("评分未保存，已保留草稿；候选已按当前草稿从未评分队列移出。", "error", true);
+      if (!saved && activeQueue === "ungraded") setReviewStatus("评分未保存，已保留草稿；候选已按当前草稿从待评分队列移出。", "error", true);
     }));
 
     byId("reviewNotes").addEventListener("input", (event) => {
@@ -2608,6 +2678,30 @@
         await flushPendingNotes();
         clearReviewError();
         setActiveQueue(button.dataset.queue);
+        if (button.dataset.queue === "graded") {
+          setActiveScoreFilter("all");
+          setActiveReviewFlag("all");
+        }
+        currentIndex = 0;
+        applyFilter(null, true);
+      });
+    });
+    document.querySelectorAll("#scoreFilterBar button").forEach((button) => {
+      button.addEventListener("click", async () => {
+        await flushPendingNotes();
+        clearReviewError();
+        setActiveQueue("graded");
+        setActiveScoreFilter(button.dataset.score);
+        currentIndex = 0;
+        applyFilter(null, true);
+      });
+    });
+    document.querySelectorAll("#reviewFlagFilterBar button").forEach((button) => {
+      button.addEventListener("click", async () => {
+        await flushPendingNotes();
+        clearReviewError();
+        setActiveQueue("graded");
+        setActiveReviewFlag(button.dataset.flag);
         currentIndex = 0;
         applyFilter(null, true);
       });

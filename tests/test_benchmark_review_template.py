@@ -92,9 +92,22 @@ def test_benchmark_review_template_has_repair_contract_markers() -> None:
     assert "overflow-y: auto" in html
     assert "max-height: calc(100vh - 24px)" in html
     assert 'data-queue="graded"' in html
+    assert 'id="scoreFilterBar"' in html
+    assert 'id="reviewFlagFilterBar"' in html
+    assert 'data-score="0"' in html
+    assert 'data-score="3"' in html
+    assert 'data-flag="low_confidence"' in html
+    assert 'data-flag="vote_disagreement"' in html
+    assert 'data-flag="hard_constraint_conflicts"' in html
     assert "function updateQueueCounts()" in html
-    assert "graded: `已评分 ${gradedCount}`" in html
-    assert 'activeQueue === "graded" ? isGraded(candidate)' in html
+    assert "graded: `已完成 ${gradedCount}`" in html
+    assert "function reviewFlags(candidate)" in html
+    assert "activeScoreFilter" in html
+    assert "activeReviewFlag" in html
+    assert "completionMatches" in html
+    assert "scoreMatches" in html
+    assert "flagMatches" in html
+    assert 'setActiveQueue("graded")' in html
     assert "查看机器评审轨迹（仅开发者）" in html
     assert "function renderCandidateMachineStatus(candidate)" in html
     assert "function machineReviewProjection(candidate)" in html
