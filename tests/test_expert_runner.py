@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import tomllib
+from pathlib import Path
 from typing import Any
 
 from agent.web.expert_review.consensus import ExpertModelProfile
@@ -8,6 +10,13 @@ from agent.web.expert_review.expert_runner import (
     AnthropicSdkExpertJudge,
     ModelExpertRunner,
 )
+
+
+def test_web_runtime_declares_openai_sdk_dependency() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    web_dependencies = project["project"]["optional-dependencies"]["web"]
+
+    assert any(str(dependency).startswith("openai>=") for dependency in web_dependencies)
 
 
 def _assessment_json() -> str:
