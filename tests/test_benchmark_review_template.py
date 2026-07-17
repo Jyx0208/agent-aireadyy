@@ -211,6 +211,25 @@ def test_benchmark_review_template_has_independent_pool_builder_llm_config() -> 
     assert 'id="poolBuilderModelSelect"' in html
     assert "先拉取可用模型" in html
     assert 'id="poolBuilderModelInput"' in html
+
+
+def test_benchmark_review_template_simplifies_model_setup_and_exposes_calibration() -> None:
+    html = TEMPLATE.read_text(encoding="utf-8")
+    config_section = html.split('id="poolBuilderConfigPanel"', 1)[1].split("</section>", 1)[0]
+
+    assert "providerBaseUrlPresets" in html
+    assert "https://api.openai.com/v1" in html
+    assert "https://api.deepseek.com" in html
+    assert "https://api.x.ai/v1" in html
+    assert 'id="profileAdvancedDetails"' in html
+    assert "高级审计信息" in html
+    assert "普通使用不需要填写" in html
+    assert "Profile ID、Base URL、模型为必填" not in html
+    assert 'id="calibrationPanel"' in html
+    assert "评分学习（实验）" in html
+    assert "至少 30 个" in html
+    assert "/api/expert-review/calibration/preview" in html
+    assert "/api/expert-review/calibration/activate" in html
     assert "或手填模型" in html
     assert 'id="poolBuilderApiKeyInput"' in html
     assert 'id="poolBuilderTimeoutInput"' in html

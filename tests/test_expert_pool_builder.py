@@ -93,3 +93,32 @@ def test_build_blinded_pool_rejects_empty_projects() -> None:
         assert False, "expected ValueError"
     except ValueError as exc:
         assert "no_candidates" in str(exc)
+
+
+def test_portfolio_quantity_prompt_does_not_create_per_project_size_penalty() -> None:
+    pool, _ = build_blinded_pool_from_discovery(
+        _record(),
+        prompt="免疫肽数据集，越多越好",
+        build_id="portfolio-quantity",
+    )
+
+    task = next(iter(pool["tasks"].values()))
+    semantics = task["task_semantics"]
+    assert semantics["quantity_scope"] == "portfolio"
+    assert semantics["portfolio_size_preference"] == "maximize_total_usable_items"
+    assert semantics["per_project_minimum"] is None
+    assert semantics["penalize_small_project"] is False
+    assert pool["candidates"][0]["task_semantics"] == semantics
+
+
+def test_explicit_per_project_minimum_is_preserved() -> None:
+    pool, _ = build_blinded_pool_from_discovery(
+        _record(),
+        prompt="免疫肽数据集，每个项目至少 20 个文件",
+        build_id="per-project-quantity",
+    )
+
+    semantics = next(iter(pool["tasks"].values()))["task_semantics"]
+    assert semantics["quantity_scope"] == "per_project"
+    assert semantics["per_project_minimum"] == {"value": 20, "unit": "files"}
+    assert semantics["penalize_small_project"] is True

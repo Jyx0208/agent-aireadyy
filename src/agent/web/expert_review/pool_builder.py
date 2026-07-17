@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from agent.web.expert_review.pool_registry import strip_pool_for_mode
+from agent.web.expert_review.task_semantics import calibration_task_identity, interpret_review_task
 
 
 _VISIBLE_PROJECT_FIELDS = (
@@ -18,6 +19,8 @@ _VISIBLE_PROJECT_FIELDS = (
     "instrument_families",
     "fragmentation_methods",
     "immunopeptide_scope",
+    "semantic_metadata_confidence",
+    "immunopeptide_metadata_confidence",
     "hla_class",
     "immunopeptide_enrichment_methods",
     "validity_status",
@@ -31,6 +34,10 @@ _VISIBLE_CONSTRAINT_FIELDS = {
     "labeling_strategy",
     "ptm_types",
     "task_type",
+    "quantity_scope",
+    "portfolio_size_preference",
+    "per_project_min_files",
+    "per_project_min_samples",
 }
 
 
@@ -90,6 +97,7 @@ def build_blinded_pool_from_discovery(
             files_by_accession.setdefault(accession, []).append(item)
 
     candidates_by_accession: dict[str, dict[str, Any]] = {}
+    task_semantics = interpret_review_task(prompt, visible_constraints)
     for project in record.get("projects") or []:
         if not isinstance(project, Mapping):
             continue
@@ -103,6 +111,10 @@ def build_blinded_pool_from_discovery(
             "visible_prompt": prompt,
             **{field: project.get(field) for field in _VISIBLE_PROJECT_FIELDS},
             **blind_file_bundle(files_by_accession.get(accession, [])),
+            "calibration_features": {
+                "heuristic_relevance": project.get("project_score"),
+            },
+            "task_semantics": task_semantics,
             "grade": None,
             "review_notes": "",
             "reviewer_id": "",
@@ -122,6 +134,7 @@ def build_blinded_pool_from_discovery(
         if str(key) in _VISIBLE_CONSTRAINT_FIELDS and value not in (None, "", [], {})
     }
     task_key = f"{scenario_id}:{variant_id}"
+    calibration_task_id = calibration_task_identity(prompt, constraints, task_semantics)
     pool = {
         "schema_version": "discovery-judgment-pool-blinded/v2",
         "instructions": {
@@ -130,6 +143,7 @@ def build_blinded_pool_from_discovery(
             "grade_1": "Related topic but not a suitable answer to the task.",
             "grade_0": "Off-topic or contradicts an explicit hard constraint.",
             "review_rule": "Judge visible repository metadata only. Candidate origin is intentionally hidden.",
+            "quantity_rule": task_semantics["quantity_rule"],
         },
         "tasks": {
             task_key: {
@@ -137,6 +151,7 @@ def build_blinded_pool_from_discovery(
                 "variant_id": variant_id,
                 "visible_prompt": prompt,
                 "visible_constraints": constraints,
+                "task_semantics": task_semantics,
             }
         },
         "candidates": [candidates_by_accession[key] for key in sorted(candidates_by_accession)],
@@ -151,6 +166,8 @@ def build_blinded_pool_from_discovery(
                 "scenario_id": scenario_id,
                 "variant_id": variant_id,
                 "project_accession": accession,
+                "calibration_task_id": calibration_task_id,
+                "calibration_features": candidates_by_accession[accession].get("calibration_features") or {},
             }
             for accession in sorted(candidates_by_accession)
         ],

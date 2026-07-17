@@ -100,6 +100,7 @@ from agent.web.expert_review.impact import compute_impact, load_json
 from agent.web.expert_review.jobs import MAX_EXPERT_JOB_WORKERS, ExpertJudgeJobManager, reset_jobs_for_tests
 from agent.web.expert_review.build_projection import attach_review_progress
 from agent.web.expert_review.pool_builds import ExpertPoolBuildManager
+from agent.web.expert_review.task_semantics import calibration_task_identity, interpret_review_task
 from agent.web.expert_review.workspace_archive import (
     MAX_WORKSPACE_ARCHIVE_BYTES,
     WorkspaceArchiveError,
@@ -4438,6 +4439,45 @@ def _expert_pool_registry() -> ExpertPoolRegistry:
     return ExpertPoolRegistry(expert_review_root())
 
 
+def _discovery_calibration_candidates() -> list[dict[str, Any]]:
+    registry = _expert_pool_registry()
+    candidates: list[dict[str, Any]] = []
+    for record in registry.list_pools():
+        pool_id = str(record.get("pool_id") or "")
+        document = registry.load_pool_document(pool_id, prefer_reviewed=True)
+        if not isinstance(document, dict):
+            continue
+        private_key = registry.load_private_key(pool_id) or {}
+        private_by_candidate = {
+            str(item.get("candidate_id") or ""): item
+            for item in (private_key.get("candidates") or [])
+            if isinstance(item, dict) and str(item.get("candidate_id") or "")
+        }
+        task_records = document.get("tasks") if isinstance(document.get("tasks"), dict) else {}
+        for raw in document.get("candidates") or []:
+            if not isinstance(raw, dict):
+                continue
+            candidate = dict(raw)
+            candidate_id = str(candidate.get("candidate_id") or "")
+            private = private_by_candidate.get(candidate_id) or {}
+            project_accession = str(private.get("project_accession") or candidate_id)
+            task_identity = str(private.get("calibration_task_id") or "")
+            if not task_identity:
+                task_key = f"{candidate.get('scenario_id') or ''}:{candidate.get('variant_id') or ''}"
+                task_record = task_records.get(task_key) if isinstance(task_records.get(task_key), dict) else {}
+                task_identity = calibration_task_identity(
+                    str(task_record.get("visible_prompt") or candidate.get("visible_prompt") or ""),
+                    task_record.get("visible_constraints") or {},
+                    task_record.get("task_semantics") or candidate.get("task_semantics") or {},
+                )
+            project_identity = f"{project_accession}:{task_identity}"
+            candidate["calibration_project_id"] = project_identity
+            if isinstance(private.get("calibration_features"), dict):
+                candidate["calibration_features"] = dict(private["calibration_features"])
+            candidates.append(candidate)
+    return candidates
+
+
 def _normalize_review_mode(raw: Any) -> str:
     mode = str(raw or "expert").strip().lower()
     if mode in {"expert", "developer", "test"}:
@@ -4710,6 +4750,15 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
             "max_files_per_project": _bounded_int(original.get("max_files_per_project"), default=preset["max_files_per_project"], minimum=1, maximum=200),
         }
     )
+    task_semantics = interpret_review_task(prompt, request)
+    request["quantity_scope"] = task_semantics["quantity_scope"]
+    request["portfolio_size_preference"] = task_semantics["portfolio_size_preference"]
+    minimum = task_semantics.get("per_project_minimum")
+    if isinstance(minimum, Mapping):
+        if minimum.get("unit") == "files":
+            request["per_project_min_files"] = int(minimum["value"])
+        elif minimum.get("unit") == "samples":
+            request["per_project_min_samples"] = int(minimum["value"])
     if parser_identity is not None:
         request["_generation_contributors"] = [parser_identity]
     warnings = [
@@ -5461,6 +5510,48 @@ async def import_expert_review_workspace(request: Request):
         "workspace": workspace,
         "restored_jobs": restored_jobs,
     }
+
+
+@app.get("/api/expert-review/calibration/status")
+async def discovery_calibration_status(request: Request):
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    from agent.discovery.calibration import DiscoveryCalibrationStore, fit_scoring_calibration
+
+    preview = fit_scoring_calibration(_discovery_calibration_candidates())
+    return {
+        "ok": True,
+        "preview": preview,
+        "active": DiscoveryCalibrationStore().load_active(),
+    }
+
+
+@app.post("/api/expert-review/calibration/preview")
+async def preview_discovery_calibration(request: Request):
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    from agent.discovery.calibration import fit_scoring_calibration
+
+    return {"ok": True, "preview": fit_scoring_calibration(_discovery_calibration_candidates())}
+
+
+@app.post("/api/expert-review/calibration/activate")
+async def activate_discovery_calibration(request: Request, body: dict[str, Any] | None = None):
+    if not _review_developer_allowed(request):
+        return {"ok": False, "error": "developer_access_required"}
+    from agent.discovery.calibration import DiscoveryCalibrationStore, fit_scoring_calibration
+
+    preview = fit_scoring_calibration(_discovery_calibration_candidates())
+    expected_preview_id = _clean_text((body or {}).get("preview_id"))
+    if not expected_preview_id or expected_preview_id != preview.get("preview_id"):
+        return {"ok": False, "error": "calibration_preview_stale", "preview": preview}
+    if not preview.get("eligible"):
+        return {"ok": False, "error": "calibration_not_eligible", "preview": preview}
+    try:
+        active = DiscoveryCalibrationStore().activate(preview)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "preview": preview}
+    return {"ok": True, "active": active, "preview": preview}
 
 
 @app.post("/api/expert-review/impact/session")

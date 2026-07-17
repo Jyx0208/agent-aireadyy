@@ -66,6 +66,7 @@ _EXPERT_HIDDEN_FIELDS = (
     "judgment_source",
     "review_method",
     "rubric_version",
+    "calibration_features",
 )
 
 
@@ -167,6 +168,17 @@ class ExpertPoolRegistry:
             if not isinstance(payload, dict):
                 return None
             return payload
+
+    def load_private_key(self, pool_id: str) -> dict[str, Any] | None:
+        with _REGISTRY_LOCK:
+            if self._load_record(pool_id) is None:
+                return None
+            path = self.root / pool_id / "private" / "judgment.key.json"
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return None
+            return payload if isinstance(payload, dict) else None
 
     def import_generated_pool(
         self,

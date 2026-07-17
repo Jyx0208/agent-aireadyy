@@ -136,6 +136,14 @@
     .help { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0 0 10px; }
     .profile-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
     .profile-grid .full { grid-column: 1 / -1; }
+    .advanced-details { grid-column: 1 / -1; border: 1px solid var(--line); border-radius: 7px; background: #f8fafb; }
+    .advanced-details > summary { cursor: pointer; padding: 10px 12px; font-weight: 650; }
+    .advanced-details[open] > summary { border-bottom: 1px solid var(--line); }
+    .advanced-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 12px; }
+    .calibration-flow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 10px 0; }
+    .calibration-step { border: 1px solid var(--line); border-radius: 7px; background: #f8fafb; padding: 10px; line-height: 1.45; }
+    .calibration-step strong { display: block; margin-bottom: 4px; }
+    .calibration-weights { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 6px; margin-top: 8px; font-size: 12px; }
     .jobs-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; align-items: end; margin: 14px 0 10px; }
     .job-row { width: 100%; display: block; border: 0; border-top: 1px solid var(--line); border-radius: 0; text-align: left; padding: 10px 4px; min-height: 0; }
     .job-row[aria-pressed="true"] { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); padding-left: 10px; }
@@ -176,7 +184,7 @@
     }
     @media (max-width: 520px) {
       .header-inner, main { width: min(100% - 20px, 1180px); }
-      .token-row, .profile-grid, .jobs-controls, .metadata, .grades { grid-template-columns: 1fr; }
+      .token-row, .profile-grid, .advanced-grid, .calibration-flow, .jobs-controls, .metadata, .grades { grid-template-columns: 1fr; }
       .profile-grid .full, .jobs-controls .primary { grid-column: auto; }
       .candidate-head, .navigation { flex-direction: column; }
       .navigation-group, .job-actions, .profile-actions { width: 100%; }
@@ -447,39 +455,23 @@
     <section class="stage developer-tools hidden" id="developerTools" aria-labelledby="developerHeading">
       <div class="stage-heading">
         <span class="stage-number">03</span>
-        <h2 id="developerHeading">开发者工具</h2>
-        <p>配置模型、运行 Agent 专家 Job，并检查测试影响。</p>
+        <h2 id="developerHeading">模型与评分学习</h2>
+        <p>先配置专家模型，再形成正式共识，最后用正式标签生成可追踪的实验权重。</p>
       </div>
       <div class="pool-meta dev-only" id="apiConfigHint">API Key 仅提交到当前服务端配置接口；开发者令牌只保留在本页内存中。</div>
 
       <section class="tool-section" id="jobsPanel">
-        <h3>Agent 专家 API 配置与 Job</h3>
-        <p class="help">Profile 编辑器与 Job 使用的 Profile 选择器彼此独立。切换 Job Profile 不会覆盖尚未保存的编辑内容。</p>
+        <h3>1. 配置专家模型</h3>
+        <p class="help">普通使用只需选择提供商、填写 API Key、确认自动给出的 Base URL，再拉取或手填模型。内部身份字段会自动生成。</p>
         <div class="field" style="max-width:560px;margin-bottom:10px">
           <label for="profileEditorSelect">编辑已保存 Profile</label>
           <select id="profileEditorSelect"><option value="">选择一个 Profile，或新建空白</option></select>
         </div>
         <div class="profile-grid" id="profileEditor">
           <div class="field">
-            <label for="profileIdInput">Profile ID</label>
-            <input id="profileIdInput" type="text" placeholder="gpt-judge / grok-judge / deepseek-judge">
-          </div>
-          <div class="field">
-            <label for="profileLabelInput">显示名</label>
-            <input id="profileLabelInput" type="text" placeholder="GPT 专家">
-          </div>
-          <div class="field full">
-            <label for="profileApiKeyInput">API Key</label>
-            <input id="profileApiKeyInput" type="password" autocomplete="off" placeholder="更新时留空表示保留原 key">
-          </div>
-          <div class="field full">
-            <label for="profileBaseUrlInput">Base URL / Provider Endpoint</label>
-            <input id="profileBaseUrlInput" type="text" placeholder="https://api.openai.com/v1">
-          </div>
-          <div class="field">
-            <label for="profileProviderInput">Provider</label>
+            <label for="profileProviderInput">提供商</label>
             <select id="profileProviderInput">
-              <option value="openai_compatible">OpenAI compatible</option>
+              <option value="openai_compatible">OpenAI-compatible / 自定义</option>
               <option value="openai">OpenAI</option>
               <option value="anthropic">Anthropic</option>
               <option value="google">Google</option>
@@ -488,8 +480,12 @@
             </select>
           </div>
           <div class="field">
-            <label for="profileModelFamilyInput">Model Family</label>
-            <input id="profileModelFamilyInput" type="text" placeholder="claude / gpt / gemini / grok">
+            <label for="profileApiKeyInput">API Key</label>
+            <input id="profileApiKeyInput" type="password" autocomplete="off" placeholder="更新时留空表示保留原 key">
+          </div>
+          <div class="field full">
+            <label for="profileBaseUrlInput">Base URL（选择提供商后自动填写，可修改）</label>
+            <input id="profileBaseUrlInput" type="text" placeholder="https://api.openai.com/v1">
           </div>
           <div class="field">
             <label for="profileModelSelect">模型（拉取后选择）</label>
@@ -503,25 +499,43 @@
             <label for="profileTimeoutInput">Timeout 秒</label>
             <input id="profileTimeoutInput" type="number" min="1" value="120">
           </div>
-          <div class="field">
-            <label for="profileResolvedModelInput">Resolved Model ID</label>
-            <input id="profileResolvedModelInput" type="text" placeholder="仅在可验证时填写">
-          </div>
-          <div class="field">
-            <label for="profileEndpointIdentityInput">Endpoint Identity</label>
-            <input id="profileEndpointIdentityInput" type="text" placeholder="provider:route / deployment id">
-          </div>
-          <div class="field">
-            <label for="profileIdentityVerificationInput">Identity Verification</label>
-            <select id="profileIdentityVerificationInput">
-              <option value="unverified">unverified</option>
-              <option value="provider_attested">provider_attested</option>
-            </select>
-          </div>
           <div class="field" style="align-content:end">
             <label><input id="profileMakeDefault" type="checkbox"> 设为默认 Profile</label>
             <label><input id="profileEnabledInput" type="checkbox" checked> 允许自动专家选择</label>
           </div>
+          <details class="advanced-details" id="profileAdvancedDetails">
+            <summary>高级审计信息（普通使用不需要填写）</summary>
+            <div class="advanced-grid">
+              <p class="help full">Model Family 用于判断专家是否真正异构；Endpoint Identity 用于识别多个名称是否实际走同一路由；Identity Verification 表示底层模型身份是否可验证，不代表 API 连接是否成功。</p>
+              <div class="field">
+                <label for="profileIdInput">Profile ID（留空自动生成）</label>
+                <input id="profileIdInput" type="text" placeholder="自动生成">
+              </div>
+              <div class="field">
+                <label for="profileLabelInput">显示名（留空自动生成）</label>
+                <input id="profileLabelInput" type="text" placeholder="提供商 · 模型">
+              </div>
+              <div class="field">
+                <label for="profileModelFamilyInput">Model Family</label>
+                <input id="profileModelFamilyInput" type="text" placeholder="自动从模型名推断">
+              </div>
+              <div class="field">
+                <label for="profileResolvedModelInput">Resolved Model ID</label>
+                <input id="profileResolvedModelInput" type="text" placeholder="仅在提供商可证明时填写">
+              </div>
+              <div class="field">
+                <label for="profileEndpointIdentityInput">Endpoint Identity</label>
+                <input id="profileEndpointIdentityInput" type="text" placeholder="默认使用 Base URL">
+              </div>
+              <div class="field">
+                <label for="profileIdentityVerificationInput">Identity Verification</label>
+                <select id="profileIdentityVerificationInput">
+                  <option value="unverified">未验证底层模型身份</option>
+                  <option value="provider_attested">提供商声明身份</option>
+                </select>
+              </div>
+            </div>
+          </details>
         </div>
         <div class="profile-actions">
           <button id="fetchModelsButton" type="button">获取模型列表</button>
@@ -531,6 +545,8 @@
         </div>
         <div class="status" id="profileStatus" role="status" aria-live="polite"></div>
 
+        <h3 style="margin-top:18px">2. 启动并查看专家评审</h3>
+        <p class="help">这里的单 Profile Job 用于开发诊断，不计入评分学习。要积累正式模型共识标签，请在上方“一键构建评审池”选择“构建并评审”；一个专家对每个项目只形成一个最终结果，内部重试不会增加票数。</p>
         <div class="jobs-controls">
           <div class="field">
             <label for="profileSelect">用于本 Job 的专家 Profile</label>
@@ -541,7 +557,7 @@
             <input id="jobWorkersInput" type="number" min="1" max="8" value="4">
           </div>
           <label><input id="independentModel" type="checkbox"> 独立模型族（provisional_independent_model）</label>
-          <button id="startJobButton" type="button" class="primary">启动 Agent 专家 Job</button>
+          <button id="startJobButton" type="button" class="primary">启动单模型诊断 Job</button>
         </div>
         <div id="jobsList" aria-live="polite"></div>
         <div class="job-detail" id="jobDetail" aria-live="polite">请选择一个 Job 查看详情。</div>
@@ -560,8 +576,25 @@
         <div class="status" id="jobStatus" role="status" aria-live="polite"></div>
       </section>
 
+      <section class="tool-section" id="calibrationPanel">
+        <h3>3. 评分学习（实验）</h3>
+        <p class="help">把每个项目在同一任务下的最终 0–3 分作为一个标签，学习项目级元数据变量的非负归一化权重。至少 30 个正式标签且分数有差异后才能激活；只计入“构建并评审”形成的正式模型共识或明确人工确认，单模型诊断不计入，模型共识也不是人工金标准。</p>
+        <div class="calibration-flow">
+          <div class="calibration-step"><strong>① 积累标签</strong><span id="calibrationLabelCount">正在统计…</span></div>
+          <div class="calibration-step"><strong>② 生成校准预览</strong><span>比较实验权重与等权基线，不立即改变 Discovery。</span></div>
+          <div class="calibration-step"><strong>③ 激活版本</strong><span>只影响后续 Discovery 软排序；原始项目分和硬约束继续保留。</span></div>
+        </div>
+        <div class="profile-actions">
+          <button id="refreshCalibrationButton" type="button">刷新学习状态</button>
+          <button id="previewCalibrationButton" type="button">生成校准预览</button>
+          <button id="activateCalibrationButton" type="button" class="primary" disabled>激活实验权重</button>
+        </div>
+        <div class="status" id="calibrationStatus" role="status" aria-live="polite"></div>
+        <div class="calibration-weights" id="calibrationWeights"></div>
+      </section>
+
       <section class="tool-section hidden" id="impactPanel">
-        <h3>测试模式影响</h3>
+        <h3>4. 测试模式影响（高级）</h3>
         <p class="help">绑定服务端可读的 key 与 run JSON。结果以数据表和文字展示，不使用装饰性图表。</p>
         <div class="impact-inputs">
           <div class="field">
@@ -584,6 +617,14 @@
     const terminalJobStatuses = new Set(["completed", "completed_with_errors", "failed", "cancelled"]);
     const activeJobStatuses = new Set(["queued", "running"]);
     const PAGE_LIMIT = 500;
+    const providerBaseUrlPresets = {
+      openai: "https://api.openai.com/v1",
+      anthropic: "https://api.anthropic.com",
+      google: "https://generativelanguage.googleapis.com/v1beta/openai",
+      xai: "https://api.x.ai/v1",
+      deepseek: "https://api.deepseek.com",
+      openai_compatible: ""
+    };
 
     let pool = null;
     let poolBase = null;
@@ -628,6 +669,7 @@
     let poolBuildPollTimer = null;
     let poolBuilderConfigBusy = false;
     let workspaceArchiveBusy = false;
+    let calibrationPreview = null;
     const terminalPoolReloads = new Set();
 
     const byId = (id) => document.getElementById(id);
@@ -695,6 +737,13 @@
 
     function currentMode() { return reviewMode.value || "expert"; }
     function isDevMode() { return currentMode() !== "expert" && developerAllowed; }
+    function applyProviderBaseUrl(providerInputId, baseUrlInputId) {
+      const provider = byId(providerInputId).value || "openai_compatible";
+      const input = byId(baseUrlInputId);
+      const current = input.value.trim().replace(/\/$/, "");
+      const knownPresets = new Set(Object.values(providerBaseUrlPresets).map((value) => value.replace(/\/$/, "")).filter(Boolean));
+      if (!current || knownPresets.has(current)) input.value = providerBaseUrlPresets[provider] || "";
+    }
     function selectedWorkers(inputId) {
       const input = byId(inputId);
       const maximum = Math.max(1, Number(input.max || 8));
@@ -2083,6 +2132,86 @@
       downloadPool(output, true);
     }
 
+    const calibrationFeatureLabels = {
+      heuristic_relevance: "原始任务匹配分",
+      evidence_completeness: "证据完整度",
+      instrument_metadata: "仪器元数据",
+      fragmentation_metadata: "碎裂方式元数据",
+      domain_scope_metadata: "任务领域元数据",
+      species_metadata: "物种元数据",
+      acquisition_metadata: "采集模式元数据",
+      validity: "项目有效性",
+      semantic_metadata_confidence: "语义元数据置信度"
+    };
+
+    function renderCalibration(payload) {
+      const preview = payload && payload.preview ? payload.preview : payload || {};
+      const active = payload && payload.active ? payload.active : null;
+      calibrationPreview = preview;
+      const sampleCount = Number(preview.sample_count || 0);
+      const sourceText = Object.entries(preview.label_sources || {}).map(([source, count]) => `${source} ${count}`).join("，") || "暂无正式标签";
+      byId("calibrationLabelCount").textContent = `${sampleCount} 个正式标签（${sourceText}）`;
+      byId("activateCalibrationButton").disabled = !preview.eligible;
+      const warnings = new Set(preview.warnings || []);
+      const reason = warnings.has("minimum_30_labels_required")
+        ? `还差 ${Math.max(0, Number(preview.minimum_sample_count || 30) - sampleCount)} 个正式标签。`
+        : warnings.has("at_least_two_grade_levels_required")
+          ? "现有标签分数没有差异，暂时无法学习权重。"
+          : "已满足激活条件。";
+      const activeText = active && active.version_id ? `当前已激活 ${active.version_id}。` : "当前仍使用原始规则分。";
+      byId("calibrationStatus").textContent = `${reason} ${activeText} 激活只影响后续 Discovery 软排序；模型共识不是人工金标准。`;
+      byId("calibrationStatus").classList.toggle("error", !preview.eligible);
+      byId("calibrationStatus").classList.toggle("success", Boolean(preview.eligible));
+      const root = byId("calibrationWeights");
+      root.replaceChildren();
+      Object.entries(preview.weights || {}).forEach(([name, weight]) => {
+        const item = document.createElement("div");
+        item.className = "calibration-step";
+        item.textContent = `${calibrationFeatureLabels[name] || name}：${(Number(weight) * 100).toFixed(1)}%`;
+        root.appendChild(item);
+      });
+    }
+
+    async function refreshCalibration() {
+      if (!isDevMode()) return;
+      try {
+        const payload = await apiRequest("/api/expert-review/calibration/status");
+        if (!payload.ok) throw new Error(payload.error || "无法读取评分学习状态");
+        renderCalibration(payload);
+      } catch (error) {
+        byId("calibrationStatus").textContent = `读取评分学习状态失败：${error.message}`;
+        byId("calibrationStatus").classList.add("error");
+      }
+    }
+
+    async function previewCalibrationWeights() {
+      try {
+        const payload = await apiRequest("/api/expert-review/calibration/preview", { method: "POST" });
+        if (!payload.ok) throw new Error(payload.error || "生成预览失败");
+        renderCalibration(payload);
+      } catch (error) {
+        byId("calibrationStatus").textContent = `生成校准预览失败：${error.message}`;
+        byId("calibrationStatus").classList.add("error");
+      }
+    }
+
+    async function activateCalibrationWeights() {
+      if (!calibrationPreview || !calibrationPreview.eligible) return;
+      if (!window.confirm("激活这版权重？它只影响之后新运行的 Discovery 软排序，不覆盖原始项目分和硬约束。")) return;
+      try {
+        const payload = await apiRequest("/api/expert-review/calibration/activate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ preview_id: calibrationPreview.preview_id })
+        });
+        if (!payload.ok) throw new Error(payload.error || "激活失败");
+        renderCalibration(payload);
+      } catch (error) {
+        byId("calibrationStatus").textContent = `激活实验权重失败：${error.message}`;
+        byId("calibrationStatus").classList.add("error");
+      }
+    }
+
     function formatMetric(value) {
       const number = Number(value);
       return Number.isFinite(number) ? number.toFixed(4) : "—";
@@ -2218,8 +2347,8 @@
       byId("profileIdInput").value = "";
       byId("profileLabelInput").value = "";
       byId("profileApiKeyInput").value = "";
-      byId("profileBaseUrlInput").value = "https://api.openai.com/v1";
-      byId("profileProviderInput").value = "openai_compatible";
+      byId("profileProviderInput").value = "openai";
+      byId("profileBaseUrlInput").value = providerBaseUrlPresets.openai;
       byId("profileModelFamilyInput").value = "";
       byId("profileResolvedModelInput").value = "";
       byId("profileEndpointIdentityInput").value = "";
@@ -2305,18 +2434,18 @@
     async function saveProfileFromEditor() {
       if (profileBusy) return;
       const id = byId("profileIdInput").value.trim();
-      const label = byId("profileLabelInput").value.trim() || id;
       const apiKey = byId("profileApiKeyInput").value.trim();
       const baseUrl = byId("profileBaseUrlInput").value.trim();
       const model = selectedModelName();
       const timeout = byId("profileTimeoutInput").value.trim() || "120";
       const provider = byId("profileProviderInput").value;
-      const modelFamily = byId("profileModelFamilyInput").value.trim() || model;
+      const label = byId("profileLabelInput").value.trim() || `${provider} · ${model}`;
+      const modelFamily = byId("profileModelFamilyInput").value.trim();
       const resolvedModel = byId("profileResolvedModelInput").value.trim();
       const endpointIdentity = byId("profileEndpointIdentityInput").value.trim() || baseUrl;
       const identityVerification = byId("profileIdentityVerificationInput").value;
-      if (!id || !baseUrl || !model) {
-        setProfileStatus("Profile ID、Base URL、模型为必填。", true);
+      if (!baseUrl || !model) {
+        setProfileStatus("请确认 Base URL，并选择或手填模型。", true);
         return;
       }
       if (!editingProfileId && !apiKey) {
@@ -2327,7 +2456,6 @@
       setProfileStatus("正在保存 Profile…");
       try {
         const profile = {
-          id,
           label,
           base_url: baseUrl,
           model,
@@ -2335,12 +2463,12 @@
           provider,
           requested_model_id: model,
           resolved_model_id: resolvedModel || null,
-          model_family: modelFamily,
           endpoint_identity: endpointIdentity,
-          routing_profile_id: id,
           identity_verification: identityVerification,
           enabled: byId("profileEnabledInput").checked
         };
+        if (modelFamily) profile.model_family = modelFamily;
+        if (id) profile.id = id;
         if (apiKey) profile.api_key = apiKey;
         const url = editingProfileId ? `/api/llm/profiles/${encodeURIComponent(editingProfileId)}` : "/api/llm/profiles";
         const payload = await apiRequest(url, {
@@ -3115,7 +3243,7 @@
       if (activePoolId) await openServerPool(activePoolId, preferred, workspaceSnapshot());
       else if (pool) applyFilter(preferred, false);
       if (isDevMode()) {
-        await Promise.all([loadPoolBuilderConfig(), refreshProfiles(), refreshJobs()]);
+        await Promise.all([loadPoolBuilderConfig(), refreshProfiles(), refreshJobs(), refreshCalibration()]);
       }
     });
 
@@ -3164,7 +3292,7 @@
       if (allowed && developerAllowed) {
         byId("modeBanner").textContent = "开发者令牌验证成功。请选择开发者或测试模式。";
         await refreshRegistry();
-        if (currentMode() !== "expert") await Promise.all([loadPoolBuilderConfig(), refreshProfiles(), refreshJobs()]);
+        if (currentMode() !== "expert") await Promise.all([loadPoolBuilderConfig(), refreshProfiles(), refreshJobs(), refreshCalibration()]);
       }
     });
     byId("workspaceArchiveFileButton").addEventListener("keydown", (event) => {
@@ -3193,8 +3321,21 @@
       else clearProfileEditor();
     });
     byId("profileModelSelect").addEventListener("change", () => {
-      if (byId("profileModelSelect").value) byId("profileModelManual").value = byId("profileModelSelect").value;
+      if (byId("profileModelSelect").value) {
+        byId("profileModelManual").value = byId("profileModelSelect").value;
+        byId("profileModelFamilyInput").value = "";
+      }
     });
+    byId("profileProviderInput").addEventListener("change", () => {
+      applyProviderBaseUrl("profileProviderInput", "profileBaseUrlInput");
+      byId("profileModelFamilyInput").value = "";
+      if (byId("profileProviderInput").value === "anthropic") setProfileStatus("Anthropic 通常需要手填模型名；连接测试与专家运行仍使用所选提供商协议。");
+    });
+    byId("profileModelManual").addEventListener("input", () => { byId("profileModelFamilyInput").value = ""; });
+    byId("poolBuilderProviderInput").addEventListener("change", () => { applyProviderBaseUrl("poolBuilderProviderInput", "poolBuilderBaseUrlInput"); });
+    byId("refreshCalibrationButton").addEventListener("click", () => { void refreshCalibration(); });
+    byId("previewCalibrationButton").addEventListener("click", () => { void previewCalibrationWeights(); });
+    byId("activateCalibrationButton").addEventListener("click", () => { void activateCalibrationWeights(); });
     byId("startJobButton").addEventListener("click", () => { void startJob(); });
     byId("refreshJobsButton").addEventListener("click", () => { void refreshJobs(); });
     byId("cancelJobButton").addEventListener("click", () => { void runJobAction("cancel"); });
@@ -3244,7 +3385,7 @@
     void (async () => {
       await refreshRegistry();
       await restoreRecentWorkspace({ automatic: true });
-      if (isDevMode()) await Promise.all([loadPoolBuilderConfig(), refreshProfiles(), refreshJobs(), refreshPoolBuilds()]);
+      if (isDevMode()) await Promise.all([loadPoolBuilderConfig(), refreshProfiles(), refreshJobs(), refreshPoolBuilds(), refreshCalibration()]);
     })();
   </script>
 </body>

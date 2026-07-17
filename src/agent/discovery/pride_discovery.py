@@ -59,7 +59,7 @@ def _sort_projects(items: list[tuple[DiscoveredProject, list[DiscoveredFile]]]) 
     return sorted(
         items,
         key=lambda item: (
-            -item[0].project_score,
+            -(item[0].calibrated_project_score if item[0].calibrated_project_score is not None else item[0].project_score),
             item[0].needs_review,
             item[0].project_accession,
         ),

@@ -228,3 +228,53 @@ def test_model_expert_runner_blinds_other_reviews_and_generator_identity() -> No
         assert hidden not in visible
     assert "hard_gate_outcome" in captured["system"]
     assert "Simplified Chinese" in captured["system"]
+
+
+def test_model_expert_prompt_separates_portfolio_quantity_from_candidate_grade() -> None:
+    captured: dict[str, str] = {}
+    profile = ExpertModelProfile(
+        profile_id="gpt",
+        provider="openai_compatible",
+        requested_model_id="gpt-test",
+        model_family="gpt",
+        endpoint_identity="https://example.test/v1",
+        routing_profile_id="gpt",
+        identity_verification="unverified",
+    )
+
+    def resolve_profile(_profile_id: str) -> dict[str, Any]:
+        return {
+            **profile.model_dump(mode="json"),
+            "id": profile.profile_id,
+            "api_key": "secret",
+            "base_url": "https://example.test/v1",
+            "model": "gpt-test",
+            "timeout": "120",
+        }
+
+    def judge_factory(_profile: ExpertModelProfile, _config: dict[str, Any]):
+        def judge(system_prompt: str, _user_prompt: str):
+            captured["system"] = system_prompt
+            return json.loads(_assessment_json())
+
+        return judge
+
+    runner = ModelExpertRunner(resolve_profile=resolve_profile, judge_factory=judge_factory)
+    runner(
+        profile,
+        {
+            "candidate_id": "candidate-small-valid",
+            "visible_prompt": "免疫肽数据集，越多越好",
+            "selected_file_count": 4,
+            "task_semantics": {
+                "quantity_scope": "portfolio",
+                "portfolio_size_preference": "maximize_usable_projects",
+                "per_project_minimum": None,
+                "penalize_small_project": False,
+            },
+        },
+    )
+
+    assert "portfolio-level" in captured["system"]
+    assert "must not lower" in captured["system"]
+    assert "Grade 3" in captured["system"]

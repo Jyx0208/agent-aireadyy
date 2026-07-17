@@ -389,13 +389,18 @@ class LLMConfigStore:
             raw_capabilities = [raw_capabilities]
         if not isinstance(raw_capabilities, list):
             raise ValueError("profile_capabilities_must_be_list")
+        provider = str(profile.get("provider") or current.get("provider") or "openai_compatible").strip()
+        explicit_family = str(profile.get("model_family") or "").strip()
+        existing_family = str(current.get("model_family") or "").strip()
+        existing_model = str(current.get("model") or "").strip()
+        model_family = explicit_family or (existing_family if existing_model == model else "") or _infer_model_family(model, provider)
         return {
-            "provider": str(profile.get("provider") or current.get("provider") or "openai_compatible").strip(),
+            "provider": provider,
             "requested_model_id": str(
                 profile.get("requested_model_id") or current.get("requested_model_id") or model
             ).strip(),
             "resolved_model_id": resolved_model_id,
-            "model_family": str(profile.get("model_family") or current.get("model_family") or model).strip(),
+            "model_family": model_family,
             "endpoint_identity": _normalize_endpoint_identity(
                 profile.get("endpoint_identity") or current.get("endpoint_identity") or base_url
             ),
@@ -455,3 +460,22 @@ def _normalize_endpoint_identity(value: Any) -> str:
     if redact_secrets(normalized) != normalized:
         raise ValueError("endpoint_identity_must_not_contain_credentials")
     return normalized
+
+
+def _infer_model_family(model: str, provider: str) -> str:
+    text = f"{provider} {model}".casefold()
+    for marker, family in (
+        ("claude", "claude"),
+        ("anthropic", "claude"),
+        ("gemini", "gemini"),
+        ("google", "gemini"),
+        ("grok", "grok"),
+        ("xai", "grok"),
+        ("deepseek", "deepseek"),
+        ("qwen", "qwen"),
+        ("gpt", "gpt"),
+        ("openai", "gpt"),
+    ):
+        if marker in text:
+            return family
+    return str(model or provider or "unknown").strip()

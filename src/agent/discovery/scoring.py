@@ -488,11 +488,24 @@ def build_discovered_project(
         raw_metadata=project,
     )
     validity = assess_project_validity(project_model, request)
-    return project_model.model_copy(
+    project_model = project_model.model_copy(
         update={
             "validity_status": validity.status,
             "validity_reasons": validity.reasons,
             "needs_review": project_model.needs_review or validity.needs_review,
+        }
+    )
+    from agent.discovery.calibration import load_active_calibration, score_project_with_calibration
+
+    active_calibration = load_active_calibration()
+    if active_calibration is None:
+        return project_model
+    calibrated = score_project_with_calibration(project_model, active_calibration)
+    return project_model.model_copy(
+        update={
+            "calibrated_project_score": calibrated["score"],
+            "calibration_version": calibrated["version_id"],
+            "calibration_components": calibrated["components"],
         }
     )
 

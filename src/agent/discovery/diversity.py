@@ -45,7 +45,7 @@ def _candidate_score(
     return (
         trust * 100.0
         + file.file_score
-        + project.project_score * 0.15
+        + (project.calibrated_project_score if project.calibrated_project_score is not None else project.project_score) * 0.15
         + file.memory_prior * 100.0
         + novelty
         - (5.0 if file.needs_review else 0.0)

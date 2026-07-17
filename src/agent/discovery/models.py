@@ -52,6 +52,10 @@ class DatasetRequest(JsonModel):
     max_files: int = Field(default=2000, ge=1)
     max_candidate_projects: int = Field(default=300, ge=1)
     max_files_per_project: int = Field(default=50, ge=1)
+    quantity_scope: Literal["unspecified", "portfolio", "per_project"] = "unspecified"
+    portfolio_size_preference: str | None = None
+    per_project_min_files: int | None = Field(default=None, ge=1)
+    per_project_min_samples: int | None = Field(default=None, ge=1)
     hard_constraint_fields: list[str] = Field(
         default_factory=lambda: [
             "repository",
@@ -97,6 +101,9 @@ class DiscoveredProject(JsonModel):
     immunopeptide_metadata_confidence: float = 0.0
     labeling_strategy: str | None = None
     project_score: float = 0.0
+    calibrated_project_score: float | None = None
+    calibration_version: str | None = None
+    calibration_components: dict[str, float] = Field(default_factory=dict)
     confidence: float = 0.0
     trust_score: float = 0.0
     evidence_completeness: float = 0.0
