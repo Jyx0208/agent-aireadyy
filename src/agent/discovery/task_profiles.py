@@ -213,6 +213,26 @@ TASK_PROFILES: dict[str, TaskProfile] = {
 }
 
 
+# Grill / UI labels that mean "no modeling task yet" — discovery only.
+OPTIONAL_TASK_TYPES = {
+    "browse_only",
+    "browse",
+    "data_only",
+    "find_data",
+    "find_data_only",
+    "none",
+    "null",
+    "unknown",
+    "undetermined",
+    "unspecified",
+    "other",
+    "n_a",
+    "na",
+    "any",
+    "general",
+}
+
+
 def normalize_task_type(value: str | None) -> str | None:
     if value is None:
         return None
@@ -220,10 +240,14 @@ def normalize_task_type(value: str | None) -> str | None:
     if not task_type:
         return None
     task_type = TASK_TYPE_ALIASES.get(task_type, task_type)
+    if task_type in OPTIONAL_TASK_TYPES:
+        # Data discovery without a fixed modeling task (e.g. grill "browse_only").
+        return None
     if task_type not in TASK_PROFILES:
         raise ValueError(
             "Unsupported task type. Supported values: "
             + ", ".join(sorted(TASK_PROFILES))
+            + ", or empty/browse_only for data-only discovery"
         )
     return task_type
 

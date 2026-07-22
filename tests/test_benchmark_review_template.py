@@ -57,6 +57,8 @@ def test_benchmark_review_template_has_repair_contract_markers() -> None:
     assert 'id="jobWorkersInput"' in html
     assert 'id="poolBuildWorkers"' in html
     assert 'workers: selectedJobWorkers()' in html
+    assert "payload.job.reused_existing" in html
+    assert "同一模型不会重复评审" in html
     assert 'body: JSON.stringify({ workers: selectedJobWorkers() })' in html
     assert 'workers: selectedPoolBuildWorkers()' in html
     assert "developer_allowed" in html
@@ -111,9 +113,14 @@ def test_benchmark_review_template_has_repair_contract_markers() -> None:
     assert 'id="reviewFlagFilterBar"' in html
     assert 'data-score="0"' in html
     assert 'data-score="3"' in html
-    assert 'data-flag="low_confidence"' in html
-    assert 'data-flag="vote_disagreement"' in html
-    assert 'data-flag="hard_constraint_conflicts"' in html
+    assert 'data-flag="awaiting_models"' in html
+    assert 'data-flag="no_formal_consensus"' in html
+    assert 'data-flag="model_score_disagreement"' in html
+    assert 'data-flag="major_disagreement"' in html
+    assert 'data-flag="hard_gate_disagreement"' in html
+    assert 'data-flag="needs_adjudication"' in html
+    assert "多模型共识问题" in html
+    assert "formatDate(log.ts)" in html
     assert "function updateQueueCounts()" in html
     assert "graded: `已完成 ${gradedCount}`" in html
     assert "function reviewFlags(candidate)" in html
@@ -179,6 +186,10 @@ def test_benchmark_review_template_restores_safe_workspace_cursor() -> None:
     assert "function workspaceSnapshot()" in html
     assert "function applyWorkspaceControls(state)" in html
     assert "async function restoreRecentWorkspace" in html
+    assert "正在恢复服务端池" in html
+    assert "浏览器只保存了位置，未保存完整候选池" in html
+    assert 'poolIdentity === `server:${state.pool_id}`' in html
+    assert "const restored = await openServerPool" in html
     assert "await restoreRecentWorkspace({ automatic: true })" in html
     assert "workspace.reviewer_id !== undefined" in html
     assert 'options.workspace || (poolSource === "local" ? workspaceMemory.load() : null)' in html

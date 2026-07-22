@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
@@ -11,38 +11,59 @@ from pydantic import Field, model_validator
 
 from agent.discovery.memory import DiscoveryMemory
 from agent.discovery.models import DatasetManifest, DatasetRequest
-from agent.discovery.pride_discovery import discover_pride_dataset
+from agent.discovery.pride_discovery import InspectionOutcomeCategory, discover_pride_dataset
 from agent.discovery.query_builder import prepare_pride_search_queries
 from agent.discovery.scoring import score_project
 from agent.models import JsonModel
-from agent.pride.client import PrideClient
+from agent.pride.client import PrideClient, search_projects_paginated
 from agent.utils import write_json
 
 
 _INTENT_STOPWORDS = {
+    "and",
+    "assets",
     "about",
     "acquired",
     "against",
+    "candidate",
+    "candidates",
     "class",
     "data",
     "dataset",
     "datasets",
     "develop",
     "development",
+    "evidence",
+    "explain",
     "find",
+    "file",
+    "files",
     "from",
     "human",
+    "inspect",
+    "judgment",
+    "level",
+    "matched",
     "model",
     "need",
+    "only",
+    "project",
+    "projects",
     "proteome",
     "proteomic",
     "proteomics",
     "sample",
     "samples",
+    "retain",
     "study",
+    "the",
+    "to",
     "using",
+    "verify",
     "with",
 }
+
+_EXACT_PRIDE_ACCESSION_RE = re.compile(r"PXD\d+", flags=re.IGNORECASE)
 
 
 class RepositoryQuery(JsonModel):
@@ -78,6 +99,15 @@ class QueryYield(JsonModel):
     skipped_reason: str | None = None
 
 
+class RepositorySearchFailure(JsonModel):
+    query: str
+    executed_query: str
+    intent_dimension: str
+    requested_depth: int
+    error_type: str
+    message: str
+
+
 class CandidatePreview(JsonModel):
     project_accession: str
     title: str = ""
@@ -111,12 +141,16 @@ class CandidateSearchObservation(JsonModel):
     semantic_coverage_gain: float = Field(default=0.0, ge=0.0, le=1.0)
     recommended_action: str = "review_candidate_previews"
     failures: list[str] = Field(default_factory=list)
+    operational_failures: list[RepositorySearchFailure] = Field(default_factory=list)
+    stop_reason: str | None = None
     rationale: str = ""
 
 
 class CandidateInspectionAction(JsonModel):
     search_id: str = Field(min_length=1)
-    accessions: list[str] = Field(min_length=1, max_length=25)
+    # Maximize harvests need large batches; 25 was silently capping inspection progress
+    # (353 high-relevance -> only 50 inspected across 2 batches).
+    accessions: list[str] = Field(min_length=1, max_length=200)
     rationale: str = Field(min_length=1, max_length=2000)
 
     @model_validator(mode="after")
@@ -130,9 +164,26 @@ class CandidateInspectionAction(JsonModel):
         return self
 
 
+class CandidateInspectionOutcome(JsonModel):
+    project_accession: str
+    category: InspectionOutcomeCategory
+    stage: str | None = None
+    reason: str | None = None
+    error: str | None = None
+    raw_file_count: int = Field(default=0, ge=0)
+    usable_file_count: int = Field(default=0, ge=0)
+    excluded_file_count: int = Field(default=0, ge=0)
+
+
 class CandidateInspectionResult(JsonModel):
     search_id: str
+    requested_accessions: list[str] = Field(default_factory=list)
     inspected_accessions: list[str]
+    eligible_accessions: list[str] = Field(default_factory=list)
+    failed_accessions: list[str] = Field(default_factory=list)
+    excluded_accessions: list[str] = Field(default_factory=list)
+    no_usable_files_accessions: list[str] = Field(default_factory=list)
+    inspection_outcomes: list[CandidateInspectionOutcome] = Field(default_factory=list)
     manifest: DatasetManifest
     usable_files: int = Field(ge=0)
     valid_files: int = Field(ge=0)
@@ -170,6 +221,7 @@ class PrideDiscoverySearchEnvironment:
         self.intent_terms = _extract_intent_terms(self.prompt, request)
         self._records: dict[str, dict[str, Any]] = {}
         self._query_hits: dict[str, set[str]] = defaultdict(set)
+        self._pinned_accessions: set[str] = set()
         self._seed_depths: dict[str, int] = {}
         self._search_counter = 0
         self._latest_search_id: str | None = None
@@ -179,7 +231,47 @@ class PrideDiscoverySearchEnvironment:
     def candidate_accessions(self) -> list[str]:
         return list(self._records)
 
+    @property
+    def latest_search_id(self) -> str | None:
+        return self._latest_search_id
+
+    def high_relevance_accessions(self, *, limit: int | None = None) -> list[str]:
+        """Return ranked non-excluded high-relevance accessions for maximize inspection."""
+        ranked = self._ranked_records()
+        floor = min(2, max(1, len(self.intent_terms)))
+        accessions = [
+            accession
+            for accession, _record, preview in ranked
+            if not preview.excluded and len(preview.matched_intent_terms) >= floor
+        ]
+        if not accessions:
+            accessions = [
+                accession
+                for accession, _record, preview in ranked
+                if not preview.excluded
+            ]
+        if limit is not None:
+            return accessions[: max(0, int(limit))]
+        return accessions
+
     def search(self, action: CandidateSearchAction) -> CandidateSearchObservation:
+        return self._search(action, request_budget=None)
+
+    def search_with_request_budget(
+        self,
+        action: CandidateSearchAction,
+        *,
+        request_budget: int,
+    ) -> CandidateSearchObservation:
+        """Search while sharing a bounded page budget fairly across new seeds."""
+        return self._search(action, request_budget=max(0, int(request_budget)))
+
+    def _search(
+        self,
+        action: CandidateSearchAction,
+        *,
+        request_budget: int | None,
+    ) -> CandidateSearchObservation:
         self._check_cancel()
         if len(self.intent_terms) <= 1:
             translated_terms = _extract_candidate_terms(
@@ -196,12 +288,30 @@ class PrideDiscoverySearchEnvironment:
         raw_total = 0
         duplicate_total = 0
         failures: list[str] = []
+        operational_failures: list[RepositorySearchFailure] = []
+        successful_repository_attempts = 0
         query_yields: list[QueryYield] = []
+        pending_seed_keys: set[str] = set()
+        for pending_query in action.queries:
+            prepared_pending = prepare_pride_search_queries([pending_query.query])
+            executed_pending = (
+                prepared_pending[0] if prepared_pending else pending_query.query
+            )
+            pending_key = " ".join(executed_pending.casefold().split())
+            if self._seed_depths.get(pending_key, 0) < pending_query.depth:
+                pending_seed_keys.add(pending_key)
+        pending_seed_count = len(pending_seed_keys)
+        page_requests_remaining = request_budget
         for query_spec in action.queries:
             self._check_cancel()
             prepared = prepare_pride_search_queries([query_spec.query])
             executed_query = prepared[0] if prepared else query_spec.query
             seed_key = " ".join(executed_query.casefold().split())
+            exact_accession = (
+                executed_query.strip().upper()
+                if _EXACT_PRIDE_ACCESSION_RE.fullmatch(executed_query.strip())
+                else None
+            )
             previous_depth = self._seed_depths.get(seed_key, 0)
             if previous_depth >= query_spec.depth:
                 query_yields.append(
@@ -224,14 +334,81 @@ class PrideDiscoverySearchEnvironment:
             new_for_query = 0
             duplicate_for_query = 0
             try:
-                rows = self.client.search_projects(
+                query_count = max(1, len(action.queries))
+                target_pool = min(
+                    int(self.request.max_candidate_projects),
+                    max(
+                        int(action.candidate_limit),
+                        int(self.request.max_projects) * 5,
+                    ),
+                )
+                target_per_query = max(
+                    int(query_spec.depth),
+                    (target_pool + query_count - 1) // query_count,
+                )
+                page_size = max(
+                    int(query_spec.depth),
+                    (target_per_query + 19) // 20,
+                )
+                page_size = max(1, min(100, page_size))
+                max_pages = max(
+                    2,
+                    min(20, (target_per_query + page_size - 1) // page_size),
+                )
+                if page_requests_remaining is not None:
+                    if page_requests_remaining <= 0:
+                        operational_failures.append(
+                            RepositorySearchFailure(
+                                query=query_spec.query,
+                                executed_query=executed_query,
+                                intent_dimension=query_spec.intent_dimension,
+                                requested_depth=query_spec.depth,
+                                error_type="RequestBudgetExhausted",
+                                message="search_request_budget_reserved_for_inspection",
+                            )
+                        )
+                        query_yields.append(
+                            QueryYield(
+                                query=query_spec.query,
+                                executed_query=executed_query,
+                                intent_dimension=query_spec.intent_dimension,
+                                requested_depth=query_spec.depth,
+                                raw_result_count=0,
+                                new_candidate_count=0,
+                                duplicate_count=0,
+                                skipped_reason="search_request_budget_reserved_for_inspection",
+                            )
+                        )
+                        continue
+                    fair_share = max(
+                        1,
+                        page_requests_remaining // max(1, pending_seed_count),
+                    )
+                    max_pages = min(max_pages, fair_share)
+                    page_requests_remaining -= max_pages
+                    pending_seed_count = max(0, pending_seed_count - 1)
+                max_results = page_size * max_pages
+                rows = search_projects_paginated(
+                    self.client,
                     executed_query,
-                    page_size=query_spec.depth,
+                    page_size=page_size,
+                    max_pages=max_pages,
+                    max_results=max_results,
                 )
                 self._seed_depths[seed_key] = query_spec.depth
             except Exception as exc:  # pragma: no cover - network boundary
                 failure = f"{query_spec.query}: {exc}"
                 failures.append(failure)
+                operational_failures.append(
+                    RepositorySearchFailure(
+                        query=query_spec.query,
+                        executed_query=executed_query,
+                        intent_dimension=query_spec.intent_dimension,
+                        requested_depth=query_spec.depth,
+                        error_type=type(exc).__name__,
+                        message=str(exc),
+                    )
+                )
                 query_yields.append(
                     QueryYield(
                         query=query_spec.query,
@@ -244,7 +421,10 @@ class PrideDiscoverySearchEnvironment:
                         error=str(exc),
                     )
                 )
+                if "search_request_budget_reserved_for_inspection" in str(exc):
+                    break
                 continue
+            successful_repository_attempts += 1
             raw_total += len(rows)
             top_accessions: list[str] = []
             for row in rows:
@@ -252,10 +432,19 @@ class PrideDiscoverySearchEnvironment:
                 if not accession:
                     continue
                 top_accessions.append(accession)
+                if exact_accession and accession == exact_accession:
+                    # A user- or Agent-requested exact accession is not merely another
+                    # ranked preview. Keep it inspectable even when broad results score
+                    # higher and fill the bounded candidate pool.
+                    self._pinned_accessions.add(accession)
                 if accession in self._records:
                     duplicate_for_query += 1
                 else:
-                    self._records[accession] = row
+                    enriched = dict(row)
+                    enriched["_discovery_query"] = query_spec.query
+                    enriched["_discovery_depth"] = query_spec.depth
+                    enriched["_discovery_intent"] = query_spec.intent_dimension
+                    self._records[accession] = enriched
                     new_for_query += 1
                 self._query_hits[accession].add(executed_query)
             duplicate_total += duplicate_for_query
@@ -268,11 +457,15 @@ class PrideDiscoverySearchEnvironment:
                     raw_result_count=len(rows),
                     new_candidate_count=new_for_query,
                     duplicate_count=duplicate_for_query,
-                    top_accessions=top_accessions[:5],
+                    top_accessions=top_accessions[:20],
                 )
             )
 
         ranked = self._ranked_records()
+        ranked = sorted(
+            ranked,
+            key=lambda item: item[0] not in self._pinned_accessions,
+        )
         retention_limit = max(1, int(self.request.max_candidate_projects))
         if len(ranked) > retention_limit:
             retained = {
@@ -292,6 +485,7 @@ class PrideDiscoverySearchEnvironment:
                     if accession in retained
                 },
             )
+            self._pinned_accessions.intersection_update(retained)
             ranked = ranked[:retention_limit]
         self._search_counter += 1
         self._latest_search_id = f"search_{self._search_counter:04d}"
@@ -310,8 +504,32 @@ class PrideDiscoverySearchEnvironment:
             not preview.excluded and len(preview.matched_intent_terms) >= high_relevance_floor
             for preview in previews
         )
+        all_current_attempts_failed = (
+            bool(operational_failures) and successful_repository_attempts == 0
+        )
+        budget_blocked = all_current_attempts_failed and all(
+            failure.message == "search_request_budget_reserved_for_inspection"
+            for failure in operational_failures
+        )
+        total_repository_outage = all_current_attempts_failed and not self._records
+        status = "completed"
+        stop_reason: str | None = None
+        recommended_action = "review_candidate_previews"
+        if budget_blocked:
+            status = "blocked"
+            stop_reason = "search_request_budget_reserved_for_inspection"
+            recommended_action = (
+                "inspect_existing_candidates_or_stop"
+                if self._records
+                else "retry_repository_or_stop"
+            )
+        elif total_repository_outage:
+            status = "failed"
+            stop_reason = "all_repository_search_attempts_failed"
+            recommended_action = "retry_repository_or_stop"
         self._save_state()
         return CandidateSearchObservation(
+            status=status,
             search_id=self._latest_search_id,
             query_yields=query_yields,
             raw_result_count=raw_total,
@@ -325,7 +543,10 @@ class PrideDiscoverySearchEnvironment:
             unresolved_intent_terms=unresolved,
             semantic_coverage=len(covered) / max(1, len(self.intent_terms)),
             high_relevance_candidate_count=high_relevance,
+            recommended_action=recommended_action,
             failures=failures,
+            operational_failures=operational_failures,
+            stop_reason=stop_reason,
             rationale=action.rationale,
         )
 
@@ -356,11 +577,81 @@ class PrideDiscoverySearchEnvironment:
             should_cancel=self.should_cancel,
             early_stop_on_limits=False,
         )
+        selected_accessions = {
+            project.project_accession.upper()
+            for project in manifest.projects
+            if project.project_accession
+        }
+        outcomes_by_accession: dict[str, CandidateInspectionOutcome] = {}
+        for payload in manifest.summary.get("inspection_outcomes") or []:
+            try:
+                outcome = CandidateInspectionOutcome.model_validate(payload)
+            except (TypeError, ValueError):
+                continue
+            outcomes_by_accession[outcome.project_accession.upper()] = outcome.model_copy(
+                update={"project_accession": outcome.project_accession.upper()}
+            )
+        for accession in action.accessions:
+            if accession not in outcomes_by_accession:
+                if accession in selected_accessions:
+                    outcomes_by_accession[accession] = CandidateInspectionOutcome(
+                        project_accession=accession,
+                        category="usable_files",
+                    )
+                else:
+                    outcomes_by_accession[accession] = CandidateInspectionOutcome(
+                        project_accession=accession,
+                        category="inspection_failure",
+                        stage="inspection",
+                        reason="inspection produced no terminal outcome",
+                    )
+        inspection_outcomes = [outcomes_by_accession[item] for item in action.accessions]
+        eligible_accessions = [
+            item.project_accession
+            for item in inspection_outcomes
+            if item.category == "usable_files"
+        ]
+        excluded_accessions = [
+            item.project_accession
+            for item in inspection_outcomes
+            if item.category == "scientific_exclusion"
+        ]
+        no_usable_files_accessions = [
+            item.project_accession
+            for item in inspection_outcomes
+            if item.category == "no_usable_files"
+        ]
+        failed_accessions = [
+            item.project_accession
+            for item in inspection_outcomes
+            if item.category in {"inspection_failure", "not_inspected"}
+        ]
+        inspected_accessions = [
+            item.project_accession
+            for item in inspection_outcomes
+            if item.category
+            in {"usable_files", "scientific_exclusion", "no_usable_files"}
+        ]
+        inspection_outcome_counts = dict(
+            sorted(
+                Counter(item.category for item in inspection_outcomes).items()
+            )
+        )
         summary = {
             **manifest.summary,
+            "inspection_outcomes": [
+                item.model_dump(mode="json") for item in inspection_outcomes
+            ],
+            "inspection_outcome_counts": inspection_outcome_counts,
             "search_environment": {
                 "search_id": action.search_id,
-                "inspected_accessions": action.accessions,
+                "requested_accessions": action.accessions,
+                "inspected_accessions": inspected_accessions,
+                "eligible_accessions": eligible_accessions,
+                "failed_accessions": failed_accessions,
+                "excluded_accessions": excluded_accessions,
+                "no_usable_files_accessions": no_usable_files_accessions,
+                "inspection_outcome_counts": inspection_outcome_counts,
                 "inspection_rationale": action.rationale,
             },
         }
@@ -369,7 +660,13 @@ class PrideDiscoverySearchEnvironment:
         valid = sum(file.validity_status == "valid" for file in manifest.files)
         return CandidateInspectionResult(
             search_id=action.search_id,
-            inspected_accessions=action.accessions,
+            requested_accessions=action.accessions,
+            inspected_accessions=inspected_accessions,
+            eligible_accessions=eligible_accessions,
+            failed_accessions=failed_accessions,
+            excluded_accessions=excluded_accessions,
+            no_usable_files_accessions=no_usable_files_accessions,
+            inspection_outcomes=inspection_outcomes,
             manifest=manifest,
             usable_files=usable,
             valid_files=valid,
@@ -432,6 +729,13 @@ class PrideDiscoverySearchEnvironment:
                     if isinstance(queries, list)
                 },
             )
+        raw_pinned = payload.get("pinned_accessions") if isinstance(payload, dict) else None
+        if isinstance(raw_pinned, list):
+            self._pinned_accessions = {
+                str(accession).strip().upper()
+                for accession in raw_pinned
+                if str(accession).strip().upper() in self._records
+            }
         raw_seed_depths = payload.get("seed_depths") if isinstance(payload, dict) else None
         if isinstance(raw_seed_depths, dict):
             self._seed_depths = {
@@ -449,7 +753,7 @@ class PrideDiscoverySearchEnvironment:
         write_json(
             self.state_path,
             {
-                "schema_version": "discovery-candidate-state/v1",
+                "schema_version": "discovery-candidate-state/v2",
                 "search_counter": self._search_counter,
                 "latest_search_id": self._latest_search_id,
                 "intent_terms": self.intent_terms,
@@ -458,6 +762,7 @@ class PrideDiscoverySearchEnvironment:
                     accession: sorted(queries)
                     for accession, queries in self._query_hits.items()
                 },
+                "pinned_accessions": sorted(self._pinned_accessions),
                 "seed_depths": self._seed_depths,
             },
         )
@@ -481,7 +786,11 @@ def _extract_candidate_terms(source: str) -> list[str]:
     seen: set[str] = set()
     for token in re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", source):
         normalized = token.casefold().strip("-")
-        if normalized in _INTENT_STOPWORDS or normalized in seen:
+        if (
+            normalized in _INTENT_STOPWORDS
+            or normalized in seen
+            or _EXACT_PRIDE_ACCESSION_RE.fullmatch(normalized)
+        ):
             continue
         seen.add(normalized)
         terms.append(normalized)

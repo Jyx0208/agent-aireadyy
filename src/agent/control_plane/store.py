@@ -410,7 +410,12 @@ class AgentRunStore:
             ).fetchall()
         return [SearchGrant.model_validate(json.loads(row["payload_json"])) for row in rows]
 
-    def consume_search_grant(self, run_id: str, grant_id: str, query_hash: str) -> SearchGrant:
+    def consume_search_grant(
+        self,
+        run_id: str,
+        grant_id: str,
+        query_hash: str | None = None,
+    ) -> SearchGrant:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -422,7 +427,7 @@ class AgentRunStore:
                 raise ValueError("search_grant_not_found")
             if str(row["run_id"]) != run_id:
                 raise ValueError("search_grant_run_mismatch")
-            if str(row["query_hash"]) != query_hash:
+            if query_hash is not None and str(row["query_hash"]) != query_hash:
                 raise ValueError("search_grant_query_mismatch")
             if str(row["status"]) != "issued":
                 raise ValueError(f"grant_already_{row['status']}")
@@ -442,6 +447,60 @@ class AgentRunStore:
             )
             connection.commit()
             return consumed
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def abandon_search_grant(
+        self,
+        run_id: str,
+        grant_id: str,
+        *,
+        reason: str,
+    ) -> SearchGrant:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload_json, status, run_id FROM agent_search_grants WHERE grant_id = ?",
+                (grant_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("search_grant_not_found")
+            if str(row["run_id"]) != run_id:
+                raise ValueError("search_grant_run_mismatch")
+            status = str(row["status"])
+            if status == "consumed":
+                raise ValueError("grant_already_consumed")
+            if status == "abandoned":
+                return SearchGrant.model_validate(json.loads(row["payload_json"]))
+            if status != "issued":
+                raise ValueError(f"grant_already_{status}")
+            grant = SearchGrant.model_validate(json.loads(row["payload_json"]))
+            abandoned = grant.model_copy(
+                update={
+                    "status": "abandoned",
+                    "updated_at": utc_now_iso(),
+                }
+            )
+            payload = abandoned.model_dump(mode="json")
+            payload["abandon_reason"] = reason
+            connection.execute(
+                """
+                UPDATE agent_search_grants
+                SET status = ?, payload_json = ?, updated_at = ? WHERE grant_id = ?
+                """,
+                (
+                    abandoned.status,
+                    canonical_json(payload),
+                    abandoned.updated_at,
+                    grant_id,
+                ),
+            )
+            connection.commit()
+            return abandoned
         except Exception:
             connection.rollback()
             raise

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent.web.expert_review.pool_registry import ExpertPoolRegistry, blind_candidate_view
+from agent.web.expert_review.pool_registry import (
+    ExpertPoolRegistry,
+    blind_candidate_view,
+    expert_review_root,
+)
 
 
 def _sample_pool() -> dict:
@@ -28,6 +32,20 @@ def _sample_pool() -> dict:
             }
         ],
     }
+
+
+def test_default_review_root_is_stable_when_working_directory_changes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("AGENT_EXPERT_REVIEW_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    root = expert_review_root()
+
+    assert root.is_absolute()
+    assert root != tmp_path / "runs" / "expert_review"
+    assert root.parts[-2:] == ("runs", "expert_review")
 
 
 def test_blind_candidate_view_strips_leaks_and_prior_judgments_in_expert_mode() -> None:

@@ -821,12 +821,17 @@ footer{font-family:"Cascadia Mono",Consolas,monospace}
           <textarea class="discovery-goal-input" id="discoveryPrompt" autocomplete="off" data-i18n-placeholder="discoveryGoalPlaceholder" placeholder="Find small DDA proteomics datasets for HLA ligandome, drug treatment, or another future modeling use case. Prioritize diversity."></textarea>
           <div class="discovery-goal-actions">
             <button class="btn btn-secondary btn-small" id="discoveryParseBtn" type="button" onclick="parseDiscoveryGoal()" data-i18n="parseDiscoveryGoal">Fill constraints (optional)</button>
-            <span class="discovery-helper" id="discoveryParseStatus" data-i18n="discoveryParseHelp">Natural language fills the fields below; the fields are the final constraints.</span>
+            <span class="discovery-helper" id="discoveryParseStatus" data-i18n="discoveryParseHelp">Natural language can suggest fields below. They apply only when manual constraints are enabled.</span>
           </div>
         </div>
-        <details class="discovery-constraints">
+        <label class="option-row discovery-constraints-toggle">
+          <input type="checkbox" id="discoveryConstraintsEnabled" onchange="toggleDiscoveryConstraintsMode()">
+          <span data-i18n="discoveryConstraintsEnabled">Enable manual search constraints and quantity limits</span>
+        </label>
+        <div class="mode-help" id="discoveryConstraintsModeHelp" data-i18n="discoveryConstraintsModeHelp">Off by default: Agent decides search strategy and quantity within server safety ceilings. Turn on only when you want to force DDA/labeling/species/project-file caps.</div>
+        <details class="discovery-constraints" id="discoveryConstraintsPanel">
           <summary data-i18n="discoveryConstraints">Search constraints and limits</summary>
-          <div class="discovery-constraints-body">
+          <div class="discovery-constraints-body" id="discoveryConstraintsBody">
         <div class="form-row">
           <label for="discoveryRepository" data-i18n="repository">Repository</label>
           <select id="discoveryRepository">
@@ -859,10 +864,10 @@ footer{font-family:"Cascadia Mono",Consolas,monospace}
         <div class="form-row">
           <label for="discoveryLabeling" data-i18n="discoveryLabeling">Labeling</label>
           <select id="discoveryLabeling">
+            <option value="unknown">unknown / any</option>
             <option value="label_free">label-free</option>
             <option value="TMT">TMT</option>
             <option value="iTRAQ">iTRAQ</option>
-            <option value="unknown">unknown / any</option>
           </select>
         </div>
         <div class="form-row">
@@ -880,7 +885,9 @@ footer{font-family:"Cascadia Mono",Consolas,monospace}
         <div class="form-row">
           <label for="discoveryAcquisition" data-i18n="discoveryAcquisition">Acquisition</label>
           <select id="discoveryAcquisition">
+            <option value="unknown">unknown / any</option>
             <option value="dda">DDA</option>
+            <option value="dia">DIA</option>
           </select>
         </div>
         <div class="form-row">
@@ -897,15 +904,15 @@ footer{font-family:"Cascadia Mono",Consolas,monospace}
         </div>
         <div class="form-row">
           <label for="discoveryMaxProjects" data-i18n="discoveryMaxProjects">Max projects</label>
-          <input type="number" id="discoveryMaxProjects" min="1" max="100" value="5">
+          <input type="number" id="discoveryMaxProjects" min="1" max="300" value="50">
         </div>
         <div class="form-row">
           <label for="discoveryMaxFiles" data-i18n="discoveryMaxFiles">Max files</label>
-          <input type="number" id="discoveryMaxFiles" min="1" max="2000" value="50">
+          <input type="number" id="discoveryMaxFiles" min="1" max="10000" value="2000">
         </div>
         <div class="form-row">
           <label for="discoveryFilesPerProject" data-i18n="discoveryFilesPerProject">Files/project</label>
-          <input type="number" id="discoveryFilesPerProject" min="1" max="100" value="20">
+          <input type="number" id="discoveryFilesPerProject" min="1" max="200" value="50">
         </div>
         <div class="form-row">
           <label for="discoveryDiversityStrategy" data-i18n="discoveryDiversityStrategy">Diversity</label>
@@ -998,12 +1005,16 @@ footer{font-family:"Cascadia Mono",Consolas,monospace}
           </section>
           <div class="discovery-actions">
             <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('dataset_manifest_csv')" data-i18n="downloadManifestCsv">Download manifest CSV</button>
+            <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('project_judgments_table_csv')">项目评分表(全部)</button>
+            <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('selected_projects_review_csv')">已选项目审查表</button>
+            <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('discovery_run_bundle_zip')">打包下载(状态+日志)</button>
             <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('batch_inputs')" data-i18n="downloadBatchInputs">Download batch inputs</button>
             <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('quality_report')" data-i18n="downloadQualityReport">Download quality report</button>
             <details class="download-menu">
               <summary class="btn btn-secondary btn-small" data-i18n="moreDownloads">More downloads</summary>
               <div class="download-menu-body">
                 <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('dataset_manifest_json')" data-i18n="downloadManifestJson">Full JSON</button>
+                <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('project_judgments_json')">Judgments JSON</button>
                 <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('dataset_manifest_usable_csv')" data-i18n="downloadUsableManifestCsv">Usable CSV</button>
                 <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('dataset_manifest_valid_csv')" data-i18n="downloadValidManifestCsv">Valid CSV</button>
                 <button class="btn btn-secondary btn-small" type="button" onclick="downloadDiscoveryFile('dataset_manifest_task_ready_csv')" data-i18n="downloadTaskReadyManifestCsv">Task-ready CSV</button>
@@ -1022,6 +1033,21 @@ footer{font-family:"Cascadia Mono",Consolas,monospace}
             <button class="btn btn-secondary btn-small" type="button" onclick="setDiscoverySelection('all')" data-i18n="selectAllDiscovery">Select all</button>
             <button class="btn btn-secondary btn-small" type="button" onclick="setDiscoverySelection('none')" data-i18n="clearDiscoverySelection">Clear</button>
             <button class="btn btn-green btn-small" type="button" onclick="sendDiscoverySelectionToBatch()" data-i18n="sendDiscoveryToBatch">Send selected to Batch</button>
+          </div>
+          <div class="discovery-filter-bar" id="discoveryProjectFilters">
+            <label>项目筛选
+              <select id="discoveryProjectFilter" onchange="renderDiscoveryProjects((currentDiscoveryRecord&&currentDiscoveryRecord.projects)||[])">
+                <option value="all">全部项目</option>
+                <option value="deliverable" selected>可交付(2/3分 include)</option>
+                <option value="graded">已评分</option>
+                <option value="ungraded">未评分</option>
+                <option value="grade3">仅 3 分</option>
+                <option value="grade2">仅 2 分</option>
+                <option value="exclude">排除</option>
+                <option value="investigate">待补证</option>
+              </select>
+            </label>
+            <input id="discoveryProjectSearch" type="search" placeholder="搜索 accession / 标题 / 理由" oninput="renderDiscoveryProjects((currentDiscoveryRecord&&currentDiscoveryRecord.projects)||[])">
           </div>
           <div class="discovery-table-wrap" id="discoveryProjectTable"></div>
           <div class="discovery-table-wrap" id="discoveryFileTable"></div>
@@ -1381,6 +1407,9 @@ const I18N={
     discoveryStageSearch:'Agent search',
     discoveryStagePackage:'Review package',
     discoveryConstraints:'Search constraints and limits',
+    discoveryConstraintsEnabled:'Enable manual search constraints and quantity limits',
+    discoveryConstraintsModeHelp:'Off by default: Agent decides search strategy and quantity within server safety ceilings. Turn on only when you want to force DDA/labeling/species/project-file caps.',
+    discoveryConstraintsModeHelpOn:'Manual constraints are ON. Values below are sent as user constraints/limits.',
     discoveryPackageEyebrow:'Discovery package',
     discoveryPackageTitle:'Candidate data package',
     discoveryPackageReady:'Ready for review',
@@ -2021,6 +2050,9 @@ const CLEAN_ZH_I18N={
   discoveryStageSearch:'Agent 搜索',
   discoveryStagePackage:'检查文件包',
   discoveryConstraints:'搜索约束与数量上限',
+  discoveryConstraintsEnabled:'启用手动搜索约束与数量上限',
+  discoveryConstraintsModeHelp:'默认关闭：Agent 在服务器安全上限内自主决定搜索策略与数量。只有当你要强制 DDA/标记/物种/项目-文件上限时再打开。',
+  discoveryConstraintsModeHelpOn:'手动约束已开启：下方字段会作为用户约束/上限提交。',
   discoveryPackageEyebrow:'Discovery 文件包',
   discoveryPackageTitle:'候选数据文件包',
   discoveryPackageReady:'等待检查',
@@ -2763,6 +2795,39 @@ function updateServerStatus(d){
   renderSystemMetrics(d.system_metrics);
 }
 
+
+async function openDiscoveryFromHistory(discoveryId, jobId){
+  try{
+    if(jobId){
+      const resp=await fetch('/api/discovery/jobs/'+encodeURIComponent(jobId)+'?detail=1');
+      const data=await resp.json();
+      if(data && data.record){
+        setWorkflowTab('discovery');
+        currentDiscoveryJobId=jobId;
+        renderDiscovery(data.record);
+        safeRenderDiscoveryJobLogs(data.logs||[]);
+        return;
+      }
+    }
+    if(discoveryId){
+      const resp=await fetch('/api/discovery/'+encodeURIComponent(discoveryId));
+      const data=await resp.json();
+      if(data && !data.error){
+        setWorkflowTab('discovery');
+        renderDiscovery(data);
+        return;
+      }
+      alert((data && data.error) || '无法打开 Discovery 结果');
+    }
+  }catch(e){
+    alert('打开 Discovery 历史失败: '+e);
+  }
+}
+
+function downloadDiscoveryHistoryBundle(discoveryId){
+  window.location.href='/api/discovery/'+encodeURIComponent(discoveryId)+'/download?file=discovery_run_bundle_zip';
+}
+
 async function loadResults(refresh=false){
   const box=document.getElementById('publicResults');
   try{
@@ -2799,11 +2864,22 @@ async function loadResults(refresh=false){
     const visibleResults=historyExpanded?results:results.slice(0,8);
     const resultHtml=visibleResults.map(item=>{
       const fileInfo=(item.file_count||0)>0?(tf('fileCount',item.file_count)+' · '+formatSize(item.size_bytes)):t('filesCleaned');
-      const viewId=item.kind==='batch'?(item.batch_id||item.result_id||''):(item.task_id||item.result_id||item.name);
-      const viewLabel=item.kind==='batch'?batchActionText(item.primary_action):actionText(item.primary_action);
-      const viewHandler=item.kind==='batch'?'attachBatch('+jsArg(viewId)+')':'attachTask('+jsArg(viewId)+')';
-      const viewBtn=viewId?UI.actionButton(viewLabel,viewHandler,viewLabel+' '+(item.display_name||item.input_value||item.name||'')):'';
-      const downloadBtn=item.can_download?(item.kind==='batch'?UI.actionButton(batchActionText('download'),'downloadBatchExcelById('+jsArg(item.batch_id||item.result_id)+')',batchActionText('download')+' '+(item.display_name||item.name||'')):UI.actionButton(t('downloadZip'),'downloadPublicResult('+jsArg(item.result_id)+')',t('downloadZip')+' '+(item.display_name||item.name||''))):'';
+      let viewBtn='';
+      let downloadBtn='';
+      if(item.kind==='discovery'){
+        const discoveryId=item.discovery_id||item.run_id||item.result_id||'';
+        const jobId=item.job_id||'';
+        viewBtn=UI.actionButton('打开Discovery','openDiscoveryFromHistory('+jsArg(discoveryId)+','+jsArg(jobId)+')','打开 '+(item.display_name||discoveryId||''));
+        if(item.can_download && discoveryId){
+          downloadBtn=UI.actionButton('下载打包','downloadDiscoveryHistoryBundle('+jsArg(discoveryId)+')','下载 '+(item.display_name||discoveryId||''));
+        }
+      }else{
+        const viewId=item.kind==='batch'?(item.batch_id||item.result_id||''):(item.task_id||item.result_id||item.name);
+        const viewLabel=item.kind==='batch'?batchActionText(item.primary_action):actionText(item.primary_action);
+        const viewHandler=item.kind==='batch'?'attachBatch('+jsArg(viewId)+')':'attachTask('+jsArg(viewId)+')';
+        viewBtn=viewId?UI.actionButton(viewLabel,viewHandler,viewLabel+' '+(item.display_name||item.input_value||item.name||'')):'';
+        downloadBtn=item.can_download?(item.kind==='batch'?UI.actionButton(batchActionText('download'),'downloadBatchExcelById('+jsArg(item.batch_id||item.result_id)+')',batchActionText('download')+' '+(item.display_name||item.name||'')):UI.actionButton(t('downloadZip'),'downloadPublicResult('+jsArg(item.result_id)+')',t('downloadZip')+' '+(item.display_name||item.name||''))):'';
+      }
       const actionHtml=(viewBtn+downloadBtn)||'<span class="public-meta">'+esc(t('noDownload'))+'</span>';
       return UI.taskRow(item,{meta:metaLine(item)+' · '+esc(fileInfo),actions:actionHtml});
     }).join('');
@@ -3175,11 +3251,47 @@ function toggleDiscoveryGoalControls(){
   if(!isPtm)discoverySetMultiSelect('discoveryPtm',['unknown_ptm']);
 }
 
+function discoveryConstraintsEnabled(){
+  return !!document.getElementById('discoveryConstraintsEnabled')?.checked;
+}
+
+function toggleDiscoveryConstraintsMode(){
+  const enabled=discoveryConstraintsEnabled();
+  const panel=document.getElementById('discoveryConstraintsPanel');
+  const body=document.getElementById('discoveryConstraintsBody');
+  const help=document.getElementById('discoveryConstraintsModeHelp');
+  if(panel){
+    panel.open=enabled;
+    panel.classList.toggle('is-disabled',!enabled);
+  }
+  if(body){
+    body.querySelectorAll('input,select,textarea,button').forEach((el)=>{
+      if(el.id==='discoveryConstraintsEnabled')return;
+      // repository stays available? when disabled we still allow repository outside - but it's inside panel.
+      // Keep repository always editable by excluding only pure scientific/limit fields if needed.
+      const alwaysOn=el.id==='discoveryRepository';
+      el.disabled=!enabled && !alwaysOn;
+    });
+  }
+  if(help){
+    help.textContent=enabled
+      ? (t('discoveryConstraintsModeHelpOn')||'Manual constraints are ON. Values below are sent as user constraints/limits.')
+      : (t('discoveryConstraintsModeHelp')||'Off by default: Agent decides search strategy and quantity within server safety ceilings.');
+  }
+}
+
 function collectDiscoveryIntentFields(){
-  return {
+  const base={
     prompt:(document.getElementById('discoveryPrompt')?.value||'').trim(),
     source:document.getElementById('discoverySource').value,
     repository:document.getElementById('discoveryRepository').value,
+    runtime:currentDiscoveryRuntime,
+    agentic:currentDiscoveryRuntime==='workflow'&&document.getElementById('discoveryAgentic').checked,
+    constraints_enabled:discoveryConstraintsEnabled()
+  };
+  if(!discoveryConstraintsEnabled())return base;
+  return {
+    ...base,
     goal:document.getElementById('discoveryGoal').value,
     ptm_type:discoverySelectedPtmType(),
     ptm_types:discoverySelectedPtmTypes(),
@@ -3188,18 +3300,24 @@ function collectDiscoveryIntentFields(){
     species_policy:document.getElementById('discoverySpeciesPolicy').value,
     acquisition_mode:document.getElementById('discoveryAcquisition').value,
     task_type:document.getElementById('discoveryTaskType').value,
-    max_projects:discoveryInt('discoveryMaxProjects',5),
-    max_files:discoveryInt('discoveryMaxFiles',50),
-    max_files_per_project:discoveryInt('discoveryFilesPerProject',20),
+    max_projects:discoveryInt('discoveryMaxProjects',50),
+    max_files:discoveryInt('discoveryMaxFiles',2000),
+    max_files_per_project:discoveryInt('discoveryFilesPerProject',50),
     agentic_rounds:discoveryInt('discoveryAgenticRounds',1),
-    runtime:currentDiscoveryRuntime,
-    diversity_strategy:document.getElementById('discoveryDiversityStrategy').value,
-    agentic:currentDiscoveryRuntime==='workflow'&&document.getElementById('discoveryAgentic').checked
+    diversity_strategy:document.getElementById('discoveryDiversityStrategy').value
   };
 }
 
 function applyDiscoveryGoalFields(fields){
   const data=fields||{};
+  // Applying parsed fields implies the user may want them; enable manual constraints.
+  if(Object.keys(data).some((key)=>!['prompt','source','repository','runtime','agentic','constraints_enabled'].includes(key))){
+    const toggle=document.getElementById('discoveryConstraintsEnabled');
+    if(toggle && !toggle.checked){
+      toggle.checked=true;
+      toggleDiscoveryConstraintsMode();
+    }
+  }
   if(data.source){
     discoverySetSelect('discoverySource',String(data.source));
     toggleDiscoverySourceControls();
@@ -3215,12 +3333,14 @@ function applyDiscoveryGoalFields(fields){
   if(data.acquisition_mode)discoverySetSelect('discoveryAcquisition',String(data.acquisition_mode));
   if(data.task_type!==undefined)discoverySetSelect('discoveryTaskType',String(data.task_type||''));
   if(data.diversity_strategy)discoverySetSelect('discoveryDiversityStrategy',String(data.diversity_strategy));
-  if(data.max_projects!==undefined)document.getElementById('discoveryMaxProjects').value=String(Math.max(1,Math.min(100,parseInt(data.max_projects,10)||5)));
-  if(data.max_files!==undefined)document.getElementById('discoveryMaxFiles').value=String(Math.max(1,Math.min(2000,parseInt(data.max_files,10)||50)));
-  if(data.max_files_per_project!==undefined)document.getElementById('discoveryFilesPerProject').value=String(Math.max(1,Math.min(100,parseInt(data.max_files_per_project,10)||20)));
+  if(data.max_projects!==undefined)document.getElementById('discoveryMaxProjects').value=String(Math.max(1,Math.min(300,parseInt(data.max_projects,10)||50)));
+  if(data.max_files!==undefined)document.getElementById('discoveryMaxFiles').value=String(Math.max(1,Math.min(10000,parseInt(data.max_files,10)||2000)));
+  if(data.max_files_per_project!==undefined)document.getElementById('discoveryFilesPerProject').value=String(Math.max(1,Math.min(200,parseInt(data.max_files_per_project,10)||50)));
   if(data.agentic_rounds!==undefined)discoverySetSelect('discoveryAgenticRounds',String(Math.max(1,Math.min(2,parseInt(data.agentic_rounds,10)||1))));
   if(data.runtime!==undefined)setDiscoveryRuntime(String(data.runtime||'workflow'));
   document.getElementById('discoveryAgentic').checked=data.agentic!==false;
+  toggleDiscoveryGoalControls();
+  toggleDiscoveryConstraintsMode();
 }
 
 function parseDiscoveryGoalFallback(showStatus=true,errorMessage=''){
@@ -3427,30 +3547,66 @@ function collectDiscoveryPayload(){
   const agentic=document.getElementById('discoveryAgentic').checked;
   const diversityStrategy=document.getElementById('discoveryDiversityStrategy').value;
   const source=document.getElementById('discoverySource').value;
-  return {
+  const prompt=buildDiscoveryPrompt();
+  const base={
     runtime:currentDiscoveryRuntime,
     source,
     local_dir:document.getElementById('discoveryLocalDir').value.trim(),
     repository:document.getElementById('discoveryRepository').value,
-    goal:document.getElementById('discoveryGoal').value,
-    ptm_type:discoverySelectedPtmType(),
-    ptm_types:discoverySelectedPtmTypes(),
-    labeling_strategy:document.getElementById('discoveryLabeling').value,
-    species:document.getElementById('discoverySpecies').value.split(/[,;\n]+/).map(v=>v.trim()).filter(Boolean),
-    species_policy:document.getElementById('discoverySpeciesPolicy').value,
-    acquisition_mode:document.getElementById('discoveryAcquisition').value,
-    task_type:document.getElementById('discoveryTaskType').value,
-    max_projects:discoveryInt('discoveryMaxProjects',5),
-    max_files:discoveryInt('discoveryMaxFiles',50),
-    max_files_per_project:discoveryInt('discoveryFilesPerProject',20),
-    max_candidate_projects:Math.max(20,discoveryInt('discoveryMaxProjects',5)*5),
     use_memory:document.getElementById('discoveryUseMemory').checked,
     save_memory:document.getElementById('discoverySaveMemory').checked,
     diversity_strategy:diversityStrategy,
     agentic:currentDiscoveryRuntime==='workflow'&&agentic,
     agentic_rounds:discoveryInt('discoveryAgenticRounds',1),
     llm_config:collectConfig(),
-    prompt:buildDiscoveryPrompt()
+    prompt,
+    constraints_enabled:discoveryConstraintsEnabled()
+  };
+  if(!discoveryConstraintsEnabled()){
+    // Agent-autonomous payload: do not force DDA/label-free/small caps from the form.
+    return {
+      ...base,
+      goal:'general',
+      acquisition_mode:'unknown',
+      labeling_strategy:'unknown',
+      species:[],
+      species_policy:'open',
+      hard_constraint_fields:['repository'],
+      constraint_provenance:{repository:'user'}
+    };
+  }
+  const hard=['repository'];
+  const provenance={repository:'user'};
+  const goal=document.getElementById('discoveryGoal').value;
+  const labeling=document.getElementById('discoveryLabeling').value;
+  const acquisition=document.getElementById('discoveryAcquisition').value;
+  const species=document.getElementById('discoverySpecies').value.split(/[,;\n]+/).map(v=>v.trim()).filter(Boolean);
+  const speciesPolicy=document.getElementById('discoverySpeciesPolicy').value;
+  if(goal && goal!=='general'){hard.push('goal'); provenance.goal='user';}
+  if(species.length){
+    hard.push('species','species_policy');
+    provenance.species='user';
+    provenance.species_policy='user';
+  }
+  if(acquisition && acquisition!=='unknown'){hard.push('acquisition_mode'); provenance.acquisition_mode='user';}
+  if(labeling && labeling!=='unknown'){hard.push('labeling_strategy'); provenance.labeling_strategy='user';}
+  const maxProjects=discoveryInt('discoveryMaxProjects',50);
+  return {
+    ...base,
+    goal,
+    ptm_type:discoverySelectedPtmType(),
+    ptm_types:discoverySelectedPtmTypes(),
+    labeling_strategy:labeling,
+    species,
+    species_policy:speciesPolicy,
+    acquisition_mode:acquisition,
+    task_type:document.getElementById('discoveryTaskType').value,
+    max_projects:maxProjects,
+    max_files:discoveryInt('discoveryMaxFiles',2000),
+    max_files_per_project:discoveryInt('discoveryFilesPerProject',50),
+    max_candidate_projects:Math.max(50,maxProjects*5),
+    hard_constraint_fields:hard,
+    constraint_provenance:provenance
   };
 }
 
@@ -3537,24 +3693,115 @@ function renderDiscoverySummary(data){
   const task=summary.task_readiness||{};
   const agentic=summary.agentic||{};
   const agent=data.agent||summary.agent_runtime||null;
+  const judgment=summary.project_judgment_summary||{};
+  const gradeCounts=judgment.grade_counts||{};
   const box=document.getElementById('discoverySummary');
   const stat=(label,value,statusClass='')=>'<div class="discovery-stat '+esc(statusClass)+'"><div class="discovery-stat-label">'+esc(label)+'</div><div class="discovery-stat-value">'+esc(value)+'</div></div>';
   const taskStatus=Object.entries(task.status_counts||{}).map(([k,v])=>k+': '+v).join('; ')||'off';
   const agenticStatus=agent
     ? ((agent.status||'unknown')+', rounds: '+(agent.discovery_rounds||0)+', tools: '+(agent.tool_calls||0))
     : (agentic.enabled?('rounds: '+(agentic.rounds||1)+', warnings: '+((agentic.warnings||[]).length||0)):'off');
+  const gradeText=['0','1','2','3','unknown'].map(k=>k+':'+(gradeCounts[k]||0)).join(' · ');
   box.innerHTML=[
-    stat(t('discoveryProjects'),String(data.project_count||summary.selected_projects||0)),
+    stat('项目数',String(data.project_count||summary.selected_projects||0)),
+    stat('可交付项目',String(summary.deliverable_projects||0), (summary.deliverable_projects||0)>0?'completed':'blocked'),
+    stat('已评分/未评分',String((summary.graded_projects||0))+' / '+String((summary.ungraded_projects||0)), (summary.ungraded_projects||0)>0?'blocked':''),
+    stat('0-3 分布',gradeText||'n/a'),
+    stat('合格/待补证/排除',String(judgment.qualified_projects||0)+' / '+String(judgment.investigate_projects||0)+' / '+String(judgment.rejected_projects||0)),
     stat(t('discoveryFiles'),String(data.file_count||summary.selected_files||0)),
     stat(t('discoveryUsable'),String(summary.usable_files||0)),
     stat(t('discoveryNeedsReview'),String(summary.needs_review_files||0)),
     stat(t('discoveryMemory'),(summary.memory_used?'prior ':'')+(summary.memory_saved?'saved':'off')),
     stat(t('discoveryValidity'),Object.entries(validity).map(([k,v])=>k+': '+v).join(' · ')||'n/a'),
-    stat(t('discoveryInstrument'),String(unknown.instrument_family||0)+' unknown'),
-    stat(t('discoveryFragmentation'),String(unknown.fragmentation_method||0)+' unknown'),
     stat(t('discoveryTaskReady'),taskStatus),
     stat(t('discoveryAgenticSummary'),agenticStatus,agent?(agent.status==='completed'?'completed':agent.status==='blocked'?'blocked':'partial'):'')
   ].join('');
+}
+
+function discoveryJudgmentBadge(project){
+  const grade=project.final_grade;
+  const decision=String(project.judgment_decision||'');
+  const gate=String(project.hard_gate||'');
+  if(grade===null||grade===undefined||grade===''){
+    return '<span class="status-pill blocked">未评分</span>';
+  }
+  const cls=decision==='include'?'completed':decision==='investigate'?'needs_review':'blocked';
+  return '<span class="status-pill '+cls+'">'+esc(String(grade))+' · '+esc(decision||'n/a')+(gate?(' · '+esc(gate)):'')+'</span>';
+}
+
+function discoveryProjectMatchesFilter(project,filter,query){
+  const grade=project.final_grade;
+  const decision=String(project.judgment_decision||'');
+  const has=!!project.has_project_judgment;
+  if(filter==='deliverable' && !project.usable_for_delivery)return false;
+  if(filter==='graded' && !has)return false;
+  if(filter==='ungraded' && has)return false;
+  if(filter==='grade3' && String(grade)!=='3')return false;
+  if(filter==='grade2' && String(grade)!=='2')return false;
+  if(filter==='exclude' && decision!=='exclude')return false;
+  if(filter==='investigate' && decision!=='investigate')return false;
+  if(query){
+    const blob=[
+      project.project_accession,
+      project.project_title,
+      project.judgment_explanation,
+      discoveryListText(project.species),
+      project.judgment_decision,
+      project.hard_gate
+    ].join(' ').toLowerCase();
+    if(!blob.includes(query))return false;
+  }
+  return true;
+}
+
+function renderDiscoveryProjects(projects){
+  const box=document.getElementById('discoveryProjectTable');
+  if(!box)return;
+  const filter=document.getElementById('discoveryProjectFilter')?.value||'all';
+  const query=(document.getElementById('discoveryProjectSearch')?.value||'').trim().toLowerCase();
+  const source=Array.isArray(projects)?projects:[];
+  const filtered=source.filter(project=>discoveryProjectMatchesFilter(project,filter,query));
+  // deliverable first, then grade desc, then accession
+  filtered.sort((a,b)=>{
+    const ua=a.usable_for_delivery?1:0, ub=b.usable_for_delivery?1:0;
+    if(ua!==ub)return ub-ua;
+    const ga=Number(a.final_grade), gb=Number(b.final_grade);
+    const va=Number.isFinite(ga)?ga:-1, vb=Number.isFinite(gb)?gb:-1;
+    if(va!==vb)return vb-va;
+    return String(a.project_accession||'').localeCompare(String(b.project_accession||''));
+  });
+  const rows=filtered.map(project=>{
+    const explanation=String(project.judgment_explanation||'').trim()||'（无评分理由）';
+    const species=discoveryListText(project.species||project.canonical_species||[]);
+    const files=project.selected_file_count||project.file_count||0;
+    const retrieval=project.retrieval_project_score??project.project_score;
+    return '<tr class="'+(project.usable_for_delivery?'':'discovery-row-muted')+'">'
+      +'<td><div class="discovery-acc">'+esc(project.project_accession||'')+'</div><div class="discovery-compact-muted">'+esc(species||'species:n/a')+'</div></td>'
+      +'<td><div class="discovery-title">'+esc(project.project_title||'')+'</div></td>'
+      +'<td>'+discoveryJudgmentBadge(project)+'</td>'
+      +'<td class="discovery-reason-cell">'+esc(explanation)+'</td>'
+      +'<td>'+esc(String(files))+'</td>'
+      +'<td class="discovery-compact-muted">'+esc(_formatScore(retrieval))+'</td>'
+      +'</tr>';
+  }).join('');
+  box.innerHTML=''
+    +'<div class="discovery-table-meta">显示 '+filtered.length+' / '+source.length+' 个项目 · 仅“可交付(2/3分 include 且有理由)”可进入正式使用</div>'
+    +'<table class="discovery-table discovery-project-judgment-table"><thead><tr>'
+    +'<th>项目</th><th>标题</th><th>0-3 判断</th><th>评分理由</th><th>文件数</th><th>检索辅助分</th>'
+    +'</tr></thead><tbody>'
+    +(rows||'<tr><td colspan="6">'+esc(t('discoveryNoResults'))+'</td></tr>')
+    +'</tbody></table>';
+}
+
+function renderDiscovery(data){
+  currentDiscoveryId=data.discovery_id||null;
+  currentDiscoveryRecord=data||null;
+  renderDiscoverySummary(data);
+  renderDiscoveryAgentResult(data);
+  renderDiscoveryProjects(data.projects||[]);
+  renderDiscoveryFiles(data.files||[]);
+  document.getElementById('discoveryResults').hidden=false;
+  setDiscoveryProgress(3);
 }
 
 function renderDiscoveryAgentResult(data){
@@ -3610,14 +3857,6 @@ function renderDiscoveryNextStep(){
     ? tf('discoveryNextStepBatch',selected,files.length)
     : t('discoveryNextStepNone');
   box.innerHTML='<strong>'+esc(t('discoveryNextStepTitle'))+'</strong>'+esc(body);
-}
-
-function renderDiscoveryProjects(projects){
-  const box=document.getElementById('discoveryProjectTable');
-  const rows=(projects||[]).slice(0,50).map(project=>{
-    return '<tr><td>'+esc(project.project_accession||'')+'</td><td>'+esc(project.project_title||'')+'</td><td>'+esc(_formatScore(project.project_score))+'</td><td>'+esc(_formatRatio(project.trust_score||project.confidence))+'</td><td>'+esc(discoveryListText(project.instrument_families))+'</td><td>'+esc(discoveryListText(project.fragmentation_methods))+'</td><td>'+esc(project.selected_file_count||0)+'</td></tr>';
-  }).join('');
-  box.innerHTML='<table class="discovery-table"><thead><tr><th>Project</th><th>Title</th><th>'+esc(t('discoveryScore'))+'</th><th>'+esc(t('discoveryTrust'))+'</th><th>'+esc(t('discoveryInstrument'))+'</th><th>'+esc(t('discoveryFragmentation'))+'</th><th>Files</th></tr></thead><tbody>'+(rows||'<tr><td colspan="7">'+esc(t('discoveryNoResults'))+'</td></tr>')+'</tbody></table>';
 }
 
 function discoveryIsUsableForBatch(file){
@@ -3997,7 +4236,7 @@ function safeRenderDiscoveryJobLogs(logs){
 }
 
 function discoveryJobIsTerminal(status){
-  return ['completed','failed','cancelled'].includes(String(status||'').toLowerCase());
+  return ['completed','failed','blocked','cancelled'].includes(String(status||'').toLowerCase());
 }
 
 async function pollDiscoveryJob(){
@@ -4119,7 +4358,7 @@ async function startDiscovery(){
   const speciesInput=document.getElementById('discoverySpecies');
   const localDirInput=document.getElementById('discoveryLocalDir');
   const promptInput=document.getElementById('discoveryPrompt');
-  if(payload.max_projects<1||payload.max_files<1){
+  if(payload.constraints_enabled && (payload.max_projects<1||payload.max_files<1)){
     showFormAlert(t('discoveryRequired'));
     return;
   }
@@ -5554,6 +5793,7 @@ toggleAiReadySource();
 loadConfig();
 pollHealth();
 setInterval(loadResults,30000);
+try{toggleDiscoveryConstraintsMode();}catch(e){}
 </script>
 </body>
 </html>

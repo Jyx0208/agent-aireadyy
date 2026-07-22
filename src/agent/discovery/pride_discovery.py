@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timezone
+from hashlib import sha256
 from math import ceil
-from typing import Any, Callable
+import re
+from typing import Any, Callable, Literal
 
 from agent.discovery.diversity import diversity_summary, select_diverse_items, validity_summary
 from agent.discovery.features import extract_file_features, extract_project_features
@@ -13,11 +15,68 @@ from agent.discovery.memory import (
     memory_prior_for_file,
     memory_prior_for_project,
 )
-from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
+from agent.discovery.models import (
+    DatasetManifest,
+    DatasetRequest,
+    DiscoveredFile,
+    DiscoveredProject,
+    DiscoveryEvidence,
+)
+from agent.discovery.ontology import interpret_immunopeptide_metadata
 from agent.discovery.query_builder import build_pride_queries, prepare_pride_search_queries
 from agent.discovery.scoring import build_discovered_project, score_file, score_project
-from agent.metadata.context import detect_sdrf_file, load_sdrf_rows, select_sdrf_rows_for_file
-from agent.pride.client import PrideClient
+from agent.metadata.context import (
+    detect_sdrf_file,
+    extract_sdrf_assay_values,
+    load_sdrf_rows,
+    select_sdrf_rows_for_file,
+    summarize_sdrf_rows,
+)
+from agent.pride.client import PrideClient, search_projects_paginated
+
+
+InspectionOutcomeCategory = Literal[
+    "usable_files",
+    "scientific_exclusion",
+    "no_usable_files",
+    "inspection_failure",
+    "not_inspected",
+]
+
+
+def _matched_sdrf_immunopeptide_evidence(
+    rows: list[dict[str, Any]],
+) -> list[DiscoveryEvidence]:
+    immunopeptide_values: list[tuple[str, str]] = []
+    other_values: list[tuple[str, str]] = []
+    for column, value in extract_sdrf_assay_values(rows):
+        semantic = interpret_immunopeptide_metadata(re.sub(r"[_-]+", " ", value))
+        target = immunopeptide_values if semantic.scope == "immunopeptidomics" else other_values
+        target.append((column, value))
+
+    if immunopeptide_values and other_values:
+        descriptions = list(
+            dict.fromkeys(
+                f"{column}={value}" for column, value in [*immunopeptide_values, *other_values]
+            )
+        )
+        return [
+            DiscoveryEvidence(
+                field="sdrf:assay",
+                source="sdrf_assay_conflict",
+                text="; ".join(descriptions[:8])[:1000],
+            )
+        ]
+
+    return [
+        DiscoveryEvidence(
+            field=f"sdrf:{column}",
+            source="immunopeptidomics",
+            text=value,
+            weight=9,
+        )
+        for column, value in dict.fromkeys(immunopeptide_values)
+    ]
 
 
 def _project_accession(project: dict[str, Any]) -> str:
@@ -42,13 +101,20 @@ def _rank_candidate_projects(
     projects: list[dict[str, Any]], request: DatasetRequest, limit: int
 ) -> list[dict[str, Any]]:
     deduped = _dedupe_projects(projects, len(projects))
-    scored = [(score_project(project, request), project) for project in deduped]
+    scored = []
+    for project in deduped:
+        try:
+            score = score_project(project, request)
+        except Exception:  # A malformed candidate is classified during inspection.
+            score = None
+        scored.append((score, project))
     ranked = sorted(
         scored,
         key=lambda item: (
-            item[0].excluded,
-            item[0].needs_review,
-            -item[0].project_score,
+            item[0] is None,
+            item[0].excluded if item[0] is not None else True,
+            item[0].needs_review if item[0] is not None else True,
+            -item[0].project_score if item[0] is not None else 0.0,
             _project_accession(item[1]),
         ),
     )
@@ -118,30 +184,86 @@ def discover_pride_dataset(
                 f"Adapted {len(proposed_queries)} semantic query term(s) into "
                 f"{len(queries)} high-recall PRIDE keyword seed(s): {'; '.join(queries)}"
             )
-        # A shallow per-query page systematically hides older but highly relevant projects.
-        # Fetch enough metadata to rank candidates globally; project/file inspection remains bounded.
+        # Page through PRIDE project search, but reserve budget for inspection.
+        # Each inspected project typically costs get_project + list_files (+ SDRF).
         if candidate_records is None:
-            search_page_size = max(
-                20,
-                min(100, ceil(request.max_candidate_projects / max(1, len(queries)))),
+            search_page_size = 100
+            target_hits = max(request.max_candidate_projects, request.max_projects * 5, 100)
+            per_query_pages = max(1, min(4, ceil(target_hits / max(1, len(queries)) / search_page_size)))
+            if str(request.quantity_scope or "") == "portfolio" or str(
+                request.portfolio_size_preference or ""
+            ).startswith("maximize"):
+                per_query_pages = max(per_query_pages, 2)
+            per_query_max_results = max(
+                50,
+                min(
+                    request.max_candidate_projects,
+                    ceil(request.max_candidate_projects * 2 / max(1, len(queries))),
+                ),
             )
             for query in queries:
                 _check_cancel()
-                _report(f"Searching PRIDE projects: {query}")
+                _report(
+                    f"Searching PRIDE projects: {query} "
+                    f"(up to {per_query_pages} page(s), max {per_query_max_results} hits)."
+                )
                 try:
-                    searched_records.extend(pride.search_projects(query, page_size=search_page_size))
-                    _report(f"Project search returned {len(searched_records)} raw records so far.")
+                    batch = search_projects_paginated(
+                        pride,
+                        query,
+                        page_size=search_page_size,
+                        max_pages=per_query_pages,
+                        max_results=per_query_max_results,
+                    )
+                    searched_records.extend(batch)
+                    _report(
+                        f"Project search returned {len(batch)} hit(s) for '{query}' "
+                        f"({len(searched_records)} raw records so far)."
+                    )
                 except Exception as exc:  # pragma: no cover - defensive network boundary
                     failures.append({"stage": "search_projects", "query": query, "error": str(exc)})
                     _report(f"Project search failed for query '{query}': {exc}")
+                    if "hard_repository_request_limit" in str(exc):
+                        _report("Repository request budget exhausted during search; stopping further queries.")
+                        break
 
         candidates = _rank_candidate_projects(
             searched_records, request, request.max_candidate_projects
         )
+        max_inspect = max(request.max_projects * 3, min(len(candidates), 120))
+        if len(candidates) > max_inspect:
+            _report(
+                f"Limiting inspection to top {max_inspect} of {len(candidates)} ranked candidates "
+                "to preserve repository request budget."
+            )
+            candidates = candidates[:max_inspect]
         _report(f"Deduped to {len(candidates)} candidate project(s).")
         scored_items: list[tuple[DiscoveredProject, list[DiscoveredFile]]] = []
         excluded_projects = 0
         excluded_files = 0
+        inspection_outcomes: dict[str, dict[str, Any]] = {}
+
+        def _record_inspection_outcome(
+            accession: str,
+            category: InspectionOutcomeCategory,
+            *,
+            stage: str | None = None,
+            reason: str | None = None,
+            error: str | None = None,
+            raw_file_count: int = 0,
+            usable_file_count: int = 0,
+            excluded_file_count: int = 0,
+        ) -> None:
+            inspection_outcomes[accession] = {
+                "project_accession": accession,
+                "category": category,
+                "stage": stage,
+                "reason": reason,
+                "error": error,
+                "raw_file_count": raw_file_count,
+                "usable_file_count": usable_file_count,
+                "excluded_file_count": excluded_file_count,
+            }
 
         for candidate in candidates:
             _check_cancel()
@@ -151,32 +273,110 @@ def discover_pride_dataset(
                 project_record = pride.get_project(accession)
             except Exception as exc:  # pragma: no cover - defensive network boundary
                 failures.append({"stage": "get_project", "project": accession, "error": str(exc)})
+                _record_inspection_outcome(
+                    accession,
+                    "inspection_failure",
+                    stage="get_project",
+                    reason="repository_or_network_failure",
+                    error=str(exc),
+                )
                 _report(f"Project metadata failed for {accession}: {exc}")
+                if "hard_repository_request_limit" in str(exc):
+                    _report(
+                        "Repository request budget exhausted during inspection; "
+                        "stopping further project metadata fetches."
+                    )
+                    break
                 continue
 
-            project_score = score_project(project_record, request)
+            try:
+                project_score = score_project(project_record, request)
+            except Exception as exc:  # pragma: no cover - defensive parser boundary
+                failures.append(
+                    {"stage": "score_project", "project": accession, "error": str(exc)}
+                )
+                _record_inspection_outcome(
+                    accession,
+                    "inspection_failure",
+                    stage="score_project",
+                    reason="parse_failure",
+                    error=str(exc),
+                )
+                _report(f"Project metadata parsing failed for {accession}: {exc}")
+                continue
             if project_score.excluded:
                 excluded_projects += 1
-                _report(f"Excluded project {accession}: acquisition evidence conflicts with request.")
+                reason = project_score.exclusion_reason or "project excluded by request constraints"
+                _record_inspection_outcome(
+                    accession,
+                    "scientific_exclusion",
+                    stage="score_project",
+                    reason=reason,
+                )
+                _report(f"Excluded project {accession}: {reason}")
                 continue
 
-            file_fetch_limit = max(request.max_files_per_project, request.max_files_per_project * 5)
+            # For maximize / "越多越好", page through ALL project files. A per-project
+            # cap only makes sense for curated pilots, not complete harvests.
+            harvest_all_files = (
+                str(request.quantity_scope or "") == "portfolio"
+                or str(request.portfolio_size_preference or "").startswith("maximize")
+                or bool(getattr(request, "harvest_all_qualified", False))
+            )
+            file_fetch_limit: int | None
+            if harvest_all_files:
+                file_fetch_limit = None
+            else:
+                file_fetch_limit = max(int(request.max_files_per_project), 100)
             try:
-                _report(f"Listing files for {accession} (limit {file_fetch_limit}).")
+                if file_fetch_limit is None:
+                    _report(f"Listing files for {accession} (all pages, no per-project cap).")
+                else:
+                    _report(f"Listing files for {accession} (limit {file_fetch_limit}).")
                 raw_files = pride.list_project_files(accession, max_files=file_fetch_limit)
-                _report(f"{accession}: fetched {len(raw_files)} file record(s).")
+                total_fetched = len(raw_files)
+                is_truncated = (
+                    file_fetch_limit is not None and total_fetched >= file_fetch_limit
+                )
+                _report(
+                    f"{accession}: fetched {total_fetched} file record(s)"
+                    + (
+                        f"; truncated by per-project limit {file_fetch_limit}."
+                        if is_truncated
+                        else " (complete listing)."
+                    )
+                )
             except Exception as exc:  # pragma: no cover - defensive network boundary
                 failures.append({"stage": "list_project_files", "project": accession, "error": str(exc)})
+                _record_inspection_outcome(
+                    accession,
+                    "inspection_failure",
+                    stage="list_project_files",
+                    reason="repository_or_network_failure",
+                    error=str(exc),
+                )
                 _report(f"File listing failed for {accession}: {exc}")
+                if "hard_repository_request_limit" in str(exc):
+                    _report(
+                        "Repository request budget exhausted while listing files; "
+                        "stopping further project inspection."
+                    )
+                    break
                 continue
 
             sdrf_rows: list[dict[str, Any]] = []
             sdrf_candidates: list[dict[str, Any]] = []
+            sdrf_url: str | None = None
+            sdrf_hash: str | None = None
+            sdrf_status = "not_found"
+            sdrf_errors: list[str] = []
             try:
                 _report(f"{accession}: checking SDRF metadata.")
                 sdrf_candidates = pride.list_project_files(accession, keyword="sdrf", max_files=5)
             except Exception as exc:  # pragma: no cover - defensive network boundary
                 failures.append({"stage": "find_sdrf", "project": accession, "error": str(exc)})
+                sdrf_status = "lookup_error"
+                sdrf_errors.append(str(exc))
                 _report(f"{accession}: SDRF lookup failed: {exc}")
             sdrf_file = detect_sdrf_file([*raw_files, *sdrf_candidates])
             if sdrf_file:
@@ -184,11 +384,26 @@ def discover_pride_dataset(
                 if sdrf_url:
                     try:
                         _report(f"{accession}: downloading SDRF text.")
-                        sdrf_rows = load_sdrf_rows(pride.download_text(sdrf_url))
-                        _report(f"{accession}: loaded {len(sdrf_rows)} SDRF row(s).")
+                        sdrf_text = pride.download_text(sdrf_url)
                     except Exception as exc:  # pragma: no cover - defensive network boundary
                         failures.append({"stage": "download_sdrf", "project": accession, "error": str(exc)})
+                        sdrf_status = "download_error"
+                        sdrf_errors.append(str(exc))
                         _report(f"{accession}: SDRF download failed: {exc}")
+                    else:
+                        sdrf_hash = sha256(sdrf_text.encode("utf-8")).hexdigest()
+                        try:
+                            sdrf_rows = load_sdrf_rows(sdrf_text)
+                            sdrf_status = "available"
+                            _report(f"{accession}: loaded {len(sdrf_rows)} SDRF row(s).")
+                        except Exception as exc:  # pragma: no cover - defensive parser boundary
+                            failures.append({"stage": "parse_sdrf", "project": accession, "error": str(exc)})
+                            sdrf_status = "parse_error"
+                            sdrf_errors.append(str(exc))
+                            _report(f"{accession}: SDRF parsing failed: {exc}")
+                else:
+                    sdrf_status = "missing_download_url"
+                    sdrf_errors.append("SDRF file record has no public download URL")
 
             project_features = extract_project_features(project_record, sdrf_rows)
             project = build_discovered_project(
@@ -201,37 +416,115 @@ def discover_pride_dataset(
             )
 
             scored_files: list[DiscoveredFile] = []
+            project_excluded_files = 0
+            file_parse_errors: list[str] = []
             for raw_file in raw_files:
                 _check_cancel()
                 file_name = str(raw_file.get("fileName") or raw_file.get("name") or "")
-                matched_sdrf_rows = select_sdrf_rows_for_file(sdrf_rows, file_name) if sdrf_rows and file_name else []
-                if not sdrf_rows:
-                    sdrf_match_status = "no_sdrf"
-                elif matched_sdrf_rows:
-                    sdrf_match_status = "matched"
-                else:
-                    sdrf_match_status = "no_file_match"
-                file_features = extract_file_features(raw_file, project_features, matched_sdrf_rows)
-                scored_file = score_file(
-                    raw_file,
-                    project,
-                    request,
-                    features=file_features,
-                    memory_prior=memory_prior_for_file(review_decisions, accession, file_name),
-                    memory_feedback=memory_feedback_for_candidate(review_decisions, accession, file_name),
-                    sdrf_match_status=sdrf_match_status,
-                )
+                try:
+                    matched_sdrf_rows = (
+                        select_sdrf_rows_for_file(sdrf_rows, file_name)
+                        if sdrf_rows and file_name
+                        else []
+                    )
+                    if not sdrf_rows:
+                        sdrf_match_status = "no_sdrf"
+                    elif matched_sdrf_rows:
+                        sdrf_match_status = "matched"
+                    else:
+                        sdrf_match_status = "no_file_match"
+                    file_features = extract_file_features(
+                        raw_file,
+                        project_features,
+                        matched_sdrf_rows,
+                    )
+                    file_features.evidence.extend(
+                        _matched_sdrf_immunopeptide_evidence(matched_sdrf_rows)
+                    )
+                    scored_file = score_file(
+                        raw_file,
+                        project,
+                        request,
+                        features=file_features,
+                        memory_prior=memory_prior_for_file(
+                            review_decisions,
+                            accession,
+                            file_name,
+                        ),
+                        memory_feedback=memory_feedback_for_candidate(
+                            review_decisions,
+                            accession,
+                            file_name,
+                        ),
+                        sdrf_match_status=sdrf_match_status,
+                    )
+                except Exception as exc:  # pragma: no cover - defensive parser boundary
+                    failures.append(
+                        {
+                            "stage": "score_file",
+                            "project": accession,
+                            "file": file_name,
+                            "error": str(exc),
+                        }
+                    )
+                    file_parse_errors.append(str(exc))
+                    continue
                 if scored_file is not None:
                     if scored_file.validity_status == "exclude":
                         excluded_files += 1
+                        project_excluded_files += 1
                     else:
                         scored_files.append(scored_file)
             if not scored_files:
-                _report(f"{accession}: no usable acquisition/peaklist file candidates after filtering.")
+                if file_parse_errors:
+                    _record_inspection_outcome(
+                        accession,
+                        "inspection_failure",
+                        stage="score_files",
+                        reason="parse_failure",
+                        error=f"{len(file_parse_errors)} file record(s) could not be parsed",
+                        raw_file_count=len(raw_files),
+                        excluded_file_count=project_excluded_files,
+                    )
+                    _report(
+                        f"{accession}: failed to parse {len(file_parse_errors)} file record(s)."
+                    )
+                else:
+                    _record_inspection_outcome(
+                        accession,
+                        "no_usable_files",
+                        stage="score_files",
+                        reason="no usable acquisition/peaklist file candidates after filtering",
+                        raw_file_count=len(raw_files),
+                        excluded_file_count=project_excluded_files,
+                    )
+                    _report(
+                        f"{accession}: no usable acquisition/peaklist file candidates after filtering."
+                    )
                 continue
 
-            project = project.model_copy(update={"file_count": len(scored_files)})
+            project = project.model_copy(
+                update={
+                    "file_count": len(scored_files),
+                    "sdrf_summary": summarize_sdrf_rows(
+                        sdrf_rows,
+                        [file.file_name for file in scored_files],
+                        source_url=sdrf_url,
+                        content_sha256=sdrf_hash,
+                        status=sdrf_status,
+                        errors=sdrf_errors,
+                    ),
+                }
+            )
             scored_items.append((project, _sort_files(scored_files)))
+            _record_inspection_outcome(
+                accession,
+                "usable_files",
+                stage="score_files",
+                raw_file_count=len(raw_files),
+                usable_file_count=len(scored_files),
+                excluded_file_count=project_excluded_files,
+            )
             _report(f"{accession}: kept {len(scored_files)} file candidate(s).")
             if early_stop_on_limits:
                 eligible_project_count = len(scored_items)
@@ -253,6 +546,23 @@ def discover_pride_dataset(
         diversity = diversity_summary(selected_files)
         validity = validity_summary(selected_files)
         file_context = _file_context_summary(selected_files)
+        for candidate in candidates:
+            accession = _project_accession(candidate)
+            if accession and accession not in inspection_outcomes:
+                _record_inspection_outcome(
+                    accession,
+                    "not_inspected",
+                    stage="inspection",
+                    reason="inspection stopped before this candidate was processed",
+                )
+        ordered_inspection_outcomes = [
+            inspection_outcomes[accession]
+            for candidate in candidates
+            if (accession := _project_accession(candidate)) in inspection_outcomes
+        ]
+        inspection_outcome_counts = dict(
+            sorted(Counter(item["category"] for item in ordered_inspection_outcomes).items())
+        )
 
         summary = {
             "repository": request.repository,
@@ -274,6 +584,8 @@ def discover_pride_dataset(
             "eligible_projects_seen": len(scored_items),
             "excluded_projects": excluded_projects,
             "excluded_files": excluded_files,
+            "inspection_outcomes": ordered_inspection_outcomes,
+            "inspection_outcome_counts": inspection_outcome_counts,
             "selected_projects": len(selected_projects),
             "selected_files": len(selected_files),
             "max_projects": request.max_projects,

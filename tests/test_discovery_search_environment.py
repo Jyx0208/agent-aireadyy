@@ -9,7 +9,9 @@ from agent.discovery.search_environment import (
     CandidateSearchAction,
     PrideDiscoverySearchEnvironment,
     RepositoryQuery,
+    _extract_candidate_terms,
 )
+from agent.pride.client import PrideClient
 
 
 def _project(accession: str, title: str, description: str = "") -> dict[str, Any]:
@@ -34,9 +36,16 @@ def _raw_file(accession: str) -> dict[str, Any]:
 
 
 class _FakePrideClient:
-    def __init__(self, search_results: dict[str, list[dict[str, Any]]]) -> None:
+    def __init__(
+        self,
+        search_results: dict[str, list[dict[str, Any]]],
+        *,
+        search_failures: dict[str, Exception] | None = None,
+    ) -> None:
         self.search_results = search_results
+        self.search_failures = search_failures or {}
         self.search_calls: list[tuple[str, int]] = []
+        self.search_options: list[dict[str, int | None]] = []
         self.project_calls: list[str] = []
         self.projects = {
             str(project["accession"]): project
@@ -44,9 +53,22 @@ class _FakePrideClient:
             for project in projects
         }
 
-    def search_projects(self, keyword: str, page_size: int = 100) -> list[dict[str, Any]]:
+    def search_projects(
+        self,
+        keyword: str,
+        page_size: int = 100,
+        *,
+        max_pages: int | None = None,
+        max_results: int | None = None,
+    ) -> list[dict[str, Any]]:
         self.search_calls.append((keyword, page_size))
-        return self.search_results.get(keyword, [])[:page_size]
+        self.search_options.append(
+            {"max_pages": max_pages, "max_results": max_results}
+        )
+        if keyword in self.search_failures:
+            raise self.search_failures[keyword]
+        limit = max_results if max_results is not None else page_size
+        return self.search_results.get(keyword, [])[:limit]
 
     def get_project(self, accession: str) -> dict[str, Any]:
         self.project_calls.append(accession)
@@ -125,6 +147,355 @@ def test_search_observation_reports_query_yield_depth_duplicates_and_coverage(tm
     assert "chemotherapy" in observation.covered_intent_terms
     assert observation.semantic_coverage > 0.0
     assert (tmp_path / "candidate_state.json").is_file()
+
+
+def test_exact_accession_hit_is_pinned_when_broad_results_fill_the_candidate_pool(
+    tmp_path: Path,
+) -> None:
+    exact = _project("PXD055544", "Exact project with sparse indexed metadata")
+    broad = [
+        _project(
+            f"PXD09{index:04d}",
+            f"Human sensory neuron chemotherapy neuropathy project {index}",
+        )
+        for index in range(4)
+    ]
+    request = _request().model_copy(
+        update={"max_projects": 1, "max_candidate_projects": 2}
+    )
+    state_path = tmp_path / "candidate_state.json"
+    client = _FakePrideClient({"PXD055544": [exact], "sensory": broad})
+    environment = PrideDiscoverySearchEnvironment(
+        request=request,
+        prompt="Find human sensory neuron chemotherapy neuropathy data.",
+        client=client,
+        state_path=state_path,
+    )
+
+    observation = environment.search(
+        CandidateSearchAction(
+            queries=[
+                RepositoryQuery(query="PXD055544", depth=5),
+                RepositoryQuery(query="sensory neuron", depth=20),
+            ],
+            candidate_limit=2,
+            rationale="Inspect an exact user-requested accession beside a broad search.",
+        )
+    )
+
+    assert "PXD055544" in environment.candidate_accessions
+    assert "PXD055544" in [item.project_accession for item in observation.previews]
+
+    reloaded = PrideDiscoverySearchEnvironment(
+        request=request,
+        prompt="Find human sensory neuron chemotherapy neuropathy data.",
+        client=client,
+        state_path=state_path,
+    )
+    assert "PXD055544" in reloaded.candidate_accessions
+
+
+def test_intent_terms_drop_accessions_and_generic_workflow_words() -> None:
+    terms = _extract_candidate_terms(
+        "Inspect PXD055544 as a human immunopeptidomics candidate. "
+        "Verify matched SDRF assay evidence at file level, retain only "
+        "delivery-eligible assets, and explain the judgment."
+    )
+
+    assert "pxd055544" not in terms
+    assert "and" not in terms
+    assert "the" not in terms
+    assert "file" not in terms
+    assert "immunopeptidomics" in terms
+    assert "sdrf" in terms
+    assert "assay" in terms
+    assert "delivery-eligible" in terms
+
+
+def test_search_environment_requests_multiple_pride_pages_for_each_new_seed(tmp_path: Path) -> None:
+    project = _project("PXD000001", "Human sensory neuron proteomics")
+    client = _FakePrideClient({"sensory": [project]})
+    environment = PrideDiscoverySearchEnvironment(
+        request=_request(),
+        prompt="Find human sensory neuron data.",
+        client=client,
+        state_path=tmp_path / "candidate_state.json",
+    )
+
+    environment.search(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="sensory neuron", depth=20)],
+            rationale="Search beyond the first PRIDE result page.",
+        )
+    )
+
+    assert client.search_options == [{"max_pages": 2, "max_results": 40}]
+
+
+def test_budgeted_search_distributes_pages_across_seeds_and_preserves_inspection_capacity(
+    tmp_path: Path,
+) -> None:
+    request = _request().model_copy(
+        update={"max_projects": 2_000, "max_candidate_projects": 5_000}
+    )
+    seeds = [f"seed-{index}" for index in range(7)]
+    client = _FakePrideClient(
+        {
+            seed: [_project(f"PXD{index:06d}", f"Human neuron project {index}")]
+            for index, seed in enumerate(seeds, start=1)
+        }
+    )
+    environment = PrideDiscoverySearchEnvironment(
+        request=request,
+        prompt="Find human stem-cell-derived sensory-neuron chemotherapy neuropathy projects.",
+        client=client,
+        state_path=tmp_path / "candidate_state.json",
+    )
+
+    environment.search_with_request_budget(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query=seed, depth=50) for seed in seeds],
+            candidate_limit=1_000,
+            rationale="Exercise the live run's seven-seed search shape.",
+        ),
+        request_budget=20,
+    )
+
+    allocated_pages = [int(options["max_pages"] or 0) for options in client.search_options]
+    assert len(allocated_pages) == len(seeds)
+    assert all(pages >= 2 for pages in allocated_pages)
+    assert sum(allocated_pages) <= 20
+
+
+def test_search_reports_total_repository_outage_as_operational_failure(
+    tmp_path: Path,
+) -> None:
+    client = _FakePrideClient(
+        {},
+        search_failures={
+            "sensory": ConnectionError("PRIDE unavailable for sensory seed"),
+            "neuropathy": TimeoutError("PRIDE timed out for neuropathy seed"),
+        },
+    )
+    environment = PrideDiscoverySearchEnvironment(
+        request=_request(),
+        prompt="Find human sensory neuron chemotherapy neuropathy data.",
+        client=client,
+        state_path=tmp_path / "candidate_state.json",
+    )
+
+    observation = environment.search(
+        CandidateSearchAction(
+            queries=[
+                RepositoryQuery(query="sensory"),
+                RepositoryQuery(query="neuropathy"),
+            ],
+            rationale="Exercise a complete PRIDE search outage.",
+        )
+    )
+
+    assert observation.status == "failed"
+    assert observation.stop_reason == "all_repository_search_attempts_failed"
+    assert observation.recommended_action == "retry_repository_or_stop"
+    assert observation.raw_result_count == 0
+    assert observation.candidate_count == 0
+    assert observation.failures == [
+        "sensory: PRIDE unavailable for sensory seed",
+        "neuropathy: PRIDE timed out for neuropathy seed",
+    ]
+    assert [failure.model_dump() for failure in observation.operational_failures] == [
+        {
+            "query": "sensory",
+            "executed_query": "sensory",
+            "intent_dimension": "general",
+            "requested_depth": 20,
+            "error_type": "ConnectionError",
+            "message": "PRIDE unavailable for sensory seed",
+        },
+        {
+            "query": "neuropathy",
+            "executed_query": "neuropathy",
+            "intent_dimension": "general",
+            "requested_depth": 20,
+            "error_type": "TimeoutError",
+            "message": "PRIDE timed out for neuropathy seed",
+        },
+    ]
+    assert [item.error for item in observation.query_yields] == [
+        "PRIDE unavailable for sensory seed",
+        "PRIDE timed out for neuropathy seed",
+    ]
+
+
+def test_search_reports_http_success_error_payload_as_invalid_response_failure(
+    tmp_path: Path,
+) -> None:
+    class MaintenanceResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, str]:
+            return {"error": "repository under maintenance"}
+
+    class MaintenanceHTTPClient:
+        def get(self, *_args: Any, **_kwargs: Any) -> MaintenanceResponse:
+            return MaintenanceResponse()
+
+    client = PrideClient(retries=1)
+    client._client = MaintenanceHTTPClient()
+    environment = PrideDiscoverySearchEnvironment(
+        request=_request(),
+        prompt="Find human sensory neuron data.",
+        client=client,
+        state_path=tmp_path / "candidate_state.json",
+    )
+
+    observation = environment.search(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="sensory")],
+            rationale="Exercise a malformed successful PRIDE response.",
+        )
+    )
+
+    assert observation.status == "failed"
+    assert observation.stop_reason == "all_repository_search_attempts_failed"
+    assert observation.raw_result_count == 0
+    assert observation.candidate_count == 0
+    assert observation.operational_failures[0].error_type == (
+        "PrideInvalidResponseError"
+    )
+    assert (
+        "repository under maintenance"
+        in observation.operational_failures[0].message
+    )
+    assert observation.query_yields[0].raw_result_count == 0
+    assert "invalid PRIDE response" in (observation.query_yields[0].error or "")
+
+
+def test_search_treats_successful_empty_repository_response_as_scientific_zero_yield(
+    tmp_path: Path,
+) -> None:
+    environment = PrideDiscoverySearchEnvironment(
+        request=_request(),
+        prompt="Find human sensory neuron data.",
+        client=_FakePrideClient({"sensory": []}),
+        state_path=tmp_path / "candidate_state.json",
+    )
+
+    observation = environment.search(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="sensory")],
+            rationale="Exercise a legitimate empty PRIDE result set.",
+        )
+    )
+
+    assert observation.status == "completed"
+    assert observation.stop_reason is None
+    assert observation.raw_result_count == 0
+    assert observation.candidate_count == 0
+    assert observation.failures == []
+    assert observation.operational_failures == []
+    assert observation.query_yields[0].error is None
+    assert observation.query_yields[0].raw_result_count == 0
+
+
+def test_search_reports_zero_request_budget_as_operationally_blocked(
+    tmp_path: Path,
+) -> None:
+    environment = PrideDiscoverySearchEnvironment(
+        request=_request(),
+        prompt="Find human sensory neuron data.",
+        client=_FakePrideClient({"sensory": []}),
+        state_path=tmp_path / "candidate_state.json",
+    )
+
+    observation = environment.search_with_request_budget(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="sensory")],
+            rationale="Exercise a search budget reserved for inspection.",
+        ),
+        request_budget=0,
+    )
+
+    assert observation.status == "blocked"
+    assert observation.stop_reason == "search_request_budget_reserved_for_inspection"
+    assert observation.raw_result_count == 0
+    assert observation.query_yields[0].skipped_reason == (
+        "search_request_budget_reserved_for_inspection"
+    )
+    assert observation.operational_failures[0].error_type == "RequestBudgetExhausted"
+
+
+def test_search_keeps_partial_repository_failure_auditable_when_another_seed_succeeds(
+    tmp_path: Path,
+) -> None:
+    project = _project("PXD000001", "Human chemotherapy neuropathy proteomics")
+    client = _FakePrideClient(
+        {"neuropathy": [project]},
+        search_failures={"sensory": ConnectionError("temporary PRIDE failure")},
+    )
+    environment = PrideDiscoverySearchEnvironment(
+        request=_request(),
+        prompt="Find human sensory neuron chemotherapy neuropathy data.",
+        client=client,
+        state_path=tmp_path / "candidate_state.json",
+    )
+
+    observation = environment.search(
+        CandidateSearchAction(
+            queries=[
+                RepositoryQuery(query="sensory"),
+                RepositoryQuery(query="neuropathy"),
+            ],
+            rationale="Exercise mixed repository failure and success.",
+        )
+    )
+
+    assert observation.status == "completed"
+    assert observation.stop_reason is None
+    assert observation.raw_result_count == 1
+    assert observation.candidate_count == 1
+    assert observation.failures == ["sensory: temporary PRIDE failure"]
+    assert len(observation.operational_failures) == 1
+    assert observation.operational_failures[0].query == "sensory"
+    assert observation.operational_failures[0].error_type == "ConnectionError"
+    assert observation.operational_failures[0].message == "temporary PRIDE failure"
+    assert observation.query_yields[0].error == "temporary PRIDE failure"
+    assert observation.query_yields[1].raw_result_count == 1
+
+
+def test_later_outage_does_not_discard_an_existing_inspectable_candidate_pool(
+    tmp_path: Path,
+) -> None:
+    project = _project("PXD000001", "Human sensory neuron proteomics")
+    client = _FakePrideClient({"sensory": [project]})
+    environment = PrideDiscoverySearchEnvironment(
+        request=_request(),
+        prompt="Find human sensory neuron data.",
+        client=client,
+        state_path=tmp_path / "candidate_state.json",
+    )
+    first = environment.search(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="sensory")],
+            rationale="Create an inspectable candidate pool.",
+        )
+    )
+    assert first.status == "completed"
+    client.search_failures["neuropathy"] = ConnectionError("later PRIDE outage")
+
+    second = environment.search(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="neuropathy")],
+            rationale="Exercise a later failed expansion round.",
+        )
+    )
+
+    assert second.status == "completed"
+    assert second.stop_reason is None
+    assert second.candidate_count == 1
+    assert second.failures == ["neuropathy: later PRIDE outage"]
+    assert second.recommended_action == "review_candidate_previews"
 
 
 def test_search_state_accumulates_new_candidates_across_actions(tmp_path: Path) -> None:
@@ -224,6 +595,204 @@ def test_inspection_only_fetches_agent_selected_candidates(tmp_path: Path) -> No
     assert [project.project_accession for project in result.manifest.projects] == ["PXD000001"]
     assert result.inspected_accessions == ["PXD000001"]
     assert result.usable_files == 1
+
+
+def test_inspection_outcomes_separate_failures_exclusions_and_empty_projects(
+    tmp_path: Path,
+) -> None:
+    usable = _project("PXD000001", "Human sensory neuron proteomics")
+    failed = _project("PXD000002", "Human sensory neuron repository failure")
+    excluded = _project("PXD000003", "Mouse sensory neuron proteomics")
+    excluded["organisms"] = [{"name": "Mus musculus"}]
+    empty = _project("PXD000004", "Human sensory neuron metadata only")
+
+    class OutcomeClient(_FakePrideClient):
+        def get_project(self, accession: str) -> dict[str, Any]:
+            if accession == "PXD000002":
+                self.project_calls.append(accession)
+                raise ConnectionError("temporary PRIDE outage")
+            return super().get_project(accession)
+
+        def list_project_files(
+            self,
+            accession: str,
+            keyword: str | None = None,
+            **kwargs: Any,
+        ) -> list[dict[str, Any]]:
+            if accession == "PXD000004":
+                return []
+            return super().list_project_files(accession, keyword=keyword, **kwargs)
+
+    client = OutcomeClient({"sensory": [usable, failed, excluded, empty]})
+    request = _request().model_copy(
+        update={"hard_constraint_fields": ["repository", "species"]}
+    )
+    environment = PrideDiscoverySearchEnvironment(
+        request=request,
+        prompt="Find human sensory neuron data.",
+        client=client,
+        state_path=tmp_path / "candidate_state.json",
+    )
+    search = environment.search(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="sensory")],
+            rationale="Find all inspection outcome types.",
+        )
+    )
+
+    result = environment.inspect(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD000001", "PXD000002", "PXD000003", "PXD000004"],
+            rationale="Classify each requested candidate exactly once.",
+        )
+    )
+
+    assert result.eligible_accessions == ["PXD000001"]
+    assert result.failed_accessions == ["PXD000002"]
+    assert result.excluded_accessions == ["PXD000003"]
+    assert result.no_usable_files_accessions == ["PXD000004"]
+    assert result.inspected_accessions == ["PXD000001", "PXD000003", "PXD000004"]
+    categories = {
+        outcome.project_accession: outcome.category
+        for outcome in result.inspection_outcomes
+    }
+    assert categories == {
+        "PXD000001": "usable_files",
+        "PXD000002": "inspection_failure",
+        "PXD000003": "scientific_exclusion",
+        "PXD000004": "no_usable_files",
+    }
+    assert result.manifest.summary["inspection_outcome_counts"] == {
+        "inspection_failure": 1,
+        "no_usable_files": 1,
+        "scientific_exclusion": 1,
+        "usable_files": 1,
+    }
+    assert result.manifest.summary["search_environment"]["failed_accessions"] == [
+        "PXD000002"
+    ]
+
+
+def test_inspection_project_parse_failure_is_a_failed_accession(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = _project("PXD000005", "Human sensory neuron malformed metadata")
+    client = _FakePrideClient({"sensory": [project]})
+    environment = PrideDiscoverySearchEnvironment(
+        request=_request(),
+        prompt="Find human sensory neuron data.",
+        client=client,
+        state_path=tmp_path / "candidate_state.json",
+    )
+    search = environment.search(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="sensory")],
+            rationale="Find a candidate with malformed inspection metadata.",
+        )
+    )
+
+    def fail_to_score(_project_record: dict[str, Any], _request: DatasetRequest):
+        raise ValueError("malformed project metadata")
+
+    monkeypatch.setattr(
+        "agent.discovery.pride_discovery.score_project",
+        fail_to_score,
+    )
+
+    result = environment.inspect(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD000005"],
+            rationale="Audit the parse failure without retrying a scientific exclusion.",
+        )
+    )
+
+    assert result.failed_accessions == ["PXD000005"]
+    assert result.excluded_accessions == []
+    assert result.no_usable_files_accessions == []
+    assert result.inspection_outcomes[0].category == "inspection_failure"
+    assert result.inspection_outcomes[0].stage == "score_project"
+    assert result.inspection_outcomes[0].reason == "parse_failure"
+
+
+def test_inspection_file_parse_failure_is_not_reported_as_no_usable_files(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = _project("PXD000008", "Human sensory neuron malformed file record")
+    client = _FakePrideClient({"sensory": [project]})
+    environment = PrideDiscoverySearchEnvironment(
+        request=_request(),
+        prompt="Find human sensory neuron data.",
+        client=client,
+        state_path=tmp_path / "candidate_state.json",
+    )
+    search = environment.search(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="sensory")],
+            rationale="Find a candidate with a malformed file record.",
+        )
+    )
+
+    def fail_to_extract_file(*_args: Any, **_kwargs: Any):
+        raise ValueError("malformed file metadata")
+
+    monkeypatch.setattr(
+        "agent.discovery.pride_discovery.extract_file_features",
+        fail_to_extract_file,
+    )
+
+    result = environment.inspect(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD000008"],
+            rationale="Keep technical parse failures separate from empty projects.",
+        )
+    )
+
+    assert result.failed_accessions == ["PXD000008"]
+    assert result.no_usable_files_accessions == []
+    assert result.inspection_outcomes[0].category == "inspection_failure"
+    assert result.inspection_outcomes[0].stage == "score_files"
+    assert result.inspection_outcomes[0].reason == "parse_failure"
+
+
+def test_inspection_counts_eligible_projects_even_when_selection_limit_drops_one(
+    tmp_path: Path,
+) -> None:
+    first = _project("PXD000006", "Human sensory neuron proteomics A")
+    second = _project("PXD000007", "Human sensory neuron proteomics B")
+    client = _FakePrideClient({"sensory": [first, second]})
+    environment = PrideDiscoverySearchEnvironment(
+        request=_request().model_copy(update={"max_projects": 1}),
+        prompt="Find human sensory neuron data.",
+        client=client,
+        state_path=tmp_path / "candidate_state.json",
+    )
+    search = environment.search(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="sensory")],
+            rationale="Find more eligible projects than the selection limit.",
+        )
+    )
+
+    result = environment.inspect(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD000006", "PXD000007"],
+            rationale="Inspect both projects before diversity selection.",
+        )
+    )
+
+    assert len(result.manifest.projects) == 1
+    assert result.eligible_accessions == ["PXD000006", "PXD000007"]
+    assert result.inspected_accessions == ["PXD000006", "PXD000007"]
+    assert result.failed_accessions == []
+    assert result.manifest.summary["inspection_outcome_counts"] == {
+        "usable_files": 2
+    }
 
 
 def test_inspection_rejects_accessions_outside_persisted_candidate_pool(tmp_path: Path) -> None:

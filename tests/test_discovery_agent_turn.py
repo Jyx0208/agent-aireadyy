@@ -1,0 +1,4523 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from agents.items import ModelResponse
+from agents.models.interface import Model
+from agents.usage import Usage
+from openai.types.responses import (
+    ResponseFunctionToolCall,
+    ResponseOutputMessage,
+    ResponseOutputText,
+)
+
+import agent.web.app as web_app
+from agent.discovery.agentic import OpenAICompatibleDiscoveryLLM
+
+
+class _TurnLLM:
+    def __init__(self, responses: list[dict[str, Any] | Exception]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, str]] = []
+        self.timeout = 999.0
+
+    def complete_json(self, *, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        self.calls.append({"system_prompt": system_prompt, "user_prompt": user_prompt})
+        if not self.responses:
+            raise AssertionError("Unexpected extra LLM call")
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class _RoleAwareTurnLLM(_TurnLLM):
+    def __init__(self, responses: list[dict[str, Any] | Exception]) -> None:
+        super().__init__(responses)
+        self.message_calls: list[list[dict[str, str]]] = []
+
+    def complete_json_messages(self, *, messages: list[dict[str, str]]) -> dict[str, Any]:
+        self.message_calls.append(messages)
+        if not self.responses:
+            raise AssertionError("Unexpected extra LLM call")
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class _DialogueScriptedModel(Model):
+    def __init__(self, actions: list[tuple[str, dict[str, Any] | str]]) -> None:
+        self.actions = actions
+        self.calls = 0
+        self.requests: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        self.requests.append((args, kwargs))
+        action, payload = self.actions[self.calls]
+        self.calls += 1
+        if action == "final":
+            output = [
+                ResponseOutputMessage(
+                    id=f"message_{self.calls}",
+                    content=[
+                        ResponseOutputText(
+                            annotations=[],
+                            text=str(payload),
+                            type="output_text",
+                        )
+                    ],
+                    role="assistant",
+                    status="completed",
+                    type="message",
+                )
+            ]
+        else:
+            output = [
+                ResponseFunctionToolCall(
+                    arguments=json.dumps(payload),
+                    call_id=f"call_{self.calls}",
+                    name=action,
+                    type="function_call",
+                    status="completed",
+                )
+            ]
+        return ModelResponse(output=output, usage=Usage(requests=1), response_id=None)
+
+    async def stream_response(self, *args: Any, **kwargs: Any):
+        if False:
+            yield None
+
+
+def _run_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    response: dict[str, Any] | Exception,
+    *,
+    user_message: str = "请按我刚才的选择更新。",
+    role_aware: bool = False,
+    **body: Any,
+) -> tuple[dict[str, Any], _TurnLLM]:
+    llm: _TurnLLM
+    if role_aware:
+        llm = _RoleAwareTurnLLM([response])
+    else:
+        llm = _TurnLLM([response])
+    monkeypatch.setattr(web_app, "_discovery_llm_client", lambda *_args, **_kwargs: llm)
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": user_message,
+                "allow_server_default": False,
+                **body,
+            }
+        )
+    )
+    return result, llm
+
+
+def _decision() -> dict[str, Any]:
+    return {
+        "focus": "horizon",
+        "target_fields": ["run_horizon"],
+        "question": "候选找到后，要不要再做一轮证据复核？",
+        "recommendation": {
+            "id": "review",
+            "label": "候选后复核",
+            "reason": "跨物种注释常需要项目级证据核验。",
+        },
+        "options": [
+            {
+                "id": "review",
+                "label": "候选后复核",
+                "reason": "质量更稳",
+                "strategy_patch": {"run_horizon": "candidates_reviewed"},
+            },
+            {
+                "id": "stop",
+                "label": "候选即停",
+                "reason": "速度更快",
+                "strategy_patch": {"run_horizon": "candidates_only"},
+            },
+        ],
+        "allow_free_text": True,
+    }
+
+
+def _ready_context() -> dict[str, Any]:
+    return {
+        "phase": "awaiting_confirm",
+        "intent_snapshot": {
+            "objective": "比较海胆不同发育阶段的蛋白质组",
+            "task_type": "browse_only",
+            "run_horizon": "candidates_only",
+            "species": ["Strongylocentrotus purpuratus"],
+            "species_policy": "include_only",
+            "coverage_mode": "curated",
+            "target_project_count": 18,
+        },
+        "gap_report": {
+            "required_missing": [],
+            "optional_missing": ["instrument"],
+            "ready_for_confirm": True,
+        },
+    }
+
+
+def test_training_agenda_prioritizes_search_scale_before_optional_labeling():
+    agenda = web_app._discovery_critical_decision_agenda(
+        {
+            "objective": "构建免疫肽 de novo 训练集",
+            "task_type": "denovo",
+            "run_horizon": "candidates_reviewed",
+            "target_project_count": None,
+            "coverage_mode": "",
+            "quota_flexibility": "recommended",
+            "acquisition_mode": "dda",
+            "species": [],
+            "species_policy": "open",
+            "labeling_strategy": "unknown",
+        },
+        {
+            "required_missing": ["coverage"],
+            "optional_missing": ["species", "labeling"],
+            "ready_for_confirm": False,
+        },
+        {"acquisition_mode"},
+    )
+
+    ids = [item["id"] for item in agenda]
+    assert ids.index("search_scale") < ids.index("labeling_compatibility")
+    assert next(item for item in agenda if item["id"] == "search_scale")["critical"] is True
+
+
+def test_confirmation_rejects_training_strategy_with_unresolved_search_scale():
+    snapshot = {
+        "objective": "构建免疫肽 de novo 训练集",
+        "task_type": "denovo",
+        "run_horizon": "candidates_reviewed",
+        "target_project_count": None,
+        "coverage_mode": "",
+        "quota_flexibility": "recommended",
+        "acquisition_mode": "dda",
+        "species": ["Homo sapiens"],
+        "species_policy": "include_only",
+    }
+    eligible, reason, _fingerprint = web_app._discovery_confirmation_context(
+        {
+            "pending_strategy_snapshot": snapshot,
+        },
+        phase="awaiting_confirm",
+        intent_snapshot=snapshot,
+        gap_report={
+            "required_missing": [],
+            "optional_missing": [],
+            "ready_for_confirm": True,
+        },
+    )
+
+    assert eligible is False
+    assert "search_scale" in reason
+
+
+@pytest.mark.parametrize(
+    "raw_decision",
+    [
+        {
+            "focus": "horizon",
+            "question": "复核吗？",
+            "recommendation": {"id": "review", "label": "复核"},
+            "options": [
+                {"id": "review", "label": "复核"},
+                {"id": "stop", "label": "停止"},
+            ],
+        },
+        {
+            "focus": "horizon",
+            "question": "复核吗？",
+            "recommendation": {
+                "id": "review",
+                "label": "复核",
+                "reason": "证据更稳",
+            },
+            "options": [{"id": "review", "label": "复核"}],
+        },
+    ],
+)
+def test_next_decision_contract_rejects_missing_reason_or_two_options(raw_decision):
+    assert web_app._normalise_discovery_next_decision(raw_decision) is None
+
+
+def test_invalid_next_decision_is_explicitly_downgraded(monkeypatch):
+    invalid = {
+        "focus": "horizon",
+        "question": "复核吗？",
+        "recommendation": {"id": "review", "label": "复核"},
+        "options": [{"id": "review", "label": "复核"}],
+    }
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "assistant_message": "这是一个不完整的下一问。",
+            "tool_calls": [],
+            "next_decision": invalid,
+        },
+    )
+
+    assert result["action"] == "advise"
+    assert "next_decision" not in result
+    assert "不把它当作有效提问" in result["assistant_message"]
+    assert result["contract_errors"]
+
+
+def test_grill_turn_exposes_agent_owned_update_and_preserves_next_decision(monkeypatch):
+    patch = {
+        "task_type": "browse_only",
+        "species": ["Strongylocentrotus purpuratus"],
+        "species_policy": "prefer",
+        "coverage_mode": "curated",
+        "target_project_count": 18,
+        "special_themes": ["developmental proteome"],
+    }
+    result, llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "已把海胆发育蛋白质组写入策略；下一步只需要决定复核深度。",
+            "tool_calls": [
+                {"name": "update_strategy", "arguments": {"patch": patch}}
+            ],
+            "next_decision": _decision(),
+        },
+        user_message="先限定紫海胆，18 个左右；然后你建议候选后要不要复核？",
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["mode"] == "update_strategy"
+    assert result["tool_calls"] == [
+        {"name": "update_strategy", "arguments": {"patch": patch}}
+    ]
+    assert result["extra_fields"] == patch
+    assert result["next_decision"]["focus"] == "horizon"
+    assert len(llm.calls) == 1
+
+    prompts = "\n".join(llm.calls[0].values()).lower()
+    assert "highest-value next decision" in prompts
+    assert "guidance, not a command" in prompts
+    assert "every and only choice" in prompts
+    assert "confirm_strategy" in prompts
+
+
+def test_discovery_agent_guidance_uses_repository_file_with_safe_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    guidance_path = tmp_path / "discovery-agent-guidance.md"
+    monkeypatch.setattr(web_app, "_DISCOVERY_AGENT_GUIDANCE_PATH", guidance_path)
+
+    guidance_path.write_text("repository-specific scientific guidance", encoding="utf-8")
+    assert web_app._discovery_agent_guidance() == "repository-specific scientific guidance"
+
+    guidance_path.unlink()
+    fallback = web_app._discovery_agent_guidance().lower()
+    assert "human-prioritized" in fallback
+    assert "ptm de novo" in fallback
+
+
+def test_history_is_sent_once_as_native_chat_roles(monkeypatch):
+    previous_user = "先比较两种方案，这轮不要改卡。"
+    previous_assistant = "第一种偏精确，第二种覆盖更广。"
+    latest = "采用第二种，但标记方式继续开放。"
+    result, llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "chat",
+            "assistant_message": "我会继续讨论，不修改策略。",
+            "tool_calls": [],
+        },
+        role_aware=True,
+        user_message=latest,
+        dialogue_history=[
+            {"role": "user", "content": previous_user},
+            {"role": "assistant", "content": previous_assistant},
+        ],
+    )
+
+    assert result["action"] == "chat"
+    role_llm = llm
+    assert isinstance(role_llm, _RoleAwareTurnLLM)
+    assert len(role_llm.message_calls) == 1
+    messages = role_llm.message_calls[0]
+    assert [item["role"] for item in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert messages[1]["content"] == previous_user
+    assert messages[2]["content"] == previous_assistant
+    assert latest in messages[-1]["content"]
+    assert previous_user not in messages[-1]["content"]
+    assert previous_assistant not in messages[-1]["content"]
+    assert "recent_dialogue_history" not in messages[-1]["content"]
+
+
+def test_social_chat_does_not_turn_into_a_structured_questionnaire(monkeypatch):
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "chat",
+            "assistant_message": "Hello! Tell me what you would like to explore.",
+            "tool_calls": [],
+            "next_decision": _decision(),
+        },
+        user_message="Hello",
+    )
+
+    assert result["action"] == "chat"
+    assert "next_decision" not in result
+
+
+@pytest.mark.parametrize("action", ["chat", "advise", "clarify", "ready_to_confirm"])
+def test_non_update_actions_cannot_mutate_strategy(monkeypatch, action: str):
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": action,
+            "assistant_message": "这轮只讨论，不修改策略。",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": {"instrument_preference": "newer"}},
+                }
+            ],
+            "extra_fields": {"instrument_preference": "newer"},
+            **({"next_decision": _decision()} if action == "clarify" else {}),
+        },
+        user_message="如果只偏好新仪器，会牺牲什么？先别改。",
+    )
+
+    assert result["tool_calls"] == []
+    assert result["extra_fields"] == {}
+    if action == "clarify":
+        assert result["next_decision"]["focus"] == "horizon"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {
+            "assistant_message": "旧字段声称已更新。",
+            "extra_fields": {"species": ["Arabidopsis thaliana"]},
+        },
+        {
+            "action": "update_strategy",
+            "assistant_message": "缺少工具调用。",
+            "extra_fields": {"species": ["Arabidopsis thaliana"]},
+            "tool_calls": [],
+        },
+        {
+            "action": "update_strategy",
+            "assistant_message": "缺少显式 patch。",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"species": ["Arabidopsis thaliana"]},
+                }
+            ],
+        },
+        {
+            "action": "update_strategy",
+            "assistant_message": "patch 不是对象。",
+            "tool_calls": [
+                {"name": "update_strategy", "arguments": {"patch": "not-an-object"}}
+            ],
+        },
+    ],
+)
+def test_malformed_or_missing_update_envelope_fails_closed(monkeypatch, response):
+    result, llm = _run_turn(monkeypatch, response)
+
+    assert result["action"] in {"advise", "clarify"}
+    assert result["tool_calls"] == []
+    assert result["extra_fields"] == {}
+    assert len(llm.calls) == 1
+
+
+def test_malformed_contract_never_falls_back_to_phrase_specific_card_mutation(monkeypatch):
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            # No D1 action and no typed tool event: the old lexical fallback
+            # used to turn these motivating examples into production branches.
+            "assistant_message": "模型返回了不完整的旧格式。",
+        },
+        user_message="改成鱼类、DIA、15 个，顺便换成斑马鱼。",
+    )
+
+    assert result["action"] in {"advise", "clarify"}
+    assert result["tool_calls"] == []
+    assert result["extra_fields"] == {}
+    assert "策略保持不变" in result["assistant_message"]
+
+
+def test_invalid_supported_values_reject_the_entire_patch_and_keep_next_decision(monkeypatch):
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "模型给出了形状错误和未知枚举。",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "species": "Danio rerio",
+                            "run_horizon": "review_candidates",
+                            "coverage_mode": "broad",
+                            "target_project_count": True,
+                        }
+                    },
+                }
+            ],
+            "next_decision": _decision(),
+        },
+    )
+
+    assert result["action"] == "clarify"
+    assert result["tool_calls"] == []
+    assert result["extra_fields"] == {}
+    assert result["next_decision"]["focus"] == "horizon"
+    assert result["contract_errors"]
+
+
+def test_update_and_confirmation_in_one_model_envelope_fail_closed(monkeypatch):
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "模型试图同时更新并确认。",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": {"species": ["mouse"]}},
+                },
+                {"name": "confirm_strategy", "arguments": {}},
+            ],
+        },
+        **_ready_context(),
+    )
+
+    assert result["action"] == "advise"
+    assert result["tool_calls"] == []
+    assert result["extra_fields"] == {}
+    assert result["ready_for_confirm"] is False
+
+
+def test_generic_multi_field_patch_accepts_unseen_categories_without_phrase_branches(monkeypatch):
+    patch = {
+        "objective": "构建线虫不同生命周期的跨实验室探索语料库",
+        "task_type": "browse_only",
+        "run_horizon": "candidates_reviewed",
+        "species": ["Caenorhabditis elegans"],
+        "species_policy": "include_only",
+        "species_coverage": "prefer_listed",
+        "acquisition_mode": "dia",
+        "mixed_acquisition_policy": "review_mixed",
+        "special_themes": ["dauer stage", "aging"],
+        "labeling_strategy": "any",
+        "labeling_hard": False,
+        "coverage_mode": "balanced",
+        "target_project_count": 47,
+        "max_candidate_projects": 190,
+        "quota_flexibility": "fixed",
+        "time_budget": "multi_round",
+        "instrument_preference": "none",
+        "exclude_rules": ["cross-linking-only studies"],
+        "success_criteria": ["生命周期注释可核验"],
+    }
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "已一次写入你明确给出的线虫研究约束。",
+            "tool_calls": [
+                {"name": "update_strategy", "arguments": {"patch": patch}}
+            ],
+        },
+        user_message=(
+            "用秀丽隐杆线虫做生命周期探索；DIA，标记不限，候选后复核，"
+            "目标 47 个并排除纯交联研究。"
+        ),
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["tool_calls"] == [
+        {"name": "update_strategy", "arguments": {"patch": patch}}
+    ]
+    assert result["extra_fields"] == patch
+
+
+def test_patch_preserves_explicit_clear_and_unset_values(monkeypatch):
+    patch = {
+        "species": [],
+        "ptm_types": [],
+        "special_themes": [],
+        "exclude_rules": [],
+        "success_criteria": [],
+        "open_risks": [],
+        "target_project_count": None,
+        "max_candidate_projects": None,
+        "legacy_floor_ratio": None,
+        "notes": None,
+        "quota_flexibility": "open_ended",
+        "species_policy": "open",
+    }
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "已清空这些限制，并把规模改为开放。",
+            "tool_calls": [
+                {"name": "update_strategy", "arguments": {"patch": patch}}
+            ],
+        },
+        user_message="清空物种、主题、排除项和固定数量，其余规模开放。",
+        intent_snapshot={
+            "species": ["human"],
+            "ptm_types": ["phospho"],
+            "target_project_count": 20,
+            "max_candidate_projects": 80,
+            "legacy_floor_ratio": 0.2,
+            "notes": "old note",
+        },
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["tool_calls"][0]["arguments"]["patch"] == patch
+
+
+@pytest.mark.parametrize("field", sorted(web_app._DISCOVERY_STRATEGY_FIRST_CLASS_FIELDS))
+def test_every_first_class_strategy_field_accepts_null_as_canonical_clear(field: str):
+    patch, errors = web_app._validate_discovery_strategy_patch({field: None})
+
+    assert errors == []
+    assert patch == {field: None}
+
+
+def test_d1_canonical_fields_are_strictly_isomorphic_with_frontend_strategy_fields():
+    assert web_app._DISCOVERY_STRATEGY_PATCH_FIELDS == {
+        "objective",
+        "task_type",
+        "run_horizon",
+        "species",
+        "species_policy",
+        "species_coverage",
+        "acquisition_mode",
+        "mixed_acquisition_policy",
+        "ptm_types",
+        "special_themes",
+        "labeling_strategy",
+        "labeling_hard",
+        "coverage_mode",
+        "target_project_count",
+        "max_candidate_projects",
+        "quota_flexibility",
+        "time_budget",
+        "on_safety_ceiling",
+        "instrument_preference",
+        "legacy_floor_ratio",
+        "exclude_rules",
+            "success_criteria",
+            "scientific_constraints",
+            "notes",
+        "open_risks",
+        "repository",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "limit"),
+    [("target_project_count", 300), ("max_candidate_projects", 1000)],
+)
+def test_numeric_contract_limits_match_frontend_product_ceilings(field: str, limit: int):
+    accepted, accepted_errors = web_app._validate_discovery_strategy_patch(
+        {field: limit}
+    )
+    rejected, rejected_errors = web_app._validate_discovery_strategy_patch(
+        {field: limit + 1}
+    )
+
+    assert accepted_errors == []
+    assert accepted == {field: limit}
+    assert rejected == {}
+    assert rejected_errors
+
+
+@pytest.mark.parametrize(("field", "limit"), [("objective", 120), ("notes", 4000)])
+def test_text_contract_limits_match_frontend_decoder(field: str, limit: int):
+    accepted, accepted_errors = web_app._validate_discovery_strategy_patch(
+        {field: "x" * limit}
+    )
+    rejected, rejected_errors = web_app._validate_discovery_strategy_patch(
+        {field: "x" * (limit + 1)}
+    )
+
+    assert accepted_errors == []
+    assert accepted == {field: "x" * limit}
+    assert rejected == {}
+    assert rejected_errors
+
+
+def test_string_array_contract_matches_frontend_item_and_length_limits():
+    accepted_items = [f"species-{index}" for index in range(100)]
+    accepted, accepted_errors = web_app._validate_discovery_strategy_patch(
+        {"species": accepted_items}
+    )
+    too_many, too_many_errors = web_app._validate_discovery_strategy_patch(
+        {"species": [*accepted_items, "one-more"]}
+    )
+    item_at_limit, item_at_limit_errors = web_app._validate_discovery_strategy_patch(
+        {"species": ["x" * 240]}
+    )
+    item_too_long, item_too_long_errors = web_app._validate_discovery_strategy_patch(
+        {"species": ["x" * 241]}
+    )
+
+    assert accepted_errors == []
+    assert accepted == {"species": accepted_items}
+    assert too_many == {}
+    assert too_many_errors
+    assert item_at_limit_errors == []
+    assert item_at_limit == {"species": ["x" * 240]}
+    assert item_too_long == {}
+    assert item_too_long_errors
+
+
+def test_runtime_payload_fields_never_escape_as_canonical_card_keys(monkeypatch):
+    internal_fields = {
+        "query_terms": ["dauer proteomics"],
+        "diversity_strategy": "high",
+        "constraints_enabled": True,
+        "hard_constraint_fields": ["species"],
+        "constraint_provenance": {"species": "user"},
+        "agentic_rounds": 7,
+        "max_files": 5000,
+        "original_prompt": "internal transport copy",
+    }
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "科学要求保留为备注，运行字段不写卡。",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "objective": "线虫生命周期探索",
+                            **internal_fields,
+                        }
+                    },
+                }
+            ],
+        },
+    )
+
+    emitted = result["extra_fields"]
+    assert emitted["objective"] == "线虫生命周期探索"
+    assert set(emitted).isdisjoint(internal_fields)
+    assert "scientific_constraints" not in emitted
+
+
+def test_aliases_are_validated_then_emitted_as_canonical_strategy_fields(monkeypatch):
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "已更新规模和预算。",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "goal": "建立跨实验室线虫目录",
+                            "maxProjects": 33,
+                            "scaleMode": "balanced",
+                            "timeBudgetPreference": "multi_round",
+                        }
+                    },
+                }
+            ],
+        },
+    )
+
+    assert result["extra_fields"] == {
+        "objective": "建立跨实验室线虫目录",
+        "target_project_count": 33,
+        "coverage_mode": "balanced",
+        "time_budget": "multi_round",
+    }
+
+
+def test_unknown_constraint_and_unsupported_repository_are_preserved_for_review(monkeypatch):
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "未映射条件会保留供后续审查。",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "repository": "unregistered-repository",
+                            "custom_fractionation_constraint": "FAIMS-only",
+                        }
+                    },
+                }
+            ],
+        },
+    )
+
+    normalized = result["extra_fields"]
+    assert "repository" not in normalized
+    assert "custom_fractionation_constraint" not in normalized
+    [constraint] = normalized["scientific_constraints"]
+    assert constraint["dimension"] == "custom_fractionation_constraint"
+    assert constraint["value"] == "FAIMS-only"
+    assert constraint["evidence_required"] is True
+    assert any("unregistered-repository" in risk for risk in normalized["open_risks"])
+
+
+def test_arbitrary_scientific_constraints_survive_strategy_into_execution_request() -> None:
+    constraints = [
+        {
+            "id": "separation.faims",
+            "label": "Only FAIMS-enabled acquisitions",
+            "dimension": "ion_mobility_separation",
+            "operator": "equals",
+            "value": "FAIMS",
+            "strength": "hard",
+            "scope": "file",
+            "evidence_required": True,
+            "source": "user",
+        },
+        {
+            "id": "sample.exclude-cell-lines",
+            "label": "Exclude immortalized cell lines",
+            "dimension": "sample_model",
+            "operator": "not_matches",
+            "value": "immortalized cell line",
+            "strength": "hard",
+            "scope": "sample",
+            "evidence_required": True,
+            "source": "user",
+        },
+        {
+            "id": "cohort.minimum-participants",
+            "label": "At least 30 participants per project",
+            "dimension": "participant_count",
+            "operator": "gte",
+            "value": 30,
+            "strength": "hard",
+            "scope": "project",
+            "evidence_required": True,
+            "source": "user",
+        },
+    ]
+    patch = web_app._normalise_discovery_strategy_patch(
+        {
+            "scientific_constraints": constraints,
+            "instrument_preference": "newer",
+        }
+    )
+    request = web_app._clean_dataset_request(
+        {
+            "repository": "pride",
+            "goal": "general",
+            "max_projects": 15,
+            "max_files": 500,
+            **patch,
+        }
+    )
+
+    by_id = {constraint.id: constraint for constraint in request.scientific_constraints}
+    assert set(by_id) >= {
+        "separation.faims",
+        "sample.exclude-cell-lines",
+        "cohort.minimum-participants",
+        "builtin.instrument-era",
+    }
+    assert by_id["cohort.minimum-participants"].value == 30
+    assert by_id["sample.exclude-cell-lines"].scope == "sample"
+    assert request.instrument_preference == "newer"
+    assert "constraint:separation.faims" in request.hard_constraint_fields
+    serialized = request.model_dump(mode="json")
+    assert serialized["scientific_constraints"][2]["operator"] == "gte"
+
+
+def test_species_patch_canonicalizes_taxon_synonyms_and_trivial_inflections():
+    assert web_app._normalise_discovery_strategy_patch(
+        {"species": ["human", "Homo sapiens"]}
+    )["species"] == ["human"]
+    assert web_app._normalise_discovery_strategy_patch(
+        {"species": ["fish", "fishes"]}
+    )["species"] == ["fish"]
+
+    # Strategy arrays are already structured values.  They must use exact
+    # aliases rather than the fuzzy free-text matcher, otherwise a qualifier
+    # such as ``non-human`` can silently reverse the user's constraint.
+    assert web_app._normalise_discovery_strategy_patch(
+        {"species": ["non-human primate"]}
+    )["species"] == ["non-human primate"]
+    assert web_app._normalise_discovery_strategy_patch(
+        {"species": ["human and mouse"]}
+    )["species"] == ["human and mouse"]
+
+
+def test_execution_request_deduplicates_same_exclusion_across_first_class_and_constraint():
+    request = web_app._clean_dataset_request(
+        {
+            "repository": "pride",
+            "goal": "general",
+            "exclude_rules": ["Exclude immortalized cell lines"],
+            "scientific_constraints": [
+                {
+                    "id": "sample.exclude-cell-lines",
+                    "label": "Exclude immortalized cell lines",
+                    "dimension": "sample_model",
+                    "operator": "not_matches",
+                    "value": "immortalized cell line",
+                    "strength": "hard",
+                    "scope": "sample",
+                    "evidence_required": True,
+                    "source": "user",
+                }
+            ],
+        }
+    )
+
+    matching = [
+        item
+        for item in request.scientific_constraints
+        if item.label == "Exclude immortalized cell lines"
+    ]
+    assert len(matching) == 1
+
+
+def test_defaults_can_update_strategy_and_offer_confirmation_without_starting_search(
+    monkeypatch,
+):
+    patch = {
+        "objective": "先摸清人源免疫肽公开数据",
+        "task_type": "browse_only",
+        "run_horizon": "candidates_only",
+        "species": ["human"],
+        "species_policy": "prefer",
+        "special_themes": ["immunopeptidomics"],
+        "coverage_mode": "curated",
+        "target_project_count": 20,
+        "quota_flexibility": "recommended",
+    }
+    started: list[dict[str, Any]] = []
+    monkeypatch.setattr(web_app, "_run_web_discovery", lambda body, **_kwargs: started.append(body))
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "已应用推荐默认；请确认这张策略后再搜索。",
+            "tool_calls": [
+                {"name": "update_strategy", "arguments": {"patch": patch}}
+            ],
+            "ready_for_confirm": True,
+            "gap_report": {
+                "required_missing": [],
+                "optional_missing": [],
+                "ready_for_confirm": True,
+            },
+        },
+        user_message="按你推荐的探索默认填好，但先别搜索。",
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["ready_for_confirm"] is True
+    assert result["gap_report"]["ready_for_confirm"] is True
+    assert started == []
+
+
+def test_natural_language_confirmation_is_an_explicit_agent_action_only_in_context(monkeypatch):
+    result, llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "confirm_strategy",
+            "assistant_message": "已确认当前这版策略，可以交给搜索入口。",
+            "tool_calls": [],
+        },
+        user_message="就照刚才展示的这一版执行，不需要再改。",
+        **_ready_context(),
+    )
+
+    assert result["action"] == "confirm_strategy"
+    assert result["mode"] == "confirm_strategy"
+    assert result["tool_calls"] == [
+        {
+            "name": "confirm_strategy",
+            "arguments": {"strategy_fingerprint": result["strategy_fingerprint"]},
+        }
+    ]
+    assert len(result["strategy_fingerprint"]) == 64
+    assert result["extra_fields"] == {}
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        {
+            "phase": "grilling",
+            "intent_snapshot": {"task_type": "browse_only"},
+            "gap_report": {"required_missing": [], "ready_for_confirm": True},
+        },
+        {
+            "phase": "awaiting_confirm",
+            "intent_snapshot": {},
+            "gap_report": {"required_missing": [], "ready_for_confirm": True},
+        },
+        {
+            "phase": "awaiting_confirm",
+            "intent_snapshot": {"task_type": "browse_only"},
+            "gap_report": {"required_missing": ["coverage"], "ready_for_confirm": False},
+        },
+        {
+            **_ready_context(),
+            "pending_strategy_fingerprint": "stale-snapshot-token",
+        },
+    ],
+)
+def test_confirmation_action_fails_closed_outside_current_awaiting_snapshot(
+    monkeypatch,
+    context,
+):
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "confirm_strategy",
+            "assistant_message": "模型试图确认。",
+            "tool_calls": [],
+        },
+        user_message="好的",
+        **context,
+    )
+
+    assert result["action"] in {"advise", "clarify"}
+    assert result["tool_calls"] == []
+    assert result["extra_fields"] == {}
+    assert result["confirmation_rejected_reason"]
+
+
+def test_confirmation_words_are_not_inferred_when_model_returns_chat(monkeypatch):
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "chat",
+            "assistant_message": "继续聊这版策略。",
+            "tool_calls": [],
+        },
+        user_message="确认并开始",
+        **_ready_context(),
+    )
+
+    assert result["action"] == "chat"
+    assert result["tool_calls"] == []
+
+
+def _agent_generated_task_decision() -> dict[str, Any]:
+    return {
+        "focus": "task_type",
+        "question": "Which task should we use?",
+        "recommendation": {
+            "id": "browse",
+            "label": "Browse first",
+            "reason": "Safest exploratory start",
+        },
+        "options": [
+            {
+                "id": "browse",
+                "label": "Browse first",
+                "reason": "Safest exploratory start",
+                "strategy_patch": {"task_type": "browse_only"},
+            },
+            {
+                "id": "rt",
+                "label": "RT prediction",
+                "reason": "Build an RT model",
+                "strategy_patch": {"task_type": "rt_prediction"},
+            },
+        ],
+        "allow_free_text": True,
+    }
+
+
+def test_numeric_reply_resolves_agent_generated_option_without_repeating_it(monkeypatch):
+    pending = _agent_generated_task_decision()
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "Applied the selected task option.",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": {"task_type": "browse_only"}},
+                }
+            ],
+            "next_decision": pending,
+        },
+        user_message="1",
+        phase="grilling",
+        pending_decision=pending,
+        intent_snapshot={
+            "objective": "Browse public proteomics projects",
+            "task_type": "browse_only",
+            "run_horizon": "candidates_only",
+            "target_project_count": 20,
+        },
+        gap_report={"required_missing": [], "optional_missing": [], "ready_for_confirm": True},
+    )
+
+    assert result["action"] == "ready_to_confirm"
+    assert "next_decision" not in result
+    assert "Browse first" in result["assistant_message"]
+
+
+def test_numeric_reply_can_drive_a_generic_strategy_tool_event(monkeypatch):
+    pending = _agent_generated_task_decision()
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "Applied the selected option.",
+            "turn_interpretation": {
+                "commitments": [
+                    {"field": "task_type", "value": "browse_only", "source": "1"}
+                ]
+            },
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": {"task_type": "browse_only"}},
+                }
+            ],
+        },
+        user_message="1",
+        phase="grilling",
+        pending_decision=pending,
+        intent_snapshot={},
+        gap_report={
+            "required_missing": ["task", "horizon"],
+            "optional_missing": [],
+            "ready_for_confirm": False,
+        },
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {"task_type": "browse_only"}
+    assert result["resolved_decision"]["selected_option_id"] == "browse"
+    assert result["decision_memory"][0]["selected_option_id"] == "browse"
+
+
+def test_numeric_selected_option_is_grounded_by_its_active_decision_context(monkeypatch):
+    pending = {
+        "focus": "immunopeptidomics use",
+        "target_fields": ["task_type", "objective"],
+        "question": "Browse first or train a model?",
+        "recommendation": {
+            "id": "browse_explore",
+            "label": "Browse first",
+            "reason": "Survey the available projects before modeling.",
+        },
+        "options": [
+            {"id": "browse_explore", "label": "Browse first"},
+            {"id": "denovo", "label": "Train de novo"},
+        ],
+        "allow_free_text": True,
+    }
+    explicit_patch = {
+        "task_type": "browse_only",
+        "objective": "Survey public immunopeptidomics projects",
+    }
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        lambda *_args, **_kwargs: pytest.fail(
+            "A server-resolved option must not be re-read as a context-free number"
+        ),
+    )
+
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "_agent_runtime": "openai_agents",
+            "action": "update_strategy",
+            "assistant_message": "We will browse first.",
+            "turn_interpretation": {
+                "commitments": [
+                    {"field": "task_type", "value": "browse_only", "source": "1"},
+                    {
+                        "field": "objective",
+                        "value": "Survey public immunopeptidomics projects",
+                        "source": "1",
+                    },
+                ]
+            },
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": explicit_patch},
+                }
+            ],
+        },
+        user_message="1",
+        phase="grilling",
+        pending_decision=pending,
+        intent_snapshot={"task_type": "", "objective": ""},
+        decision_memory=[],
+        resolved_fields=[],
+        gap_report={
+            "required_missing": ["task_type", "run_horizon"],
+            "optional_missing": [],
+            "ready_for_confirm": False,
+        },
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == explicit_patch
+    assert result["resolved_decision"]["selected_option_id"] == "browse_explore"
+    assert result.get("contract_errors") in (None, [])
+
+
+def test_predeclared_option_patch_blocks_model_from_inventing_plan_only(monkeypatch):
+    """Regression for the captured build-training -> plan_only production bug."""
+
+    pending = {
+        "focus": "immunopeptidomics use",
+        # Deliberately reproduce the unsafe model-authored scope from the real
+        # session. The server must derive authority from option patches instead.
+        "target_fields": ["objective", "task_type", "run_horizon"],
+        "question": "先浏览还是构建训练集？",
+        "recommendation": {
+            "id": "browse",
+            "label": "先浏览",
+            "reason": "先了解数据范围。",
+        },
+        "options": [
+            {
+                "id": "browse",
+                "label": "先浏览",
+                "strategy_patch": {
+                    "task_type": "browse_only",
+                    "objective": "浏览免疫肽组学公开项目",
+                },
+            },
+            {
+                "id": "build_training",
+                "label": "构建训练集",
+                "strategy_patch": {
+                    "task_type": "other",
+                    "objective": "构建免疫肽组学机器学习训练集",
+                },
+            },
+        ],
+    }
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "_agent_runtime": "openai_agents",
+            "action": "update_strategy",
+            "assistant_message": "已选择构建训练集，并只做计划。",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "task_type": "other",
+                            "objective": "构建免疫肽组学机器学习训练集",
+                            "run_horizon": "plan_only",
+                        }
+                    },
+                }
+            ],
+        },
+        user_message="2",
+        phase="grilling",
+        pending_decision=pending,
+        intent_snapshot={
+            "task_type": "",
+            "objective": "免疫肽组学",
+            "run_horizon": "",
+        },
+        gap_report={
+            "required_missing": ["task", "horizon", "coverage"],
+            "optional_missing": [],
+            "ready_for_confirm": False,
+        },
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {
+        "task_type": "other",
+        "objective": "构建免疫肽组学机器学习训练集",
+    }
+    assert "run_horizon" not in result["extra_fields"]
+    assert result["option_resolution"]["contract"] == "predeclared_v1"
+    assert result["option_resolution"]["discarded_model_fields"] == ["run_horizon"]
+    assert result["resolved_decision"]["target_fields"] == ["task_type", "objective"]
+
+
+def test_next_decision_derives_scope_from_predeclared_option_patches():
+    decision = web_app._normalise_discovery_next_decision(
+        {
+            "focus": "training direction",
+            "target_fields": ["task_type", "objective", "run_horizon"],
+            "question": "Which training direction?",
+            "recommendation": {
+                "id": "denovo",
+                "label": "De novo",
+                "reason": "It needs high-quality MS/MS labels.",
+            },
+            "options": [
+                {
+                    "id": "denovo",
+                    "label": "De novo",
+                    "strategy_patch": {
+                        "task_type": "denovo",
+                        "objective": "Build an immunopeptide de novo training set",
+                    },
+                },
+                {
+                    "id": "psm",
+                    "label": "PSM scoring",
+                    "strategy_patch": {
+                        "task_type": "psm_scoring",
+                        "objective": "Build an immunopeptide PSM scoring set",
+                    },
+                },
+            ],
+        }
+    )
+
+    assert decision is not None
+    assert decision["target_fields"] == ["task_type", "objective"]
+    assert decision["option_patch_contract"] == "predeclared_v1"
+    assert decision["recommendation"]["strategy_patch"]["task_type"] == "denovo"
+
+
+def test_numeric_selected_option_cannot_authorize_out_of_scope_fields(monkeypatch):
+    pending = {
+        "focus": "task choice",
+        "target_fields": ["task_type"],
+        "question": "Browse or model?",
+        "recommendation": {
+            "id": "browse",
+            "label": "Browse",
+            "reason": "Explore first.",
+        },
+        "options": [
+            {"id": "browse", "label": "Browse"},
+            {"id": "denovo", "label": "De novo"},
+        ],
+        "allow_free_text": True,
+    }
+    verifier_calls: list[dict[str, Any]] = []
+
+    def reject_out_of_scope(*_args, **kwargs):
+        verifier_calls.append(kwargs)
+        return {
+            "verified": False,
+            "verdict": "reject",
+            "patch": {},
+            "rationale": "The project count was not authorized by this option.",
+        }
+
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        reject_out_of_scope,
+    )
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "_agent_runtime": "openai_agents",
+            "action": "update_strategy",
+            "assistant_message": "Browse first and silently change the quota.",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "task_type": "browse_only",
+                            "target_project_count": 25,
+                        }
+                    },
+                }
+            ],
+        },
+        user_message="1",
+        phase="grilling",
+        pending_decision=pending,
+        intent_snapshot={"task_type": "", "target_project_count": None},
+        decision_memory=[],
+        resolved_fields=[],
+        gap_report={
+            "required_missing": ["task_type"],
+            "optional_missing": [],
+            "ready_for_confirm": False,
+        },
+    )
+
+    assert len(verifier_calls) == 1
+    assert result["tool_calls"] == []
+    assert result["extra_fields"] == {}
+    assert "resolved_decision" not in result
+    assert any("semantic verification" in error for error in result["contract_errors"])
+
+
+@pytest.mark.parametrize(
+    ("pending", "explicit_patch", "intent_snapshot", "selected_option_id"),
+    [
+        (
+            {
+                "focus": "species scope",
+                "target_fields": ["species", "species_policy"],
+                "question": "Which species scope should be used?",
+                "recommendation": {
+                    "id": "all_species",
+                    "label": "Keep species open",
+                    "reason": "This is an exploratory search.",
+                },
+                "options": [
+                    {"id": "all_species", "label": "Keep species open"},
+                    {"id": "human_only", "label": "Human only"},
+                ],
+                "allow_free_text": True,
+            },
+            {"species": [], "species_policy": "open"},
+            {"species": [], "species_policy": "open"},
+            "all_species",
+        ),
+        (
+            {
+                "focus": "MHC class scope",
+                "target_fields": ["scientific_constraints"],
+                "question": "Which MHC classes should be included?",
+                "recommendation": {
+                    "id": "both_open",
+                    "label": "Keep both classes open",
+                    "reason": "This preserves exploratory coverage.",
+                },
+                "options": [
+                    {"id": "both_open", "label": "Keep both classes open"},
+                    {"id": "mhc_i_only", "label": "MHC-I only"},
+                    {"id": "mhc_ii_only", "label": "MHC-II only"},
+                ],
+                "allow_free_text": True,
+            },
+            {"scientific_constraints": []},
+            {"scientific_constraints": []},
+            "both_open",
+        ),
+    ],
+    ids=["open-species", "open-scientific-constraint"],
+)
+def test_selected_default_value_is_kept_as_an_explicit_resolution_delta(
+    monkeypatch,
+    pending,
+    explicit_patch,
+    intent_snapshot,
+    selected_option_id,
+):
+    """An accepted open/default option must resolve even when its value is unchanged."""
+
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        lambda *_args, **_kwargs: pytest.fail(
+            "A pure decision-state delta must not need semantic re-interpretation"
+        ),
+    )
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "_agent_runtime": "openai_agents",
+            "action": "update_strategy",
+            "assistant_message": "The open choice is recorded.",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": explicit_patch},
+                }
+            ],
+        },
+        user_message="1",
+        phase="grilling",
+        pending_decision=pending,
+        intent_snapshot=intent_snapshot,
+        decision_memory=[],
+        resolved_fields=[],
+        gap_report={
+            "required_missing": ["run_horizon"],
+            "optional_missing": [],
+            "ready_for_confirm": False,
+        },
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == explicit_patch
+    assert result["resolved_decision"]["selected_option_id"] == selected_option_id
+    assert result["resolved_decision"]["selected_values"] == explicit_patch
+    assert result["decision_memory"][0]["selected_option_id"] == selected_option_id
+
+    repeated, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "assistant_message": "Choose the same scope again.",
+            "tool_calls": [],
+            "next_decision": pending,
+        },
+        user_message="continue",
+        phase="grilling",
+        intent_snapshot=intent_snapshot,
+        decision_memory=result["decision_memory"],
+        resolved_fields=list(explicit_patch),
+        gap_report={
+            "required_missing": ["run_horizon"],
+            "optional_missing": [],
+            "ready_for_confirm": False,
+        },
+    )
+
+    assert "next_decision" not in repeated
+    assert repeated["action"] == "advise"
+
+
+def test_mixed_value_and_resolution_delta_survives_semantic_verification(monkeypatch):
+    pending = {
+        "focus": "species scope",
+        "target_fields": ["species", "species_policy"],
+        "question": "How should human studies be prioritized?",
+        "recommendation": {
+            "id": "human_prefer",
+            "label": "Prefer human, keep others",
+            "reason": "Human immunopeptidomics is best annotated.",
+        },
+        "options": [
+            {"id": "human_prefer", "label": "Prefer human, keep others"},
+            {"id": "human_only", "label": "Human only"},
+        ],
+        "allow_free_text": True,
+    }
+    explicit_patch = {"species": ["human"], "species_policy": "prefer"}
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        lambda *_args, **kwargs: {
+            "verified": True,
+            "verdict": "accept",
+            "patch": dict(kwargs["proposed_patch"]),
+            "evidence": [
+                {"field": field, "source": "1"}
+                for field in kwargs["proposed_patch"]
+            ],
+            "rationale": "The active option grounds both target fields.",
+        },
+    )
+
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "_agent_runtime": "openai_agents",
+            "action": "update_strategy",
+            "assistant_message": "Human is now preferred without excluding other species.",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": explicit_patch},
+                }
+            ],
+        },
+        user_message="1",
+        phase="grilling",
+        pending_decision=pending,
+        intent_snapshot={"species": ["human"], "species_policy": "open"},
+        decision_memory=[],
+        resolved_fields=[],
+        gap_report={
+            "required_missing": ["run_horizon"],
+            "optional_missing": [],
+            "ready_for_confirm": False,
+        },
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == explicit_patch
+    assert result["resolved_decision"]["selected_values"] == explicit_patch
+
+
+def test_grounded_free_text_open_answer_is_a_resolution_delta(monkeypatch):
+    pending = {
+        "focus": "species scope",
+        "target_fields": ["species", "species_policy"],
+        "question": "Which species scope should be used?",
+        "recommendation": {
+            "id": "human_prefer",
+            "label": "Prefer human",
+            "reason": "Human data is best annotated.",
+        },
+        "options": [
+            {"id": "human_prefer", "label": "Prefer human"},
+            {"id": "all_species", "label": "All species"},
+        ],
+        "allow_free_text": True,
+    }
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        lambda *_args, **_kwargs: pytest.fail(
+            "A grounded no-op commitment must not need semantic re-interpretation"
+        ),
+    )
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "_agent_runtime": "openai_agents",
+            "action": "update_strategy",
+            "assistant_message": "All species remain open.",
+            "turn_interpretation": {
+                "commitments": [
+                    {"field": "species", "value": [], "source": "anything works"},
+                    {
+                        "field": "species_policy",
+                        "value": "open",
+                        "source": "anything works",
+                    },
+                ]
+            },
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {"species": [], "species_policy": "open"}
+                    },
+                }
+            ],
+            # A weak model may try to ask the same question again. The server
+            # must recognize the explicit resolution before returning it.
+            "next_decision": pending,
+        },
+        user_message="anything works",
+        phase="grilling",
+        pending_decision=pending,
+        intent_snapshot={"species": [], "species_policy": "open"},
+        decision_memory=[],
+        resolved_fields=[],
+        gap_report={
+            "required_missing": ["run_horizon"],
+            "optional_missing": [],
+            "ready_for_confirm": False,
+        },
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {"species": [], "species_policy": "open"}
+    assert "next_decision" not in result
+    assert "resolved_decision" not in result
+
+
+def test_predeclared_numeric_option_self_repairs_invalid_later_model_patch(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        "AGENT_DIALOGUE_SESSION_DB",
+        str(tmp_path / "failed_numeric_option.sqlite"),
+    )
+    pending = _agent_generated_task_decision()
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "Applied the selected option.",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": {"task_type": "not_a_real_task"}},
+                }
+            ],
+            "next_decision": pending,
+        },
+        user_message="1",
+        phase="grilling",
+        session_id="failed-numeric-option",
+        pending_decision=pending,
+        intent_snapshot={},
+        decision_memory=[],
+        gap_report={
+            "required_missing": ["task"],
+            "optional_missing": [],
+            "ready_for_confirm": False,
+        },
+    )
+
+    assert result["tool_calls"] == [
+        {
+            "name": "update_strategy",
+            "arguments": {"patch": {"task_type": "browse_only"}},
+        }
+    ]
+    assert result["resolved_decision"]["selected_option_id"] == "browse"
+    assert result["decision_memory"][0]["selected_option_id"] == "browse"
+    assert "next_decision" not in result
+    _history, memory = web_app._load_discovery_dialogue_session(
+        "failed-numeric-option",
+        [],
+    )
+    assert memory[0]["selected_option_id"] == "browse"
+
+
+def test_predeclared_numeric_option_discards_unrelated_later_model_patch(monkeypatch):
+    pending = _agent_generated_task_decision()
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "Updated coverage, not the task choice.",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": {"coverage_mode": "curated"}},
+                }
+            ],
+            "next_decision": pending,
+        },
+        user_message="1",
+        phase="grilling",
+        pending_decision=pending,
+        intent_snapshot={},
+        decision_memory=[],
+        gap_report={
+            "required_missing": ["task"],
+            "optional_missing": [],
+            "ready_for_confirm": False,
+        },
+    )
+
+    assert result["tool_calls"] == [
+        {
+            "name": "update_strategy",
+            "arguments": {"patch": {"task_type": "browse_only"}},
+        }
+    ]
+    assert result["resolved_decision"]["selected_option_id"] == "browse"
+    assert result["decision_memory"][0]["selected_option_id"] == "browse"
+    assert "next_decision" not in result
+    assert result["option_resolution"]["discarded_model_fields"] == ["coverage_mode"]
+
+
+def test_selected_enum_repairs_only_an_explicit_malformed_tool_event(monkeypatch):
+    pending = _agent_generated_task_decision()
+    pending["focus"] = "objective_and_task"
+    pending["recommendation"]["id"] = "browse_only"
+    pending["options"][0]["id"] = "browse_only"
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "Applied the selected option.",
+            "turn_interpretation": {
+                "commitments": [
+                    {
+                        "field": "task_type",
+                        "value": {"value": "browse_only", "label": "Browse first"},
+                        "source": "1",
+                    }
+                ]
+            },
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "task_type": {
+                                "value": "browse_only",
+                                "label": "Browse first",
+                            }
+                        }
+                    },
+                }
+            ],
+        },
+        user_message="1",
+        phase="grilling",
+        pending_decision=pending,
+        intent_snapshot={},
+        gap_report={
+            "required_missing": ["task"],
+            "optional_missing": [],
+            "ready_for_confirm": False,
+        },
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {"task_type": "browse_only"}
+    assert result.get("contract_errors") is None
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected_id"),
+    [
+        ("1", "browse"),
+        ("browse", "browse"),
+        ("Browse first", "browse"),
+        ("RT prediction", "rt"),
+    ],
+)
+def test_pending_selection_resolves_only_against_dynamic_option_context(
+    reply: str,
+    expected_id: str,
+):
+    selected = web_app._resolve_discovery_pending_selection(
+        reply,
+        _agent_generated_task_decision(),
+    )
+
+    assert selected is not None
+    assert selected["option"]["id"] == expected_id
+    assert selected["explicit_acceptance"] is True
+
+
+@pytest.mark.parametrize("reply", ["3", "15", "something else"])
+def test_pending_selection_does_not_invent_an_option(reply: str):
+    assert (
+        web_app._resolve_discovery_pending_selection(
+            reply,
+            _agent_generated_task_decision(),
+        )
+        is None
+    )
+
+
+def test_decision_identity_survives_focus_paraphrasing():
+    original = {
+        **_agent_generated_task_decision(),
+        "target_fields": ["task_type"],
+    }
+    paraphrased = {**original, "focus": "objective_and_task"}
+
+    assert web_app._same_discovery_decision(original, paraphrased) is True
+
+
+def test_decision_memory_keeps_same_option_ids_for_distinct_fallback_focuses():
+    memory = web_app._normalise_discovery_decision_memory(
+        [
+            {
+                "focus": "first_unmapped_tradeoff",
+                "target_fields": [],
+                "option_ids": ["recommended", "open"],
+                "selected_option_id": "recommended",
+            },
+            {
+                "focus": "second_unmapped_tradeoff",
+                "target_fields": [],
+                "option_ids": ["recommended", "open"],
+                "selected_option_id": "open",
+            },
+        ]
+    )
+
+    assert [item["focus"] for item in memory] == [
+        "first_unmapped_tradeoff",
+        "second_unmapped_tradeoff",
+    ]
+
+
+def test_same_option_ids_for_different_target_fields_do_not_collide(monkeypatch):
+    pending = {
+        "focus": "labeling_strategy",
+        "target_fields": ["labeling_strategy"],
+        "question": "How should labeling be handled?",
+        "recommendation": {
+            "id": "recommended",
+            "label": "Use the recommendation",
+            "reason": "It is the safest labeling default.",
+        },
+        "options": [
+            {"id": "recommended", "label": "Use the recommendation"},
+            {"id": "open", "label": "Keep it open"},
+        ],
+        "allow_free_text": True,
+    }
+    next_decision = {
+        **pending,
+        "focus": "acquisition_mode",
+        "target_fields": ["acquisition_mode"],
+        "question": "How should acquisition be handled?",
+        "recommendation": {
+            "id": "recommended",
+            "label": "Use the recommendation",
+            "reason": "It is the safest acquisition default.",
+        },
+    }
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "The labeling choice is recorded.",
+            "turn_interpretation": {
+                "commitments": [
+                    {
+                        "field": "labeling_strategy",
+                        "value": "any",
+                        "source": "1",
+                    }
+                ]
+            },
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": {"labeling_strategy": "any"}},
+                }
+            ],
+            "next_decision": next_decision,
+        },
+        user_message="1",
+        phase="grilling",
+        pending_decision=pending,
+        intent_snapshot={},
+        decision_memory=[],
+        gap_report={
+            "required_missing": ["acquisition"],
+            "optional_missing": [],
+            "ready_for_confirm": False,
+        },
+    )
+
+    assert result["resolved_decision"]["target_fields"] == ["labeling_strategy"]
+    assert result["next_decision"]["target_fields"] == ["acquisition_mode"]
+
+
+def _coverage_decision(*, revisit_existing: bool = False) -> dict[str, Any]:
+    return {
+        "focus": "coverage_mode",
+        "target_fields": ["coverage_mode", "target_project_count"],
+        "question": "How broad should this search be?",
+        "recommendation": {
+            "id": "curated",
+            "label": "Curated",
+            "reason": "A focused first pass is easier to review.",
+        },
+        "options": [
+            {"id": "curated", "label": "Curated", "reason": "About 20"},
+            {"id": "balanced", "label": "Balanced", "reason": "More breadth"},
+            {"id": "exhaustive", "label": "Exhaustive", "reason": "Maximum recall"},
+        ],
+        "revisit_existing": revisit_existing,
+        "allow_free_text": True,
+    }
+
+
+def test_resolved_decision_memory_blocks_a_later_question_loop(monkeypatch):
+    decision = _coverage_decision()
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "assistant_message": "Let's choose coverage again.",
+            "tool_calls": [],
+            "next_decision": decision,
+        },
+        user_message="继续",
+        phase="grilling",
+        decision_memory=[
+            {
+                "focus": "coverage_mode",
+                "target_fields": ["coverage_mode", "target_project_count"],
+                "option_ids": ["curated", "balanced", "exhaustive"],
+                "selected_option_id": "curated",
+                "selected_option_label": "Curated",
+            }
+        ],
+        intent_snapshot={
+            "objective": "Browse a focused proteomics landscape",
+            "task_type": "browse_only",
+            "run_horizon": "candidates_only",
+            "coverage_mode": "curated",
+            "target_project_count": 20,
+        },
+        gap_report={
+            "required_missing": [],
+            "optional_missing": ["labeling"],
+            "ready_for_confirm": True,
+        },
+    )
+
+    assert "next_decision" not in result
+    assert result["action"] == "ready_to_confirm"
+    assert "不会重复" in result["assistant_message"]
+
+
+def test_redundant_next_question_does_not_erase_update_acknowledgement(monkeypatch):
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "已把物种改为斑马鱼。",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": {"species": ["zebrafish"]}},
+                }
+            ],
+            "next_decision": {
+                "focus": "task_type",
+                "target_fields": ["task_type"],
+                "question": "Which downstream task?",
+                "recommendation": {
+                    "id": "browse_only",
+                    "label": "Browse",
+                    "reason": "The card already records browsing.",
+                },
+                "options": [
+                    {"id": "browse_only", "label": "Browse", "reason": "Explore"},
+                    {"id": "denovo", "label": "De novo", "reason": "Model"},
+                ],
+                "allow_free_text": True,
+            },
+        },
+        user_message="把物种改为斑马鱼，其它不变。",
+        intent_snapshot={"task_type": "browse_only", "species": ["rat"]},
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {"species": ["zebrafish"]}
+    assert "next_decision" not in result
+    assert result["assistant_message"].startswith("已把物种改为斑马鱼。")
+    assert "不会重复询问" in result["assistant_message"]
+
+
+def test_changed_or_cleared_fields_reopen_stale_decision_memory(
+    monkeypatch,
+):
+    decision = _coverage_decision()
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "assistant_message": "Let's choose the now-open coverage decision.",
+            "tool_calls": [],
+            "next_decision": decision,
+        },
+        user_message="继续",
+        phase="grilling",
+        decision_memory=[
+            {
+                "focus": "coverage_mode",
+                "target_fields": ["coverage_mode", "target_project_count"],
+                "option_ids": ["curated", "balanced", "exhaustive"],
+                "selected_option_id": "curated",
+                "selected_values": {
+                    "coverage_mode": "curated",
+                    "target_project_count": 20,
+                },
+            }
+        ],
+        intent_snapshot={"coverage_mode": None, "target_project_count": None},
+        gap_report={
+            "required_missing": [],
+            "optional_missing": ["coverage"],
+            "ready_for_confirm": False,
+        },
+    )
+
+    assert result["next_decision"]["focus"] == "coverage_mode"
+    assert result["decision_memory"] == []
+
+
+def test_replaced_fields_remove_old_selected_values_from_prompt_memory():
+    memory = web_app._normalise_discovery_decision_memory(
+        [
+            {
+                "focus": "coverage_mode",
+                "target_fields": ["coverage_mode", "target_project_count"],
+                "option_ids": ["curated", "balanced", "exhaustive"],
+                "selected_option_id": "curated",
+                "selected_values": {
+                    "coverage_mode": "curated",
+                    "target_project_count": 20,
+                },
+            }
+        ]
+    )
+
+    assert web_app._filter_discovery_decision_memory_for_snapshot(
+        memory,
+        intent_snapshot={"coverage_mode": "balanced", "target_project_count": 50},
+        resolved_fields=set(),
+    ) == []
+
+
+def test_explicit_revisit_can_reopen_an_existing_strategy_field(monkeypatch):
+    decision = _coverage_decision(revisit_existing=True)
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "assistant_message": "可以，我们重新比较覆盖范围。",
+            "tool_calls": [],
+            "next_decision": decision,
+        },
+        user_message="我想重新考虑覆盖范围",
+        phase="grilling",
+        decision_memory=[
+            {
+                "focus": "coverage_mode",
+                "target_fields": ["coverage_mode", "target_project_count"],
+                "option_ids": ["curated", "balanced", "exhaustive"],
+                "selected_option_id": "curated",
+            }
+        ],
+        intent_snapshot={"coverage_mode": "curated", "target_project_count": 20},
+        gap_report={
+            "required_missing": [],
+            "optional_missing": [],
+            "ready_for_confirm": True,
+        },
+    )
+
+    assert result["next_decision"]["focus"] == "coverage_mode"
+    assert result["next_decision"]["revisit_existing"] is True
+
+
+def test_dynamic_decision_keeps_all_material_options():
+    raw = {
+        "focus": "labeling_strategy",
+        "target_fields": ["labeling_strategy"],
+        "question": "Which labeling family fits this study?",
+        "recommendation": {
+            "id": "label_free",
+            "label": "Label-free",
+            "reason": "It is the least restrictive exploratory default.",
+        },
+        "options": [
+            {"id": "label_free", "label": "Label-free"},
+            {"id": "tmt", "label": "TMT"},
+            {"id": "itraq", "label": "iTRAQ"},
+            {"id": "silac", "label": "SILAC"},
+            {"id": "dimethyl", "label": "Dimethyl"},
+            {"id": "any", "label": "Keep open"},
+        ],
+        "option_mode": "expanded",
+    }
+
+    decision = web_app._normalise_discovery_next_decision(raw)
+
+    assert decision is not None
+    assert [option["id"] for option in decision["options"]] == [
+        "label_free",
+        "tmt",
+        "itraq",
+        "silac",
+        "dimethyl",
+        "any",
+    ]
+    assert decision["target_fields"] == ["labeling_strategy"]
+
+
+def test_expanded_enum_decision_fills_material_labeling_alternatives(monkeypatch):
+    result, llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "assistant_message": (
+                "Besides label-free, relevant alternatives include TMT, iTRAQ, "
+                "SILAC, and dimethyl labeling."
+            ),
+            "tool_calls": [],
+            "next_decision": {
+                "focus": "labeling_strategy",
+                "target_fields": ["labeling_strategy"],
+                "question": "Which labeling strategy should we compare?",
+                "recommendation": {
+                    "id": "label_free",
+                    "label": "Label-free",
+                    "reason": "It is the least restrictive exploratory default.",
+                },
+                "options": [
+                    {"id": "label_free", "label": "Label-free"},
+                    {"id": "any", "label": "Keep open"},
+                ],
+                "option_mode": "expanded",
+                "revisit_existing": False,
+            },
+        },
+        user_message="What other labeling methods are there? Please compare them.",
+    )
+
+    assert [option["id"] for option in result["next_decision"]["options"]] == [
+        "label_free",
+        "tmt",
+        "itraq",
+        "silac",
+        "dimethyl",
+        "any",
+    ]
+    assert result["next_decision"]["option_mode"] == "expanded"
+    assert '"option_mode": "focused|expanded"' in llm.calls[0]["user_prompt"]
+
+
+def test_labeling_discussion_expands_even_when_model_omits_option_mode(monkeypatch):
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "assistant_message": "We can compare label-free, TMT, and SILAC.",
+            "tool_calls": [],
+            "next_decision": {
+                "focus": "labeling_strategy",
+                "target_fields": ["labeling_strategy"],
+                "question": "Which labeling family should we use?",
+                "recommendation": {
+                    "id": "label_free",
+                    "label": "Label-free",
+                    "reason": "It keeps an exploratory search broad.",
+                },
+                "options": [
+                    {"id": "label_free", "label": "Label-free"},
+                    {"id": "any", "label": "Keep open"},
+                ],
+            },
+        },
+        user_message="What other labeling methods are available?",
+    )
+
+    assert [option["id"] for option in result["next_decision"]["options"]] == [
+        "label_free",
+        "tmt",
+        "itraq",
+        "silac",
+        "dimethyl",
+        "any",
+    ]
+    assert result["next_decision"]["option_mode"] == "expanded"
+
+
+def test_focused_enum_decision_does_not_expand_from_an_empty_catalog_label():
+    decision = web_app._normalise_discovery_next_decision(
+        {
+            "focus": "task_type",
+            "target_fields": ["task_type"],
+            "question": "What is the downstream task?",
+            "recommendation": {
+                "id": "browse_only",
+                "label": "Browse first",
+                "reason": "It is a flexible exploratory start.",
+            },
+            "options": [
+                {"id": "browse_only", "label": "Browse first"},
+                {"id": "denovo", "label": "De novo"},
+                {"id": "psm_scoring", "label": "PSM scoring"},
+                {"id": "other", "label": "Other"},
+            ],
+            "option_mode": "focused",
+        }
+    )
+
+    expanded = web_app._expand_discovery_enum_decision_options(
+        decision,
+        "Browse, de novo, or PSM scoring are useful task-specific directions.",
+    )
+
+    assert expanded is not None
+    assert expanded["option_mode"] == "focused"
+    assert [option["id"] for option in expanded["options"]] == [
+        "browse_only",
+        "denovo",
+        "psm_scoring",
+        "other",
+    ]
+
+
+def test_sdk_boundary_drops_recommended_defaults_not_accepted_by_user():
+    accepted, dropped = web_app._filter_discovery_unaccepted_recommendations(
+        {
+            "special_themes": ["immunopeptidomics"],
+            "task_type": "browse_only",
+            "species": ["human"],
+            "species_policy": "prefer",
+            "coverage_mode": "curated",
+            "target_project_count": 20,
+        },
+        user_message="\u514d\u75ab\u80bd\u5427",
+        selected_decision=None,
+    )
+
+    assert accepted == {"special_themes": ["immunopeptidomics"]}
+    assert set(dropped) == {
+        "task_type",
+        "species",
+        "species_policy",
+        "coverage_mode",
+        "target_project_count",
+    }
+
+
+def test_sdk_boundary_keeps_multi_field_values_stated_by_user():
+    accepted, dropped = web_app._filter_discovery_unaccepted_recommendations(
+        {
+            "species": ["human"],
+            "acquisition_mode": "dda",
+            "labeling_strategy": "tmt",
+            "target_project_count": 20,
+            "quota_flexibility": "recommended",
+        },
+        user_message="Human DDA with TMT, about 20 projects",
+        selected_decision=None,
+    )
+
+    assert dropped == []
+    assert accepted == {
+        "species": ["human"],
+        "acquisition_mode": "dda",
+        "labeling_strategy": "tmt",
+        "target_project_count": 20,
+        "quota_flexibility": "recommended",
+    }
+
+
+def test_sdk_session_persists_dialogue_and_resolved_decisions(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        "AGENT_DIALOGUE_SESSION_DB",
+        str(tmp_path / "dialogue_sessions.sqlite"),
+    )
+    resolved = {
+        "focus": "coverage_mode",
+        "target_fields": ["coverage_mode"],
+        "option_ids": ["curated", "balanced", "exhaustive"],
+        "selected_option_id": "curated",
+        "selected_option_label": "Curated",
+    }
+
+    web_app._store_discovery_dialogue_session_turn(
+        "session-test",
+        user_message="1",
+        assistant_message="已选择精选。",
+        action="update_strategy",
+        patch={"coverage_mode": "curated"},
+        next_decision=None,
+        resolved_decision=resolved,
+    )
+    history, decision_memory = web_app._load_discovery_dialogue_session(
+        "session-test",
+        [],
+    )
+
+    assert [item["role"] for item in history] == ["user", "assistant"]
+    assert history[0]["content"] == "1"
+    assert decision_memory[0]["selected_option_id"] == "curated"
+
+
+def test_d1_agents_sdk_runs_real_strategy_tool_and_persistent_session(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        "AGENT_DIALOGUE_SESSION_DB",
+        str(tmp_path / "dialogue_agent.sqlite"),
+    )
+    final_payload = {
+        "action": "update_strategy",
+        "assistant_message": "TMT has been recorded as the labeling strategy.",
+        "turn_interpretation": {
+            "commitments": [
+                {
+                    "field": "labeling_strategy",
+                    "value": "tmt",
+                    "source": "Use TMT",
+                }
+            ],
+            "consultations": [],
+            "clause_audit": [
+                {
+                    "clause_id": "C1",
+                    "classification": "commitment",
+                    "decisions": [
+                        {"field": "labeling_strategy", "value": "tmt"}
+                    ],
+                }
+            ],
+        },
+        # This textual projection is deliberately wrong. The SDK-executed
+        # function call below must be the only mutation authority.
+        "tool_calls": [
+            {
+                "name": "update_strategy",
+                "arguments": {"patch": {"labeling_strategy": "label_free"}},
+            }
+        ],
+    }
+    model = _DialogueScriptedModel(
+        [
+            (
+                "update_strategy",
+                {
+                    "patch": {"labeling_strategy": "tmt"},
+                    "response_json": json.dumps(final_payload),
+                },
+            ),
+        ]
+    )
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+
+    raw = web_app._run_discovery_dialogue_agents_sdk(
+        client,
+        system_prompt="You are a dialogue agent.",
+        dialogue_history=[],
+        state_prompt="Return JSON.",
+        user_message="Use TMT",
+        session_id="sdk-d1-test",
+        model=model,
+    )
+
+    assert model.calls == 1
+    assert raw["_agent_runtime"] == "openai_agents"
+    # The SDK runner must not persist pre-validation tool output.  The web
+    # boundary stores only the final, normalized turn after semantic review.
+    assert raw["_sdk_session_managed"] is False
+    assert raw["tool_calls"] == [
+        {
+            "name": "update_strategy",
+            "arguments": {"patch": {"labeling_strategy": "tmt"}},
+        }
+    ]
+
+    history, _memory = web_app._load_discovery_dialogue_session(
+        "sdk-d1-test",
+        [],
+    )
+    assert history == []
+
+
+def test_d1_agents_sdk_recovers_provider_plain_text_as_non_mutating():
+    plain_reply = "免疫肽是一个研究主题。你更关注哪种下游用途？"
+    model = _DialogueScriptedModel([("final", plain_reply)])
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+
+    raw = web_app._run_discovery_dialogue_agents_sdk(
+        client,
+        system_prompt="You are a dialogue agent.",
+        dialogue_history=[],
+        state_prompt="Finish with one function tool.",
+        user_message="免疫肽数据",
+        session_id="plain-text-provider-test",
+        model=model,
+    )
+
+    assert raw["action"] == "advise"
+    assert raw["assistant_message"] == plain_reply
+    assert raw["tool_calls"] == []
+    assert raw["_provider_compatibility_recovery"] == {
+        "mode": "plain_text_as_non_mutating",
+        "chars": len(plain_reply),
+        "advisor_calls": 0,
+    }
+
+
+def test_dialogue_json_action_compatibility_preserves_roles_and_typed_envelope():
+    response = {
+        "action": "update_strategy",
+        "assistant_message": "已记录免疫肽主题。",
+        "turn_interpretation": {
+            "commitments": [
+                {
+                    "field": "special_themes",
+                    "value": ["immunopeptidomics"],
+                    "source": "免疫肽数据",
+                }
+            ]
+        },
+        "tool_calls": [
+            {
+                "name": "update_strategy",
+                "arguments": {
+                    "patch": {"special_themes": ["immunopeptidomics"]}
+                },
+            }
+        ],
+    }
+    llm = _RoleAwareTurnLLM([response])
+
+    raw = web_app._run_discovery_dialogue_json_compatibility(
+        llm,
+        system_prompt="manager system",
+        dialogue_history=[
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "你好，请说目标。"},
+        ],
+        state_prompt="current state contract",
+    )
+
+    assert raw == response
+    messages = llm.message_calls[0]
+    assert [item["role"] for item in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert "PROVIDER JSON ACTION COMPATIBILITY" in messages[-1]["content"]
+    assert "typed event" in messages[-1]["content"]
+
+
+def test_dialogue_manager_can_consult_read_only_scientific_agent_as_tool():
+    advisor_output = {
+        "analysis": "Scale is the highest unresolved execution decision.",
+        "critical_decisions": [
+            {
+                "id": "search_scale",
+                "priority": 92,
+                "target_fields": [
+                    "coverage_mode",
+                    "target_project_count",
+                    "quota_flexibility",
+                ],
+                "question": "How many usable projects should the search target?",
+                "recommendation": "Start with about 20 reviewed projects.",
+                "reason": "This balances training diversity and review cost.",
+            }
+        ],
+        "repository_evidence_to_fetch": ["project-level raw and identification files"],
+        "scientific_risks": ["cross-project label heterogeneity"],
+    }
+    final_payload = {
+        "action": "clarify",
+        "assistant_message": "搜索规模是当前影响最大的未决项。",
+        "next_decision": {
+            "focus": "search_scale",
+            "target_fields": [
+                "coverage_mode",
+                "target_project_count",
+                "quota_flexibility",
+            ],
+            "question": "这轮希望目标约多少个可用项目？",
+            "recommendation": {
+                "id": "focused_20",
+                "label": "约 20 个",
+                "reason": "兼顾训练多样性和逐项目审查成本。",
+            },
+            "options": [
+                {
+                    "id": "focused_20",
+                    "label": "约 20 个",
+                    "strategy_patch": {
+                        "coverage_mode": "curated",
+                        "target_project_count": 20,
+                        "quota_flexibility": "recommended",
+                    },
+                },
+                {
+                    "id": "balanced_50",
+                    "label": "约 50 个",
+                    "strategy_patch": {
+                        "coverage_mode": "balanced",
+                        "target_project_count": 50,
+                        "quota_flexibility": "recommended",
+                    },
+                },
+            ],
+        },
+    }
+    model = _DialogueScriptedModel(
+        [
+            (
+                "consult_scientific_advisor",
+                {
+                    "question": "Prioritize the next decision for this de novo training set.",
+                    "decision_goal": "identify the highest-impact unresolved user choice",
+                },
+            ),
+            ("final", json.dumps(advisor_output)),
+            ("respond", {"response_json": json.dumps(final_payload)}),
+        ]
+    )
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+
+    raw = web_app._run_discovery_dialogue_agents_sdk(
+        client,
+        system_prompt="You are a dialogue manager.",
+        dialogue_history=[],
+        state_prompt="Ask the highest-impact next decision.",
+        user_message="我想做免疫肽 de novo 训练集",
+        session_id="advisor-as-tool-test",
+        advisor_context={
+            "intent_snapshot": {"task_type": "denovo"},
+            "critical_decision_agenda": [{"id": "search_scale", "priority": 92}],
+        },
+        model=model,
+    )
+
+    assert raw["action"] == "clarify"
+    assert raw["tool_calls"] == []
+    assert raw["_advisor_calls"][0]["critical_decisions"][0]["id"] == "search_scale"
+    assert model.calls == 3
+
+
+def test_d1_agents_sdk_ignores_textual_tool_call_without_function_execution(tmp_path):
+    model = _DialogueScriptedModel(
+        [
+            (
+                "final",
+                json.dumps(
+                    {
+                        "action": "update_strategy",
+                        "assistant_message": "Pretend update",
+                        "tool_calls": [
+                            {
+                                "name": "update_strategy",
+                                "arguments": {
+                                    "patch": {"target_project_count": 999}
+                                },
+                            }
+                        ],
+                    }
+                ),
+            )
+        ]
+    )
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+
+    raw = web_app._run_discovery_dialogue_agents_sdk(
+        client,
+        system_prompt="You are a dialogue agent.",
+        dialogue_history=[],
+        state_prompt="Return JSON.",
+        user_message="What can you do?",
+        session_id="",
+        model=model,
+    )
+
+    assert raw["tool_calls"] == []
+
+
+def test_sdk_managed_turn_persists_resolved_decision_without_client_memory(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        "AGENT_DIALOGUE_SESSION_DB",
+        str(tmp_path / "sdk_semantic_memory.sqlite"),
+    )
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+
+    def fake_sdk_turn(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "action": "update_strategy",
+            "assistant_message": "Curated coverage recorded.",
+            "turn_interpretation": {
+                "commitments": [
+                    {"field": "coverage_mode", "value": "curated", "source": "1"}
+                ],
+                "consultations": [],
+                "clause_audit": [
+                    {
+                        "clause_id": "C1",
+                        "classification": "commitment",
+                        "decisions": [
+                            {"field": "coverage_mode", "value": "curated"}
+                        ],
+                    }
+                ],
+            },
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": {"coverage_mode": "curated"}},
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": True,
+        }
+
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_dialogue_agents_sdk",
+        fake_sdk_turn,
+    )
+    pending = _coverage_decision()
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "1",
+                "phase": "grilling",
+                "session_id": "semantic-memory-session",
+                "pending_decision": pending,
+                "intent_snapshot": {},
+                "decision_memory": [],
+                "resolved_fields": [],
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert result["resolved_decision"]["selected_option_id"] == "curated"
+    _history, memory = web_app._load_discovery_dialogue_session(
+        "semantic-memory-session",
+        [],
+    )
+    assert memory[0]["selected_option_id"] == "curated"
+
+
+def test_grounded_commitment_audit_drops_incidental_tool_fields():
+    raw = {
+        "action": "update_strategy",
+        "turn_interpretation": {
+            "commitments": [
+                {"field": "species", "value": ["mouse"], "source": "Use mouse"}
+            ]
+        },
+        "tool_calls": [
+            {
+                "name": "update_strategy",
+                "arguments": {
+                    "patch": {
+                        "species": ["mouse"],
+                        "max_candidate_projects": 64,
+                    }
+                },
+            }
+        ],
+    }
+
+    patch, errors = web_app._discovery_turn_patch(
+        raw,
+        user_message="Use mouse; keep the count unchanged, but why was 64 suggested?",
+        intent_snapshot={"max_candidate_projects": 80},
+    )
+
+    assert errors == []
+    assert patch == {"species": ["mouse"]}
+
+
+def test_grounded_commitment_audit_completes_omitted_tool_fields():
+    raw = {
+        "action": "update_strategy",
+        "turn_interpretation": {
+            "commitments": [
+                {"field": "species", "value": ["mouse"], "source": "Use mouse"},
+                {"field": "labeling_strategy", "value": "any", "source": "leave labeling open"},
+                {
+                    "field": "run_horizon",
+                    "value": "candidates_reviewed",
+                    "source": "review the candidates afterward",
+                },
+            ]
+        },
+        "tool_calls": [
+            {
+                "name": "update_strategy",
+                "arguments": {"patch": {"species": ["mouse"]}},
+            }
+        ],
+    }
+
+    patch, errors = web_app._discovery_turn_patch(
+        raw,
+        user_message="Use mouse, leave labeling open, and review the candidates afterward.",
+        intent_snapshot={},
+    )
+
+    assert errors == []
+    assert patch == {
+        "species": ["mouse"],
+        "labeling_strategy": "any",
+        "run_horizon": "candidates_reviewed",
+    }
+
+
+def test_empty_optional_commitment_audit_does_not_veto_typed_sdk_patch():
+    raw = {
+        "action": "update_strategy",
+        "turn_interpretation": {
+            "commitments": [],
+            "consultations": [],
+            "clause_audit": [],
+        },
+        "tool_calls": [
+            {
+                "name": "update_strategy",
+                "arguments": {
+                    "patch": {
+                        "instrument_preference": "newer",
+                        "run_horizon": "candidates_reviewed",
+                    }
+                },
+            }
+        ],
+    }
+
+    patch, errors = web_app._discovery_turn_patch(
+        raw,
+        user_message="Prefer the newest feasible instrument generation and review the result set afterward.",
+        intent_snapshot={},
+    )
+
+    assert errors == []
+    assert patch == {
+        "instrument_preference": "newer",
+        "run_horizon": "candidates_reviewed",
+    }
+
+
+def test_one_malformed_optional_commitment_does_not_veto_valid_tool_or_siblings():
+    raw = {
+        "action": "update_strategy",
+        "turn_interpretation": {
+            "commitments": [
+                {"field": "species", "value": ["fish"], "source": "Use fish"},
+                {"field": "broken_without_value", "source": "and DIA"},
+            ]
+        },
+        "tool_calls": [
+            {
+                "name": "update_strategy",
+                "arguments": {
+                    "patch": {
+                        "species": ["fish"],
+                        "acquisition_mode": "dia",
+                    }
+                },
+            }
+        ],
+    }
+
+    patch, errors = web_app._discovery_turn_patch(
+        raw,
+        user_message="Use fish and DIA.",
+        intent_snapshot={},
+    )
+
+    assert errors == []
+    assert patch == {"species": ["fish"]}
+
+
+def test_typed_tool_value_wins_harmless_commitment_paraphrase_without_losing_siblings():
+    raw = {
+        "action": "update_strategy",
+        "turn_interpretation": {
+            "commitments": [
+                {
+                    "field": "objective",
+                    "value": "Explore fish immunopeptidomics",
+                    "source": "fish immunopeptidomics",
+                },
+                {
+                    "field": "instrument_preference",
+                    "value": "newer",
+                    "source": "prefer the newest feasible instruments",
+                },
+            ]
+        },
+        "tool_calls": [
+            {
+                "name": "update_strategy",
+                "arguments": {
+                    "patch": {
+                        "objective": "Curate fish immunopeptidomics datasets",
+                        "instrument_preference": "newer",
+                    }
+                },
+            }
+        ],
+    }
+
+    patch, errors = web_app._discovery_turn_patch(
+        raw,
+        user_message=(
+            "Please curate fish immunopeptidomics datasets and prefer the newest feasible instruments."
+        ),
+        intent_snapshot={},
+    )
+
+    assert errors == []
+    assert patch == {
+        "objective": "Curate fish immunopeptidomics datasets",
+        "instrument_preference": "newer",
+    }
+
+
+def test_semantic_critic_cannot_add_or_change_manager_patch_fields():
+    verification = {
+        "verdict": "repair",
+        "patch": {
+            "species": ["fish"],
+            "special_themes": ["immunopeptidomics"],
+            "instrument_preference": "newer",
+            "task_type": "browse_only",
+            # This is an unaccepted recommendation and deliberately has no
+            # exact evidence span in the latest message.
+            "coverage_mode": "curated",
+        },
+        "evidence": [
+            {"field": "species", "source": "fish"},
+            {"field": "special_themes", "source": "immunopeptidomics"},
+            {"field": "instrument_preference", "source": "newest feasible instruments"},
+            {"field": "task_type", "source": "Use fish immunopeptidomics"},
+            {"field": "coverage_mode", "source": "recommended curated mode"},
+        ],
+    }
+
+    patch = web_app._ground_discovery_patch_verification(
+        verification,
+        user_message=(
+            "Use fish immunopeptidomics and prefer the newest feasible instruments."
+        ),
+        intent_snapshot={},
+        proposed_patch={
+            "species": ["fish", "fish synonym"],
+            "instrument_preference": "newer",
+        },
+    )
+
+    assert patch == {"instrument_preference": "newer"}
+
+    recovered = web_app._ground_discovery_patch_verification(
+        {
+            "verdict": "repair",
+            "patch": {
+                "task_type": "browse_only",
+                "species": ["Danio rerio"],
+                "acquisition_mode": "dia",
+                "target_project_count": 12,
+            },
+            "evidence": [
+                {"field": "task_type", "source": "浏览探索"},
+                {"field": "species", "source": "斑马鱼"},
+                {"field": "acquisition_mode", "source": "DIA"},
+                {"field": "target_project_count", "source": "12个项目"},
+            ],
+        },
+        user_message="先做浏览探索，只要斑马鱼，DIA，目标12个项目。",
+        intent_snapshot={},
+        proposed_patch={},
+        allow_commitment_recovery=True,
+    )
+    assert recovered == {}
+
+
+def test_semantic_verifier_accepts_indexed_evidence_for_structured_constraints():
+    constraint = {
+        "id": "min_bio_replicates",
+        "label": "At least 10 biological replicates per project",
+        "dimension": "biological_replicates",
+        "operator": "gte",
+        "value": 10,
+        "strength": "hard",
+        "scope": "project",
+        "evidence_required": True,
+        "source": "user",
+    }
+    patch = web_app._ground_discovery_patch_verification(
+        {
+            "verdict": "repair",
+            "patch": {"scientific_constraints": [constraint]},
+            "evidence": [
+                {
+                    "field": "scientific_constraints[0]",
+                    "source": "at least 10 biological replicates per project",
+                }
+            ],
+        },
+        user_message="Use at least 10 biological replicates per project.",
+        intent_snapshot={},
+        proposed_patch={"scientific_constraints": [constraint]},
+        allow_commitment_recovery=True,
+    )
+
+    assert patch["scientific_constraints"][0]["id"] == "min_bio_replicates"
+
+
+def test_semantic_verifier_missing_tool_result_is_unavailable_not_reject():
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    model = _DialogueScriptedModel(
+        [("final", json.dumps({"verdict": "reject", "patch": {}}))]
+    )
+
+    result = web_app._run_discovery_patch_verifier_agents_sdk(
+        client,
+        user_message="Use mouse DIA.",
+        intent_snapshot={},
+        proposed_patch={"species": ["mouse"], "acquisition_mode": "dia"},
+        timeout_seconds=10,
+        model=model,
+    )
+
+    assert result["verified"] is False
+    assert result["verdict"] == "unavailable"
+    assert result["patch"] == {}
+
+
+def test_read_only_verifier_json_fallback_classifies_clauses_without_write_authority():
+    llm = _TurnLLM(
+        [
+            {
+                "verdict": "repair",
+                "candidate_findings": [
+                    {
+                        "field": "special_themes",
+                        # Provider compatibility: one finding may serialize an
+                        # array-valued field as a scalar item.
+                        "value": "immunopeptidomics",
+                        "source": "免疫肽数据",
+                    }
+                ],
+                "rationale": "The short topic utterance is a commitment.",
+            }
+        ]
+    )
+
+    result = web_app._run_discovery_patch_verifier_json_fallback(
+        llm,
+        user_message="免疫肽数据",
+        intent_snapshot={},
+        proposed_patch={},
+        selected_decision=None,
+    )
+
+    assert result["verdict"] == "repair"
+    assert result["patch"] == {
+        "special_themes": ["immunopeptidomics"]
+    }
+    assert result["evidence"] == [
+        {"field": "special_themes", "source": "免疫肽数据"}
+    ]
+    assert result["findings_contract"] == "candidate_findings_v1"
+    assert "read-only semantic critic" in llm.calls[0]["system_prompt"]
+    assert "Classify every punctuation-delimited clause" in llm.calls[0][
+        "system_prompt"
+    ]
+    assert "Latest user message: 免疫肽数据" in llm.calls[0]["user_prompt"]
+    assert "candidate_findings" in llm.calls[0]["system_prompt"]
+
+
+def test_semantic_verifier_partial_grounding_is_not_a_verified_subset():
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    model = _DialogueScriptedModel(
+        [
+            (
+                "verify_strategy_patch",
+                {
+                    "verification": {
+                        "verdict": "accept",
+                        "patch": {
+                            "species": ["mouse"],
+                            "acquisition_mode": "dia",
+                        },
+                        "evidence": [
+                            {"field": "species", "source": "mouse"},
+                        ],
+                        "rationale": "Both fields are complete.",
+                    },
+                },
+            )
+        ]
+    )
+
+    result = web_app._run_discovery_patch_verifier_agents_sdk(
+        client,
+        user_message="Use mouse DIA.",
+        intent_snapshot={},
+        proposed_patch={"species": ["mouse"], "acquisition_mode": "dia"},
+        timeout_seconds=10,
+        model=model,
+    )
+
+    assert result["verified"] is False
+    assert result["patch"] == {}
+    assert result["missing_fields"] == ["acquisition_mode"]
+
+
+def test_semantic_verifier_ignores_unmentioned_null_schema_placeholders():
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    model = _DialogueScriptedModel(
+        [
+            (
+                "verify_strategy_patch",
+                {
+                    "verification": {
+                        "verdict": "repair",
+                        "patch": {
+                            "species": ["Rattus norvegicus"],
+                            "acquisition_mode": "dia",
+                            # Some OpenAI-compatible providers materialize all
+                            # omitted optional tool fields as JSON null.
+                            "objective": None,
+                            "task_type": None,
+                            "coverage_mode": None,
+                            "repository": None,
+                        },
+                        "evidence": [
+                            {
+                                "field": "species",
+                                "source": "Rattus norvegicus",
+                            },
+                            {"field": "acquisition_mode", "source": "DIA"},
+                        ],
+                        "rationale": "The two proposed fields are grounded.",
+                    }
+                },
+            )
+        ]
+    )
+
+    result = web_app._run_discovery_patch_verifier_agents_sdk(
+        client,
+        user_message="Use Rattus norvegicus and DIA.",
+        intent_snapshot={},
+        proposed_patch={
+            "species": ["Rattus norvegicus"],
+            "acquisition_mode": "dia",
+        },
+        timeout_seconds=10,
+        model=model,
+    )
+
+    assert result["verified"] is True
+    assert result["verdict"] == "accept"
+    assert result["patch"] == {
+        "species": ["rat"],
+        "acquisition_mode": "dia",
+    }
+    assert result.get("missing_fields") in (None, [])
+
+
+def test_commitment_recovery_benign_reject_confirms_no_commitment():
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    model = _DialogueScriptedModel(
+        [
+            (
+                "verify_strategy_patch",
+                {
+                    "verification": {
+                        "verdict": "reject",
+                        "patch": {},
+                        "evidence": [],
+                        "rationale": "The latest message is consultation only.",
+                    },
+                },
+            )
+        ]
+    )
+
+    result = web_app._run_discovery_patch_verifier_agents_sdk(
+        client,
+        user_message="Please compare DIA and DDA without changing the strategy.",
+        intent_snapshot={},
+        proposed_patch={},
+        timeout_seconds=10,
+        model=model,
+        allow_commitment_recovery=True,
+    )
+
+    assert result["verified"] is True
+    assert result["verdict"] == "accept"
+    assert result["patch"] == {}
+    assert result["no_commitment_confirmed"] is True
+
+
+def test_commitment_omission_audit_separates_goal_clause_from_advice_clause():
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    source = "我想做免疫肽 de novo 训练集"
+    model = _DialogueScriptedModel(
+        [
+            (
+                "verify_strategy_patch",
+                {
+                    "verification": {
+                        "verdict": "repair",
+                        "patch": {
+                            "objective": "构建免疫肽 de novo 训练集",
+                            "task_type": "denovo",
+                            "special_themes": ["immunopeptidomics"],
+                        },
+                        "evidence": [
+                            {"field": "objective", "source": source},
+                            {"field": "task_type", "source": source},
+                            {"field": "special_themes", "source": source},
+                        ],
+                        "rationale": (
+                            "The first clause is a commitment; the second clause only asks "
+                            "for next-step advice."
+                        ),
+                    }
+                },
+            )
+        ]
+    )
+
+    result = web_app._run_discovery_patch_verifier_agents_sdk(
+        client,
+        user_message=f"{source}，你先帮我分析下一步最关键的决定。",
+        intent_snapshot={},
+        proposed_patch={},
+        timeout_seconds=10,
+        model=model,
+        allow_commitment_recovery=True,
+    )
+
+    assert result["verdict"] == "repair"
+    assert result["patch"] == {}
+    assert result["critic_suggested_fields"] == [
+        "objective",
+        "special_themes",
+        "task_type",
+    ]
+    _args, request_kwargs = model.requests[0]
+    system_instructions = request_kwargs["system_instructions"]
+    tools = request_kwargs["tools"]
+    assert "OMISSION-AUDIT PRECEDENCE" in system_instructions
+    assert "cannot cancel or reclassify the preceding commitment" in system_instructions
+    assert "Read-only omission audit" in tools[0].description
+    assert "verdict=repair is mandatory" in tools[0].description
+
+
+def test_semantic_verifier_audit_matches_the_effective_grounded_delta():
+    proposed = {
+        "species": ["non-human primate"],
+        "acquisition_mode": "unknown",
+        "target_project_count": 18,
+    }
+    result = web_app._normalise_discovery_patch_verification_audit(
+        {
+            "verdict": "repair",
+            "evidence": [
+                {"field": "species", "source": "非人灵长类"},
+                {"field": "acquisition_mode", "source": "采集方式开放"},
+                {"field": "target_project_count", "source": "18"},
+                # This describes retained state rather than a field in the
+                # effective delta and must not be presented as patch evidence.
+                {"field": "scientific_constraints", "source": "要求保留"},
+            ],
+            "rationale": "I repaired fields that were actually unchanged.",
+        },
+        user_message="物种改成非人灵长类，采集方式开放，目标18个；重复要求保留。",
+        proposed_patch=proposed,
+        grounded_patch=proposed,
+    )
+
+    assert result["verdict"] == "accept"
+    assert {item["field"] for item in result["evidence"]} == {
+        "species",
+        "acquisition_mode",
+        "target_project_count",
+    }
+    assert result["model_rationale"] == (
+        "I repaired fields that were actually unchanged."
+    )
+    assert "confirmed" in result["rationale"].lower()
+
+
+def test_semantic_verifier_omits_empty_enum_placeholders_before_validation():
+    context = SimpleNamespace(verification=None)
+    ctx = SimpleNamespace(context=context)
+    verification = web_app._DiscoveryPatchVerificationInput(
+        verdict="repair",
+        patch=web_app._DiscoveryStrategyPatchToolInput(
+            species=["non-human primate"],
+            target_project_count=18,
+            coverage_mode="",
+            time_budget="",
+        ),
+        evidence=[
+            web_app._DiscoveryPatchEvidenceInput(
+                field="species",
+                source="non-human primate",
+            )
+        ],
+        rationale="Remove unrequested empty defaults.",
+    )
+
+    asyncio.run(web_app._sdk_discovery_verify_strategy_patch(ctx, verification))
+
+    assert context.verification["verdict"] == "repair"
+    assert context.verification["errors"] == []
+    assert context.verification["patch"] == {
+        "species": ["non-human primate"],
+        "target_project_count": 18,
+    }
+
+
+def test_read_only_critic_cannot_recover_commitment_missed_by_manager(
+    monkeypatch,
+):
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "chat",
+            "assistant_message": "I am not sure what you want.",
+            "tool_calls": [],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    verifier_calls: list[dict[str, Any]] = []
+
+    def recover(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        verifier_calls.append(kwargs)
+        return {
+            "verified": True,
+            "verdict": "repair",
+            "patch": {
+                "task_type": "browse_only",
+                "species": ["Danio rerio"],
+                "acquisition_mode": "dia",
+                "target_project_count": 12,
+            },
+            "rationale": "Recovered four exact commitments.",
+            "tool_authority": "update_strategy",
+        }
+
+    monkeypatch.setattr(web_app, "_run_discovery_patch_verifier_agents_sdk", recover)
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "先做浏览探索，只要斑马鱼，DIA，目标12个项目。",
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert len(verifier_calls) == 1
+    assert verifier_calls[0]["proposed_patch"] == {}
+    assert verifier_calls[0]["use_update_strategy_tool"] is False
+    assert result["action"] == "chat"
+    assert result["tool_calls"] == []
+    assert result["extra_fields"] == {}
+    assert result["semantic_verification"]["verdict"] == "repair"
+    assert result["semantic_verification"]["patch"] == {}
+
+
+def test_read_only_critic_feedback_triggers_one_same_manager_retry(monkeypatch):
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=30)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    manager_calls: list[dict[str, Any]] = []
+
+    def manager(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        manager_calls.append(kwargs)
+        if len(manager_calls) == 1:
+            return {
+                "action": "advise",
+                "assistant_message": "Let's discuss the task.",
+                "tool_calls": [],
+                "_provider_compatibility_recovery": {
+                    "mode": "plain_text_as_non_mutating",
+                    "chars": 24,
+                    "advisor_calls": 0,
+                },
+                "_agent_runtime": "openai_agents",
+            }
+        return {
+            "action": "update_strategy",
+            "assistant_message": "I re-read the explicit commitments.",
+            "turn_interpretation": {
+                "commitments": [
+                    {"field": "task_type", "value": "denovo", "source": "de novo"},
+                    {
+                        "field": "objective",
+                        "value": "Build an immunopeptide de novo training set",
+                        "source": "免疫肽 de novo 训练集",
+                    },
+                ]
+            },
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "task_type": "denovo",
+                            "objective": "Build an immunopeptide de novo training set",
+                        }
+                    },
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+        }
+
+    monkeypatch.setattr(web_app, "_complete_discovery_dialogue_json", manager)
+    critic_calls: list[dict[str, Any]] = []
+
+    def critic(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        critic_calls.append(kwargs)
+        if len(critic_calls) == 1:
+            return {
+                "verified": False,
+                "verdict": "repair",
+                "patch": {},
+                "critic_suggested_fields": ["objective", "task_type"],
+                "evidence": [
+                    {"field": "objective", "source": "免疫肽 de novo 训练集"},
+                    {"field": "task_type", "source": "de novo"},
+                ],
+                "tool_authority": "verify_strategy_patch",
+            }
+        return {
+            "verified": True,
+            "verdict": "accept",
+            "patch": dict(kwargs["proposed_patch"]),
+            "evidence": [
+                {"field": "objective", "source": "免疫肽 de novo 训练集"},
+                {"field": "task_type", "source": "de novo"},
+            ],
+            "tool_authority": "verify_strategy_patch",
+        }
+
+    monkeypatch.setattr(web_app, "_run_discovery_patch_verifier_agents_sdk", critic)
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "我想做免疫肽 de novo 训练集，请分析下一步。",
+                "phase": "grilling",
+                "request_timeout_seconds": 30,
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task", "objective", "horizon", "coverage"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert len(manager_calls) == 2
+    assert "read_only_critic_feedback_from_previous_attempt" in manager_calls[1]["user_prompt"]
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"]["task_type"] == "denovo"
+    assert result["manager_repair"]["writer"] == "dialogue_manager"
+    assert result["manager_repair"]["critic_authority"] == "read_only"
+    assert result["manager_repair"]["trigger"]["provider_compatibility_recovery"] == {
+        "mode": "plain_text_as_non_mutating",
+        "chars": 24,
+        "advisor_calls": 0,
+    }
+
+
+def test_short_topic_plain_text_recovery_is_audited_and_repaired(monkeypatch):
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=30)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    manager_calls: list[dict[str, Any]] = []
+
+    def manager(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        manager_calls.append(kwargs)
+        if len(manager_calls) == 1:
+            return {
+                "action": "advise",
+                "assistant_message": "你想用这些数据做什么？",
+                "tool_calls": [],
+                "_provider_compatibility_recovery": {
+                    "mode": "plain_text_as_non_mutating",
+                    "chars": 12,
+                    "advisor_calls": 0,
+                },
+                "_agent_runtime": "openai_agents",
+            }
+        return {
+            "action": "update_strategy",
+            "assistant_message": "已记录免疫肽研究主题。",
+            "turn_interpretation": {
+                "commitments": [
+                    {
+                        "field": "special_themes",
+                        "value": ["immunopeptidomics"],
+                        "source": "免疫肽数据",
+                    }
+                ]
+            },
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {"special_themes": ["immunopeptidomics"]}
+                    },
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+        }
+
+    monkeypatch.setattr(web_app, "_complete_discovery_dialogue_json", manager)
+    verifier_calls: list[dict[str, Any]] = []
+
+    def critic(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        verifier_calls.append(kwargs)
+        return {
+            "verified": False,
+            "verdict": "repair",
+            "patch": {},
+            "critic_suggested_fields": ["special_themes"],
+            "evidence": [
+                {"field": "special_themes", "source": "免疫肽数据"}
+            ],
+            "tool_authority": "verify_strategy_patch",
+        }
+
+    monkeypatch.setattr(web_app, "_run_discovery_patch_verifier_agents_sdk", critic)
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "免疫肽数据",
+                "phase": "grilling",
+                "request_timeout_seconds": 30,
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task", "objective", "horizon", "coverage"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert len(manager_calls) == 2
+    assert len(verifier_calls) == 1
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {
+        "special_themes": ["immunopeptidomics"]
+    }
+    assert result["manager_repair"]["trigger"]["provider_compatibility_recovery"][
+        "mode"
+    ] == "plain_text_as_non_mutating"
+
+
+def test_semantic_verifier_retries_once_to_repair_a_partial_primary_omission(
+    monkeypatch,
+):
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=30)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "已更新斑马鱼范围。",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": {"species": ["Danio rerio"]}},
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    verifier_calls: list[dict[str, Any]] = []
+
+    def verify(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        verifier_calls.append(kwargs)
+        if len(verifier_calls) == 1:
+            return {
+                "verified": False,
+                "verdict": "unavailable",
+                "patch": {},
+                "rationale": "No valid tool result.",
+            }
+        return {
+            "verified": True,
+            "verdict": "repair",
+            "patch": {
+                "species": ["Danio rerio"],
+                "special_themes": ["immunopeptidomics"],
+            },
+            "rationale": "Recovered the omitted study theme.",
+            "tool_authority": "verify_strategy_patch",
+        }
+
+    monkeypatch.setattr(web_app, "_run_discovery_patch_verifier_agents_sdk", verify)
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "只要斑马鱼免疫肽；找到后再复核。",
+                "phase": "grilling",
+                "request_timeout_seconds": 30,
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert len(verifier_calls) == 2
+    assert verifier_calls[0]["allow_commitment_recovery"] is False
+    assert verifier_calls[0]["use_update_strategy_tool"] is False
+    assert verifier_calls[1]["allow_commitment_recovery"] is False
+    assert verifier_calls[1]["use_update_strategy_tool"] is False
+    assert result["extra_fields"] == {"species": ["Danio rerio"]}
+    assert result["tool_calls"] == [
+        {
+            "name": "update_strategy",
+            "arguments": {"patch": {"species": ["Danio rerio"]}},
+        }
+    ]
+    assert "special_themes" not in result["extra_fields"]
+    assert result["semantic_verification"]["attempts"] == 2
+    assert result["semantic_verification"]["previous_attempts"][0]["verdict"] == (
+        "unavailable"
+    )
+
+
+def test_independent_agent_confirms_long_consultation_should_not_write_card(
+    monkeypatch,
+):
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "advise",
+            "assistant_message": "Here are the scientific trade-offs.",
+            "tool_calls": [],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        lambda *_args, **_kwargs: {
+            "verified": False,
+            "verdict": "reject",
+            "patch": {},
+            "rationale": "The user requested discussion only.",
+            "tool_authority": "update_strategy",
+        },
+    )
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "请比较DIA和DDA的利弊，先讨论，不要修改策略。",
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert result["action"] == "advise"
+    assert result["tool_calls"] == []
+    assert result["extra_fields"] == {}
+    assert result["semantic_verification"]["verdict"] == "accept"
+    assert result["semantic_verification"]["no_commitment_confirmed"] is True
+
+
+def test_semantic_verifier_reject_blocks_strategy_write_and_persists_final_memory(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        "AGENT_DIALOGUE_SESSION_DB",
+        str(tmp_path / "semantic_reject.sqlite"),
+    )
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "I will update the strategy.",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "species": ["mouse"],
+                            "acquisition_mode": "dia",
+                        }
+                    },
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        lambda *_args, **_kwargs: {
+            "verified": False,
+            "verdict": "reject",
+            "patch": {},
+            "rationale": "The proposed patch is not grounded in the latest message.",
+        },
+    )
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "Can you compare mouse DIA with other options?",
+                "session_id": "semantic-reject-session",
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert result["tool_calls"] == []
+    assert result["extra_fields"] == {}
+    assert result["action"] in {"advise", "clarify"}
+    assert result["semantic_verification"]["verdict"] == "reject"
+    assert any("semantic verification" in error for error in result["contract_errors"])
+
+    history, _memory = web_app._load_discovery_dialogue_session(
+        "semantic-reject-session",
+        [],
+    )
+    assert len(history) == 2
+    assert '"strategy_patch":{}' in history[-1]["content"]
+    assert '"species":["mouse"]' not in history[-1]["content"]
+
+
+def test_semantic_verifier_runs_for_final_reconciled_multi_field_patch(monkeypatch):
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "Recorded both choices.",
+            "turn_interpretation": {
+                "commitments": [
+                    {"field": "species", "value": ["mouse"], "source": "mouse"},
+                ],
+                "clause_audit": [
+                    {
+                        "clause_id": "C1",
+                        "classification": "commitment",
+                        "decisions": [
+                            {"field": "species", "value": ["mouse"]},
+                            {"field": "acquisition_mode", "value": "dia"},
+                        ],
+                    }
+                ],
+            },
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": {"species": ["mouse"]}},
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    verifier_calls: list[dict[str, Any]] = []
+
+    def verify(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        verifier_calls.append(kwargs)
+        return {
+            "verified": True,
+            "verdict": "accept",
+            "patch": {
+                "species": ["mouse"],
+                "acquisition_mode": "dia",
+            },
+            "rationale": "Both commitments are grounded.",
+        }
+
+    monkeypatch.setattr(web_app, "_run_discovery_patch_verifier_agents_sdk", verify)
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "Use mouse and DIA.",
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert len(verifier_calls) == 1
+    assert verifier_calls[0]["proposed_patch"] == {
+        "species": ["mouse"],
+        "acquisition_mode": "dia",
+    }
+    assert result["extra_fields"] == {
+        "species": ["mouse"],
+        "acquisition_mode": "dia",
+    }
+
+
+def test_single_sentence_primary_sdk_delta_difference_triggers_completeness_review(
+    monkeypatch,
+):
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "Recorded mouse DIA.",
+            # This compatibility audit accidentally omitted acquisition_mode.
+            "turn_interpretation": {
+                "commitments": [
+                    {"field": "species", "value": ["mouse"], "source": "mouse"},
+                ],
+            },
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "species": ["mouse"],
+                            "acquisition_mode": "dia",
+                        }
+                    },
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    verifier_calls: list[dict[str, Any]] = []
+
+    def verify(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        verifier_calls.append(kwargs)
+        return {
+            "verified": True,
+            "verdict": "accept",
+            "patch": {"species": ["mouse"], "acquisition_mode": "dia"},
+            "rationale": "The complete SDK delta is grounded.",
+        }
+
+    monkeypatch.setattr(web_app, "_run_discovery_patch_verifier_agents_sdk", verify)
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "Use mouse DIA.",
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert len(verifier_calls) == 1
+    assert verifier_calls[0]["proposed_patch"] == {
+        "species": ["mouse"],
+        "acquisition_mode": "dia",
+    }
+    assert result["extra_fields"] == {
+        "species": ["mouse"],
+        "acquisition_mode": "dia",
+    }
+
+
+def test_primary_sdk_null_schema_placeholders_are_not_treated_as_clear_commands(
+    monkeypatch,
+):
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "Recorded rat DIA.",
+            "turn_interpretation": {
+                "commitments": [
+                    {"field": "species", "value": ["rat"], "source": "rat"},
+                    {
+                        "field": "acquisition_mode",
+                        "value": "dia",
+                        "source": "DIA",
+                    },
+                ],
+            },
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "species": ["rat"],
+                            "acquisition_mode": "dia",
+                            "objective": None,
+                            "task_type": None,
+                            "coverage_mode": None,
+                            "repository": None,
+                        }
+                    },
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    verifier_calls: list[dict[str, Any]] = []
+
+    def verify(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        verifier_calls.append(kwargs)
+        return {
+            "verified": True,
+            "verdict": "accept",
+            "patch": {"species": ["rat"], "acquisition_mode": "dia"},
+            "rationale": "The complete committed delta is grounded.",
+        }
+
+    monkeypatch.setattr(web_app, "_run_discovery_patch_verifier_agents_sdk", verify)
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "Use rat DIA.",
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert verifier_calls[0]["proposed_patch"] == {
+        "species": ["rat"],
+        "acquisition_mode": "dia",
+    }
+    assert result["extra_fields"] == {
+        "species": ["rat"],
+        "acquisition_mode": "dia",
+    }
+
+
+def test_partial_completeness_verifier_cannot_write_a_grounded_subset(monkeypatch):
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "Recorded mouse DIA.",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "species": ["mouse"],
+                            "acquisition_mode": "dia",
+                        }
+                    },
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        lambda *_args, **_kwargs: {
+            "verified": True,
+            "verdict": "repair",
+            "patch": {"species": ["mouse"]},
+            "rationale": "Only one field was grounded.",
+        },
+    )
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "Use mouse DIA.",
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert result["tool_calls"] == []
+    assert result["extra_fields"] == {}
+    assert result["semantic_verification"]["verified"] is False
+    assert result["semantic_verification"]["missing_fields"] == [
+        "acquisition_mode"
+    ]
+
+
+def test_verifier_can_remove_primary_tool_fields_not_classified_as_commitments(
+    monkeypatch,
+):
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "Recorded mouse DIA.",
+            "turn_interpretation": {
+                "commitments": [
+                    {"field": "species", "value": ["mouse"], "source": "mouse"},
+                    {
+                        "field": "acquisition_mode",
+                        "value": "dia",
+                        "source": "DIA",
+                    },
+                    {
+                        "field": "notes",
+                        "value": "Model-authored convenience summary",
+                        "source": "Use mouse DIA",
+                    },
+                ]
+            },
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "species": ["mouse"],
+                            "acquisition_mode": "dia",
+                            "notes": "Model-authored convenience summary",
+                        }
+                    },
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+
+    def verify(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        assert kwargs["required_fields"] == {
+            "species",
+            "acquisition_mode",
+            "notes",
+        }
+        return {
+            "verified": True,
+            "verdict": "repair",
+            "patch": {"species": ["mouse"], "acquisition_mode": "dia"},
+            "rationale": "Removed a field not grounded as a user commitment.",
+        }
+
+    monkeypatch.setattr(web_app, "_run_discovery_patch_verifier_agents_sdk", verify)
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "Use mouse DIA.",
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {
+        "species": ["mouse"],
+        "acquisition_mode": "dia",
+    }
+    assert result["semantic_verification"]["removed_uncommitted_fields"] == [
+        "notes"
+    ]
+
+
+def test_clause_audit_decisions_are_a_redundant_generic_completeness_channel():
+    raw = {
+        "action": "update_strategy",
+        "turn_interpretation": {
+            "commitments": [
+                {"field": "species", "value": ["mouse"], "source": "Use mouse"}
+            ],
+            "clause_audit": [
+                {
+                    "clause_id": "C1",
+                    "classification": "commitment",
+                    "decisions": [{"field": "species", "value": ["mouse"]}],
+                },
+                {
+                    "clause_id": "C2",
+                    "classification": "commitment",
+                    "decisions": [
+                        {
+                            "field": "run_horizon",
+                            "value": "candidates_reviewed",
+                        }
+                    ],
+                },
+            ],
+        },
+        "tool_calls": [
+            {
+                "name": "update_strategy",
+                "arguments": {"patch": {"species": ["mouse"]}},
+            }
+        ],
+    }
+
+    patch, errors = web_app._discovery_turn_patch(
+        raw,
+        user_message="Use mouse, and review candidates afterward.",
+        intent_snapshot={},
+    )
+
+    assert errors == []
+    assert patch == {
+        "species": ["mouse"],
+        "run_horizon": "candidates_reviewed",
+    }
+
+
+def test_reconciled_patch_replaces_inconsistent_model_prose(monkeypatch):
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "Species changed and the old theme was secretly removed.",
+            "turn_interpretation": {
+                "commitments": [
+                    {"field": "species", "value": ["mouse"], "source": "Use mouse"},
+                    {
+                        "field": "special_themes",
+                        "value": [],
+                        "source": "old theme was incompatible",
+                    },
+                ]
+            },
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {"species": ["mouse"], "special_themes": []}
+                    },
+                }
+            ],
+        },
+        user_message="Use mouse; keep every other setting unchanged.",
+        intent_snapshot={"special_themes": ["immunopeptide"]},
+    )
+
+    assert result["extra_fields"] == {"species": ["mouse"]}
+    assert "secretly removed" not in result["assistant_message"]
+    assert "物种=mouse" in result["assistant_message"]
+
+
+def test_commitment_audit_requires_latest_turn_evidence_and_matching_values():
+    ungrounded = {
+        "action": "update_strategy",
+        "turn_interpretation": {
+            "commitments": [
+                {"field": "species", "value": ["rat"], "source": "earlier rat idea"}
+            ]
+        },
+        "tool_calls": [
+            {
+                "name": "update_strategy",
+                "arguments": {"patch": {"species": ["rat"]}},
+            }
+        ],
+    }
+    patch, errors = web_app._discovery_turn_patch(
+        ungrounded,
+        user_message="Keep the current species.",
+        intent_snapshot={"species": ["human"]},
+    )
+    assert patch == {}
+    assert errors
+
+    conflicting = {
+        "action": "update_strategy",
+        "turn_interpretation": {
+            "commitments": [
+                {"field": "species", "value": ["mouse"], "source": "Use mouse"}
+            ]
+        },
+        "tool_calls": [
+            {
+                "name": "update_strategy",
+                "arguments": {"patch": {"species": ["rat"]}},
+            }
+        ],
+    }
+    patch, errors = web_app._discovery_turn_patch(
+        conflicting,
+        user_message="Use mouse.",
+        intent_snapshot={},
+    )
+    assert patch == {}
+    assert errors
+
+
+def test_grill_turn_uses_one_bounded_model_attempt(monkeypatch):
+    result, llm = _run_turn(
+        monkeypatch,
+        TimeoutError("temporary timeout"),
+        user_message="继续",
+        request_timeout_seconds=25,
+    )
+
+    assert result["status"] == "failed"
+    assert result["action"] == "advise"
+    assert result["tool_calls"] == []
+    assert result["extra_fields"] == {}
+    assert "策略保持不变" in result["assistant_message"]
+    assert len(llm.calls) == 1
+    assert llm.timeout == 25
+
+
+@pytest.mark.parametrize("grill_confirmed", [None, False, 1, "true"])
+def test_discovery_job_start_requires_explicit_boolean_confirmation(
+    monkeypatch,
+    tmp_path,
+    grill_confirmed: Any,
+):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    started: list[str] = []
+    monkeypatch.setattr(web_app, "_start_discovery_job_thread", started.append)
+    before = set(web_app._discovery_jobs)
+    body: dict[str, Any] = {"prompt": "Find human data"}
+    if grill_confirmed is not None:
+        body["grill_confirmed"] = grill_confirmed
+
+    try:
+        result = asyncio.run(web_app.start_discovery_job(body))
+
+        assert result["status"] == "rejected"
+        assert result["code"] == "grill_confirmation_required"
+        assert "grill_confirmed must be true" in result["error"]
+        assert started == []
+        assert set(web_app._discovery_jobs) == before
+    finally:
+        with web_app._discovery_jobs_lock:
+            for job_id in set(web_app._discovery_jobs) - before:
+                web_app._discovery_jobs.pop(job_id, None)
+
+
+@pytest.mark.parametrize("grill_confirmed", [None, False, 1, "true"])
+def test_legacy_direct_discovery_route_cannot_bypass_confirmation(
+    monkeypatch,
+    grill_confirmed: Any,
+):
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        web_app,
+        "_run_web_discovery",
+        lambda body, **_kwargs: calls.append(body) or {"status": "completed"},
+    )
+    body: dict[str, Any] = {"prompt": "Find human data"}
+    if grill_confirmed is not None:
+        body["grill_confirmed"] = grill_confirmed
+
+    result = asyncio.run(web_app.create_discovery(body))
+
+    assert result["status"] == "rejected"
+    assert result["code"] == "grill_confirmation_required"
+    assert calls == []
+
+
+def test_core_discovery_runner_enforces_confirmation_even_for_internal_callers():
+    with pytest.raises(ValueError, match="grill_confirmed must be true"):
+        web_app._run_web_discovery({"prompt": "Find human data"})
+
+
+def test_discovery_job_preserves_quality_blocked_terminal_state(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr(
+        web_app,
+        "_run_web_discovery",
+        lambda _body, **_kwargs: {
+            "status": "blocked",
+            "project_count": 24,
+            "file_count": 1477,
+            "summary": {
+                "candidate_projects": 24,
+                "selected_projects": 0,
+                "delivery_eligible_projects": 0,
+            },
+            "agent": {
+                "status": "blocked",
+                "stop_reason": "selection_quality_gate_not_completed",
+            },
+        },
+    )
+    monkeypatch.setattr(web_app, "_archive_discovery_job_artifacts", lambda _job_id: None)
+    job_id = "discovery_job_quality_blocked"
+    with web_app._discovery_jobs_lock:
+        web_app._discovery_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "created_at": web_app._now_app_iso(),
+            "started_at": None,
+            "finished_at": None,
+            "cancel_requested": False,
+            "logs": [],
+            "body": {"grill_confirmed": True},
+            "record": None,
+            "error": None,
+        }
+    try:
+        web_app._run_discovery_job(job_id)
+        final = asyncio.run(web_app.get_discovery_job(job_id))
+
+        assert final["status"] == "blocked"
+        assert final["record"]["summary"]["selected_projects"] == 0
+        assert any("quality gate" in item["message"].lower() for item in final["logs"])
+    finally:
+        with web_app._discovery_jobs_lock:
+            web_app._discovery_jobs.pop(job_id, None)
+
+
+def test_discovery_job_start_accepts_explicit_confirmation(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    started: list[str] = []
+    monkeypatch.setattr(web_app, "_start_discovery_job_thread", started.append)
+    before = set(web_app._discovery_jobs)
+
+    try:
+        result = asyncio.run(
+            web_app.start_discovery_job(
+                {"prompt": "Find human data", "grill_confirmed": True}
+            )
+        )
+
+        assert result["status"] == "queued"
+        assert started == [result["job_id"]]
+    finally:
+        with web_app._discovery_jobs_lock:
+            for job_id in set(web_app._discovery_jobs) - before:
+                web_app._discovery_jobs.pop(job_id, None)
+
+
+def test_confirmation_fingerprint_is_bound_to_exact_execution_payload(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    started: list[str] = []
+    monkeypatch.setattr(web_app, "_start_discovery_job_thread", started.append)
+    before = set(web_app._discovery_jobs)
+    confirmed = {
+        "prompt": "Find human DIA data",
+        "species": ["human"],
+        "acquisition_mode": "dia",
+        "max_projects": 20,
+        "grill_confirmed": True,
+    }
+    fingerprint = web_app._discovery_execution_fingerprint(confirmed)
+
+    try:
+        stale_payload = {
+            **confirmed,
+            "species": ["mouse"],
+            "strategy_fingerprint": fingerprint,
+        }
+        rejected = asyncio.run(web_app.start_discovery_job(stale_payload))
+
+        assert rejected["status"] == "rejected"
+        assert rejected["code"] == "strategy_confirmation_mismatch"
+        assert started == []
+        assert set(web_app._discovery_jobs) == before
+
+        exact_payload = {**confirmed, "strategy_fingerprint": fingerprint}
+        accepted = asyncio.run(web_app.start_discovery_job(exact_payload))
+        assert accepted["status"] == "queued"
+        assert started == [accepted["job_id"]]
+    finally:
+        with web_app._discovery_jobs_lock:
+            for job_id in set(web_app._discovery_jobs) - before:
+                web_app._discovery_jobs.pop(job_id, None)
+
+
+def test_arbitrary_confirmation_fingerprint_is_rejected():
+    rejection = web_app._discovery_confirmation_rejection(
+        {
+            "prompt": "Find human data",
+            "grill_confirmed": True,
+            "strategy_fingerprint": "a" * 64,
+        }
+    )
+
+    assert rejection is not None
+    assert rejection["code"] == "strategy_confirmation_mismatch"
+
+
+def test_execution_fingerprint_matches_frontend_contract_fixture():
+    assert web_app._discovery_execution_fingerprint(
+        {
+            "acquisition_mode": "unknown",
+            "grill_confirmed": True,
+            "idempotency_key": "request-one",
+            "mixed_acquisition_policy": "review_mixed",
+            "strategy_fingerprint": "old-proof",
+        }
+    ) == "6efcfee288ca15ae5331a3e8aaa811b490f54ce461a11771ca785986ee5c21f1"
+
+
+def test_browser_canonical_fingerprint_accepts_valid_small_numbers():
+    canonical = '{"grill_confirmed":true,"legacy_floor_ratio":0.000001}'
+    body = {
+        "grill_confirmed": True,
+        "legacy_floor_ratio": 0.000001,
+        "strategy_fingerprint_payload": canonical,
+        "strategy_fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
+
+    assert web_app._discovery_confirmation_rejection(body) is None
+
+    rejection = web_app._discovery_confirmation_rejection(
+        {**body, "legacy_floor_ratio": 0.000002}
+    )
+    assert rejection is not None
+    assert rejection["code"] == "strategy_confirmation_mismatch"
+
+
+def test_browser_canonical_fingerprint_comparison_is_type_strict():
+    canonical = (
+        '{"grill_confirmed":true,"scientific_constraints":'
+        '[{"value":true}]}'
+    )
+    rejection = web_app._discovery_confirmation_rejection(
+        {
+            "grill_confirmed": True,
+            "scientific_constraints": [{"value": 1}],
+            "strategy_fingerprint_payload": canonical,
+            "strategy_fingerprint": hashlib.sha256(
+                canonical.encode("utf-8")
+            ).hexdigest(),
+        }
+    )
+
+    assert rejection is not None
+    assert rejection["code"] == "strategy_confirmation_mismatch"
+
+
+def test_legacy_direct_discovery_route_accepts_explicit_confirmation(monkeypatch):
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        web_app,
+        "_run_web_discovery",
+        lambda body, **_kwargs: calls.append(body) or {"status": "completed"},
+    )
+    body = {"prompt": "Find human data", "grill_confirmed": True}
+
+    result = asyncio.run(web_app.create_discovery(body))
+
+    assert result == {"status": "completed"}
+    assert calls == [body]

@@ -46,6 +46,33 @@ def hash_queries(queries: list[str]) -> str:
     return hashlib.sha256(canonical_json(queries).encode("utf-8")).hexdigest()
 
 
+def grant_execution_summary(store: AgentRunStore, run_id: str) -> dict[str, object]:
+    grants = store.list_search_grants(run_id)
+    counts = {
+        "issued": 0,
+        "consumed": 0,
+        "abandoned": 0,
+        "rejected": 0,
+        "expired": 0,
+    }
+    for grant in grants:
+        status = str(grant.status)
+        if status in counts:
+            counts[status] += 1
+    run = store.load_run(run_id)
+    search_batches = int(run.dynamic_usage.search_batches) if run is not None else 0
+    issued_or_terminal = counts["issued"] + counts["consumed"] + counts["abandoned"]
+    return {
+        "grant_counts": counts,
+        "search_batches": search_batches,
+        "approved_query_units_pending": sum(
+            grant.query_units for grant in grants if grant.status == "issued"
+        ),
+        "execution_gap": issued_or_terminal > 0 and search_batches <= 0,
+        "active_grant_id": run.active_grant_id if run is not None else None,
+    }
+
+
 class BudgetGovernor:
     def __init__(self, store: AgentRunStore, run_id: str) -> None:
         self.store = store
@@ -59,6 +86,8 @@ class BudgetGovernor:
 
     def register_proposal(self, payload: SearchProposalInput) -> SearchProposalRecord:
         self.authorize_tool("request_search_budget")
+        # Unconsumed grants must not deadlock later proposals.
+        self.abandon_active_grant("unconsumed_grant_replaced_by_new_proposal")
         queries = canonicalize_queries(payload.queries)
         proposal = SearchProposalRecord(
             **payload.model_dump(exclude={"queries"}),
@@ -86,6 +115,24 @@ class BudgetGovernor:
         if decision.decision == "replan":
             return BudgetReviewResult(outcome="replan", decision=decision, reason="budget_agent_requested_replan")
         if decision.decision == "stop":
+            run = self._require_run()
+            execution = grant_execution_summary(self.store, self.run_id)
+            # Do not permanently stop search before any repository search executed.
+            if int(run.dynamic_usage.search_batches) <= 0:
+                self.store.append_event(
+                    self.run_id,
+                    "budget_stop_refused_before_any_search",
+                    {
+                        "proposal_id": proposal.proposal_id,
+                        "execution": execution,
+                        "reason": "budget_stop_refused_before_any_search",
+                    },
+                )
+                return BudgetReviewResult(
+                    outcome="replan",
+                    decision=decision,
+                    reason="budget_stop_refused_before_any_search",
+                )
             self._mark_search_stopped("budget_agent_stop")
             return BudgetReviewResult(outcome="stopped", decision=decision, reason="budget_agent_stop")
         approved = [proposal.queries[index] for index in decision.approved_query_indexes]
@@ -97,6 +144,7 @@ class BudgetGovernor:
                 {"proposal_id": proposal.proposal_id, "reason": denial_reason},
             )
             return BudgetReviewResult(outcome="denied", decision=decision, reason=denial_reason)
+        self.abandon_active_grant("unconsumed_grant_replaced_by_new_grant")
         grant = SearchGrant(
             grant_id=f"grant_{uuid.uuid4().hex}",
             run_id=self.run_id,
@@ -110,17 +158,65 @@ class BudgetGovernor:
         self.store.append_event(self.run_id, "search_grant_issued", grant.model_dump(mode="json"))
         return BudgetReviewResult(outcome="granted", decision=decision, grant=grant, reason="budget_agent_grant")
 
-    def consume_grant(self, grant_id: str, queries: list[str]) -> SearchGrant:
-        canonical_queries = canonicalize_queries(queries)
-        consumed = self.store.consume_search_grant(self.run_id, grant_id, hash_queries(canonical_queries))
+    def consume_grant(self, grant_id: str, queries: list[str] | None = None) -> SearchGrant:
+        """Consume a one-use grant.
+
+        When queries is omitted, the stored approved query set is used. Callers should
+        bind the search action to the grant first so query mismatches never reach here.
+        """
+        grant = self.store.load_search_grant(grant_id)
+        if grant is None or grant.run_id != self.run_id:
+            raise ValueError("search_grant_not_found")
+        if grant.status != "issued":
+            raise ValueError(f"grant_already_{grant.status}")
+        if queries is None:
+            query_hash = grant.query_hash
+            consumed_queries = list(grant.approved_queries)
+        else:
+            canonical_queries = canonicalize_queries(queries)
+            query_hash = hash_queries(canonical_queries)
+            if query_hash != grant.query_hash:
+                raise ValueError("search_grant_query_mismatch")
+            consumed_queries = canonical_queries
+        consumed = self.store.consume_search_grant(self.run_id, grant_id, query_hash)
         self._set_active_grant(None)
         self.store.increment_dynamic_usage(
             self.run_id,
             query_units=consumed.query_units,
             search_batches=1,
         )
-        self.store.append_event(self.run_id, "search_grant_consumed", consumed.model_dump(mode="json"))
+        self.store.append_event(
+            self.run_id,
+            "search_grant_consumed",
+            {
+                **consumed.model_dump(mode="json"),
+                "executed_queries": consumed_queries,
+            },
+        )
         return consumed
+
+    def abandon_active_grant(self, reason: str) -> SearchGrant | None:
+        run = self._require_run()
+        grant_id = run.active_grant_id
+        if not grant_id:
+            return None
+        return self.abandon_grant(grant_id, reason)
+
+    def abandon_grant(self, grant_id: str, reason: str) -> SearchGrant:
+        abandoned = self.store.abandon_search_grant(self.run_id, grant_id, reason=reason)
+        run = self._require_run()
+        if run.active_grant_id == grant_id:
+            self._set_active_grant(None)
+        self.store.append_event(
+            self.run_id,
+            "search_grant_abandoned",
+            {
+                "grant_id": grant_id,
+                "reason": reason,
+                "approved_queries": abandoned.approved_queries,
+            },
+        )
+        return abandoned
 
     def stop_for_hard_limit(self, reason: str) -> None:
         self._mark_search_stopped(reason)
@@ -176,8 +272,6 @@ class BudgetGovernor:
         proposal: SearchProposalRecord,
     ) -> str | None:
         run = self._require_run()
-        if run.active_grant_id:
-            return "active_search_grant_exists"
         if self.elapsed_seconds() >= run.dynamic_limits.max_elapsed_seconds:
             return "hard_elapsed_time_limit"
         if run.dynamic_usage.query_units + len(approved) > run.dynamic_limits.max_query_units:
@@ -193,30 +287,38 @@ class BudgetGovernor:
         )
         if projected_query_units > initial_limit:
             metrics = run.latest_metrics
-            if metrics is None:
-                return "quality_budget_expansion_requires_measured_gap"
-            quality_gap = max(
-                metrics.quality_gap,
-                metrics.semantic_coverage_gap,
-                metrics.hard_constraint_evidence_gap,
-                metrics.metadata_gap,
-            )
-            expected_dimensions = {
-                str(value).strip()
-                for value in proposal.expected_gain_dimensions
-                if str(value).strip()
-            }
-            if not expected_dimensions:
-                return "quality_budget_expansion_requires_expected_gain_dimension"
-            if metrics.no_gain_streak >= 2 and not proposal.alternatives_considered:
-                return "no_gain_recovery_requires_alternative_strategy"
-            if projected_query_units <= expanded_limit:
-                if quality_gap < 0.15 and metrics.high_relevance_gain <= 0.0:
-                    return "quality_budget_expansion_requires_measured_gap"
-            elif quality_gap < 0.30 or (
-                metrics.strategy_novelty < 0.20 and metrics.high_relevance_gain <= 0.0
+            # Only the true first grant may expand without measured metrics.
+            if (
+                metrics is None
+                and run.dynamic_usage.search_batches <= 0
+                and run.dynamic_usage.query_units <= 0
             ):
-                return "maximum_quality_budget_requires_strong_gap_and_novel_strategy"
+                pass
+            elif metrics is None:
+                return "quality_budget_expansion_requires_measured_gap"
+            else:
+                quality_gap = max(
+                    metrics.quality_gap,
+                    metrics.semantic_coverage_gap,
+                    metrics.hard_constraint_evidence_gap,
+                    metrics.metadata_gap,
+                )
+                expected_dimensions = {
+                    str(value).strip()
+                    for value in proposal.expected_gain_dimensions
+                    if str(value).strip()
+                }
+                if not expected_dimensions:
+                    return "quality_budget_expansion_requires_expected_gain_dimension"
+                if metrics.no_gain_streak >= 2 and not proposal.alternatives_considered:
+                    return "no_gain_recovery_requires_alternative_strategy"
+                if projected_query_units <= expanded_limit:
+                    if quality_gap < 0.15 and metrics.high_relevance_gain <= 0.0:
+                        return "quality_budget_expansion_requires_measured_gap"
+                elif quality_gap < 0.30 or (
+                    metrics.strategy_novelty < 0.20 and metrics.high_relevance_gain <= 0.0
+                ):
+                    return "maximum_quality_budget_requires_strong_gap_and_novel_strategy"
         repository = str(run.request.get("repository") or "pride")
         if (
             run.search_recovery_required

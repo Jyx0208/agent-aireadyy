@@ -24,6 +24,8 @@ LC_MINUTES_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:min|mins|minute|minutes
 class DiscoveryFeatureSummary:
     instrument_names: list[str] = field(default_factory=list)
     instrument_families: list[str] = field(default_factory=list)
+    instrument_generation_score: float | None = None
+    instrument_generation_label: str | None = None
     fragmentation_methods: list[str] = field(default_factory=list)
     lc_gradient: str | None = None
     lc_gradient_minutes: float | None = None
@@ -111,6 +113,61 @@ def _instrument_names_from_project(project: dict[str, Any]) -> tuple[list[str], 
     return names, evidence
 
 
+# Scores are deliberately coarse generations, not a claim that one platform is
+# universally better.  They make a user preference such as "仪器尽可能新"
+# observable and auditable.  Unknown instruments remain unknown rather than
+# being ranked from project publication date.
+INSTRUMENT_GENERATIONS: tuple[tuple[re.Pattern[str], float, str], ...] = (
+    (re.compile(r"orbitrap\s+astral|astral", re.I), 1.00, "current"),
+    (re.compile(r"tims?tof\s+(?:ultra|scp)|astral\s+zoom", re.I), 0.95, "current"),
+    (re.compile(r"orbitrap\s+(?:eclipse|exploris\s*480|exploris\s*240)", re.I), 0.86, "recent"),
+    (re.compile(r"tims?tof\s+(?:pro\s*2|ht)", re.I), 0.84, "recent"),
+    (re.compile(r"orbitrap\s+fusion\s+lumos|q\s*exactive\s*hf[- ]?x", re.I), 0.70, "modern"),
+    (re.compile(r"tims?tof\s+pro\b", re.I), 0.68, "modern"),
+    (re.compile(r"q\s*exactive\s*hf\b|orbitrap\s+fusion\b", re.I), 0.55, "established"),
+    (re.compile(r"q\s*exactive\b|orbitrap\s+elite", re.I), 0.36, "legacy"),
+    (re.compile(r"orbitrap\s+(?:velos|xl)|ltq\s+orbitrap", re.I), 0.18, "legacy"),
+)
+
+
+def instrument_generation(names: Iterable[str]) -> tuple[float | None, str | None]:
+    matches: list[tuple[float, str]] = []
+    for name in names:
+        for pattern, score, label in INSTRUMENT_GENERATIONS:
+            if pattern.search(str(name or "")):
+                matches.append((score, label))
+                break
+    if not matches:
+        return None, None
+    score, label = max(matches, key=lambda item: item[0])
+    return score, label
+
+
+def _instrument_names_from_protocols(fields: list[tuple[str, str]]) -> tuple[list[str], list[DiscoveryEvidence]]:
+    """Recover specific models mentioned in protocols when PRIDE CV is generic."""
+
+    names: list[str] = []
+    evidence: list[DiscoveryEvidence] = []
+    for field_name, text in fields:
+        if not text:
+            continue
+        for pattern, _score, _label in INSTRUMENT_GENERATIONS:
+            for match in pattern.finditer(text):
+                name = " ".join(match.group(0).split()).strip()
+                if not name:
+                    continue
+                names.append(name)
+                evidence.append(
+                    DiscoveryEvidence(
+                        field=field_name,
+                        source="instrument_protocol",
+                        text=name,
+                        weight=9,
+                    )
+                )
+    return _dedupe(names), evidence
+
+
 def _instrument_names_from_fields(fields: list[tuple[str, str]]) -> tuple[list[str], list[DiscoveryEvidence]]:
     values: list[str] = []
     evidence: list[DiscoveryEvidence] = []
@@ -173,9 +230,21 @@ def merge_feature_summaries(*summaries: DiscoveryFeatureSummary) -> DiscoveryFea
     fragmentations = _dedupe(method for summary in summaries for method in summary.fragmentation_methods)
     lc_summary = next((summary for summary in summaries if summary.lc_gradient), None)
     evidence = [item for summary in summaries for item in summary.evidence]
+    generation_candidates = [
+        (summary.instrument_generation_score, summary.instrument_generation_label)
+        for summary in summaries
+        if summary.instrument_generation_score is not None
+    ]
+    generation_score, generation_label = (
+        max(generation_candidates, key=lambda item: float(item[0] or 0.0))
+        if generation_candidates
+        else (None, None)
+    )
     return DiscoveryFeatureSummary(
         instrument_names=names,
         instrument_families=families,
+        instrument_generation_score=generation_score,
+        instrument_generation_label=generation_label,
         fragmentation_methods=fragmentations,
         lc_gradient=lc_summary.lc_gradient if lc_summary else None,
         lc_gradient_minutes=lc_summary.lc_gradient_minutes if lc_summary else None,
@@ -190,18 +259,28 @@ def extract_project_features(project: dict[str, Any], sdrf_rows: list[dict[str, 
 
     project_names, project_name_evidence = _instrument_names_from_project(project)
     sdrf_names, sdrf_name_evidence = _instrument_names_from_fields(fields)
-    names = _dedupe([*project_names, *sdrf_names])
+    protocol_names, protocol_name_evidence = _instrument_names_from_protocols(fields)
+    names = _dedupe([*project_names, *sdrf_names, *protocol_names])
     families = _instrument_families(names)
+    generation_score, generation_label = instrument_generation(names)
     fragmentation, fragmentation_evidence = _fragmentation_from_fields(fields)
     lc_gradient, lc_minutes, lc_evidence = _lc_gradient_from_fields(fields)
 
     return DiscoveryFeatureSummary(
         instrument_names=names,
         instrument_families=families,
+        instrument_generation_score=generation_score,
+        instrument_generation_label=generation_label,
         fragmentation_methods=fragmentation,
         lc_gradient=lc_gradient,
         lc_gradient_minutes=lc_minutes,
-        evidence=project_name_evidence + sdrf_name_evidence + fragmentation_evidence + lc_evidence,
+        evidence=(
+            project_name_evidence
+            + sdrf_name_evidence
+            + protocol_name_evidence
+            + fragmentation_evidence
+            + lc_evidence
+        ),
     )
 
 
@@ -215,8 +294,19 @@ def extract_file_features(
         fields.extend(_sdrf_text_fields(matched_sdrf_rows))
 
     sdrf_names, sdrf_name_evidence = _instrument_names_from_fields(fields)
-    names = _dedupe([*sdrf_names, *project_features.instrument_names])
-    families = _known([*_instrument_families(sdrf_names), *project_features.instrument_families])
+    if sdrf_names:
+        names = _dedupe(sdrf_names)
+        families = _instrument_families(names)
+    elif len(project_features.instrument_names) == 1:
+        # A single project-level instrument is a reasonable file default.  A
+        # mixed-instrument project is not: broadcasting every model to every
+        # file creates false per-file evidence.
+        names = list(project_features.instrument_names)
+        families = list(project_features.instrument_families)
+    else:
+        names = []
+        families = []
+    generation_score, generation_label = instrument_generation(names)
     fragmentation, fragmentation_evidence = _fragmentation_from_fields(fields)
     if not fragmentation:
         fragmentation = list(project_features.fragmentation_methods)
@@ -228,6 +318,8 @@ def extract_file_features(
     return DiscoveryFeatureSummary(
         instrument_names=names,
         instrument_families=families,
+        instrument_generation_score=generation_score,
+        instrument_generation_label=generation_label,
         fragmentation_methods=fragmentation,
         lc_gradient=lc_gradient,
         lc_gradient_minutes=lc_minutes,

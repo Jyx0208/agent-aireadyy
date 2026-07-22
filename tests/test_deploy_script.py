@@ -79,3 +79,10 @@ def test_deploy_defaults_to_deepseek_v4_pro() -> None:
 
     assert "AGENT_LLM_MODEL=deepseek-v4-pro" in env_text
     assert "AGENT_LLM_MODEL=${AGENT_LLM_MODEL:-deepseek-v4-pro}" in compose_text
+
+
+def test_local_web_launcher_enables_loopback_workbench_access() -> None:
+    script = Path("scripts/run_web.ps1").read_text(encoding="utf-8")
+
+    assert 'if ($ListenHost -in @("127.0.0.1", "localhost", "::1"))' in script
+    assert 'AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER = "1"' in script

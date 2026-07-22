@@ -45,7 +45,7 @@ function Ensure-WebSetup {
         $ConfiguredPython = (Get-Content $PythonPathFile -TotalCount 1).Trim()
     }
 
-    & $ConfiguredPython -c "import fastapi, uvicorn" *> $null
+    & $ConfiguredPython -c "import agents, fastapi, uvicorn" *> $null
     if ($LASTEXITCODE -ne 0) {
         if ($UseConda) {
             & (Join-Path $RepoRoot "scripts\setup.ps1") -NoDev -Web -UseConda -CondaEnvName $CondaEnvName
@@ -63,6 +63,11 @@ $Python = Ensure-WebSetup
 $Url = "http://localhost:$Port"
 if (-not $env:AGENT_WEB_FULL_WORKFLOW_ENABLED) {
     $env:AGENT_WEB_FULL_WORKFLOW_ENABLED = "0"
+}
+if ($ListenHost -in @("127.0.0.1", "localhost", "::1")) {
+    if (-not $env:AGENT_EXPERT_REVIEW_DEVELOPER_TOKEN -and -not $env:AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER) {
+        $env:AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER = "1"
+    }
 }
 
 Write-Host "Starting PRIDE AI-ready Agent Web..." -ForegroundColor Green

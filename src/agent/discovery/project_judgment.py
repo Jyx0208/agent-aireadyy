@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
+from agent.discovery.constraints import ConstraintAssessment
 from agent.models import JsonModel
 
 
@@ -35,6 +36,10 @@ class ProjectJudgmentInput(JsonModel):
     missing_information: list[str] = Field(default_factory=list)
     next_action: ProjectJudgmentNextAction
     explanation: str = Field(min_length=1, max_length=2000)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=30)
+    constraint_assessments: list[ConstraintAssessment] = Field(default_factory=list, max_length=100)
+    rubric_version: str = Field(default="project-fit/v2", min_length=1, max_length=80)
+    limitations: list[str] = Field(default_factory=list, max_length=30)
     target_file_count: int = Field(default=0, ge=0)
     evidence_stage: ProjectEvidenceStage
 
@@ -42,6 +47,17 @@ class ProjectJudgmentInput(JsonModel):
     @classmethod
     def normalize_accession(cls, value: str) -> str:
         return value.strip().upper()
+
+    @field_validator("evidence_refs", "limitations")
+    @classmethod
+    def normalize_string_lists(cls, values: list[str]) -> list[str]:
+        return list(
+            dict.fromkeys(
+                " ".join(str(value or "").split()).strip()[:240]
+                for value in values
+                if str(value or "").strip()
+            )
+        )
 
     @model_validator(mode="after")
     def validate_semantics(self) -> "ProjectJudgmentInput":
@@ -68,6 +84,15 @@ class ProjectJudgmentInput(JsonModel):
             "investigate_missing_evidence",
         }:
             raise ValueError("investigate requires an investigation next_action")
+        if (
+            self.evidence_stage == "inspection"
+            and self.status == "evidence_backed"
+            and not self.evidence_refs
+        ):
+            raise ValueError("inspection-backed judgments require evidence_refs")
+        ids = [item.constraint_id.casefold() for item in self.constraint_assessments]
+        if len(ids) != len(set(ids)):
+            raise ValueError("constraint assessments must be unique per constraint_id")
         return self
 
 

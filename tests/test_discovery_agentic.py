@@ -459,3 +459,13 @@ def test_discover_dataset_cli_task_type_writes_task_ready_exports(monkeypatch, t
     assert manifest["files"][0]["task_readiness_status"] == "weak_ready"
     assert (output_dir / "dataset_manifest_task_ready.csv").exists()
     assert (output_dir / "batch_inputs_task_ready.txt").read_text(encoding="utf-8").strip() == "HeLa_01.raw"
+
+
+def test_normalize_task_type_browse_only_is_optional():
+    from agent.discovery.task_profiles import normalize_task_type
+
+    assert normalize_task_type("browse_only") is None
+    assert normalize_task_type("") is None
+    assert normalize_task_type(None) is None
+    assert normalize_task_type("rt_prediction") == "rt_prediction"
+    assert normalize_task_type("de-novo") == "denovo"

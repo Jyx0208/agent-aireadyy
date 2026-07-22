@@ -45,6 +45,10 @@ def _normalise_job_workers(value: Any, *, default: int) -> int:
     return workers
 
 
+def _model_key(value: Any) -> str:
+    return str(value or "").strip().casefold()
+
+
 def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -201,6 +205,32 @@ class ExpertJudgeJobManager:
         if document is None:
             raise ValueError("pool_not_found")
         secrets = self.resolve_profile(profile_id)
+        model_key = _model_key(secrets.get("model"))
+        self.list_jobs(pool_id=pool_id)
+        with _JOBS_LOCK:
+            existing = next(
+                (
+                    job
+                    for job in _JOBS.values()
+                    if str(job.get("pool_id") or "") == pool_id
+                    and str(job.get("job_type") or "single_model") == "single_model"
+                    and _model_key(job.get("model")) == model_key
+                ),
+                None,
+            )
+            if existing is not None:
+                public = _public_job(existing)
+                public["reused_existing"] = True
+                return public
+        already_merged = any(
+            _model_key(run.get("model")) == model_key
+            for candidate in (document.get("candidates") or [])
+            if isinstance(candidate, Mapping)
+            for run in (candidate.get("machine_review_runs") or [])
+            if isinstance(run, Mapping)
+        )
+        if model_key and already_merged:
+            raise ValueError(f"model_already_reviewed_pool:{secrets['model']}")
         job_id = f"judge_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         candidates = [item for item in (document.get("candidates") or []) if isinstance(item, dict)]
         items = {
@@ -314,6 +344,20 @@ class ExpertJudgeJobManager:
             "consensus_summary": {},
         }
         with _JOBS_LOCK:
+            existing = next(
+                (
+                    candidate_job
+                    for candidate_job in _JOBS.values()
+                    if str(candidate_job.get("pool_id") or "") == pool_id
+                    and str(candidate_job.get("job_type") or "single_model") == "single_model"
+                    and _model_key(candidate_job.get("model")) == model_key
+                ),
+                None,
+            )
+            if existing is not None:
+                public = _public_job(existing)
+                public["reused_existing"] = True
+                return public
             _JOBS[job_id] = job
             self._persist_job(job)
         self._kick()
@@ -376,23 +420,27 @@ class ExpertJudgeJobManager:
                 self._append_log(job, "warning", "Resume is available only for interrupted terminal jobs.")
                 self._persist_job(job)
                 return _public_job(job)
-            pending = [cid for cid, status in (job.get("items") or {}).items() if status in {"pending", "failed"}]
-            if not pending:
+            recoverable = [
+                cid
+                for cid, status in (job.get("items") or {}).items()
+                if status in {"pending", "failed", "running"}
+            ]
+            if not recoverable:
                 self._append_log(job, "info", "No pending candidates to resume.")
                 self._persist_job(job)
                 return _public_job(job)
-            for cid in pending:
+            for cid in recoverable:
                 job.setdefault("items", {})[cid] = "pending"
             if workers is not None:
                 job["workers"] = _normalise_job_workers(workers, default=int(job.get("workers") or 2))
-            job["run_targets"] = pending
+            job["run_targets"] = recoverable
             job["failed_ids"] = []
             job["progress"]["failed"] = 0
             job["status"] = "queued"
             job["cancel_requested"] = False
             job["error"] = None
             job["finished_at"] = None
-            self._append_log(job, "info", f"Resuming {len(pending)} pending candidates.")
+            self._append_log(job, "info", f"Resuming {len(recoverable)} pending candidates.")
             _JOBS[job_id] = job
             self._persist_job(job)
         self._kick()
@@ -839,6 +887,10 @@ class ExpertJudgeJobManager:
             job = _JOBS.get(job_id)
             if job is None:
                 return
+            if status == "cancelled":
+                for candidate_id, item_status in list((job.get("items") or {}).items()):
+                    if item_status == "running":
+                        job.setdefault("items", {})[candidate_id] = "pending"
             job["status"] = status
             job["finished_at"] = _utc_now()
             job["error"] = error

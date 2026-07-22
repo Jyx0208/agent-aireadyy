@@ -130,7 +130,30 @@ def build_pride_queries(request: DatasetRequest) -> list[str]:
     elif immunopeptide_goal:
         queries.extend(immunopeptide_terms)
     elif general_goal:
-        queries.extend(general_terms or ["proteomics", "mass spectrometry proteomics"])
+        broad_defaults = [
+            "proteomics",
+            "shotgun proteomics",
+            "mass spectrometry proteomics",
+            "label free quantitation",
+            "TMT proteomics",
+            "DIA proteomics",
+            "phosphoproteomics",
+            "plasma proteomics",
+            "affinity purification mass spectrometry",
+        ]
+        if any(str(item).casefold() == "human" for item in request.species):
+            broad_defaults = [
+                "human proteomics",
+                "homo sapiens proteomics",
+                "human shotgun proteomics",
+                "human label free proteomics",
+                "human TMT proteomics",
+                "human DIA proteomics",
+                "human phosphoproteomics",
+                "human plasma proteomics",
+                *broad_defaults,
+            ]
+        queries.extend(general_terms or broad_defaults)
 
     species_aliases: list[str] = []
     for species in request.species:

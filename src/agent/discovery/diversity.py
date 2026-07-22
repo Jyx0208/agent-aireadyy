@@ -21,6 +21,7 @@ def _file_key(file: DiscoveredFile) -> tuple[str, str]:
 def _candidate_score(
     file: DiscoveredFile,
     project: DiscoveredProject,
+    request: DatasetRequest,
     seen_species: set[str],
     seen_instruments: set[str],
     seen_fragmentation: set[str],
@@ -42,12 +43,26 @@ def _candidate_score(
         novelty += 4.0
 
     trust = file.trust_score if file.trust_score > 0 else file.confidence
+    generation = (
+        file.instrument_generation_score
+        if file.instrument_generation_score is not None
+        else project.instrument_generation_score
+    )
+    instrument_preference_bonus = 0.0
+    if generation is not None and request.instrument_preference in {
+        "newer",
+        "newer_with_legacy_floor",
+    }:
+        instrument_preference_bonus = float(generation) * 24.0
+    elif generation is not None and request.instrument_preference == "classic":
+        instrument_preference_bonus = (1.0 - float(generation)) * 18.0
     return (
         trust * 100.0
         + file.file_score
         + (project.calibrated_project_score if project.calibrated_project_score is not None else project.project_score) * 0.15
         + file.memory_prior * 100.0
         + novelty
+        + instrument_preference_bonus
         - (5.0 if file.needs_review else 0.0)
     )
 
@@ -71,20 +86,44 @@ def select_diverse_items(
     seen_fragmentation: set[str] = set()
     seen_lc: set[str] = set()
 
-    while len(selected_keys) < request.max_files:
+    portfolio_mode = (
+        bool(getattr(request, "harvest_all_qualified", False))
+        or str(getattr(request, "quantity_scope", "") or "") == "portfolio"
+        or str(getattr(request, "portfolio_size_preference", "") or "").startswith("maximize")
+        or int(request.max_projects) >= 100
+    )
+    # Soft ceilings for curated pilots; maximize harvests keep all quality candidates.
+    project_limit = (
+        max(int(request.max_projects), len(items), 5000)
+        if portfolio_mode
+        else int(request.max_projects)
+    )
+    file_limit = (
+        max(int(request.max_files), sum(len(files) for _project, files in items), 100000)
+        if portfolio_mode
+        else int(request.max_files)
+    )
+    per_project_limit = (
+        max(int(request.max_files_per_project), 500)
+        if portfolio_mode
+        else int(request.max_files_per_project)
+    )
+
+    while len(selected_keys) < file_limit:
         ranked: list[tuple[float, str, str, DiscoveredProject, DiscoveredFile]] = []
         for project, file in candidates:
             key = _file_key(file)
             if key in selected_keys:
                 continue
             project_is_selected = project.project_accession in selected_projects
-            if not project_is_selected and len(selected_projects) >= request.max_projects:
+            if not project_is_selected and len(selected_projects) >= project_limit:
                 continue
-            if len(files_by_project.get(project.project_accession, [])) >= request.max_files_per_project:
+            if len(files_by_project.get(project.project_accession, [])) >= per_project_limit:
                 continue
             score = _candidate_score(
                 file,
                 project,
+                request,
                 seen_species,
                 seen_instruments,
                 seen_fragmentation,
@@ -127,6 +166,9 @@ def _count_list_values(files: list[DiscoveredFile], field_name: str) -> dict[str
 
 def diversity_summary(files: list[DiscoveredFile]) -> dict[str, Any]:
     lc_counts: Counter[str] = Counter(lc_gradient_bucket(file.lc_gradient_minutes) for file in files)
+    generation_counts: Counter[str] = Counter(
+        str(file.instrument_generation_label or UNKNOWN) for file in files
+    )
     unknown_counts = {
         "species": sum(1 for file in files if not _known_values(file.species)),
         "instrument_family": sum(1 for file in files if not _known_values(file.instrument_families)),
@@ -136,6 +178,7 @@ def diversity_summary(files: list[DiscoveredFile]) -> dict[str, Any]:
     return {
         "species_distribution": _count_list_values(files, "species"),
         "instrument_family_distribution": _count_list_values(files, "instrument_families"),
+        "instrument_generation_distribution": dict(sorted(generation_counts.items())),
         "fragmentation_method_distribution": _count_list_values(files, "fragmentation_methods"),
         "lc_gradient_distribution": dict(sorted(lc_counts.items())),
         "unknown_counts": unknown_counts,

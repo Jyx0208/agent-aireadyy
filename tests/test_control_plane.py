@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 
 from agent.cli import app
 from agent.control_plane.budget_governor import BudgetGovernor
-from agent.control_plane.discovery import DiscoveryToolService
+from agent.control_plane.discovery import DiscoveryToolService, _project_assessments
 from agent.control_plane.models import (
     AgentBudget,
     AgentEvent,
@@ -30,9 +30,11 @@ from agent.discovery.search_environment import (
     CandidateInspectionResult,
     CandidateSearchAction,
     CandidateSearchObservation,
+    PrideDiscoverySearchEnvironment,
     QueryYield,
     RepositoryQuery,
 )
+from agent.repositories.metering import record_repository_request
 
 
 def _run(run_id: str = "run_001") -> AgentRunRecord:
@@ -63,8 +65,34 @@ def _inspection_judgment(
         decision="include" if include else "exclude",
         next_action="include_in_manifest" if include else "exclude_project",
         explanation="Inspection evidence supports this project-level decision.",
+        evidence_refs=["project_description_excerpt"],
         target_file_count=1,
         evidence_stage="inspection",
+    )
+
+
+def _delivery_file(
+    accession: str,
+    name: str,
+    *,
+    project_title: str | None = None,
+    **updates: Any,
+) -> DiscoveredFile:
+    return DiscoveredFile.model_validate(
+        {
+            "project_accession": accession,
+            "project_title": project_title,
+            "file_name": name,
+            "file_accession_or_path": name,
+            "download_url": f"https://example.test/{accession}/{name}",
+            "transfer_method": "https",
+            "file_type": Path(name).suffix or ".raw",
+            "file_role": "raw_acquisition",
+            "validity_status": "valid",
+            "evidence_level": "file",
+            "expected_size_bytes": 1024,
+            **updates,
+        }
     )
 
 
@@ -112,14 +140,15 @@ def _dynamic_discovery_service(
 
     def fake_discovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
         calls.append(list(queries or []))
-        project = DiscoveredProject(project_accession="PXD_DYNAMIC", project_title="Dynamic fixture")
-        file = DiscoveredFile(
-            project_accession=project.project_accession,
+        project = DiscoveredProject(
+            project_accession="PXD_DYNAMIC",
+            project_title="Dynamic fixture",
+            project_description="Persisted dynamic fixture evidence.",
+        )
+        file = _delivery_file(
+            project.project_accession,
+            "dynamic.raw",
             project_title=project.project_title,
-            file_name="dynamic.raw",
-            file_type=".raw",
-            validity_status="valid",
-            evidence_level="file",
         )
         return DatasetManifest(
             request=request,
@@ -208,17 +237,18 @@ class _FakeSearchEnvironment:
     def inspect(self, action: CandidateInspectionAction) -> CandidateInspectionResult:
         self.inspection_actions.append(action)
         projects = [
-            DiscoveredProject(project_accession=accession, project_title=f"Selected {accession}")
+            DiscoveredProject(
+                project_accession=accession,
+                project_title=f"Selected {accession}",
+                project_description="Persisted inspection evidence.",
+            )
             for accession in action.accessions
         ]
         files = [
-            DiscoveredFile(
-                project_accession=project.project_accession,
+            _delivery_file(
+                project.project_accession,
+                f"{project.project_accession}.raw",
                 project_title=project.project_title,
-                file_name=f"{project.project_accession}.raw",
-                file_type=".raw",
-                validity_status="valid",
-                evidence_level="file",
             )
             for project in projects
         ]
@@ -239,6 +269,126 @@ class _FakeSearchEnvironment:
 
     def close(self) -> None:
         return None
+
+
+def test_candidate_search_reserves_repository_requests_for_one_inspection_batch(
+    tmp_path: Path,
+) -> None:
+    class MeteredSearchClient:
+        def __init__(self) -> None:
+            self.accessions: dict[str, str] = {}
+
+        def search_projects(
+            self,
+            keyword: str,
+            page_size: int = 100,
+            *,
+            max_pages: int | None = None,
+            max_results: int | None = None,
+        ) -> list[dict[str, Any]]:
+            del page_size, max_results
+            for _ in range(int(max_pages or 1)):
+                record_repository_request("pride", "search_projects")
+            accession = self.accessions.setdefault(
+                keyword,
+                f"PXD{len(self.accessions) + 1:06d}",
+            )
+            return [
+                {
+                    "accession": accession,
+                    "title": f"Human sensory neuron {keyword}",
+                    "projectDescription": "Chemotherapy neuropathy proteomics",
+                    "organisms": [{"name": "Homo sapiens"}],
+                    "experimentTypes": [{"name": "shotgun proteomics"}],
+                }
+            ]
+
+        def close(self) -> None:
+            return None
+
+    request = DatasetRequest(
+        repository="pride",
+        max_projects=2_000,
+        max_candidate_projects=5_000,
+    )
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("search_reserve").model_copy(
+            update={
+                "status": "running",
+                "dynamic_budget_enabled": True,
+                "dynamic_limits": DynamicBudgetLimits(
+                    initial_repository_requests=80,
+                    expanded_repository_requests=80,
+                    max_repository_requests=80,
+                ),
+            }
+        )
+    )
+    governor = BudgetGovernor(store, run.run_id)
+    environment = PrideDiscoverySearchEnvironment(
+        request=request,
+        prompt="Find human sensory neurons for chemotherapy neuropathy.",
+        client=MeteredSearchClient(),  # type: ignore[arg-type]
+        state_path=tmp_path / "candidate_state.json",
+    )
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=environment,
+        dynamic_budget=True,
+        budget_governor=governor,
+    )
+    queries = [
+        "stem cell",
+        "iPSC",
+        "chemotherapy",
+        "human",
+        "neuroprotective",
+        "peripheral",
+        "sensory",
+    ]
+    proposal = governor.register_proposal(
+        SearchProposalInput(
+            objective="Find relevant candidate projects.",
+            reasoning_summary="Use the same seven-seed shape as the live failure.",
+            queries=queries,
+            expected_gain="Relevant projects across complementary intent dimensions.",
+            stop_condition="Inspect the best candidates after this search.",
+        )
+    )
+    review = governor.apply_decision(
+        BudgetDecision(
+            proposal_id=proposal.proposal_id,
+            decision="grant",
+            approved_query_indexes=list(range(len(queries))),
+            reasoning_summary="The bounded search leaves capacity for inspection.",
+        )
+    )
+    assert review.grant is not None
+
+    observation = service.search_repository_candidates(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query=query, depth=50) for query in queries],
+            candidate_limit=1_000,
+            rationale="Find candidates without consuming the inspection reserve.",
+        ),
+        grant_id=review.grant.grant_id,
+    )
+
+    stored = store.load_run(run.run_id)
+    assert observation.status == "completed"
+    assert stored is not None
+    assert stored.dynamic_usage.repository_requests == 20
+    started = next(
+        event
+        for event in store.list_events(run.run_id)
+        if event.event_type == "candidate_search_started"
+    )
+    assert started.payload["search_repository_request_budget"] == 20
+    assert started.payload["inspection_repository_request_reserve"] == 60
 
 
 def test_quality_first_search_and_inspection_are_separate_control_plane_actions(tmp_path: Path) -> None:
@@ -337,6 +487,147 @@ def test_agent_can_filter_inspected_projects_during_final_selection(tmp_path: Pa
     assert selection["selected_project_accessions"] == ["PXD_GOOD"]
     assert [project.project_accession for project in selected_manifest.projects] == ["PXD_GOOD"]
     assert {file.project_accession for file in selected_manifest.files} == {"PXD_GOOD"}
+
+
+def test_project_assessments_expose_bounded_project_and_file_evidence() -> None:
+    request = DatasetRequest(repository="pride")
+    project = DiscoveredProject(
+        project_accession="PXD_EVIDENCE",
+        project_title="Mixed proteome and immunopeptidome study",
+        project_description="The HLA ligandome was isolated from a human cell line.",
+        sdrf_summary={
+            "status": "available",
+            "source_url": "https://user:secret@ftp.pride.ebi.ac.uk/PXD_EVIDENCE.sdrf.tsv?token=secret#fragment",
+            "content_sha256": "a" * 64,
+            "row_count": 12,
+            "match_status_counts": {"matched": 1, "no_file_match": 1, "no_sdrf": 0},
+            "canonical_fields": {"cell_line": ["HeLa"], "organism": ["Homo sapiens"]},
+            "file_match_examples": [
+                {"file_name": "hla_ligand_ip_01.raw", "status": "matched", "matched_row_count": 1}
+            ],
+            "missing_columns": ["disease", "control"],
+            "conflicts": [],
+            "errors": [],
+        },
+        immunopeptide_scope="immunopeptidomics",
+        hla_class=["class_i"],
+        immunopeptide_evidence_terms=["W6/32", "HLA-I"],
+        raw_metadata={
+            "sampleProcessingProtocol": "Anti-HLA W6/32 immunoaffinity purification was used.",
+            "dataProcessingProtocol": "Unspecific peptide search for HLA ligands.",
+        },
+    )
+    files = [
+        DiscoveredFile(
+            project_accession=project.project_accession,
+            project_title=project.project_title,
+            file_name="global_proteome_fraction_01.raw",
+            file_type=".raw",
+            validity_status="weak_keep",
+            evidence_level="project",
+            evidence_warnings=["project_level_evidence_only"],
+        ),
+        DiscoveredFile(
+            project_accession=project.project_accession,
+            project_title=project.project_title,
+            file_name="hla_ligand_ip_01.raw",
+            file_type=".raw",
+            validity_status="valid",
+            evidence_level="mixed",
+        ),
+    ]
+
+    assessment = _project_assessments(
+        DatasetManifest(request=request, projects=[project], files=files),
+        {"previews": []},
+    )[0]
+
+    assert assessment["project_description_excerpt"].startswith("The HLA ligandome")
+    assert "W6/32" in assessment["sample_processing_excerpt"]
+    assert "Unspecific peptide search" in assessment["data_processing_excerpt"]
+    assert assessment["selected_file_examples"] == [
+        "global_proteome_fraction_01.raw",
+        "hla_ligand_ip_01.raw",
+    ]
+    assert assessment["file_evidence_warning_counts"] == {
+        "project_level_evidence_only": 1
+    }
+    assert assessment["immunopeptide_scope"] == "immunopeptidomics"
+    assert assessment["hla_class"] == ["class_i"]
+    assert assessment["sdrf"]["status"] == "available"
+    assert assessment["sdrf"]["row_count"] == 12
+    assert assessment["sdrf"]["canonical_fields"]["cell_line"] == ["HeLa"]
+    assert assessment["sdrf"]["source_url"] == (
+        "https://ftp.pride.ebi.ac.uk/PXD_EVIDENCE.sdrf.tsv"
+    )
+
+
+def test_agent_sdrf_inspection_is_limited_to_inspected_candidate_pool(tmp_path: Path) -> None:
+    class SdrfSearchEnvironment(_FakeSearchEnvironment):
+        def inspect(self, action: CandidateInspectionAction) -> CandidateInspectionResult:
+            result = super().inspect(action)
+            projects = [
+                project.model_copy(
+                    update={
+                        "sdrf_summary": {
+                            "status": "available",
+                            "source_url": f"https://ftp.pride.ebi.ac.uk/{project.project_accession}.sdrf.tsv",
+                            "content_sha256": "b" * 64,
+                            "row_count": 4,
+                            "match_status_counts": {"matched": 1, "no_file_match": 0, "no_sdrf": 0},
+                            "canonical_fields": {"organism": ["Homo sapiens"]},
+                            "file_match_examples": [],
+                            "missing_columns": ["disease"],
+                            "conflicts": [],
+                            "errors": [],
+                        }
+                    }
+                )
+                for project in result.manifest.projects
+            ]
+            return result.model_copy(
+                update={"manifest": result.manifest.model_copy(update={"projects": projects})}
+            )
+
+    request = DatasetRequest(repository="pride", max_projects=2, max_files=10)
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("sdrf_tool").model_copy(
+            update={"status": "running", "dynamic_limits": DynamicBudgetLimits()}
+        )
+    )
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=SdrfSearchEnvironment(request),
+    )
+    search = service.search_repository_candidates(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="human cell line")],
+            rationale="Create the bounded candidate pool.",
+        )
+    )
+    service.inspect_repository_candidates(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD_ALLOWED"],
+            rationale="Inspect before requesting focused SDRF evidence.",
+        )
+    )
+
+    allowed = service.inspect_project_sdrf("PXD_ALLOWED")
+    denied = service.inspect_project_sdrf("PXD_OUTSIDE")
+
+    assert allowed["status"] == "completed"
+    assert allowed["project_accession"] == "PXD_ALLOWED"
+    assert allowed["sdrf"]["row_count"] == 4
+    assert denied == {
+        "status": "blocked",
+        "project_accession": "PXD_OUTSIDE",
+        "reason": "project_not_in_inspected_candidate_pool",
+    }
 
 
 def test_candidate_pool_preserves_agent_choices_until_final_selection(tmp_path: Path) -> None:
@@ -718,15 +1009,12 @@ def test_discovery_tool_service_reuses_identical_query_result(tmp_path: Path) ->
             project_accession="PXDTEST001",
             project_title="Human phosphoproteomics",
         )
-        file = DiscoveredFile(
-            project_accession=project.project_accession,
+        file = _delivery_file(
+            project.project_accession,
+            "sample.raw",
             project_title=project.project_title,
-            file_name="sample.raw",
-            file_type=".raw",
-            file_role="raw_acquisition",
             acquisition_mode="dda",
             species=["human"],
-            validity_status="valid",
             evidence_level="mixed",
         )
         return DatasetManifest(
@@ -769,8 +1057,11 @@ def test_discovery_tool_service_reuses_identical_query_result(tmp_path: Path) ->
     assert Path(stored.current_manifest_path or "").exists()
     assert "tool_result_reused" in [event.event_type for event in store.list_events(run.run_id)]
     selected = service.auto_select_best_manifest()
-    assert selected.selected_round_index == 0
-    assert "manifest_auto_selected" in [event.event_type for event in store.list_events(run.run_id)]
+    assert selected.selected_round_index is None
+    assert "auto_selection_requires_project_judgments" in selected.blockers
+    assert "manifest_selection_rejected" in [
+        event.event_type for event in store.list_events(run.run_id)
+    ]
 
 
 def test_discovery_tool_service_retains_nonempty_manifest_after_empty_followup(tmp_path: Path) -> None:
@@ -783,16 +1074,12 @@ def test_discovery_tool_service_retains_nonempty_manifest_after_empty_followup(t
         if calls == 2:
             return DatasetManifest(request=request, summary={"selected_projects": 0, "selected_files": 0})
         project = DiscoveredProject(project_accession="PXD_RETAIN", project_title="usable project")
-        file = DiscoveredFile(
-            project_accession=project.project_accession,
+        file = _delivery_file(
+            project.project_accession,
+            "retain.raw",
             project_title=project.project_title,
-            file_name="retain.raw",
-            file_type=".raw",
-            file_role="raw_acquisition",
             acquisition_mode="dda",
             species=["human"],
-            validity_status="valid",
-            evidence_level="file",
         )
         return DatasetManifest(
             request=request,
@@ -850,16 +1137,13 @@ def test_discovery_tool_service_merges_distinct_round_candidates(tmp_path: Path)
         calls += 1
         accession = f"PXD_POOL_{calls}"
         project = DiscoveredProject(project_accession=accession, project_title=f"Pool round {calls}")
-        file = DiscoveredFile(
-            project_accession=accession,
+        file = _delivery_file(
+            accession,
+            f"round_{calls}.raw",
             project_title=project.project_title,
-            file_name=f"round_{calls}.raw",
-            file_type=".raw",
-            file_role="raw_acquisition",
             acquisition_mode="dda",
             species=["human"],
             validity_status="valid" if calls == 1 else "weak_keep",
-            evidence_level="file",
             trust_score=0.9 - calls * 0.1,
         )
         return DatasetManifest(
@@ -938,12 +1222,9 @@ def test_discovery_requires_atomic_recovery_after_zero_yield_compound_search(tmp
         calls.append(list(queries or []))
         if queries == ["human", "DDA"]:
             project = DiscoveredProject(project_accession="PXD_RECOVERED", project_title="Recovered")
-            file = DiscoveredFile(
-                project_accession=project.project_accession,
-                file_name="recovered.raw",
-                file_type=".raw",
-                validity_status="valid",
-                evidence_level="file",
+            file = _delivery_file(
+                project.project_accession,
+                "recovered.raw",
             )
             return DatasetManifest(
                 request=request,
@@ -1150,6 +1431,7 @@ def test_openai_agents_function_tools_expose_strict_bounded_schemas() -> None:
     search_tool = sdk["function_tool"](openai_agents.search_repository_datasets)
     state_tool = sdk["function_tool"](openai_agents.get_discovery_state)
     selection_tool = sdk["function_tool"](openai_agents.select_discovery_manifest)
+    sdrf_tool = sdk["function_tool"](openai_agents.inspect_project_sdrf)
 
     assert search_tool.name == "search_repository_datasets"
     assert search_tool.params_json_schema["required"] == ["queries"]
@@ -1163,6 +1445,10 @@ def test_openai_agents_function_tools_expose_strict_bounded_schemas() -> None:
         "rationale",
     ]
     assert selection_tool.params_json_schema["additionalProperties"] is False
+    assert sdrf_tool.name == "inspect_project_sdrf"
+    assert sdrf_tool.params_json_schema["required"] == ["project_accession"]
+    assert sdrf_tool.params_json_schema["additionalProperties"] is False
+    assert sdrf_tool.params_json_schema["properties"]["project_accession"]["maxLength"] == 64
 
 
 def test_openai_agents_model_configuration_accepts_transient_web_config(monkeypatch) -> None:
@@ -1270,16 +1556,12 @@ def test_openai_agents_runner_executes_real_function_tool_loop(tmp_path: Path) -
 
     def fake_discovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
         project = DiscoveredProject(project_accession="PXDAGENT001", project_title="Agent test")
-        file = DiscoveredFile(
-            project_accession=project.project_accession,
+        file = _delivery_file(
+            project.project_accession,
+            "agent_test.raw",
             project_title=project.project_title,
-            file_name="agent_test.raw",
-            file_type=".raw",
-            file_role="raw_acquisition",
             acquisition_mode="dda",
             species=["human"],
-            validity_status="valid",
-            evidence_level="file",
         )
         return DatasetManifest(
             request=request,
@@ -1445,13 +1727,10 @@ def test_openai_agents_runner_executes_multi_agent_budget_loop(monkeypatch, tmp_
 
     def fake_discovery(request: DatasetRequest, memory=None, queries=None) -> DatasetManifest:
         project = DiscoveredProject(project_accession="PXD_MULTI", project_title="Multi-agent fixture")
-        file = DiscoveredFile(
-            project_accession=project.project_accession,
+        file = _delivery_file(
+            project.project_accession,
+            "multi.raw",
             project_title=project.project_title,
-            file_name="multi.raw",
-            file_type=".raw",
-            validity_status="valid",
-            evidence_level="file",
         )
         return DatasetManifest(
             request=request,
@@ -1538,6 +1817,35 @@ def test_openai_agents_runner_uses_quality_first_search_environment(tmp_path: Pa
                     },
                 ),
                 (
+                    "inspect_project_sdrf",
+                    {"project_accession": "PXD000001"},
+                ),
+                (
+                    "submit_project_judgments",
+                    {
+                        "judgments": [
+                            {
+                                "project_accession": "PXD000001",
+                                "grade": 2,
+                                "status": "evidence_backed",
+                                "hard_gate": "pass",
+                                "confidence": 0.85,
+                                "decision": "include",
+                                "missing_information": [],
+                                "next_action": "include_in_manifest",
+                                "explanation": (
+                                    "The inspected project has a directly selected valid raw file."
+                                ),
+                                "evidence_refs": ["selected_file_examples"],
+                                "constraint_assessments": [],
+                                "limitations": ["The fixture has intentionally minimal metadata."],
+                                "target_file_count": 1,
+                                "evidence_stage": "inspection",
+                            }
+                        ]
+                    },
+                ),
+                (
                     "select_discovery_manifest",
                     {
                         "round_index": 0,
@@ -1580,7 +1888,7 @@ def test_openai_agents_runner_uses_quality_first_search_environment(tmp_path: Pa
             if False:
                 yield None
 
-    request = DatasetRequest(repository="pride", max_projects=2, max_files=10)
+    request = DatasetRequest(repository="pride", max_projects=1, max_files=10)
     state_db = tmp_path / "agent_control.sqlite"
     environment = _FakeSearchEnvironment(request)
     result = run_openai_agents_discovery(
@@ -1606,6 +1914,151 @@ def test_openai_agents_runner_uses_quality_first_search_environment(tmp_path: Pa
     assert run.latest_candidate_search_id == "search_0001"
     assert environment.search_actions[0].queries[0].depth == 40
     assert environment.inspection_actions[0].accessions == ["PXD000001"]
+    assert any(
+        event.event_type == "tool_completed"
+        and event.payload.get("tool") == "inspect_project_sdrf"
+        for event in AgentRunStore(state_db).list_events(result.run_id)
+    )
+
+
+def test_quality_first_runner_autonomously_repairs_a_premature_final_answer(
+    tmp_path: Path,
+) -> None:
+    from agents.items import ModelResponse
+    from agents.models.interface import Model
+    from agents.usage import Usage
+    from openai.types.responses import (
+        ResponseFunctionToolCall,
+        ResponseOutputMessage,
+        ResponseOutputText,
+    )
+
+    from agent.control_plane.openai_agents import run_openai_agents_discovery
+
+    class PrematureThenRepairModel(Model):
+        def __init__(self) -> None:
+            self.actions = [
+                (
+                    "search_repository_candidates",
+                    {
+                        "action": {
+                            "queries": [
+                                {
+                                    "query": "sensory neuron",
+                                    "depth": 40,
+                                    "intent_dimension": "cell model",
+                                    "expected_gain": "Relevant projects",
+                                }
+                            ],
+                            "candidate_limit": 20,
+                            "rationale": "Search the distinctive biological context.",
+                        }
+                    },
+                ),
+                (
+                    "inspect_repository_candidates",
+                    {
+                        "action": {
+                            "search_id": "search_0001",
+                            "accessions": ["PXD000001"],
+                            "rationale": "Inspect the strongest persisted candidate.",
+                        }
+                    },
+                ),
+                ("final", "I am done before scoring the inspected project."),
+                (
+                    "submit_project_judgments",
+                    {
+                        "judgments": [
+                            {
+                                "project_accession": "PXD000001",
+                                "grade": 2,
+                                "status": "evidence_backed",
+                                "hard_gate": "pass",
+                                "confidence": 0.85,
+                                "decision": "include",
+                                "next_action": "include_in_manifest",
+                                "explanation": "The inspected candidate contains a valid raw file.",
+                                "evidence_refs": ["selected_file_examples"],
+                                "limitations": ["Minimal fixture metadata."],
+                                "target_file_count": 1,
+                                "evidence_stage": "inspection",
+                            }
+                        ]
+                    },
+                ),
+                ("audit_discovery_state", {}),
+                (
+                    "select_discovery_manifest",
+                    {
+                        "round_index": 0,
+                        "project_accessions": ["PXD000001"],
+                        "rationale": "The post-repair quality audit is ready for selection.",
+                    },
+                ),
+                ("final", "Repaired, audited, and selected the evidence-backed project."),
+            ]
+            self.calls = 0
+
+        async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+            action, payload = self.actions[self.calls]
+            self.calls += 1
+            if action == "final":
+                output = [
+                    ResponseOutputMessage(
+                        id=f"message_{self.calls}",
+                        content=[
+                            ResponseOutputText(
+                                annotations=[], text=str(payload), type="output_text"
+                            )
+                        ],
+                        role="assistant",
+                        status="completed",
+                        type="message",
+                    )
+                ]
+            else:
+                output = [
+                    ResponseFunctionToolCall(
+                        arguments=json.dumps(payload),
+                        call_id=f"call_{self.calls}",
+                        name=action,
+                        type="function_call",
+                        status="completed",
+                    )
+                ]
+            return ModelResponse(output=output, usage=Usage(requests=1), response_id=None)
+
+        async def stream_response(self, *args: Any, **kwargs: Any):
+            if False:
+                yield None
+
+    request = DatasetRequest(repository="pride", max_projects=1, max_files=10)
+    state_db = tmp_path / "repair.sqlite"
+    environment = _FakeSearchEnvironment(request)
+    model = PrematureThenRepairModel()
+
+    result = run_openai_agents_discovery(
+        prompt="Find a sensory-neuron dataset",
+        request=request,
+        output_dir=tmp_path / "output",
+        state_db=state_db,
+        run_id="autonomous_quality_repair",
+        mode="single_agent",
+        dynamic_limits=DynamicBudgetLimits(),
+        budget=AgentBudget(max_turns=12, max_tool_calls=30),
+        search_environment=environment,
+        model=model,
+        stream_events=False,
+    )
+
+    events = AgentRunStore(state_db).list_events(result.run_id)
+    assert result.status == "completed"
+    assert result.selected_round_index == 0
+    assert model.calls == len(model.actions)
+    assert any(event.event_type == "discovery_quality_repair_started" for event in events)
+    assert any(event.event_type == "discovery_quality_repair_completed" for event in events)
+    assert "Repaired, audited" in result.final_output
 
 
 def test_openai_agents_setup_failure_is_persisted(monkeypatch, tmp_path: Path) -> None:

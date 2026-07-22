@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import csv
+import hashlib
 import json
+import math
 import os
 import re
 import secrets
 import shutil
+import sqlite3
 import threading
 import time
 import uuid
@@ -21,8 +25,10 @@ from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
+from pydantic import BaseModel, ConfigDict
 from fastapi import BackgroundTasks, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from agent.agent_core.harness import run_agent_harness
 from agent.ai_ready.agent_run_bridge import build_ai_ready_from_agent_run
 from agent.ai_ready.agent_run_locator import locate_agent_run_inputs
@@ -46,13 +52,20 @@ from agent.ai_ready.validation import validate_ai_ready_build
 from agent.control_plane.models import (
     AgentBudget,
     AgentEvent,
+    DiscoveryQualityAudit,
     DynamicBudgetLimits,
+    RuntimeProvenance,
     recommended_inspection_rounds,
 )
 from agent.discovery.runner import run_agents_discovery
 from agent.discovery.agentic import AgenticDiscoveryPlanner, OpenAICompatibleDiscoveryLLM, default_agentic_discovery_planner, default_discovery_llm_client
 from agent.discovery.agentic_runner import run_agentic_discovery
 from agent.discovery.features import extract_file_features, extract_project_features
+from agent.discovery.constraints import (
+    ScientificConstraint,
+    constraint_slug,
+    normalize_scientific_constraints,
+)
 from agent.discovery.manifest import write_dataset_manifest
 from agent.discovery.memory import (
     VALID_REVIEW_DECISIONS,
@@ -66,6 +79,7 @@ from agent.discovery.memory import (
 )
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject, DiscoveryEvidence
 from agent.discovery.ontology import (
+    SPECIES_TERMS,
     general_query_terms_from_text,
     interpret_immunopeptide_metadata,
     is_immunopeptidomics_goal,
@@ -104,6 +118,11 @@ from agent.web.expert_review.grading import (
 from agent.web.expert_review.impact import compute_impact, load_json
 from agent.web.expert_review.jobs import MAX_EXPERT_JOB_WORKERS, ExpertJudgeJobManager, reset_jobs_for_tests
 from agent.web.expert_review.build_projection import attach_review_progress
+
+try:
+    from agents import RunContextWrapper
+except ImportError:  # pragma: no cover - the direct adapter remains an optional fallback
+    RunContextWrapper = Any  # type: ignore[assignment,misc]
 from agent.web.expert_review.pool_builds import ExpertPoolBuildManager
 from agent.web.expert_review.task_semantics import calibration_task_identity, interpret_review_task
 from agent.web.expert_review.workspace_archive import (
@@ -125,6 +144,18 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="PRIDE AI-ready Agent", version="0.3.1", lifespan=lifespan)
+
+_benchmark_review_next_dir = Path(__file__).parent / "static" / "benchmark-review-next"
+app.mount(
+    "/benchmark-review-next/assets",
+    StaticFiles(directory=_benchmark_review_next_dir / "assets", check_dir=False),
+    name="benchmark-review-next-assets",
+)
+app.mount(
+    "/benchmark-review/assets",
+    StaticFiles(directory=_benchmark_review_next_dir / "assets", check_dir=False),
+    name="benchmark-review-assets",
+)
 
 _tasks: dict[str, dict[str, Any]] = {}
 _tasks_lock = threading.Lock()
@@ -184,6 +215,12 @@ _DISCOVERY_DOWNLOAD_FILES = {
     "agents_discovery_events_json": ("agents_discovery_events.json", "application/json"),
     "agents_discovery_report_md": ("agents_discovery_report.md", "text/markdown"),
     "agents_discovery_budget_json": ("agents_discovery_budget.json", "application/json"),
+    "discovery_run_bundle_zip": ("discovery_run_bundle.zip", "application/zip"),
+    "discovery_job_log_jsonl": ("logs/discovery_job.jsonl", "application/x-ndjson"),
+    "project_judgments_table_csv": ("project_judgments_table.csv", "text/csv"),
+    "selected_projects_review_csv": ("selected_projects_review.csv", "text/csv"),
+    "selected_projects_review_json": ("selected_projects_review.json", "application/json"),
+    "project_judgments_json": ("project_judgments.json", "application/json"),
 }
 _AI_READY_DOWNLOAD_FILES = {
     "input_profile_json": ("ai_ready_input_profile.json", "application/json"),
@@ -1156,50 +1193,89 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int
 def _agent_discovery_configuration(
     body: dict[str, Any],
 ) -> tuple[str, AgentBudget, DynamicBudgetLimits]:
-    mode = _clean_text(os.getenv("AGENT_DISCOVERY_MODE") or "multi_agent").lower()
-    if mode not in {"single_agent", "multi_agent"}:
-        mode = "single_agent"
+    # Agent-autonomous default: no Budget-Agent grant chain. Explicit multi_agent remains
+    # available via body.discovery_mode / AGENT_DISCOVERY_MODE for legacy cost control.
+    requested_mode = _clean_text(
+        body.get("discovery_mode")
+        or body.get("agent_mode")
+        or os.getenv("AGENT_DISCOVERY_MODE")
+        or "single_agent"
+    ).lower()
+    mode = requested_mode if requested_mode in {"single_agent", "multi_agent"} else "single_agent"
     target_projects = _bounded_int(
         body.get("max_projects"),
-        default=20,
+        default=100,
         minimum=1,
-        maximum=300,
+        maximum=1000,
     )
     target_inspection_rounds = recommended_inspection_rounds(target_projects)
     budget = AgentBudget(
-        max_turns=_bounded_int(os.getenv("AGENT_MAX_MODEL_TURNS"), default=50, minimum=1, maximum=50),
-        max_tool_calls=_bounded_int(os.getenv("AGENT_MAX_TOOL_CALLS"), default=100, minimum=1, maximum=100),
+        max_turns=_bounded_int(os.getenv("AGENT_MAX_MODEL_TURNS"), default=80, minimum=1, maximum=200),
+        max_tool_calls=_bounded_int(os.getenv("AGENT_MAX_TOOL_CALLS"), default=250, minimum=1, maximum=500),
         max_discovery_rounds=_bounded_int(
             os.getenv("AGENT_MAX_DISCOVERY_ROUNDS"),
-            default=target_inspection_rounds,
+            default=max(target_inspection_rounds, 8),
             minimum=1,
-            maximum=8,
+            maximum=30,
         ),
     )
+    # Hard safety ceilings only. Sized so multi-page PRIDE search + full inspection
+    # of large candidate pools does not hit hard_repository_request_limit casually.
     limits = DynamicBudgetLimits(
         initial_query_units=_bounded_int(
-            os.getenv("AGENT_INITIAL_QUERY_UNITS"), default=12, minimum=1, maximum=500
+            os.getenv("AGENT_INITIAL_QUERY_UNITS"), default=200, minimum=1, maximum=10000
         ),
         expanded_query_units=_bounded_int(
-            os.getenv("AGENT_EXPANDED_QUERY_UNITS"), default=30, minimum=1, maximum=500
+            os.getenv("AGENT_EXPANDED_QUERY_UNITS"), default=800, minimum=1, maximum=10000
         ),
-        max_query_units=_bounded_int(os.getenv("AGENT_MAX_QUERY_UNITS"), default=60, minimum=1, maximum=500),
+        max_query_units=_bounded_int(os.getenv("AGENT_MAX_QUERY_UNITS"), default=2500, minimum=1, maximum=10000),
         initial_repository_requests=_bounded_int(
-            os.getenv("AGENT_INITIAL_REPOSITORY_REQUESTS"), default=80, minimum=1, maximum=5000
+            os.getenv("AGENT_INITIAL_REPOSITORY_REQUESTS"), default=5000, minimum=1, maximum=100000
         ),
         expanded_repository_requests=_bounded_int(
-            os.getenv("AGENT_EXPANDED_REPOSITORY_REQUESTS"), default=160, minimum=1, maximum=5000
+            os.getenv("AGENT_EXPANDED_REPOSITORY_REQUESTS"), default=15000, minimum=1, maximum=100000
         ),
         max_repository_requests=_bounded_int(
-            os.getenv("AGENT_MAX_REPOSITORY_REQUESTS"), default=300, minimum=1, maximum=5000
+            os.getenv("AGENT_MAX_REPOSITORY_REQUESTS"), default=30000, minimum=1, maximum=100000
         ),
         max_elapsed_seconds=_bounded_int(
-            os.getenv("AGENT_MAX_ELAPSED_SECONDS"), default=1800, minimum=30, maximum=86400
+            os.getenv("AGENT_MAX_ELAPSED_SECONDS"), default=14400, minimum=30, maximum=172800
         ),
         budget_agent_max_turns=_bounded_int(
             os.getenv("AGENT_BUDGET_AGENT_MAX_TURNS"), default=3, minimum=2, maximum=10
         ),
     )
+    time_preference = _clean_text(
+        body.get("time_budget_preference") or body.get("time_budget") or "multi_round"
+    ).lower()
+    if time_preference == "fast":
+        # A user-selected fast run is an operational budget, not a claim that
+        # quality gates can be skipped. The closing audit still reports any
+        # target or evidence shortfall explicitly.
+        budget = budget.model_copy(
+            update={
+                "max_turns": min(budget.max_turns, 20),
+                "max_tool_calls": min(budget.max_tool_calls, 80),
+                "max_discovery_rounds": min(budget.max_discovery_rounds, 3),
+            }
+        )
+        limits = limits.model_copy(
+            update={
+                "initial_query_units": min(limits.initial_query_units, 80),
+                "expanded_query_units": min(limits.expanded_query_units, 160),
+                "max_query_units": min(limits.max_query_units, 300),
+                "initial_repository_requests": min(
+                    limits.initial_repository_requests, 1_000
+                ),
+                "expanded_repository_requests": min(
+                    limits.expanded_repository_requests, 2_000
+                ),
+                "max_repository_requests": min(
+                    limits.max_repository_requests, 3_000
+                ),
+                "max_elapsed_seconds": min(limits.max_elapsed_seconds, 900),
+            }
+        )
     return mode, budget, limits
 
 
@@ -1226,22 +1302,95 @@ def _clean_discovery_ptm_types(value: Any, *, default: list[str] | None = None) 
 
 
 def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
-    acquisition_supplied = any(
-        key in body and bool(_clean_text(body.get(key)))
-        for key in ("acquisition_mode", "acquisition")
+    prompt_text = _clean_text(body.get("prompt") or body.get("visible_prompt") or body.get("goal") or "")
+    incoming_provenance = body.get("constraint_provenance")
+    incoming_provenance = (
+        {str(key): str(value) for key, value in incoming_provenance.items()}
+        if isinstance(incoming_provenance, dict)
+        else {}
     )
-    labeling_supplied = any(
-        key in body and bool(_clean_text(body.get(key)))
-        for key in ("labeling_strategy", "labeling")
-    )
-    acquisition = _clean_text(
-        body.get("acquisition_mode") or body.get("acquisition") or "unknown"
-    ).lower()
+    explicit_hard = body.get("hard_constraint_fields")
+    explicit_hard_contract = isinstance(explicit_hard, list)
+    explicit_hard_fields = {
+        str(item).strip()
+        for item in (explicit_hard if isinstance(explicit_hard, list) else [])
+        if str(item).strip()
+    }
+
+    def _user_hard(field: str, *, supplied: bool) -> bool:
+        # Only user-explicit or caller-whitelisted fields become hard constraints.
+        # Parser/LLM defaults ("inferred"/"default"/"user_or_parsed") stay soft.
+        if explicit_hard_contract:
+            return supplied and field in explicit_hard_fields
+        provenance = str(incoming_provenance.get(field) or "").strip().lower()
+        if provenance in {"inferred", "default", "parser", "llm", "user_or_parsed"}:
+            return False
+        if provenance == "user" and supplied:
+            return True
+        return supplied and not provenance
+
+    acquisition_raw = body.get("acquisition_mode") if "acquisition_mode" in body else body.get("acquisition")
+    labeling_raw = body.get("labeling_strategy") if "labeling_strategy" in body else body.get("labeling")
+    acquisition_supplied = bool(_clean_text(acquisition_raw))
+    labeling_supplied = bool(_clean_text(labeling_raw))
+    acquisition = _clean_text(acquisition_raw or "unknown").lower() or "unknown"
+    if acquisition in {"", "any", "auto"}:
+        acquisition = "unknown"
     repository = _clean_repository(body.get("repository") or "pride")
+    mixed_acquisition_policy = _clean_text(
+        body.get("mixed_acquisition_policy") or "review_mixed"
+    ).lower()
+    if mixed_acquisition_policy not in {"reject_mixed", "review_mixed", "allow"}:
+        mixed_acquisition_policy = "review_mixed"
+    run_horizon = _clean_text(body.get("run_horizon") or "candidates_only").lower()
+    if run_horizon not in {
+        "plan_only",
+        "candidates_only",
+        "candidates_reviewed",
+        "ai_ready_table",
+        "pre_release",
+        "full_release",
+    }:
+        run_horizon = "candidates_only"
+    quota_flexibility = _clean_text(
+        body.get("quota_flexibility") or "recommended"
+    ).lower()
+    if quota_flexibility not in {"fixed", "recommended", "open_ended"}:
+        quota_flexibility = "recommended"
+    time_budget_preference = _clean_text(
+        body.get("time_budget_preference") or body.get("time_budget") or "multi_round"
+    ).lower()
+    if time_budget_preference not in {"fast", "multi_round"}:
+        time_budget_preference = "multi_round"
+    on_safety_ceiling = _clean_text(body.get("on_safety_ceiling") or "ask").lower()
+    if on_safety_ceiling not in {"ask", "auto_continue_within_safety", "stop"}:
+        on_safety_ceiling = "ask"
+
     goal_supplied = "goal" in body and bool(_clean_text(body.get("goal")))
-    goal = _clean_text(body.get("goal") or "general").lower()
-    if goal not in {"general", "ptm"} and is_immunopeptidomics_goal(goal):
-        goal = "immunopeptidomics"
+    raw_goal = _clean_text(body.get("goal") or "general")
+    goal = raw_goal.lower()
+    broad_proteomics = bool(
+        re.search(
+            r"(proteomics|proteome|peptidomics|shotgun|bottom[\s-]?up|蛋白质组|肽组|蛋白肽|质谱蛋白)",
+            f"{raw_goal} {prompt_text}",
+            re.IGNORECASE,
+        )
+    )
+    # Prevent "human protein/peptide data" from being collapsed into immunopeptidomics
+    # unless the user explicitly asked for HLA/MHC/immunopeptidomics.
+    if is_immunopeptidomics_goal(goal) or is_immunopeptidomics_goal(prompt_text):
+        if broad_proteomics and not re.search(
+            r"(immunopeptidom|hla\b|mhc\b|ligandome|免疫肽)",
+            f"{raw_goal} {prompt_text}",
+            re.IGNORECASE,
+        ):
+            goal = "general"
+        else:
+            goal = "immunopeptidomics"
+    elif goal not in {"general", "ptm", "immunopeptidomics"}:
+        # Free-form scientific goals stay open; keep distinctive terms as query seeds.
+        goal = "general"
+
     if goal == "general":
         ptm_type = "unknown_ptm"
         ptm_types: list[str] = []
@@ -1249,43 +1398,226 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
         default_ptm = "unknown_ptm" if is_immunopeptidomics_goal(goal) else "phospho"
         ptm_types = _clean_discovery_ptm_types(body.get("ptm_types"), default=[])
         if not ptm_types:
-            ptm_types = _clean_discovery_ptm_types(body.get("ptm_type") or body.get("ptm"), default=[default_ptm])
-        ptm_type = ptm_types[0] if ptm_types else default_ptm
+            ptm_types = _clean_discovery_ptm_types(
+                body.get("ptm_type") or body.get("ptm"),
+                default=[default_ptm] if _user_hard("ptm_type", supplied=True) else [],
+            )
+        ptm_type = ptm_types[0] if ptm_types else "unknown_ptm"
+
     raw_query_terms = body.get("query_terms")
     if isinstance(raw_query_terms, list):
         query_terms = [_clean_text(item) for item in raw_query_terms if _clean_text(item)]
     else:
         query_terms = []
     if goal == "general":
-        query_terms = [*query_terms, *general_query_terms_from_text(_clean_text(body.get("prompt")))]
+        query_terms = [*query_terms, *general_query_terms_from_text(prompt_text or raw_goal)]
     raw_species = body.get("species")
     species = _clean_discovery_species(raw_species, default=[])
     species_supplied = "species" in body and bool(species)
+    # Free-text human preference becomes a soft species seed (not hard unless provenance=user).
+    if not species and (
+        re.search(r"\b(human|homo sapiens)\b", prompt_text, re.IGNORECASE)
+        or re.search(r"(人类|人源|智人)", prompt_text)
+    ):
+        species = ["human"]
+        species_supplied = True
+        incoming_provenance.setdefault("species", "inferred")
     species_policy = _clean_text(body.get("species_policy") or "open").lower()
     if species_policy not in {"open", "include_only", "exclude"}:
         species_policy = "open"
+    # Broad human proteomics / "越多越好" should hard-filter non-human projects.
+    if species and {"human", "homo sapiens"} & {str(item).casefold() for item in species}:
+        if re.search(
+            r"(人类|人源|human|homo sapiens).{0,24}(蛋白|肽|proteom|peptid)|越多越好|尽可能多|as many as possible",
+            prompt_text,
+            re.IGNORECASE,
+        ):
+            species_policy = "include_only"
+            incoming_provenance["species"] = str(incoming_provenance.get("species") or "user")
+            incoming_provenance["species_policy"] = "user"
+    if species and species_policy == "open" and str(incoming_provenance.get("species") or "") == "user":
+        species_policy = "include_only"
     canonical_species, taxon_ids = normalize_species_values(species)
-    immunopeptide = interpret_immunopeptide_metadata(" ".join([goal, _clean_text(body.get("prompt")), _clean_text(body.get("immunopeptide_context"))]))
+    immunopeptide = interpret_immunopeptide_metadata(
+        " ".join([goal, prompt_text, _clean_text(body.get("immunopeptide_context"))])
+    )
+
     hard_constraint_fields = ["repository"]
     constraint_provenance = {
-        "repository": "user" if "repository" in body else "default"
+        "repository": "user" if "repository" in body else "default",
     }
-    if goal_supplied:
+    if goal_supplied and _user_hard("goal", supplied=True) and goal in {"ptm", "immunopeptidomics"}:
         hard_constraint_fields.append("goal")
-        constraint_provenance["goal"] = "user_or_parsed"
-    if species_supplied:
+        constraint_provenance["goal"] = "user"
+    elif goal_supplied:
+        constraint_provenance["goal"] = str(incoming_provenance.get("goal") or "inferred")
+    if species_supplied and _user_hard("species", supplied=True):
         hard_constraint_fields.extend(["species", "species_policy"])
-        constraint_provenance["species"] = "user_or_parsed"
-        constraint_provenance["species_policy"] = "user_or_parsed"
-    if acquisition_supplied:
+        constraint_provenance["species"] = "user"
+        constraint_provenance["species_policy"] = "user"
+    elif species_supplied:
+        constraint_provenance["species"] = str(incoming_provenance.get("species") or "inferred")
+    if acquisition_supplied and _user_hard("acquisition_mode", supplied=True) and acquisition != "unknown":
         hard_constraint_fields.append("acquisition_mode")
-        constraint_provenance["acquisition_mode"] = "user_or_parsed"
-    if labeling_supplied:
+        constraint_provenance["acquisition_mode"] = "user"
+    elif acquisition_supplied:
+        constraint_provenance["acquisition_mode"] = str(
+            incoming_provenance.get("acquisition_mode") or "inferred"
+        )
+    labeling_strategy = normalize_labeling_strategy(labeling_raw or "unknown")
+    if labeling_supplied and _user_hard("labeling_strategy", supplied=True) and labeling_strategy != "unknown":
         hard_constraint_fields.append("labeling_strategy")
-        constraint_provenance["labeling_strategy"] = "user_or_parsed"
-    if goal != "general" and any(key in body for key in ("ptm", "ptm_type", "ptm_types")):
+        constraint_provenance["labeling_strategy"] = "user"
+    elif labeling_supplied:
+        constraint_provenance["labeling_strategy"] = str(
+            incoming_provenance.get("labeling_strategy") or "inferred"
+        )
+    ptm_supplied = any(key in body for key in ("ptm", "ptm_type", "ptm_types"))
+    if goal != "general" and ptm_supplied and _user_hard("ptm_type", supplied=True):
         hard_constraint_fields.extend(["ptm_type", "ptm_types"])
-        constraint_provenance["ptm_type"] = "user_or_parsed"
+        constraint_provenance["ptm_type"] = "user"
+    elif ptm_supplied:
+        constraint_provenance["ptm_type"] = str(incoming_provenance.get("ptm_type") or "inferred")
+
+    # Portfolio quantity language ("越多越好") is a soft success preference, never a hard cap.
+    quantity_scope = _clean_text(body.get("quantity_scope") or "unspecified").lower()
+    portfolio_size_preference = _clean_text(body.get("portfolio_size_preference") or "") or None
+    if quantity_scope not in {"unspecified", "portfolio", "per_project"}:
+        quantity_scope = "unspecified"
+    if quota_flexibility == "open_ended":
+        quantity_scope = "portfolio"
+        portfolio_size_preference = (
+            portfolio_size_preference or "maximize_qualified_projects"
+        )
+    if quantity_scope == "unspecified" and re.search(
+        r"(越多越好|尽可能多|as many as possible|maximize.*(project|dataset|sample)|越多越)",
+        prompt_text,
+        re.IGNORECASE,
+    ):
+        quantity_scope = "portfolio"
+        portfolio_size_preference = portfolio_size_preference or "maximize_qualified_projects"
+
+    instrument_preference = _clean_text(body.get("instrument_preference") or "none").lower()
+    if instrument_preference not in {
+        "none",
+        "newer",
+        "classic",
+        "newer_with_legacy_floor",
+    }:
+        instrument_preference = "none"
+    legacy_floor_ratio_raw = body.get("legacy_floor_ratio")
+    try:
+        legacy_floor_ratio = (
+            max(0.0, min(1.0, float(legacy_floor_ratio_raw)))
+            if legacy_floor_ratio_raw is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        legacy_floor_ratio = None
+
+    def _bounded_text_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return list(
+            dict.fromkeys(
+                _clean_text(item)[:240]
+                for item in value[:100]
+                if _clean_text(item)
+            )
+        )
+
+    exclude_rules = _bounded_text_list(body.get("exclude_rules"))
+    success_criteria = _bounded_text_list(body.get("success_criteria"))
+    scientific_constraints = normalize_scientific_constraints(body.get("scientific_constraints"))
+    existing_constraint_ids = {item.id.casefold() for item in scientific_constraints}
+    if instrument_preference != "none" and "builtin.instrument-era" not in existing_constraint_ids:
+        scientific_constraints.append(
+            ScientificConstraint(
+                id="builtin.instrument-era",
+                label="仪器代际偏好",
+                dimension="instrument_generation",
+                operator=("prefer_newer" if instrument_preference != "classic" else "prefer_classic"),
+                value={
+                    "preference": instrument_preference,
+                    "legacy_floor_ratio": legacy_floor_ratio,
+                },
+                strength="soft",
+                scope="project",
+                evidence_required=True,
+                rationale="Use observed instrument models, not publication date, for ranking.",
+                source="user" if "instrument_preference" in body else "inferred",
+            )
+        )
+
+    def _exclusion_identity(value: Any) -> str:
+        normalized = _clean_text(value).casefold()
+        normalized = re.sub(
+            r"^(?:排除|不要|不含|剔除|exclude(?:d)?|without|omit|remove|no)\s*[:：-]?\s*",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        return re.sub(r"[^\w\u4e00-\u9fff]+", "", normalized)
+
+    for index, rule in enumerate(exclude_rules, start=1):
+        constraint_id = f"exclude.{index}"
+        if constraint_id.casefold() in existing_constraint_ids:
+            continue
+        normalized_rule = _exclusion_identity(rule)
+        if any(
+            normalized_rule
+            and normalized_rule
+            in {
+                _exclusion_identity(constraint.label),
+                _exclusion_identity(constraint.value)
+                if isinstance(constraint.value, str)
+                else "",
+            }
+            for constraint in scientific_constraints
+        ):
+            # The semantic verifier may preserve the same user exclusion in
+            # both the first-class exclusion list and a structured constraint.
+            # One evidence-backed assessment is sufficient; do not create a
+            # second synthetic constraint for the same requirement.
+            continue
+        scientific_constraints.append(
+            ScientificConstraint(
+                id=constraint_id,
+                label=rule,
+                dimension="user_exclusion",
+                operator="exclude_if_matches",
+                value=rule,
+                strength="hard",
+                scope="project",
+                evidence_required=True,
+                rationale="User-specified exclusion rule.",
+                source="user",
+            )
+        )
+    for index, criterion in enumerate(success_criteria, start=1):
+        constraint_id = f"success.{index}"
+        if constraint_id.casefold() in existing_constraint_ids:
+            continue
+        scientific_constraints.append(
+            ScientificConstraint(
+                id=constraint_id,
+                label=criterion,
+                dimension="success_criterion",
+                operator="satisfies",
+                value=criterion,
+                strength="soft",
+                scope="portfolio",
+                evidence_required=True,
+                rationale="User-defined success criterion.",
+                source="user",
+            )
+        )
+    if scientific_constraints:
+        for constraint in scientific_constraints:
+            constraint_provenance[f"constraint:{constraint.id}"] = constraint.source
+            if constraint.strength == "hard":
+                hard_constraint_fields.append(f"constraint:{constraint.id}")
+
     return DatasetRequest(
         repository=repository,
         goal=goal,
@@ -1293,24 +1625,48 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
         ptm_types=ptm_types,
         query_terms=list(dict.fromkeys(query_terms)),
         species=species,
-        species_policy=species_policy,
+        species_policy=species_policy,  # type: ignore[arg-type]
         canonical_species=canonical_species,
         organism_taxon_id=taxon_ids,
-        modification_scope=None if goal == "general" else ";".join(ptm_types or [ptm_type]),
-        immunopeptide_scope=immunopeptide.scope if is_immunopeptidomics_goal(goal) else None,
-        hla_class=list(immunopeptide.hla_classes),
-        hla_alleles=list(immunopeptide.hla_alleles),
-        immunopeptide_evidence_terms=list(immunopeptide.evidence_terms),
-        immunopeptide_enrichment_methods=list(immunopeptide.enrichment_methods),
-        immunopeptide_metadata_confidence=immunopeptide.confidence,
-        labeling_strategy=normalize_labeling_strategy(
-            body.get("labeling_strategy") or body.get("labeling") or "unknown"
+        modification_scope=(
+            ";".join(ptm_types)
+            if goal == "ptm" and ptm_types
+            else None
         ),
+        immunopeptide_scope=immunopeptide.scope if goal == "immunopeptidomics" else None,
+        hla_class=list(immunopeptide.hla_classes) if goal == "immunopeptidomics" else [],
+        hla_alleles=list(immunopeptide.hla_alleles) if goal == "immunopeptidomics" else [],
+        immunopeptide_evidence_terms=list(immunopeptide.evidence_terms) if goal == "immunopeptidomics" else [],
+        immunopeptide_enrichment_methods=(
+            list(immunopeptide.enrichment_methods) if goal == "immunopeptidomics" else []
+        ),
+        immunopeptide_metadata_confidence=(
+            immunopeptide.confidence if goal == "immunopeptidomics" else 0.0
+        ),
+        labeling_strategy=labeling_strategy,
+        labeling_hard="labeling_strategy" in hard_constraint_fields,
         acquisition_mode=acquisition,
-        max_projects=_bounded_int(body.get("max_projects"), default=5, minimum=1, maximum=300),
-        max_files=_bounded_int(body.get("max_files"), default=50, minimum=1, maximum=10000),
-        max_candidate_projects=_bounded_int(body.get("max_candidate_projects"), default=50, minimum=1, maximum=1000),
-        max_files_per_project=_bounded_int(body.get("max_files_per_project"), default=20, minimum=1, maximum=200),
+        mixed_acquisition_policy=mixed_acquisition_policy,  # type: ignore[arg-type]
+        instrument_preference=instrument_preference,  # type: ignore[arg-type]
+        legacy_floor_ratio=legacy_floor_ratio,
+        exclude_rules=exclude_rules,
+        success_criteria=success_criteria,
+        scientific_constraints=scientific_constraints,
+        max_projects=_bounded_int(body.get("max_projects"), default=2000, minimum=1, maximum=5000),
+        max_files=_bounded_int(body.get("max_files"), default=100000, minimum=1, maximum=200000),
+        max_candidate_projects=_bounded_int(
+            body.get("max_candidate_projects"), default=5000, minimum=1, maximum=20000
+        ),
+        max_files_per_project=_bounded_int(
+            body.get("max_files_per_project"), default=500, minimum=1, maximum=5000
+        ),
+        quantity_scope=quantity_scope,  # type: ignore[arg-type]
+        portfolio_size_preference=portfolio_size_preference,
+        quota_flexibility=quota_flexibility,  # type: ignore[arg-type]
+        run_horizon=run_horizon,  # type: ignore[arg-type]
+        time_budget_preference=time_budget_preference,  # type: ignore[arg-type]
+        on_safety_ceiling=on_safety_ceiling,  # type: ignore[arg-type]
+        harvest_all_qualified=quantity_scope == "portfolio" and bool(portfolio_size_preference),
         hard_constraint_fields=list(dict.fromkeys(hard_constraint_fields)),
         constraint_provenance=constraint_provenance,
     )
@@ -1458,22 +1814,24 @@ _DISCOVERY_REPOSITORIES = {"pride", "massive", "iprox", "auto"}
 _DISCOVERY_GOALS = {"general", "ptm", "immunopeptidomics"}
 _POOL_BUILD_SCALE_PRESETS: dict[str, dict[str, int]] = {
     "curated": {
-        "max_projects": 20,
-        "max_candidate_projects": 100,
-        "max_files": 500,
-        "max_files_per_project": 25,
+        "max_projects": 50,
+        "max_candidate_projects": 250,
+        "max_files": 2000,
+        "max_files_per_project": 150,
     },
     "balanced": {
-        "max_projects": 75,
-        "max_candidate_projects": 300,
-        "max_files": 2000,
-        "max_files_per_project": 50,
+        "max_projects": 200,
+        "max_candidate_projects": 800,
+        "max_files": 10000,
+        "max_files_per_project": 250,
     },
     "exhaustive": {
-        "max_projects": 200,
-        "max_candidate_projects": 600,
-        "max_files": 5000,
-        "max_files_per_project": 100,
+        # Soft ambition only. Portfolio maximize keeps every qualified project
+        # within server safety ceilings; these are not "stop at 300" hard caps.
+        "max_projects": 2000,
+        "max_candidate_projects": 5000,
+        "max_files": 100000,
+        "max_files_per_project": 500,
     },
 }
 
@@ -1613,12 +1971,28 @@ def _normalise_discovery_goal_parse(raw: dict[str, Any], current: dict[str, Any]
         repository = "pride"
 
     goal = raw_goal
+    prompt_text = _clean_text(current.get("prompt"))
     if goal not in _DISCOVERY_GOALS:
-        if is_immunopeptidomics_goal(goal):
+        if is_immunopeptidomics_goal(goal) and not re.search(
+            r"(proteomics|proteome|peptidomics|蛋白质组|肽组|蛋白肽|shotgun|bottom[\s-]?up)",
+            f"{raw_goal} {prompt_text}",
+            re.IGNORECASE,
+        ):
             goal = "immunopeptidomics"
         else:
             warnings.append(f"Unsupported discovery target '{goal}' was ignored; using general.")
             goal = "general"
+    if goal == "immunopeptidomics" and re.search(
+        r"(proteomics|proteome|peptidomics|蛋白质组|肽组|蛋白肽|shotgun|bottom[\s-]?up)",
+        f"{raw_goal} {prompt_text}",
+        re.IGNORECASE,
+    ) and not re.search(
+        r"(immunopeptidom|hla\b|mhc\b|ligandome|免疫肽)",
+        f"{raw_goal} {prompt_text}",
+        re.IGNORECASE,
+    ):
+        warnings.append("Broad proteomics/peptidomics request kept as general rather than immunopeptidomics.")
+        goal = "general"
     if goal == "general":
         ptm_type = "unknown_ptm"
         ptm_types: list[str] = []
@@ -1629,19 +2003,31 @@ def _normalise_discovery_goal_parse(raw: dict[str, Any], current: dict[str, Any]
             ptm_types = _clean_discovery_ptm_types(payload.get("ptm_type") or current.get("ptm_types") or current.get("ptm_type"), default=[default_ptm])
         ptm_type = ptm_types[0] if ptm_types else default_ptm
     labeling_strategy = normalize_labeling_strategy(
-        payload.get("labeling_strategy") or current.get("labeling_strategy") or "label_free"
+        payload.get("labeling_strategy") or current.get("labeling_strategy") or "unknown"
     )
 
-    acquisition = _clean_text(payload.get("acquisition_mode") or current.get("acquisition_mode") or "dda").lower()
-    if acquisition != "dda":
-        warnings.append(f"Acquisition '{acquisition}' is not supported in this DDA-first workflow; using dda.")
-        acquisition = "dda"
+    acquisition = _clean_text(payload.get("acquisition_mode") or current.get("acquisition_mode") or "unknown").lower()
+    if acquisition in {"", "any", "auto"}:
+        acquisition = "unknown"
+    if acquisition not in {"dda", "dia", "unknown"}:
+        warnings.append(f"Acquisition '{acquisition}' is not a supported open mode; using unknown.")
+        acquisition = "unknown"
+    if not species_values and re.search(r"(human|homo sapiens|人类|人源|智人)", prompt_text, re.IGNORECASE):
+        species_values = ["human"]
+    if species_values and species_policy == "open" and re.search(
+        r"(only human|human only|strict human|只要人|仅人类|人类数据|人源数据|人类蛋白质组|人类肽组|人类蛋白肽)",
+        prompt_text,
+        re.IGNORECASE,
+    ):
+        species_policy = "include_only"
     canonical_species, taxon_ids = normalize_species_values(species_values)
     raw_query_terms = payload.get("query_terms") or current.get("query_terms") or []
     query_terms = _english_discovery_query_terms(raw_query_terms)
+    if goal == "general" and not query_terms:
+        query_terms = _english_discovery_query_terms(general_query_terms_from_text(prompt_text or raw_goal))
     scale_mode = _normalise_pool_build_scale(
         payload.get("scale_mode") or current.get("scale_mode"),
-        prompt=_clean_text(current.get("prompt")),
+        prompt=prompt_text,
         allow_auto=True,
     )
     output_language = _normalise_pool_build_language(
@@ -1663,10 +2049,10 @@ def _normalise_discovery_goal_parse(raw: dict[str, Any], current: dict[str, Any]
             "labeling_strategy": labeling_strategy,
             "acquisition_mode": acquisition,
             "task_type": task_type,
-            "max_projects": _bounded_int(payload.get("max_projects"), default=_bounded_int(current.get("max_projects"), default=5, minimum=1, maximum=300), minimum=1, maximum=300),
-            "max_files": _bounded_int(payload.get("max_files"), default=_bounded_int(current.get("max_files"), default=50, minimum=1, maximum=10000), minimum=1, maximum=10000),
-            "max_candidate_projects": _bounded_int(payload.get("max_candidate_projects"), default=_bounded_int(current.get("max_candidate_projects"), default=50, minimum=1, maximum=1000), minimum=1, maximum=1000),
-            "max_files_per_project": _bounded_int(payload.get("max_files_per_project"), default=_bounded_int(current.get("max_files_per_project"), default=20, minimum=1, maximum=200), minimum=1, maximum=200),
+            "max_projects": _bounded_int(payload.get("max_projects"), default=_bounded_int(current.get("max_projects"), default=50, minimum=1, maximum=300), minimum=1, maximum=300),
+            "max_files": _bounded_int(payload.get("max_files"), default=_bounded_int(current.get("max_files"), default=2000, minimum=1, maximum=10000), minimum=1, maximum=10000),
+            "max_candidate_projects": _bounded_int(payload.get("max_candidate_projects"), default=_bounded_int(current.get("max_candidate_projects"), default=300, minimum=1, maximum=1000), minimum=1, maximum=1000),
+            "max_files_per_project": _bounded_int(payload.get("max_files_per_project"), default=_bounded_int(current.get("max_files_per_project"), default=100, minimum=1, maximum=200), minimum=1, maximum=200),
             "agentic_rounds": _bounded_int(payload.get("agentic_rounds"), default=_bounded_int(current.get("agentic_rounds"), default=1, minimum=1, maximum=2), minimum=1, maximum=2),
             "diversity_strategy": diversity_strategy,
             "agentic": current.get("agentic") is True,
@@ -1688,19 +2074,20 @@ def _discovery_goal_parse_system_prompt() -> str:
         "Use goal=ptm only when the user explicitly asks for PTM-enriched data. Use goal=immunopeptidomics only when the user explicitly wants HLA/MHC ligandome/immunopeptidomics as the discovery target. "
         "For general HLA, drug-treatment, disease, perturbation, cell-line, or future task searches, keep goal=general and put useful search phrases in query_terms. "
         "For HLA/MHC ligandome, eluted ligand, neoantigen, or immunopeptidome goals set ptm_type=unknown_ptm and ptm_types=[] unless a modification is explicitly requested. "
-        "Supported ptm_type values: phospho, acetyl, ubiquitin, glyco, methyl, unknown_ptm; when goal=ptm, return ptm_types as a list and allow multiple values. acquisition_mode=dda. "
-        "Supported labeling_strategy values: label_free, TMT, iTRAQ, unknown. "
-        "Species policy defaults to open; use include_only only when the user explicitly says only/strict species, and exclude only when the user explicitly excludes species. "
+        "Supported ptm_type values: phospho, acetyl, ubiquitin, glyco, methyl, unknown_ptm; when goal=ptm, return ptm_types as a list and allow multiple values. acquisition_mode=unknown unless the user explicitly requires DDA or DIA. "
+        "Supported labeling_strategy values: label_free, TMT, iTRAQ, unknown. Prefer unknown unless the user explicitly requires a labeling strategy. "
+        "Species policy defaults to open; use include_only when the user asks for human-only or only listed species, and exclude only when the user explicitly excludes species. "
+        "For requests about human proteomics/peptidomics/protein-peptide data (including Chinese '人类蛋白质组/肽组/蛋白肽'), set goal=general, species=['human'], species_policy=include_only, and do NOT set goal=immunopeptidomics unless HLA/MHC/immunopeptidomics is explicit. "
         "PTM interpretation should normalize semantic terms and enrichment methods such as pSer/pThr/pTyr, kinase signaling, phosphosite localization, Ti/Fe/Ga/Ti4+-IMAC, MOAC, PolyMAC, Titansphere, GlyGly/K-GG, Kac, HILIC, lectin enrichment, Kme/Rme. "
         "Immunopeptidomics interpretation should normalize HLA/MHC ligandome, immunopeptidome, HLA/MHC eluted ligands, neoantigen, antigen presentation, HLA-IP/MHC-IP, W6/32, pan-HLA, HLA class I/II, MHC class I/II, and HLA alleles such as HLA-A*02:01. "
         "Supported task_type values: rt_prediction, fragment_intensity_prediction, psm_scoring, "
         "denovo, ptm_denovo, chimeric_interpretation, or empty string. "
         "Supported diversity_strategy values: balanced, high, off. "
-        "Supported scale_mode values: curated, balanced, exhaustive. Infer exhaustive when the user asks for as many relevant projects as possible. "
-        "All query_terms must be concise English phrases suitable for repository search even when the request is written in another language. "
+        "Supported scale_mode values: curated, balanced, exhaustive. Infer exhaustive when the user asks for as many relevant projects as possible / 越多越好 / 尽可能多. "
+        "All query_terms must be concise English phrases suitable for repository search even when the request is written in another language. For broad human proteomics, include terms such as human proteomics, shotgun proteomics, label free quantitation, TMT, DIA, phosphoproteomics, affinity purification mass spectrometry, plasma proteomics. "
         "Warnings and reasoning must use the requested output language. "
         "Do not enable agentic discovery; agentic execution is controlled only by explicit advanced settings. "
-        "If the user asks for DIA/PRM/SRM/MRM, keep dda and add a warning."
+        "If the user asks for DIA/PRM/SRM/MRM, keep acquisition_mode open/unknown unless they force DDA, and add a warning only when a hard DDA constraint was requested."
     )
 
 
@@ -1757,6 +2144,5255 @@ def _run_discovery_goal_parse(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_DISCOVERY_AGENT_GUIDANCE_PATH = (
+    Path(__file__).resolve().parents[3] / "docs" / "discovery-agent-guidance.md"
+)
+_DISCOVERY_AGENT_GUIDANCE_FALLBACK = """Scientific discovery guidance:
+- Choose the highest-value next decision from the current science context; do not follow a fixed questionnaire.
+- Treat gap reports and legacy pending questions as guidance, not a command.
+- For exploratory immunopeptide/HLA-ligandome discovery, do not default to PTM de novo. Recommend a human-prioritized, browse-only, curated set around 20 projects first.
+- De novo sequencing, PSM scoring, and RT prediction are optional later tasks after the exploratory corpus is understood.
+"""
+_DISCOVERY_TURN_ACTIONS = {
+    "chat",
+    "advise",
+    "clarify",
+    "update_strategy",
+    "ready_to_confirm",
+    "confirm_strategy",
+    "refuse_search",
+}
+_DISCOVERY_STRATEGY_FIRST_CLASS_FIELDS = {
+    "objective",
+    "task_type",
+    "run_horizon",
+    "species",
+    "species_policy",
+    "species_coverage",
+    "acquisition_mode",
+    "mixed_acquisition_policy",
+    "ptm_types",
+    "special_themes",
+    "labeling_strategy",
+    "labeling_hard",
+    "coverage_mode",
+    "target_project_count",
+    "max_candidate_projects",
+    "quota_flexibility",
+    "time_budget",
+    "on_safety_ceiling",
+    "instrument_preference",
+    "legacy_floor_ratio",
+    "exclude_rules",
+    "success_criteria",
+    "scientific_constraints",
+    "notes",
+    "open_risks",
+    "repository",
+}
+_DISCOVERY_STRATEGY_PATCH_FIELDS = set(_DISCOVERY_STRATEGY_FIRST_CLASS_FIELDS)
+# ``notes`` is explicitly context-only; actionable requirements must live in a
+# first-class field or scientific_constraints.  A repair verifier may remove a
+# duplicated model-authored note without invalidating the atomic strategy
+# update, while every execution-affecting field remains required.
+_DISCOVERY_NON_ATOMIC_CONTEXT_FIELDS = {"notes"}
+_DISCOVERY_STRATEGY_RESERVED_RUNTIME_FIELDS = {
+    "query_terms",
+    "diversity_strategy",
+    "constraints_enabled",
+    "hard_constraint_fields",
+    "constraint_provenance",
+    "agentic_rounds",
+    "max_files",
+    "max_files_per_project",
+    "original_prompt",
+    "runtime",
+    "llm_config",
+    "grill_confirmed",
+    "strategy_fingerprint",
+    "strategy_fingerprint_payload",
+}
+_DISCOVERY_STRATEGY_PATCH_ALIASES = {
+    "goal": "objective",
+    "goal_summary": "objective",
+    "goalSummary": "objective",
+    "taskType": "task_type",
+    "runHorizon": "run_horizon",
+    "speciesPolicy": "species_policy",
+    "speciesCoverage": "species_coverage",
+    "acquisitionMode": "acquisition_mode",
+    "mixedAcquisitionPolicy": "mixed_acquisition_policy",
+    "ptmTypes": "ptm_types",
+    "specialThemes": "special_themes",
+    "labelingStrategy": "labeling_strategy",
+    "labelingHard": "labeling_hard",
+    "coverageMode": "coverage_mode",
+    "scale_mode": "coverage_mode",
+    "scaleMode": "coverage_mode",
+    "targetProjectCount": "target_project_count",
+    "max_projects": "target_project_count",
+    "maxProjects": "target_project_count",
+    "maxCandidateProjects": "max_candidate_projects",
+    "quotaFlexibility": "quota_flexibility",
+    "timeBudget": "time_budget",
+    "time_budget_preference": "time_budget",
+    "timeBudgetPreference": "time_budget",
+    "onSafetyCeiling": "on_safety_ceiling",
+    "instrumentPreference": "instrument_preference",
+    "legacyFloorRatio": "legacy_floor_ratio",
+    "excludeRules": "exclude_rules",
+    "successCriteria": "success_criteria",
+    "scientificConstraints": "scientific_constraints",
+    "openRisks": "open_risks",
+}
+_DISCOVERY_STRATEGY_PATCH_CONTRACT = {
+    "$clear": (
+        "Every first-class strategy field accepts null to reset to the empty-strategy default; "
+        "array fields also accept [] to clear. Query/runtime extension fields use omission, not null."
+    ),
+    "$limits": {
+        "objective_chars": 120,
+        "notes_chars": 4000,
+        "array_items": 100,
+        "array_item_chars": 240,
+        "target_project_count": 300,
+        "max_candidate_projects": 1000,
+    },
+    "objective": "string",
+    "task_type": [
+        "rt_prediction",
+        "fragment_intensity_prediction",
+        "psm_scoring",
+        "denovo",
+        "ptm_denovo",
+        "chimeric_interpretation",
+        "browse_only",
+        "other",
+    ],
+    "run_horizon": [
+        "plan_only",
+        "candidates_only",
+        "candidates_reviewed",
+        "ai_ready_table",
+        "pre_release",
+        "full_release",
+    ],
+    "species": "array[string], [] clears",
+    "species_policy": ["open", "include_only", "prefer", "exclude"],
+    "species_coverage": ["none", "prefer_listed", "broaden"],
+    "acquisition_mode": ["dda", "dia", "unknown"],
+    "mixed_acquisition_policy": ["reject_mixed", "review_mixed", "allow"],
+    "ptm_types": "array[string], [] clears",
+    "special_themes": "array[string], [] clears",
+    "labeling_strategy": [
+        "label_free",
+        "tmt",
+        "itraq",
+        "silac",
+        "dimethyl",
+        "unknown",
+        "any",
+    ],
+    "labeling_hard": "boolean or null",
+    "coverage_mode (scale_mode accepted as input alias)": ["curated", "balanced", "exhaustive"],
+    "target_project_count (max_projects accepted as input alias)": "positive integer or null",
+    "max_candidate_projects": "positive integer or null",
+    "quota_flexibility": ["fixed", "recommended", "open_ended"],
+    "time_budget": ["fast", "multi_round"],
+    "on_safety_ceiling": ["ask", "auto_continue_within_safety", "stop"],
+    "instrument_preference": ["none", "newer", "classic", "newer_with_legacy_floor"],
+    "legacy_floor_ratio": "number from 0 to 1 or null",
+    "exclude_rules/success_criteria/open_risks": "array[string], [] clears",
+    "scientific_constraints": (
+        "array[{id,label,dimension,operator,value,strength,scope,evidence_required,"
+        "rationale,source}], [] clears"
+    ),
+    "notes": "non-empty string or null",
+    "repository": ["pride", "massive", "iprox", "auto"],
+}
+_DISCOVERY_STRATEGY_FIELD_SEMANTICS = {
+    "objective": "The user's scientific/data-discovery objective; do not use it as a dump for other fields.",
+    "task_type": (
+        "The downstream analytical use of the data. browse_only is a deliberate user choice, "
+        "not a default. Finding or reviewing candidates describes run_horizon and never by itself "
+        "authorizes browse_only."
+    ),
+    "run_horizon": "交付终点/where this run stops. candidates_reviewed means find candidates and then review them.",
+    "species": "Organism names or taxa chosen by the user.",
+    "species_policy": "Whether species are open, mandatory inclusions, preferences, or exclusions.",
+    "species_coverage": "Whether to keep species neutral, prefer listed organisms, or broaden coverage.",
+    "acquisition_mode": "Mass-spectrometry acquisition mode; unknown means intentionally unrestricted/open.",
+    "mixed_acquisition_policy": "How mixed-acquisition projects are handled.",
+    "ptm_types": "Post-translational modifications only; immunopeptidomics itself is not a PTM.",
+    "special_themes": "研究主题/biological study themes. Never use this field for 标记方式, labeling chemistry, acquisition, or run horizon.",
+    "labeling_strategy": "标记方式/chemical or isotope labeling strategy; any means intentionally unrestricted/open. A request that labeling is open belongs here, never in special_themes.",
+    "labeling_hard": "Whether the labeling choice is a hard filter.",
+    "coverage_mode": "Curation-versus-breadth preference, distinct from the exact project target.",
+    "target_project_count": "Desired selected-project count, not the candidate-pool size.",
+    "max_candidate_projects": "Maximum candidate pool inspected before selecting final projects.",
+    "quota_flexibility": (
+        "Whether the project target is fixed, recommended, or open-ended. A numeric target alone "
+        "does not mean fixed; fixed requires explicit hard/exact language."
+    ),
+    "time_budget": "Fast single-pass preference versus a multi-round search.",
+    "on_safety_ceiling": "What to do at server safety limits; it cannot remove those limits.",
+    "instrument_preference": "Instrument-era preference, not an observed repository fact.",
+    "legacy_floor_ratio": "Minimum legacy share when a mixed instrument-era preference is used.",
+    "exclude_rules": "Explicit exclusions.",
+    "success_criteria": "User-defined criteria for a successful discovery result.",
+    "scientific_constraints": (
+        "Open-ended structured scientific requirements. Use this whenever a meaningful user "
+        "requirement has no first-class field; do not reduce it to prose-only notes."
+    ),
+    "notes": "Meaningful constraints without a first-class field.",
+    "open_risks": "Evidence checks or unresolved scientific risks retained for later review.",
+    "repository": "Repository scope.",
+}
+_DISCOVERY_STRATEGY_FIELD_LABELS_ZH = {
+    "objective": "目标",
+    "task_type": "下游任务",
+    "run_horizon": "交付终点",
+    "species": "物种",
+    "species_policy": "物种策略",
+    "species_coverage": "物种覆盖",
+    "acquisition_mode": "采集方式",
+    "mixed_acquisition_policy": "混合采集处理",
+    "ptm_types": "PTM",
+    "special_themes": "研究主题",
+    "labeling_strategy": "标记方式",
+    "labeling_hard": "标记硬限制",
+    "coverage_mode": "覆盖模式",
+    "target_project_count": "目标项目数",
+    "max_candidate_projects": "候选池上限",
+    "quota_flexibility": "数量弹性",
+    "time_budget": "时间偏好",
+    "on_safety_ceiling": "触顶策略",
+    "instrument_preference": "仪器偏好",
+    "legacy_floor_ratio": "经典仪器占比下限",
+    "exclude_rules": "排除条件",
+    "success_criteria": "成功标准",
+    "scientific_constraints": "科学约束",
+    "notes": "备注约束",
+    "open_risks": "待核验证据",
+    "repository": "仓库",
+}
+
+_DISCOVERY_EXPLICIT_ENUM_HINTS: dict[str, dict[str, tuple[str, ...]]] = {
+    "task_type": {
+        "browse_only": ("browse", "浏览", "先看看", "只找数据", "任务未定", "摸清"),
+        "rt_prediction": ("rt", "保留时间"),
+        "fragment_intensity_prediction": ("fragment intensity", "碎片强度"),
+        "psm_scoring": ("psm", "打分", "评分"),
+        "denovo": ("de novo", "denovo", "从头测序"),
+        "ptm_denovo": ("ptm de novo", "ptm denovo", "修饰从头测序"),
+        "chimeric_interpretation": ("chimeric", "嵌合谱"),
+        "other": ("other", "其它任务", "其他任务"),
+    },
+    "run_horizon": {
+        "plan_only": ("plan only", "只做计划", "先做计划"),
+        "candidates_only": ("candidates only", "候选即停", "找到候选", "只要候选"),
+        "candidates_reviewed": ("review candidates", "审查候选", "复核候选"),
+        "ai_ready_table": ("ai-ready", "ai ready", "训练表", "数据表"),
+        "pre_release": ("pre-release", "预发布"),
+        "full_release": ("full release", "完整发布"),
+    },
+    "species_policy": {
+        "open": ("open", "开放", "不限物种", "不限制物种"),
+        "include_only": ("only", "只要", "仅限", "必须是"),
+        "prefer": ("prefer", "优先"),
+        "exclude": ("exclude", "排除", "不要"),
+    },
+    "species_coverage": {
+        "none": ("neutral", "不扩物种", "无需扩展"),
+        "prefer_listed": ("prefer listed", "优先列出"),
+        "broaden": ("broaden", "覆盖更多物种", "扩展物种"),
+    },
+    "acquisition_mode": {
+        "dda": ("dda",),
+        "dia": ("dia",),
+        "unknown": ("不限采集", "采集方式开放", "采集方式未知"),
+    },
+    "mixed_acquisition_policy": {
+        "reject_mixed": ("reject mixed", "排除混合", "不要混合"),
+        "review_mixed": ("review mixed", "审查混合", "文件级审查"),
+        "allow": ("allow mixed", "允许混合", "混合也可以"),
+    },
+    "labeling_strategy": {
+        "label_free": ("label-free", "label free", "无标记"),
+        "tmt": ("tmt",),
+        "itraq": ("itraq",),
+        "silac": ("silac",),
+        "dimethyl": ("dimethyl", "二甲基"),
+        "unknown": ("标记未知",),
+        "any": ("标记开放", "不限标记", "任何标记"),
+    },
+    "coverage_mode": {
+        "curated": ("curated", "精选", "少量高质量"),
+        "balanced": ("balanced", "均衡", "平衡"),
+        "exhaustive": ("exhaustive", "尽量搜全", "搜全", "最大覆盖"),
+    },
+    "quota_flexibility": {
+        "fixed": ("fixed", "固定数量", "必须达到"),
+        "recommended": ("recommended", "about", "around", "approximately", "大约", "约", "左右"),
+        "open_ended": ("open ended", "数量不限", "越多越好"),
+    },
+    "time_budget": {
+        "fast": ("fast", "尽快", "快速"),
+        "multi_round": ("multi-round", "multi round", "多轮"),
+    },
+    "on_safety_ceiling": {
+        "ask": ("撞顶询问", "到上限问我"),
+        "auto_continue_within_safety": ("安全范围自动继续",),
+        "stop": ("撞顶停止", "到上限停止"),
+    },
+    "instrument_preference": {
+        "none": ("不限仪器", "无仪器偏好"),
+        "newer": ("newer", "新仪器", "较新仪器"),
+        "classic": ("classic", "经典仪器", "老仪器"),
+        "newer_with_legacy_floor": ("legacy floor", "保留经典仪器", "新旧兼顾"),
+    },
+    "repository": {
+        "pride": ("pride",),
+        "massive": ("massive",),
+        "iprox": ("iprox",),
+        "auto": ("自动选仓库", "多仓库", "all repositories"),
+    },
+}
+
+
+def _filter_discovery_unaccepted_recommendations(
+    patch: Mapping[str, Any],
+    *,
+    user_message: str,
+    selected_decision: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Fail closed when an SDK tool tries to write its own recommended defaults.
+
+    The Agent remains responsible for semantic interpretation. This boundary
+    only requires surface evidence for schema fields that commonly carry
+    defaults; free-form scientific constraints continue through the generic
+    validated patch contract.
+    """
+
+    text = user_message.casefold().replace("_", " ")
+    if re.search(
+        r"按.{0,8}(推荐|建议|默认)|采用.{0,8}(上述|这套|方案)|use .{0,8}(recommended |suggested )?defaults?",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return dict(patch), []
+
+    selected_fields: set[str] = set()
+    if isinstance(selected_decision, Mapping):
+        selected_fields.update(
+            _normalise_discovery_decision_target_fields(
+                selected_decision.get("target_fields"),
+                focus=_clean_text(selected_decision.get("focus")),
+                option_ids=[
+                    _clean_text((selected_decision.get("option") or {}).get("id"))
+                ]
+                if isinstance(selected_decision.get("option"), Mapping)
+                else [],
+            )
+        )
+
+    free_form_fields = {
+        "objective",
+        "ptm_types",
+        "special_themes",
+        "exclude_rules",
+        "success_criteria",
+        "scientific_constraints",
+        "notes",
+        "open_risks",
+    }
+    numeric_tokens = set(re.findall(r"\d+(?:\.\d+)?", text))
+    detected_species, _taxa = species_from_text(user_message)
+    normalized_detected_species = {
+        value.casefold() for value in detected_species
+    }
+
+    accepted: dict[str, Any] = {}
+    dropped: list[str] = []
+    for field, value in patch.items():
+        if field in free_form_fields or field in selected_fields:
+            accepted[field] = value
+            continue
+        supported = False
+        if field == "species" and isinstance(value, list):
+            normalized_values, _ids = normalize_species_values(value)
+            supported = bool(normalized_values) and all(
+                item.casefold() in normalized_detected_species
+                or item.casefold() in text
+                for item in normalized_values
+            )
+        elif field in {"target_project_count", "max_candidate_projects"}:
+            supported = str(value) in numeric_tokens
+        elif field == "labeling_hard":
+            supported = bool(re.search(r"只要|必须|硬限制|hard constraint|required", text))
+        elif field == "legacy_floor_ratio":
+            supported = bool(numeric_tokens) and bool(
+                re.search(r"经典|老仪器|legacy|占比|比例", text)
+            )
+        else:
+            value_text = _clean_text(value).casefold()
+            hints = _DISCOVERY_EXPLICIT_ENUM_HINTS.get(field, {}).get(value_text, ())
+            supported = bool(value_text) and (
+                value_text.replace("_", " ") in text
+                or any(hint.casefold() in text for hint in hints)
+            )
+        if supported:
+            accepted[field] = value
+        else:
+            dropped.append(field)
+    return accepted, dropped
+
+_DISCOVERY_STRATEGY_ENUM_FIELDS: dict[str, set[str]] = {
+    "task_type": {
+        "rt_prediction",
+        "fragment_intensity_prediction",
+        "psm_scoring",
+        "denovo",
+        "ptm_denovo",
+        "chimeric_interpretation",
+        "browse_only",
+        "other",
+    },
+    "run_horizon": {
+        "plan_only",
+        "candidates_only",
+        "candidates_reviewed",
+        "ai_ready_table",
+        "pre_release",
+        "full_release",
+    },
+    "species_policy": {"open", "include_only", "prefer", "exclude"},
+    "species_coverage": {"none", "prefer_listed", "broaden"},
+    "acquisition_mode": {"dda", "dia", "unknown"},
+    "mixed_acquisition_policy": {"reject_mixed", "review_mixed", "allow"},
+    "labeling_strategy": {
+        "label_free",
+        "tmt",
+        "itraq",
+        "silac",
+        "dimethyl",
+        "unknown",
+        "any",
+    },
+    "coverage_mode": {"curated", "balanced", "exhaustive"},
+    "quota_flexibility": {"fixed", "recommended", "open_ended"},
+    "time_budget": {"fast", "multi_round"},
+    "on_safety_ceiling": {"ask", "auto_continue_within_safety", "stop"},
+    "instrument_preference": {"none", "newer", "classic", "newer_with_legacy_floor"},
+}
+_DISCOVERY_STRATEGY_STRING_FIELDS = {
+    "objective",
+    "notes",
+}
+_DISCOVERY_STRATEGY_TEXT_LIMITS = {"objective": 120, "notes": 4000}
+_DISCOVERY_STRATEGY_ARRAY_MAX_ITEMS = 100
+_DISCOVERY_STRATEGY_ARRAY_ITEM_MAX_CHARS = 240
+_DISCOVERY_STRATEGY_ARRAY_FIELDS = {
+    "species",
+    "ptm_types",
+    "special_themes",
+    "exclude_rules",
+    "success_criteria",
+    "open_risks",
+}
+_DISCOVERY_STRATEGY_BOOLEAN_FIELDS = {"labeling_hard"}
+_DISCOVERY_STRATEGY_INTEGER_LIMITS = {
+    # D1 card/product ceilings. The execution layer may have broader internal
+    # budgets, but the public strategy contract must match the typed frontend.
+    "target_project_count": 300,
+    "max_candidate_projects": 1000,
+}
+# ``null`` has one cross-layer meaning for every first-class IntentSpec field:
+# reset that field to createEmptyIntent's safe default. Query/runtime extension
+# fields deliberately do not accept null; omission keeps their server defaults.
+_DISCOVERY_STRATEGY_NULLABLE_FIELDS = _DISCOVERY_STRATEGY_FIRST_CLASS_FIELDS
+
+
+def _normalise_strategy_species_values(values: list[str]) -> list[str]:
+    """Canonicalize structured taxa using exact aliases only.
+
+    Natural-language species detection intentionally supports fuzzy matching,
+    but this function receives an already structured strategy array.  Applying
+    substring matching here can turn ``non-human primate`` into ``human`` or
+    collapse ``human and mouse`` to a single taxon, reversing user intent.
+    Unknown structured values therefore survive verbatim for the discovery
+    Agent to resolve with evidence later.
+    """
+
+    exact_terms: dict[str, str] = {}
+    for term in SPECIES_TERMS:
+        aliases = {
+            term.canonical,
+            term.scientific_name,
+            term.taxon_id,
+            *term.aliases,
+        }
+        for alias in aliases:
+            exact_terms[_clean_text(alias).casefold()] = term.canonical
+
+    normalized = [
+        exact_terms.get(_clean_text(item).casefold(), _clean_text(item))
+        for item in values
+        if _clean_text(item)
+    ]
+    cleaned = list(
+        dict.fromkeys(_clean_text(item) for item in normalized if _clean_text(item))
+    )
+    folded = {item.casefold() for item in cleaned}
+
+    def _group_key(item: str) -> str:
+        value = item.casefold()
+        candidates: list[str] = []
+        if value.endswith("ies") and len(value) > 4:
+            candidates.append(value[:-3] + "y")
+        if value.endswith("es") and len(value) > 3:
+            candidates.append(value[:-2])
+        if value.endswith("s") and len(value) > 3:
+            candidates.append(value[:-1])
+        return next((candidate for candidate in candidates if candidate in folded), value)
+
+    grouped: dict[str, list[tuple[int, str]]] = {}
+    for index, item in enumerate(cleaned):
+        grouped.setdefault(_group_key(item), []).append((index, item))
+    representatives = [
+        min(items, key=lambda pair: (len(pair[1]), pair[0]))
+        for items in grouped.values()
+    ]
+    return [item for _index, item in sorted(representatives)]
+
+
+def _discovery_agent_guidance() -> str:
+    """Load repository guidance when packaged, otherwise keep D1 usable."""
+    try:
+        guidance = _DISCOVERY_AGENT_GUIDANCE_PATH.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        guidance = ""
+    return guidance or _DISCOVERY_AGENT_GUIDANCE_FALLBACK.strip()
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    try:
+        normalized = json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+    except (TypeError, ValueError):
+        return {}
+    return normalized if isinstance(normalized, dict) else {}
+
+
+def _validate_discovery_strategy_patch(
+    raw_patch: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate one generic strategy delta at the model boundary.
+
+    Unknown scientific constraints are preserved as reviewable notes. A known
+    field with an invalid shape/value is different: it invalidates the complete
+    tool event so a malformed model envelope can never produce a partial write.
+    """
+    patch: dict[str, Any] = {}
+    errors: list[str] = []
+    unknown: list[tuple[str, Any]] = []
+    repository_risks: list[str] = []
+
+    def _store(key: str, value: Any, raw_key: str) -> None:
+        if key in patch and patch[key] != value:
+            errors.append(f"conflicting values for {key} (including alias {raw_key})")
+            return
+        patch[key] = value
+
+    for raw_key_value, value in raw_patch.items():
+        raw_key = str(raw_key_value)
+        key = _DISCOVERY_STRATEGY_PATCH_ALIASES.get(raw_key, raw_key)
+        if key not in _DISCOVERY_STRATEGY_PATCH_FIELDS:
+            # Execution transport fields are not scientific dimensions. The
+            # strict SDK tool cannot emit them; direct/fallback adapters ignore
+            # them rather than polluting the live strategy card.
+            if raw_key in _DISCOVERY_STRATEGY_RESERVED_RUNTIME_FIELDS:
+                continue
+            try:
+                rendered = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError):
+                errors.append(f"{raw_key} is not JSON serializable")
+            else:
+                unknown.append((raw_key, value))
+            continue
+
+        if value is None:
+            if key in _DISCOVERY_STRATEGY_NULLABLE_FIELDS:
+                _store(key, None, raw_key)
+            else:
+                errors.append(f"{key} does not allow null")
+            continue
+
+        if key in _DISCOVERY_STRATEGY_ENUM_FIELDS:
+            if not isinstance(value, str):
+                errors.append(f"{key} must be a string enum")
+                continue
+            normalized = value.strip().lower()
+            if normalized not in _DISCOVERY_STRATEGY_ENUM_FIELDS[key]:
+                errors.append(f"{key} has unsupported value {value!r}")
+                continue
+            _store(key, normalized, raw_key)
+            continue
+
+        if key in _DISCOVERY_STRATEGY_STRING_FIELDS:
+            if not isinstance(value, str):
+                errors.append(f"{key} must be a string")
+                continue
+            normalized = value.strip()
+            if not normalized:
+                errors.append(f"{key} must not be empty")
+                continue
+            text_limit = _DISCOVERY_STRATEGY_TEXT_LIMITS[key]
+            if len(normalized) > text_limit:
+                errors.append(f"{key} must be at most {text_limit} characters")
+                continue
+            _store(key, normalized, raw_key)
+            continue
+
+        if key == "scientific_constraints":
+            if not isinstance(value, list):
+                errors.append("scientific_constraints must be an array")
+                continue
+            if len(value) > _DISCOVERY_STRATEGY_ARRAY_MAX_ITEMS:
+                errors.append(
+                    f"scientific_constraints must contain at most "
+                    f"{_DISCOVERY_STRATEGY_ARRAY_MAX_ITEMS} items"
+                )
+                continue
+            constraints: list[dict[str, Any]] = []
+            invalid_constraint = False
+            for item in value:
+                if not isinstance(item, Mapping):
+                    invalid_constraint = True
+                    break
+                try:
+                    constraint = ScientificConstraint.model_validate(dict(item))
+                except Exception:
+                    invalid_constraint = True
+                    break
+                constraints.append(constraint.model_dump(mode="json"))
+            if invalid_constraint:
+                errors.append("scientific_constraints contains an invalid constraint")
+                continue
+            _store(key, constraints, raw_key)
+            continue
+
+        if key == "species":
+            if not isinstance(value, list):
+                errors.append("species must be an array of strings")
+                continue
+            if len(value) > _DISCOVERY_STRATEGY_ARRAY_MAX_ITEMS:
+                errors.append(
+                    f"species must contain at most {_DISCOVERY_STRATEGY_ARRAY_MAX_ITEMS} items"
+                )
+                continue
+            if any(
+                not isinstance(item, str)
+                or not item.strip()
+                or len(item.strip()) > _DISCOVERY_STRATEGY_ARRAY_ITEM_MAX_CHARS
+                for item in value
+            ):
+                errors.append(
+                    "species must contain only non-empty strings of at most "
+                    f"{_DISCOVERY_STRATEGY_ARRAY_ITEM_MAX_CHARS} characters"
+                )
+                continue
+            _store(
+                key,
+                _normalise_strategy_species_values([item.strip() for item in value]),
+                raw_key,
+            )
+            continue
+
+        if key in _DISCOVERY_STRATEGY_ARRAY_FIELDS:
+            if not isinstance(value, list):
+                errors.append(f"{key} must be an array of strings")
+                continue
+            if len(value) > _DISCOVERY_STRATEGY_ARRAY_MAX_ITEMS:
+                errors.append(
+                    f"{key} must contain at most {_DISCOVERY_STRATEGY_ARRAY_MAX_ITEMS} items"
+                )
+                continue
+            normalized_items: list[str] = []
+            invalid_item = False
+            for item in value:
+                if (
+                    not isinstance(item, str)
+                    or not item.strip()
+                    or len(item.strip()) > _DISCOVERY_STRATEGY_ARRAY_ITEM_MAX_CHARS
+                ):
+                    invalid_item = True
+                    break
+                cleaned = item.strip()
+                if cleaned not in normalized_items:
+                    normalized_items.append(cleaned)
+            if invalid_item:
+                errors.append(
+                    f"{key} must contain only non-empty strings of at most "
+                    f"{_DISCOVERY_STRATEGY_ARRAY_ITEM_MAX_CHARS} characters"
+                )
+                continue
+            _store(key, normalized_items, raw_key)
+            continue
+
+        if key in _DISCOVERY_STRATEGY_BOOLEAN_FIELDS:
+            if type(value) is not bool:
+                errors.append(f"{key} must be boolean")
+                continue
+            _store(key, value, raw_key)
+            continue
+
+        if key in _DISCOVERY_STRATEGY_INTEGER_LIMITS:
+            limit = _DISCOVERY_STRATEGY_INTEGER_LIMITS[key]
+            if type(value) is not int or not 1 <= value <= limit:
+                errors.append(f"{key} must be an integer from 1 to {limit}")
+                continue
+            _store(key, value, raw_key)
+            continue
+
+        if key == "legacy_floor_ratio":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                errors.append("legacy_floor_ratio must be a number from 0 to 1")
+                continue
+            normalized_ratio = float(value)
+            if not math.isfinite(normalized_ratio) or not 0 <= normalized_ratio <= 1:
+                errors.append("legacy_floor_ratio must be a number from 0 to 1")
+                continue
+            _store(key, normalized_ratio, raw_key)
+            continue
+
+        if key == "constraint_provenance":
+            if not isinstance(value, Mapping):
+                errors.append("constraint_provenance must be an object of strings")
+                continue
+            normalized_provenance: dict[str, str] = {}
+            invalid_entry = False
+            for item_key, item_value in value.items():
+                if not isinstance(item_key, str) or not isinstance(item_value, str):
+                    invalid_entry = True
+                    break
+                clean_key = item_key.strip()
+                clean_value = item_value.strip()
+                if not clean_key or not clean_value:
+                    invalid_entry = True
+                    break
+                normalized_provenance[clean_key] = clean_value
+            if invalid_entry:
+                errors.append("constraint_provenance must contain non-empty string pairs")
+                continue
+            _store(key, normalized_provenance, raw_key)
+            continue
+
+        if key == "repository":
+            if not isinstance(value, str) or not value.strip():
+                errors.append("repository must be a non-empty string")
+                continue
+            requested_repository = value.strip()
+            repository = _clean_repository(requested_repository, default="")
+            if repository:
+                _store(key, repository, raw_key)
+            else:
+                repository_risks.append(
+                    f"Unsupported repository requires review: {requested_repository}"
+                )
+            continue
+
+        # Every canonical field must have a validator above. This branch is a
+        # schema-maintenance failure and therefore fails closed.
+        errors.append(f"{key} has no strategy validator")
+
+    if unknown:
+        existing_constraints = patch.get("scientific_constraints")
+        if not isinstance(existing_constraints, list):
+            existing_constraints = []
+        generated: list[dict[str, Any]] = []
+        for index, (raw_key, raw_value) in enumerate(unknown, start=1):
+            generated.append(
+                ScientificConstraint(
+                    id=f"unmapped.{index}.{constraint_slug(raw_key)}"[:96],
+                    label=f"未映射约束：{raw_key}",
+                    dimension=raw_key[:120],
+                    operator="matches",
+                    value=raw_value,
+                    strength="soft",
+                    scope="project",
+                    evidence_required=True,
+                    rationale=(
+                        "Preserved losslessly because the strategy schema has no dedicated field."
+                    ),
+                    source="user",
+                ).model_dump(mode="json")
+            )
+        patch["scientific_constraints"] = [*existing_constraints, *generated]
+    if repository_risks:
+        existing_risks = patch.get("open_risks")
+        if not isinstance(existing_risks, list):
+            existing_risks = []
+        patch["open_risks"] = list(
+            dict.fromkeys([*existing_risks, *repository_risks])
+        )
+    notes = patch.get("notes")
+    if isinstance(notes, str) and len(notes) > _DISCOVERY_STRATEGY_TEXT_LIMITS["notes"]:
+        errors.append(
+            f"notes must be at most {_DISCOVERY_STRATEGY_TEXT_LIMITS['notes']} characters"
+        )
+    risks = patch.get("open_risks")
+    if isinstance(risks, list) and (
+        len(risks) > _DISCOVERY_STRATEGY_ARRAY_MAX_ITEMS
+        or any(
+            not isinstance(item, str)
+            or not item
+            or len(item) > _DISCOVERY_STRATEGY_ARRAY_ITEM_MAX_CHARS
+            for item in risks
+        )
+    ):
+        errors.append("generated open_risks exceed the public string-array limits")
+    return patch, errors
+
+
+def _normalise_discovery_strategy_patch(raw_patch: Mapping[str, Any]) -> dict[str, Any]:
+    patch, errors = _validate_discovery_strategy_patch(raw_patch)
+    return {} if errors else patch
+
+
+def _drop_unchanged_discovery_patch_fields(
+    patch: Mapping[str, Any],
+    intent_snapshot: Mapping[str, Any],
+    *,
+    preserve_fields: set[str] | None = None,
+) -> dict[str, Any]:
+    """Keep true value deltas plus explicitly authorized resolution deltas.
+
+    A selected Agent option may intentionally resolve a field to the value that
+    already represents the empty/open default.  ``preserve_fields`` is supplied
+    only after a real SDK ``update_strategy`` call explicitly names an active
+    decision target, so those keys carry new decision state even when their
+    values are unchanged.  Ordinary model echoes are still removed.
+    """
+
+    preserved = preserve_fields or set()
+    return {
+        key: value
+        for key, value in patch.items()
+        if (
+            key in preserved
+            or value is None
+            or key not in intent_snapshot
+            or intent_snapshot.get(key) != value
+        )
+    }
+
+
+def _discovery_turn_commitment_patch(
+    raw: Mapping[str, Any],
+    *,
+    user_message: str,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Decode the model's clause-level self-audit with source grounding.
+
+    ``None`` means an older response omitted the additive audit contract. An
+    object (including ``{}``) means the model supplied it. The audit never
+    authorizes mutation by itself: callers still require one explicit
+    ``update_strategy`` tool event. It only makes that event complete and
+    prevents tool fields that the model could not ground in the latest turn.
+    """
+
+    interpretation = raw.get("turn_interpretation")
+    if not isinstance(interpretation, Mapping):
+        return None, []
+    commitments = interpretation.get("commitments")
+    if not isinstance(commitments, list):
+        return None, ["turn_interpretation.commitments must be an array"]
+    if len(commitments) > 50:
+        return None, ["turn_interpretation contains too many commitments"]
+
+    # A clause-level decision list is a redundant completeness channel from the
+    # same model call. It is grounded by the server-provided clause id, so a
+    # smaller model can omit an item from the summary list without losing an
+    # explicit user choice.
+    audit_items: list[Mapping[str, Any]] = [
+        item for item in commitments if isinstance(item, Mapping)
+    ]
+    clause_text_by_id = {
+        item["id"]: item["text"]
+        for item in _discovery_latest_message_clauses(user_message)
+    }
+    clause_audit = interpretation.get("clause_audit")
+    if isinstance(clause_audit, list):
+        for clause in clause_audit[:30]:
+            if not isinstance(clause, Mapping):
+                continue
+            clause_id = _clean_text(clause.get("clause_id"))
+            clause_text = clause_text_by_id.get(clause_id)
+            decisions = clause.get("decisions")
+            if not clause_text or not isinstance(decisions, list):
+                continue
+            for decision in decisions[:20]:
+                if not isinstance(decision, Mapping):
+                    continue
+                audit_items.append(
+                    {
+                        "field": decision.get("field"),
+                        "value": decision.get("value"),
+                        "source": clause_text,
+                    }
+                )
+
+    # The clause audit is additive.  Some OpenAI-compatible providers omit the
+    # nested response_json audit even though they executed the typed
+    # ``update_strategy`` function correctly.  Treating an explicitly empty
+    # audit as an authoritative empty patch made every such tool call collapse
+    # into "no changed fields".  In that compatibility case the real SDK tool
+    # call remains the mutation authority and the normal schema validator below
+    # still applies to it.
+    if not audit_items:
+        return None, []
+
+    message_evidence = re.sub(r"\s+", "", user_message).casefold()
+    raw_patch: dict[str, Any] = {}
+    for index, item in enumerate(audit_items):
+        raw_field = _clean_text(item.get("field"))
+        source = _clean_text(item.get("source"))
+        if not raw_field or "value" not in item or not source:
+            # This is an optional redundant audit channel.  One malformed item
+            # must not veto a valid SDK function call or the other grounded
+            # commitments from the same turn.
+            continue
+        source_evidence = re.sub(r"\s+", "", source).casefold()
+        if not source_evidence or source_evidence not in message_evidence:
+            # The audit is a per-field authorization filter. A model may echo a
+            # snapshot-derived recommendation alongside genuine commitments;
+            # ignore that ungrounded field without sacrificing other grounded
+            # clauses from the same explicit tool event.
+            continue
+        canonical_field = _DISCOVERY_STRATEGY_PATCH_ALIASES.get(raw_field, raw_field)
+        value = item.get("value")
+        if canonical_field in raw_patch and raw_patch[canonical_field] != value:
+            # Keep the first grounded interpretation; the explicit typed tool
+            # value resolves overlaps later.
+            continue
+        candidate, candidate_errors = _validate_discovery_strategy_patch(
+            {canonical_field: value}
+        )
+        if candidate_errors:
+            continue
+        for candidate_field, candidate_value in candidate.items():
+            if candidate_field not in raw_patch:
+                raw_patch[candidate_field] = candidate_value
+    if not raw_patch:
+        # The model attempted an audit but grounded none of its claims in the
+        # latest message.  This is materially different from an omitted/empty
+        # compatibility audit and must fail the proposed mutation closed.
+        return {}, []
+    patch, validation_errors = _validate_discovery_strategy_patch(raw_patch)
+    if validation_errors:
+        return None, []
+    return patch, []
+
+
+def _discovery_turn_patch(
+    raw: Mapping[str, Any],
+    *,
+    user_message: str,
+    intent_snapshot: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Decode the sole authorized mutation path: action + typed tool patch.
+
+    Legacy ``extra_fields`` and lexical parsing are intentionally not inputs.
+    They remain response projections only, so a missing/malformed D1 envelope
+    cannot mutate the strategy card.
+    """
+    if _clean_text(raw.get("action") or raw.get("mode")).lower() != "update_strategy":
+        return {}, []
+    raw_calls = raw.get("tool_calls")
+    if not isinstance(raw_calls, list):
+        return {}, ["update_strategy requires a tool_calls array"]
+    update_calls = [
+        call
+        for call in raw_calls
+        if isinstance(call, Mapping)
+        and _clean_text(call.get("name") or call.get("tool")) == "update_strategy"
+    ]
+    if len(update_calls) != 1:
+        return {}, ["update_strategy requires exactly one update_strategy tool call"]
+    arguments = update_calls[0].get("arguments")
+    if not isinstance(arguments, Mapping) or "patch" not in arguments:
+        return {}, ["update_strategy tool arguments require an explicit patch object"]
+    raw_patch = arguments.get("patch")
+    if not isinstance(raw_patch, Mapping):
+        return {}, ["update_strategy patch must be an object"]
+    serializable_patch = _json_object(dict(raw_patch))
+    if raw_patch and not serializable_patch:
+        return {}, ["update_strategy patch must be valid JSON"]
+    patch, errors = _validate_discovery_strategy_patch(serializable_patch)
+    if errors:
+        return {}, errors
+    commitment_patch, commitment_errors = _discovery_turn_commitment_patch(
+        raw,
+        user_message=user_message,
+    )
+    if commitment_errors:
+        return {}, commitment_errors
+    if commitment_patch is not None:
+        # A non-empty grounded audit is the per-field authorization filter: it
+        # fills omissions and drops tool-only defaults.  Free-text paraphrases
+        # may legitimately differ between the audit and typed tool, so the
+        # typed value wins only for string fields.  Conflicting enum/list/
+        # numeric commitments remain unsafe and fail closed.
+        conflicts = {
+            key
+            for key in set(patch).intersection(commitment_patch)
+            if patch[key] != commitment_patch[key]
+        }
+        unsafe_conflicts = conflicts.difference(_DISCOVERY_STRATEGY_STRING_FIELDS)
+        if unsafe_conflicts:
+            return {}, [
+                "update_strategy patch conflicts with grounded commitments: "
+                + ", ".join(sorted(unsafe_conflicts))
+            ]
+        reconciled_patch = dict(commitment_patch)
+        for key in conflicts:
+            reconciled_patch[key] = patch[key]
+        patch = reconciled_patch
+    patch = _drop_unchanged_discovery_patch_fields(patch, intent_snapshot)
+    if not patch:
+        return {}, ["update_strategy patch contains no changed fields"]
+    return patch, []
+
+
+def _discovery_explicit_tool_patch(
+    raw: Mapping[str, Any],
+    *,
+    intent_snapshot: Mapping[str, Any],
+    include_unchanged: bool = False,
+) -> dict[str, Any]:
+    """Best-effort canonical view of exactly what the raw tool patch claimed."""
+
+    calls = raw.get("tool_calls")
+    if not isinstance(calls, list):
+        return {}
+    updates = [
+        call
+        for call in calls
+        if isinstance(call, Mapping)
+        and _clean_text(call.get("name") or call.get("tool")) == "update_strategy"
+    ]
+    if len(updates) != 1:
+        return {}
+    arguments = updates[0].get("arguments")
+    if not isinstance(arguments, Mapping):
+        return {}
+    candidate = arguments.get("patch")
+    if not isinstance(candidate, Mapping):
+        return {}
+    patch = _normalise_discovery_strategy_patch(_json_object(dict(candidate)))
+    if include_unchanged:
+        return patch
+    return _drop_unchanged_discovery_patch_fields(patch, intent_snapshot)
+
+
+def _drop_uncommitted_discovery_null_placeholders(
+    patch: Mapping[str, Any],
+    commitment_patch: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Separate provider-expanded optional nulls from explicit clear actions.
+
+    Some OpenAI-compatible tool callers serialize every omitted optional field
+    as ``null``. A null is a real clear operation only when the model's
+    independent turn interpretation also records that field as a commitment.
+    With no interpretation, one isolated null remains backward-compatible; a
+    mass of null optional fields fails closed instead of wiping the live card.
+    """
+
+    candidate = dict(patch)
+    null_fields = {key for key, value in candidate.items() if value is None}
+    if not null_fields:
+        return candidate
+    committed_nulls = {
+        key
+        for key, value in (commitment_patch or {}).items()
+        if value is None
+    }
+    if commitment_patch is None and len(null_fields) == 1:
+        return candidate
+    return {
+        key: value
+        for key, value in candidate.items()
+        if value is not None or key in committed_nulls
+    }
+
+
+def _format_discovery_reconciled_update_message(patch: Mapping[str, Any]) -> str:
+    """Tell the user the card truth when model prose and validated delta diverge."""
+
+    rendered: list[str] = []
+    priority = [
+        "objective",
+        "task_type",
+        "run_horizon",
+        "species",
+        "acquisition_mode",
+        "special_themes",
+        "target_project_count",
+        "instrument_preference",
+        "exclude_rules",
+        "scientific_constraints",
+    ]
+    ordered_keys = [key for key in priority if key in patch]
+    ordered_keys.extend(key for key in patch if key not in ordered_keys)
+    value_labels = {
+        ("task_type", "browse_only"): "先浏览探索",
+        ("run_horizon", "candidates_only"): "找到候选即停",
+        ("run_horizon", "candidates_reviewed"): "找到并审查候选",
+        ("instrument_preference", "newer"): "新仪器优先",
+        ("instrument_preference", "classic"): "经典仪器优先",
+        ("acquisition_mode", "dda"): "DDA",
+        ("acquisition_mode", "dia"): "DIA",
+    }
+    for key in ordered_keys:
+        value = patch[key]
+        label = _DISCOVERY_STRATEGY_FIELD_LABELS_ZH.get(key, key)
+        if value is None or value == [] or value == "":
+            value_text = "已清空"
+        elif isinstance(value, list):
+            list_values: list[str] = []
+            for item in value:
+                if isinstance(item, Mapping):
+                    list_values.append(
+                        _clean_text(item.get("label") or item.get("id"))
+                        or "结构化约束"
+                    )
+                else:
+                    list_values.append(str(item))
+            value_text = "、".join(list_values)
+        elif isinstance(value, Mapping):
+            value_text = _clean_text(value.get("label") or value.get("id")) or "结构化设置"
+        elif isinstance(value, bool):
+            value_text = "是" if value else "否"
+        else:
+            value_text = value_labels.get((key, str(value)), str(value))
+        rendered.append(f"{label}={value_text}")
+    visible = rendered[:10]
+    remainder = len(rendered) - len(visible)
+    summary = "；".join(visible) or "无"
+    if remainder > 0:
+        summary += f"；另有 {remainder} 项结构化设置"
+    return (
+        f"已按你这轮明确的要求更新策略：{summary}。"
+        "没有列出的现有设置保持不变；其它科学建议只作为讨论，不会悄悄写入策略。"
+    )
+
+
+_DISCOVERY_DECISION_MAX_OPTIONS = 8
+
+
+def _normalise_discovery_decision_target_fields(
+    raw: Any,
+    *,
+    focus: str,
+    option_ids: list[str],
+) -> list[str]:
+    fields: list[str] = []
+    if isinstance(raw, list):
+        for value in raw:
+            name = _clean_text(value)
+            canonical = _DISCOVERY_STRATEGY_PATCH_ALIASES.get(name, name)
+            if canonical in _DISCOVERY_STRATEGY_PATCH_FIELDS and canonical not in fields:
+                fields.append(canonical)
+    if fields:
+        return fields
+
+    canonical_focus = _DISCOVERY_STRATEGY_PATCH_ALIASES.get(focus, focus)
+    if canonical_focus in _DISCOVERY_STRATEGY_PATCH_FIELDS:
+        return [canonical_focus]
+
+    ids = {value.casefold() for value in option_ids if value}
+    enum_matches = [
+        field
+        for field, allowed in _DISCOVERY_STRATEGY_ENUM_FIELDS.items()
+        if len(ids.intersection(allowed)) >= 2
+    ]
+    return enum_matches if len(enum_matches) == 1 else []
+
+
+def _normalise_discovery_next_decision(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    focus = _clean_text(raw.get("focus"))
+    question = _clean_text(raw.get("question"))
+    if not focus or not question:
+        return None
+
+    options: list[dict[str, Any]] = []
+    option_patch_presence: list[bool] = []
+    raw_options = raw.get("options") if isinstance(raw.get("options"), list) else []
+    for raw_option in raw_options:
+        if not isinstance(raw_option, Mapping):
+            continue
+        option_id = _clean_text(raw_option.get("id"))
+        label = _clean_text(raw_option.get("label"))
+        if not option_id or not label:
+            continue
+        option: dict[str, Any] = {"id": option_id, "label": label}
+        reason = _clean_text(raw_option.get("reason"))
+        if reason:
+            option["reason"] = reason
+        raw_option_patch = raw_option.get("strategy_patch")
+        if raw_option_patch is None:
+            raw_option_patch = raw_option.get("strategyPatch")
+        option_patch_presence.append(isinstance(raw_option_patch, Mapping))
+        if isinstance(raw_option_patch, Mapping):
+            option_patch, option_patch_errors = _validate_discovery_strategy_patch(
+                _json_object(dict(raw_option_patch))
+            )
+            # A rendered option is executable UI, not explanatory prose.  Its
+            # mutation meaning must therefore be complete and schema-valid at
+            # the time the Manager creates the option; a later turn may not
+            # invent extra fields for a short/numeric selection.
+            if option_patch_errors or not option_patch:
+                return None
+            option["strategy_patch"] = option_patch
+        if not any(existing["id"] == option_id for existing in options):
+            options.append(option)
+
+    # Mixed executable/non-executable menus are ambiguous: the same numeric UI
+    # gesture would have different authority depending on which row it hits.
+    # Keep legacy all-unpatched decisions readable during rollout, but reject a
+    # partial migration.  Newly prompted decisions are required to predeclare
+    # every option patch below.
+    if any(option_patch_presence) and not all(option_patch_presence):
+        return None
+
+    recommendation: dict[str, Any] | None = None
+    raw_recommendation = raw.get("recommendation")
+    if isinstance(raw_recommendation, Mapping):
+        rec_id = _clean_text(raw_recommendation.get("id"))
+        rec_label = _clean_text(raw_recommendation.get("label"))
+        if rec_id and rec_label:
+            recommendation = {"id": rec_id, "label": rec_label}
+            rec_reason = _clean_text(raw_recommendation.get("reason"))
+            if rec_reason:
+                recommendation["reason"] = rec_reason
+    else:
+        rec_id = _clean_text(raw_recommendation)
+        recommendation = next((dict(option) for option in options if option["id"] == rec_id), None)
+    if recommendation is None and options:
+        recommendation = dict(options[0])
+    if recommendation is None or not _clean_text(recommendation.get("reason")):
+        return None
+    if recommendation is not None and not any(
+        option.get("id") == recommendation.get("id") for option in options
+    ):
+        options.insert(0, dict(recommendation))
+    option_mode = (
+        "expanded" if _clean_text(raw.get("option_mode")).lower() == "expanded" else "focused"
+    )
+    option_limit = _DISCOVERY_DECISION_MAX_OPTIONS if option_mode == "expanded" else 5
+    options = options[:option_limit]
+    if len(options) < 2:
+        return None
+
+    target_fields = _normalise_discovery_decision_target_fields(
+        raw.get("target_fields"),
+        focus=focus,
+        option_ids=[option["id"] for option in options],
+    )
+    executable_options = [
+        option for option in options if isinstance(option.get("strategy_patch"), Mapping)
+    ]
+    if executable_options:
+        # target_fields is a display/memory projection only.  Derive it from
+        # the already validated executable contracts instead of trusting a
+        # model-authored scope list that could smuggle an unrelated field into
+        # the next turn (for example build_training -> plan_only).
+        target_fields = list(
+            dict.fromkeys(
+                field
+                for option in executable_options
+                for field in option["strategy_patch"]
+            )
+        )
+        recommendation_option = next(
+            (
+                option
+                for option in executable_options
+                if option.get("id") == recommendation.get("id")
+            ),
+            None,
+        )
+        if recommendation_option is None:
+            return None
+        recommendation = {
+            **recommendation_option,
+            **recommendation,
+            "strategy_patch": dict(recommendation_option["strategy_patch"]),
+        }
+
+    return {
+        "focus": focus,
+        "target_fields": target_fields,
+        "question": question,
+        "recommendation": recommendation,
+        "options": options,
+        "option_mode": option_mode,
+        "revisit_existing": raw.get("revisit_existing") is True,
+        "allow_free_text": True,
+        "option_patch_contract": (
+            "predeclared_v1" if executable_options else "legacy_unbound"
+        ),
+    }
+
+
+_DISCOVERY_ENUM_OPTION_ORDER: dict[str, list[str]] = {
+    "labeling_strategy": [
+        "label_free",
+        "tmt",
+        "itraq",
+        "silac",
+        "dimethyl",
+        "any",
+        "unknown",
+    ],
+}
+_DISCOVERY_ENUM_OPTION_LABELS: dict[str, dict[str, str]] = {
+    "labeling_strategy": {
+        "label_free": "无标记（label-free）",
+        "tmt": "TMT（多重等重标签）",
+        "itraq": "iTRAQ（等重标签）",
+        "silac": "SILAC（细胞代谢标记）",
+        "dimethyl": "二甲基标记（化学同位素）",
+        "any": "保持开放（不限制标记方式）",
+        "unknown": "标记信息未知",
+    }
+}
+
+
+def _discovery_enum_option_values(field: str) -> list[str]:
+    allowed = _DISCOVERY_STRATEGY_ENUM_FIELDS.get(field, set())
+    preferred = _DISCOVERY_ENUM_OPTION_ORDER.get(field, [])
+    ordered = [value for value in preferred if value in allowed]
+    ordered.extend(sorted(value for value in allowed if value not in ordered))
+    if "any" in ordered and "unknown" in ordered:
+        ordered.remove("unknown")
+    return ordered[:_DISCOVERY_DECISION_MAX_OPTIONS]
+
+
+def _expand_discovery_enum_decision_options(
+    decision: Mapping[str, Any] | None,
+    assistant_message: str,
+) -> dict[str, Any] | None:
+    if not isinstance(decision, Mapping):
+        return None
+    target_fields = decision.get("target_fields")
+    if not isinstance(target_fields, list) or len(target_fields) != 1:
+        return dict(decision)
+    field = _clean_text(target_fields[0])
+    allowed_values = _discovery_enum_option_values(field)
+    if len(allowed_values) < 2:
+        return dict(decision)
+
+    options = [
+        dict(option)
+        for option in decision.get("options") or []
+        if isinstance(option, Mapping)
+    ]
+    existing_ids = {
+        _clean_text(option.get("id")).casefold()
+        for option in options
+        if _clean_text(option.get("id"))
+    }
+    missing_values = [
+        value for value in allowed_values if value.casefold() not in existing_ids
+    ]
+    if not missing_values:
+        return dict(decision)
+
+    expanded = decision.get("option_mode") == "expanded"
+    if not expanded:
+        folded_message = assistant_message.casefold().replace("_", " ")
+        labels = _DISCOVERY_ENUM_OPTION_LABELS.get(field, {})
+        for value in missing_values:
+            normalized_value = value.casefold().replace("_", " ")
+            normalized_label = _clean_text(labels.get(value)).casefold()
+            if (
+                (len(value) >= 3 and normalized_value in folded_message)
+                or (bool(normalized_label) and normalized_label in folded_message)
+            ):
+                expanded = True
+                break
+    if not expanded:
+        return dict(decision)
+
+    labels = _DISCOVERY_ENUM_OPTION_LABELS.get(field, {})
+    by_id = {
+        _clean_text(option.get("id")).casefold(): option
+        for option in options
+        if _clean_text(option.get("id"))
+    }
+    expanded_options: list[dict[str, Any]] = []
+    for value in allowed_values:
+        existing = by_id.get(value.casefold())
+        if existing is not None:
+            option = dict(existing)
+            option.setdefault("strategy_patch", {field: value})
+            expanded_options.append(option)
+        else:
+            expanded_options.append(
+                {
+                    "id": value,
+                    "label": labels.get(value) or value.replace("_", " "),
+                    "strategy_patch": {field: value},
+                }
+            )
+    result = dict(decision)
+    result["options"] = expanded_options
+    result["option_mode"] = "expanded"
+    result["option_patch_contract"] = "predeclared_v1"
+    recommendation = result.get("recommendation")
+    if isinstance(recommendation, Mapping):
+        recommendation_id = _clean_text(recommendation.get("id")).casefold()
+        recommended_option = next(
+            (
+                option
+                for option in expanded_options
+                if _clean_text(option.get("id")).casefold() == recommendation_id
+            ),
+            None,
+        )
+        if recommended_option is not None:
+            result["recommendation"] = {
+                **recommended_option,
+                **dict(recommendation),
+                "strategy_patch": dict(recommended_option["strategy_patch"]),
+            }
+    return result
+
+
+def _normalise_discovery_gap_report(raw: Any) -> dict[str, Any]:
+    report = raw if isinstance(raw, Mapping) else {}
+
+    def _slots(key: str) -> list[str]:
+        values = report.get(key) if isinstance(report.get(key), list) else []
+        cleaned = [_clean_text(value) for value in values]
+        return list(dict.fromkeys(value for value in cleaned if value))
+
+    return {
+        "required_missing": _slots("required_missing"),
+        "optional_missing": _slots("optional_missing"),
+        "ready_for_confirm": report.get("ready_for_confirm") is True,
+    }
+
+
+def _discovery_critical_decision_agenda(
+    intent_snapshot: Mapping[str, Any],
+    gap_report: Mapping[str, Any],
+    resolved_fields: set[str],
+) -> list[dict[str, Any]]:
+    """Prioritize unresolved user decisions without prescribing a questionnaire.
+
+    This is a deterministic planning guard, not a turn-order engine.  It tells
+    the Manager which unresolved choices materially affect feasibility, search
+    cost, or scientific validity.  The Manager may still chat, answer a user
+    question, accept a compound update, or choose a more relevant personalized
+    question; it must not declare readiness while a critical item remains.
+    Repository facts are deliberately excluded because the Agent should fetch
+    those during Discovery rather than ask the user to guess them.
+    """
+
+    task_type = _clean_text(intent_snapshot.get("task_type")).lower()
+    run_horizon = _clean_text(intent_snapshot.get("run_horizon")).lower()
+    quota_flexibility = _clean_text(
+        intent_snapshot.get("quota_flexibility")
+    ).lower()
+    training_tasks = {
+        "rt_prediction",
+        "fragment_intensity_prediction",
+        "psm_scoring",
+        "denovo",
+        "ptm_denovo",
+        "chimeric_interpretation",
+        "other",
+    }
+    agenda: list[dict[str, Any]] = []
+
+    def add(
+        decision_id: str,
+        priority: int,
+        target_fields: list[str],
+        reason: str,
+        *,
+        critical: bool = True,
+    ) -> None:
+        agenda.append(
+            {
+                "id": decision_id,
+                "priority": priority,
+                "critical": critical,
+                "target_fields": target_fields,
+                "reason": reason,
+                "source": "ask_user_preference",
+            }
+        )
+
+    objective = _clean_text(intent_snapshot.get("objective"))
+    if not objective:
+        add(
+            "scientific_objective",
+            100,
+            ["objective"],
+            "The scientific objective determines relevance and cannot be recovered from repository metadata alone.",
+        )
+    if not task_type:
+        add(
+            "downstream_task",
+            98,
+            ["task_type"],
+            "Different downstream tasks require different spectra, labels, and project evidence.",
+        )
+    if not run_horizon:
+        add(
+            "delivery_horizon",
+            94,
+            ["run_horizon"],
+            "The stopping point controls whether the Agent only plans, finds candidates, or performs evidence review.",
+        )
+    if (
+        run_horizon != "plan_only"
+        and intent_snapshot.get("target_project_count") is None
+        and quota_flexibility != "open_ended"
+    ):
+        add(
+            "search_scale",
+            92,
+            ["coverage_mode", "target_project_count", "quota_flexibility"],
+            "Search scale materially changes runtime, candidate-pool size, diversity, and review depth; it must be explicit or explicitly open-ended.",
+        )
+
+    if task_type in training_tasks:
+        acquisition = _clean_text(intent_snapshot.get("acquisition_mode")).lower()
+        if (
+            (not acquisition or acquisition == "unknown")
+            and "acquisition_mode" not in resolved_fields
+        ):
+            add(
+                "acquisition_compatibility",
+                82,
+                ["acquisition_mode", "mixed_acquisition_policy"],
+                "Training suitability depends on how spectra were acquired and how mixed DDA/DIA projects are handled.",
+            )
+        species = intent_snapshot.get("species")
+        species_policy = _clean_text(intent_snapshot.get("species_policy")).lower()
+        if (
+            not species
+            and species_policy in {"", "open"}
+            and not {"species", "species_policy"}.intersection(resolved_fields)
+        ):
+            add(
+                "generalization_scope",
+                78,
+                ["species", "species_policy", "species_coverage"],
+                "Species scope determines biological generalization and whether taxa should be mixed or stratified.",
+            )
+        labeling = _clean_text(intent_snapshot.get("labeling_strategy")).lower()
+        if (
+            (not labeling or labeling in {"unknown", "any"})
+            and "labeling_strategy" not in resolved_fields
+        ):
+            add(
+                "labeling_compatibility",
+                58,
+                ["labeling_strategy", "labeling_hard"],
+                "Labeling can alter usable ions or batch structure, but it is usually lower impact than task, horizon, scale, and acquisition.",
+                critical=False,
+            )
+
+    return sorted(agenda, key=lambda item: (-int(item["priority"]), item["id"]))
+
+
+def _normalise_discovery_dialogue_history(raw: Any) -> list[dict[str, str]]:
+    """Keep a compact, role-safe conversation window for follow-up reasoning."""
+    items = raw if isinstance(raw, list) else []
+    history: list[dict[str, str]] = []
+    for item in items[-40:]:
+        if not isinstance(item, Mapping):
+            continue
+        role = _clean_text(item.get("role")).lower()
+        content = _clean_text(item.get("content"))[:2000]
+        if role in {"user", "assistant"} and content:
+            history.append({"role": role, "content": content})
+    return history
+
+
+_DISCOVERY_SESSION_MEMORY_PREFIX = "[discovery-session-state]"
+
+
+def _normalise_discovery_session_id(raw: Any) -> str:
+    value = _clean_text(raw)[:160]
+    if not value:
+        return ""
+    return re.sub(r"[^A-Za-z0-9_.:-]+", "-", value).strip("-.")
+
+
+def _discovery_dialogue_session_db() -> Path:
+    configured = _clean_text(os.getenv("AGENT_DIALOGUE_SESSION_DB"))
+    path = Path(configured) if configured else _discovery_jobs_dir() / "dialogue_sessions.sqlite"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _discovery_decision_memory_signature(record: Mapping[str, Any]) -> str:
+    identity = {
+        "focus": _clean_text(record.get("focus")).casefold(),
+        "target_fields": sorted(
+            _clean_text(value)
+            for value in record.get("target_fields") or []
+            if _clean_text(value)
+        ),
+        "option_ids": sorted(
+            _clean_text(value).casefold()
+            for value in record.get("option_ids") or []
+            if _clean_text(value)
+        ),
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _load_discovery_persistent_decision_memory(
+    session_id: str,
+) -> list[dict[str, Any]]:
+    if not session_id:
+        return []
+    try:
+        with sqlite3.connect(_discovery_dialogue_session_db(), timeout=5.0) as database:
+            database.execute(
+                """
+                CREATE TABLE IF NOT EXISTS discovery_decision_memory (
+                    session_id TEXT NOT NULL,
+                    decision_signature TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (session_id, decision_signature)
+                )
+                """
+            )
+            rows = database.execute(
+                """
+                SELECT record_json
+                FROM discovery_decision_memory
+                WHERE session_id = ?
+                ORDER BY updated_at ASC
+                LIMIT 50
+                """,
+                (session_id,),
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return []
+    records: list[dict[str, Any]] = []
+    for (raw_record,) in rows:
+        try:
+            record = json.loads(raw_record)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(record, Mapping):
+            records.append(dict(record))
+    return _normalise_discovery_decision_memory(records)
+
+
+def _store_discovery_persistent_decision_memory(
+    session_id: str,
+    resolved_decision: Mapping[str, Any] | None,
+) -> None:
+    if not session_id or not isinstance(resolved_decision, Mapping):
+        return
+    normalized = _normalise_discovery_decision_memory([resolved_decision])
+    if not normalized:
+        return
+    record = normalized[0]
+    signature = _discovery_decision_memory_signature(record)
+    try:
+        with sqlite3.connect(_discovery_dialogue_session_db(), timeout=5.0) as database:
+            database.execute(
+                """
+                CREATE TABLE IF NOT EXISTS discovery_decision_memory (
+                    session_id TEXT NOT NULL,
+                    decision_signature TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (session_id, decision_signature)
+                )
+                """
+            )
+            database.execute(
+                """
+                INSERT INTO discovery_decision_memory (
+                    session_id, decision_signature, record_json, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id, decision_signature) DO UPDATE SET
+                    record_json = excluded.record_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    session_id,
+                    signature,
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+                    time.time(),
+                ),
+            )
+            database.execute(
+                """
+                DELETE FROM discovery_decision_memory
+                WHERE session_id = ?
+                  AND decision_signature NOT IN (
+                    SELECT decision_signature
+                    FROM discovery_decision_memory
+                    WHERE session_id = ?
+                    ORDER BY updated_at DESC
+                    LIMIT 50
+                  )
+                """,
+                (session_id, session_id),
+            )
+    except (OSError, sqlite3.Error):
+        return
+
+
+def _discovery_session_item_text(item: Mapping[str, Any]) -> str:
+    content = item.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for value in content:
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, Mapping):
+            text_value = _clean_text(value.get("text") or value.get("content"))
+            if text_value:
+                parts.append(text_value)
+    return "\n".join(parts).strip()
+
+
+def _load_discovery_dialogue_session(
+    session_id: str,
+    fallback_history: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    if not session_id:
+        return fallback_history, []
+    persistent_memory = _load_discovery_persistent_decision_memory(session_id)
+    try:
+        from agents import SQLiteSession
+
+        async def _load() -> list[dict[str, Any]]:
+            session = SQLiteSession(session_id, _discovery_dialogue_session_db())
+            try:
+                return list(await session.get_items(limit=120))
+            finally:
+                session.close()
+
+        items = asyncio.run(_load())
+    except Exception:
+        return fallback_history, persistent_memory
+
+    history: list[dict[str, str]] = []
+    remembered: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        role = _clean_text(item.get("role")).lower()
+        content = _discovery_session_item_text(item)
+        if _clean_text(item.get("type")).lower() == "function_call_output":
+            tool_output = _clean_text(item.get("output"))
+            try:
+                response = _coerce_discovery_dialogue_json(tool_output)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                response = {}
+            assistant_text = _clean_text(response.get("assistant_message"))
+            if assistant_text:
+                role = "assistant"
+                content = assistant_text
+        if role not in {"user", "assistant"} or not content:
+            continue
+        history.append({"role": role, "content": content[:8000]})
+        if role == "assistant" and _DISCOVERY_SESSION_MEMORY_PREFIX in content:
+            raw_state = content.rsplit(_DISCOVERY_SESSION_MEMORY_PREFIX, 1)[-1].strip()
+            try:
+                state = json.loads(raw_state)
+            except (TypeError, ValueError):
+                continue
+            record = state.get("resolved_decision") if isinstance(state, Mapping) else None
+            if isinstance(record, Mapping):
+                remembered.append(dict(record))
+    normalized_history = _normalise_discovery_dialogue_history(history)
+    return (
+        normalized_history or fallback_history,
+        _normalise_discovery_decision_memory([*persistent_memory, *remembered]),
+    )
+
+
+def _store_discovery_dialogue_session_turn(
+    session_id: str,
+    *,
+    user_message: str,
+    assistant_message: str,
+    action: str,
+    patch: Mapping[str, Any],
+    next_decision: Mapping[str, Any] | None,
+    resolved_decision: Mapping[str, Any] | None,
+) -> None:
+    if not session_id:
+        return
+    _store_discovery_persistent_decision_memory(session_id, resolved_decision)
+    state = {
+        "action": action,
+        "strategy_patch": dict(patch),
+        "next_decision": dict(next_decision) if isinstance(next_decision, Mapping) else None,
+        "resolved_decision": (
+            dict(resolved_decision) if isinstance(resolved_decision, Mapping) else None
+        ),
+    }
+    memory_text = (
+        f"{assistant_message.strip()}\n\n{_DISCOVERY_SESSION_MEMORY_PREFIX}"
+        f"{json.dumps(state, ensure_ascii=False, separators=(',', ':'))}"
+    )
+    try:
+        from agents import SQLiteSession
+
+        async def _store() -> None:
+            session = SQLiteSession(session_id, _discovery_dialogue_session_db())
+            try:
+                await session.add_items(
+                    [
+                        {"role": "user", "content": user_message},
+                        {"role": "assistant", "content": memory_text},
+                    ]
+                )
+            finally:
+                session.close()
+
+        asyncio.run(_store())
+    except Exception:
+        # Dialogue remains functional with the request-carried fallback history.
+        return
+
+
+def _normalise_discovery_turn_action(
+    raw: Mapping[str, Any],
+    *,
+    legacy_intent: str,
+    patch: Mapping[str, Any],
+    next_decision: Mapping[str, Any] | None,
+) -> str:
+    requested = _clean_text(raw.get("action") or raw.get("mode")).lower()
+    if requested in _DISCOVERY_TURN_ACTIONS:
+        action = requested
+    else:
+        # Legacy outputs may still project conversational actions, but legacy
+        # fields can never authorize a card write or a confirmation.
+        action = {
+            "chitchat": "chat",
+            "explain": "advise",
+            "clarify": "clarify",
+            "request_defaults": "advise",
+            "request_confirm": "ready_to_confirm",
+            "refuse_search": "refuse_search",
+        }.get(legacy_intent, "clarify" if next_decision is not None else "advise")
+    if action == "update_strategy" and not patch:
+        return "clarify" if next_decision is not None else "advise"
+    return action
+
+
+def _legacy_discovery_turn_intent(action: str, raw_intent: str) -> str:
+    if action == "update_strategy" and raw_intent in {
+        "answer_question",
+        "multi_fill",
+        "revise",
+        "request_defaults",
+    }:
+        return raw_intent
+    if action == "ready_to_confirm" and raw_intent == "request_confirm":
+        return raw_intent
+    return {
+        "chat": "chitchat",
+        "advise": "explain",
+        "clarify": "clarify",
+        "update_strategy": "revise",
+        "ready_to_confirm": "explain",
+        "confirm_strategy": "request_confirm",
+        "refuse_search": "refuse_search",
+    }[action]
+
+
+_DISCOVERY_GRILL_MAX_REQUEST_SECONDS = 60.0
+_DISCOVERY_SEMANTIC_VERIFIER_ATTEMPT_SECONDS = 15.0
+_DISCOVERY_SEMANTIC_VERIFIER_MAX_ATTEMPTS = 2
+_DISCOVERY_CONFIRMATION_VOLATILE_FIELDS = {
+    "confirmed",
+    "answered",
+    "inferred",
+    "parseWarnings",
+    "parse_warnings",
+    "parseReasoning",
+    "parse_reasoning",
+}
+
+
+def _discovery_strategy_fingerprint(intent_snapshot: Mapping[str, Any]) -> str:
+    snapshot = _json_object(dict(intent_snapshot))
+    for key in _DISCOVERY_CONFIRMATION_VOLATILE_FIELDS:
+        snapshot.pop(key, None)
+    if not snapshot:
+        return ""
+    canonical = json.dumps(
+        snapshot,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+_DISCOVERY_EXECUTION_FINGERPRINT_VOLATILE_FIELDS = {
+    "strategy_fingerprint",
+    "strategy_fingerprint_payload",
+    "idempotency_key",
+}
+
+
+def _discovery_execution_snapshot(body: Mapping[str, Any]) -> dict[str, Any]:
+    snapshot = _json_object(dict(body))
+    for key in _DISCOVERY_EXECUTION_FINGERPRINT_VOLATILE_FIELDS:
+        snapshot.pop(key, None)
+    return snapshot
+
+
+def _discovery_execution_fingerprint(body: Mapping[str, Any]) -> str:
+    """Bind an explicit confirmation to the exact repository-search payload.
+
+    This Python-native projection remains the backward-compatible proof path.
+    New browser clients also submit their exact canonical JSON text so valid
+    numbers cannot diverge solely because Python and JavaScript format an
+    exponent differently.
+    """
+
+    snapshot = _discovery_execution_snapshot(body)
+    if not snapshot:
+        return ""
+    canonical = json.dumps(
+        snapshot,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _json_values_equal(left: Any, right: Any) -> bool:
+    """Type-safe JSON semantic equality (JSON has one numeric type)."""
+
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left is right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return math.isfinite(float(left)) and math.isfinite(float(right)) and left == right
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, str) or isinstance(right, str):
+        return isinstance(left, str) and isinstance(right, str) and left == right
+    if isinstance(left, list) or isinstance(right, list):
+        return (
+            isinstance(left, list)
+            and isinstance(right, list)
+            and len(left) == len(right)
+            and all(_json_values_equal(a, b) for a, b in zip(left, right))
+        )
+    if isinstance(left, Mapping) or isinstance(right, Mapping):
+        return (
+            isinstance(left, Mapping)
+            and isinstance(right, Mapping)
+            and set(left) == set(right)
+            and all(_json_values_equal(left[key], right[key]) for key in left)
+        )
+    return False
+
+
+def _discovery_confirmation_context(
+    body: Mapping[str, Any],
+    *,
+    phase: str,
+    intent_snapshot: Mapping[str, Any],
+    gap_report: Mapping[str, Any],
+) -> tuple[bool, str, str]:
+    fingerprint = _discovery_strategy_fingerprint(intent_snapshot)
+    if phase != "awaiting_confirm":
+        return False, "phase is not awaiting_confirm", fingerprint
+    if not fingerprint:
+        return False, "current strategy snapshot is empty", fingerprint
+    normalized_gap = _normalise_discovery_gap_report(gap_report)
+    if normalized_gap["required_missing"] or not normalized_gap["ready_for_confirm"]:
+        return False, "current strategy is not ready for confirmation", fingerprint
+    resolved_fields = _normalise_discovery_resolved_fields(None, intent_snapshot)
+    unresolved_critical = [
+        item
+        for item in _discovery_critical_decision_agenda(
+            intent_snapshot,
+            normalized_gap,
+            resolved_fields,
+        )
+        if item.get("critical") is True
+    ]
+    if unresolved_critical:
+        return (
+            False,
+            "critical strategy decisions remain unresolved: "
+            + ", ".join(_clean_text(item.get("id")) for item in unresolved_critical),
+            fingerprint,
+        )
+
+    expected_fingerprint = _clean_text(body.get("pending_strategy_fingerprint"))
+    pending_snapshot = body.get("pending_strategy_snapshot")
+    if isinstance(pending_snapshot, Mapping):
+        expected_fingerprint = _discovery_strategy_fingerprint(pending_snapshot)
+    if expected_fingerprint and not secrets.compare_digest(
+        expected_fingerprint,
+        fingerprint,
+    ):
+        return False, "current strategy no longer matches the pending snapshot", fingerprint
+    return True, "", fingerprint
+
+
+def _bind_discovery_turn_request_budget(client: Any, body: Mapping[str, Any]) -> float:
+    raw_budget = body.get("request_timeout_seconds")
+    try:
+        requested = float(raw_budget) if raw_budget is not None else _DISCOVERY_GRILL_MAX_REQUEST_SECONDS
+    except (TypeError, ValueError):
+        requested = _DISCOVERY_GRILL_MAX_REQUEST_SECONDS
+    if not math.isfinite(requested) or requested <= 0:
+        requested = _DISCOVERY_GRILL_MAX_REQUEST_SECONDS
+    budget = min(_DISCOVERY_GRILL_MAX_REQUEST_SECONDS, max(1.0, requested))
+
+    # The production OpenAI-compatible client exposes a per-request timeout.
+    # Clamp it to this turn's single budget; custom test/adapter clients without
+    # that attribute still receive exactly one call below.
+    if hasattr(client, "timeout"):
+        try:
+            current = float(getattr(client, "timeout"))
+        except (TypeError, ValueError):
+            current = budget
+        try:
+            setattr(client, "timeout", min(current, budget) if current > 0 else budget)
+        except (AttributeError, TypeError):
+            pass
+    return budget
+
+
+class _DiscoveryStrategyPatchToolInput(BaseModel):
+    """SDK tool input; deterministic validators remain the mutation authority."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    objective: str | None = None
+    task_type: str | None = None
+    run_horizon: str | None = None
+    species: list[str] | None = None
+    species_policy: str | None = None
+    species_coverage: str | None = None
+    acquisition_mode: str | None = None
+    mixed_acquisition_policy: str | None = None
+    ptm_types: list[str] | None = None
+    special_themes: list[str] | None = None
+    labeling_strategy: str | None = None
+    labeling_hard: bool | None = None
+    coverage_mode: str | None = None
+    target_project_count: int | None = None
+    max_candidate_projects: int | None = None
+    quota_flexibility: str | None = None
+    time_budget: str | None = None
+    on_safety_ceiling: str | None = None
+    instrument_preference: str | None = None
+    legacy_floor_ratio: float | None = None
+    exclude_rules: list[str] | None = None
+    success_criteria: list[str] | None = None
+    scientific_constraints: list[ScientificConstraint] | None = None
+    notes: str | None = None
+    open_risks: list[str] | None = None
+    repository: str | None = None
+
+
+class _DiscoveryPatchEvidenceInput(BaseModel):
+    """One verifier claim grounded in an exact latest-turn quote."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: str
+    source: str
+    rationale: str = ""
+
+
+class _DiscoveryPatchVerificationInput(BaseModel):
+    """Bounded second-Agent review for multi-clause strategy mutations."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    verdict: str
+    patch: _DiscoveryStrategyPatchToolInput
+    evidence: list[_DiscoveryPatchEvidenceInput]
+    rationale: str = ""
+
+
+class _DiscoveryScientificAdvisorInput(BaseModel):
+    """Bounded question from the Dialogue Manager to its scientific specialist."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    question: str
+    decision_goal: str = "prioritize the next scientifically material user decision"
+
+
+class _DiscoveryScientificAdvisorDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    priority: int
+    target_fields: list[str]
+    question: str
+    recommendation: str
+    reason: str
+
+
+class _DiscoveryScientificAdvisorOutput(BaseModel):
+    """Read-only specialist result consumed by the user-facing Manager."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    analysis: str
+    critical_decisions: list[_DiscoveryScientificAdvisorDecision]
+    repository_evidence_to_fetch: list[str]
+    scientific_risks: list[str]
+
+
+async def _sdk_discovery_update_strategy(
+    ctx: RunContextWrapper[SimpleNamespace],
+    patch: _DiscoveryStrategyPatchToolInput,
+    response_json: str,
+) -> str:
+    """Record one explicit strategy delta and return the complete D1 response JSON."""
+
+    payload = patch.model_dump(mode="python", exclude_unset=True)
+    validated, errors = _validate_discovery_strategy_patch(payload)
+    if errors:
+        return json.dumps(
+            {
+                "action": "advise",
+                "assistant_message": (
+                    "这轮策略修改没有通过结构校验，当前策略保持不变。"
+                    "你可以继续用自然语言说明想改什么。"
+                ),
+                "tool_calls": [],
+                "contract_errors": errors,
+            },
+            ensure_ascii=False,
+        )
+    calls = ctx.context.tool_calls
+    if calls:
+        return json.dumps(
+            {
+                "action": "advise",
+                "assistant_message": "同一轮只能执行一个对话动作，当前策略保持不变。",
+                "tool_calls": [],
+            },
+            ensure_ascii=False,
+        )
+    calls.append(
+        {
+            "name": "update_strategy",
+            "arguments": {"patch": validated},
+        }
+    )
+    try:
+        response = _coerce_discovery_dialogue_json(response_json)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        response = {
+            "assistant_message": "已按你的明确选择更新策略。",
+            "turn_interpretation": {"commitments": [], "consultations": []},
+        }
+    response["action"] = "update_strategy"
+    return json.dumps(response, ensure_ascii=False)
+
+
+async def _sdk_discovery_verify_strategy_patch(
+    ctx: RunContextWrapper[SimpleNamespace],
+    verification: _DiscoveryPatchVerificationInput,
+) -> str:
+    """Capture one auditable semantic review; this tool never writes the card."""
+
+    verdict = _clean_text(verification.verdict).lower()
+    if verdict not in {"accept", "repair", "reject"}:
+        verdict = "reject"
+    candidate = verification.patch.model_dump(mode="python", exclude_unset=True)
+    # Some OpenAI-compatible models serialize unmentioned optional enum fields
+    # as ``""``.  Empty strings are neither a valid enum nor the contract's
+    # explicit clear operation (which is null), so treating them as omission is
+    # the only non-mutating interpretation.  This avoids rejecting an otherwise
+    # grounded multi-field correction because of model-generated placeholders.
+    candidate = {
+        key: value
+        for key, value in candidate.items()
+        if not (isinstance(value, str) and not value.strip())
+    }
+    validated, errors = _validate_discovery_strategy_patch(candidate)
+    payload = {
+        "verdict": "reject" if errors else verdict,
+        "patch": {} if errors else validated,
+        "evidence": [item.model_dump(mode="json") for item in verification.evidence],
+        "rationale": _clean_text(verification.rationale)[:1200],
+        "errors": errors,
+    }
+    ctx.context.verification = payload
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def _sdk_discovery_respond(
+    ctx: RunContextWrapper[SimpleNamespace],
+    response_json: str,
+) -> str:
+    """Return one non-mutating chat, advice, clarification, or readiness response."""
+
+    try:
+        response = _coerce_discovery_dialogue_json(response_json)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        response = {
+            "action": "chat",
+            "assistant_message": "我在听。你可以继续说你的科学问题或数据需求。",
+            "tool_calls": [],
+        }
+    if _clean_text(response.get("action")).lower() in {
+        "update_strategy",
+        "confirm_strategy",
+    }:
+        response["action"] = "advise"
+        response["assistant_message"] = (
+            "这轮只进行了讨论，策略没有修改。"
+            + (" " + _clean_text(response.get("assistant_message")) if _clean_text(response.get("assistant_message")) else "")
+        )
+    return json.dumps(response, ensure_ascii=False)
+
+
+async def _sdk_discovery_confirm_strategy(
+    ctx: RunContextWrapper[SimpleNamespace],
+    response_json: str,
+) -> str:
+    """Record explicit approval and return the complete D1 response JSON."""
+
+    calls = ctx.context.tool_calls
+    if calls:
+        return json.dumps(
+            {
+                "action": "advise",
+                "assistant_message": "同一轮不能既修改策略又确认策略；本轮未确认。",
+                "tool_calls": [],
+            },
+            ensure_ascii=False,
+        )
+    calls.append({"name": "confirm_strategy", "arguments": {}})
+    try:
+        response = _coerce_discovery_dialogue_json(response_json)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        response = {"assistant_message": "已确认当前策略，但尚未启动仓库搜索。"}
+    response["action"] = "confirm_strategy"
+    return json.dumps(response, ensure_ascii=False)
+
+
+def _load_discovery_dialogue_agents_sdk() -> dict[str, Any]:
+    try:
+        from agents import (
+            Agent,
+            AsyncOpenAI,
+            ModelSettings,
+            OpenAIChatCompletionsModel,
+            RunConfig,
+            Runner,
+            function_tool,
+        )
+    except ImportError as exc:  # pragma: no cover - deployment configuration failure
+        raise RuntimeError(
+            "OpenAI Agents SDK is required for discovery dialogue. "
+            "Install the project agents-sdk dependency."
+        ) from exc
+    return {
+        "Agent": Agent,
+        "AsyncOpenAI": AsyncOpenAI,
+        "ModelSettings": ModelSettings,
+        "OpenAIChatCompletionsModel": OpenAIChatCompletionsModel,
+        "RunConfig": RunConfig,
+        "Runner": Runner,
+        "function_tool": function_tool,
+    }
+
+
+def _coerce_discovery_dialogue_json(content: str) -> dict[str, Any]:
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(r"```$", "", text).strip()
+    try:
+        decoded = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            raise
+        decoded = json.loads(match.group(0))
+    if not isinstance(decoded, dict):
+        raise ValueError("Discovery dialogue Agent output must be a JSON object.")
+    return decoded
+
+
+def _run_discovery_dialogue_json_compatibility(
+    client: OpenAICompatibleDiscoveryLLM,
+    *,
+    system_prompt: str,
+    dialogue_history: list[dict[str, str]],
+    state_prompt: str,
+) -> dict[str, Any]:
+    """Recover a Manager action when a provider ignores required SDK tools.
+
+    The completion is still model-owned and schema-generic.  This helper does
+    not mutate state: the caller may synthesize one typed action event only
+    after validating the returned action/tool envelope, and the normal
+    commitment plus semantic gates run afterwards.
+    """
+
+    compatibility_prompt = (
+        f"{state_prompt}\n\n"
+        "PROVIDER JSON ACTION COMPATIBILITY (authoritative for this retry): The previous "
+        "SDK attempt returned ordinary prose instead of invoking its required terminal "
+        "function. Return exactly one JSON object matching the D1 contract above; do not "
+        "return prose outside JSON. For action=update_strategy, include exactly one textual "
+        "tool_calls entry named update_strategy with arguments.patch. The server will schema-"
+        "validate that envelope and synthesize the equivalent typed event before the normal "
+        "commitment and semantic gates. For a non-mutating turn use action=chat, advise, or "
+        "clarify and tool_calls=[]. Never confirm unless the supplied confirmation_context is "
+        "eligible. This compatibility retry grants no additional strategy authority."
+    )
+    raw = client.complete_json_messages(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            *dialogue_history,
+            {"role": "user", "content": compatibility_prompt},
+        ]
+    )
+    return dict(raw) if isinstance(raw, Mapping) else {}
+
+
+def _run_discovery_dialogue_agents_sdk(
+    client: OpenAICompatibleDiscoveryLLM,
+    *,
+    system_prompt: str,
+    dialogue_history: list[dict[str, str]],
+    state_prompt: str,
+    user_message: str,
+    session_id: str,
+    advisor_context: Mapping[str, Any] | None = None,
+    model: Any | None = None,
+) -> dict[str, Any]:
+    """Run D1 as a real SDK Agent; persistence happens after server validation.
+
+    The SDK session cannot be attached here because it would persist raw tool
+    output before commitment reconciliation and semantic verification.  The
+    caller supplies canonical history and stores exactly one normalized turn
+    only after all server-side gates have finished.
+    """
+
+    sdk = _load_discovery_dialogue_agents_sdk()
+    caller_supplied_model = model is not None
+    owned_async_client: Any | None = None
+    if model is None:
+        owned_async_client = sdk["AsyncOpenAI"](
+            api_key=client.api_key,
+            base_url=client.base_url,
+            timeout=client.timeout,
+            max_retries=1,
+        )
+        model = sdk["OpenAIChatCompletionsModel"](
+            model=client.model,
+            openai_client=owned_async_client,
+            buffer_streamed_tool_calls=True,
+        )
+
+    context = SimpleNamespace(tool_calls=[], advisor_calls=[])
+    bounded_advisor_context = _json_object(dict(advisor_context or {}))
+    advisor_instructions = (
+        "You are a read-only scientific planning specialist for a proteomics data-discovery "
+        "Dialogue Manager. Analyze the concrete scientific task rather than following a fixed "
+        "questionnaire. Prioritize only decisions the user must make; list repository facts under "
+        "repository_evidence_to_fetch instead of asking the user to guess them. Search scale is a "
+        "material decision for every executable run unless quota is explicitly open-ended. For "
+        "training tasks, examine downstream labels, acquisition compatibility, biological "
+        "generalization, leakage/batch risks, and evidence requirements. Never mutate a strategy, "
+        "confirm it, or claim PRIDE facts that have not been retrieved. Return concise structured "
+        "analysis for the user-facing Manager.\n\n"
+        "Authoritative bounded context:\n"
+        + json.dumps(bounded_advisor_context, ensure_ascii=False, indent=2)
+    )
+    advisor_agent = sdk["Agent"][SimpleNamespace](
+        name="Proteomics Scientific Planning Advisor",
+        instructions=advisor_instructions,
+        model=model,
+        output_type=_DiscoveryScientificAdvisorOutput,
+        model_settings=sdk["ModelSettings"](temperature=0),
+    )
+
+    async def _extract_advisor_output(run_result: Any) -> str:
+        output = run_result.final_output
+        if isinstance(output, BaseModel):
+            payload = output.model_dump(mode="json")
+        elif isinstance(output, Mapping):
+            payload = dict(output)
+        else:
+            try:
+                payload = _coerce_discovery_dialogue_json(str(output or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {"analysis": _clean_text(output)}
+        context.advisor_calls.append(_json_safe(payload))
+        return json.dumps(payload, ensure_ascii=False)
+
+    advisor_tool = advisor_agent.as_tool(
+        tool_name="consult_scientific_advisor",
+        tool_description=(
+            "Ask the read-only proteomics specialist to prioritize task-specific scientific "
+            "decisions and distinguish user choices from repository evidence. Use for an open-ended "
+            "recommendation, a newly introduced scientific task, or a nontrivial conflict; do not "
+            "use for greetings, exact option selections, straightforward field edits, or confirmation."
+        ),
+        parameters=_DiscoveryScientificAdvisorInput,
+        include_input_schema=True,
+        custom_output_extractor=_extract_advisor_output,
+        max_turns=1,
+    )
+    tools = [
+        advisor_tool,
+        sdk["function_tool"](
+            _sdk_discovery_respond,
+            name_override="respond",
+            description_override=(
+                "Finish a non-mutating chat, advice, clarification, refusal, or ready-to-confirm "
+                "turn. Pass the complete D1 contract object serialized in response_json."
+            ),
+            strict_mode=False,
+        ),
+        sdk["function_tool"](
+            _sdk_discovery_update_strategy,
+            name_override="update_strategy",
+            description_override=(
+                "Write only strategy choices the user has explicitly committed to in this "
+                "turn, and pass the complete D1 contract object serialized in response_json. "
+                "Advice, comparisons, examples, hypothetical values, and your own recommended "
+                "defaults must not be written unless the user explicitly accepts them."
+            ),
+            strict_mode=False,
+        ),
+        sdk["function_tool"](
+            _sdk_discovery_confirm_strategy,
+            name_override="confirm_strategy",
+            description_override=(
+                "Record unambiguous approval of the exact strategy currently awaiting confirmation. "
+                "Pass the complete D1 contract object serialized in response_json. This does not "
+                "start PRIDE search."
+            ),
+            strict_mode=False,
+        ),
+    ]
+    instructions = (
+        f"{system_prompt}\n\n"
+        "SDK ACTION PROTOCOL (mandatory): finish by invoking exactly one function tool and never "
+        "return assistant text directly. Use respond for a non-mutating turn, update_strategy for "
+        "an explicit user commitment, or confirm_strategy for eligible approval. Put the complete "
+        "D1 response object, serialized as JSON text, in response_json. For update_strategy, also "
+        "supply the canonical patch. The selected function tool is the action authority; a textual "
+        "tool_calls array is only a projection and cannot replace the function call. When "
+        "selected_agent_option is present, it is an explicit commitment: invoke update_strategy, "
+        "not respond. If the option intentionally keeps a field open/default, submit the relevant "
+        "target field with its canonical open, empty, or default value so the decision itself is "
+        "recorded. consult_scientific_advisor is a bounded read-only specialist: use it only when "
+        "scientific planning genuinely benefits, then continue as the same Manager and finish with "
+        "exactly one of respond/update_strategy/confirm_strategy. It never owns the user reply or "
+        "strategy mutation.\n\n"
+        "CURRENT TURN STATE AND OUTPUT CONTRACT (authoritative for this run):\n"
+        f"{state_prompt}"
+    )
+    agent = sdk["Agent"][SimpleNamespace](
+        name="Proteomics Discovery Dialogue Agent",
+        instructions=instructions,
+        model=model,
+        tools=tools,
+        model_settings=sdk["ModelSettings"](
+            temperature=0,
+            parallel_tool_calls=False,
+            tool_choice="required",
+        ),
+        tool_use_behavior={
+            "stop_at_tool_names": ["respond", "update_strategy", "confirm_strategy"]
+        },
+    )
+
+    runner_input: list[dict[str, str]] = [
+        *dialogue_history,
+        {"role": "user", "content": user_message},
+    ]
+    async def _execute() -> Any:
+        try:
+            return await sdk["Runner"].run(
+                starting_agent=agent,
+                input=runner_input,
+                context=context,
+                max_turns=3,
+                run_config=sdk["RunConfig"](
+                    workflow_name="proteomics_discovery_dialogue_v1",
+                    group_id=session_id or None,
+                    trace_metadata={"workflow": "discovery_dialogue"},
+                    tracing_disabled=True,
+                    trace_include_sensitive_data=False,
+                ),
+            )
+        finally:
+            if owned_async_client is not None:
+                await owned_async_client.close()
+
+    # The budget applies to the complete Agent loop (including a possible
+    # tool round-trip), not independently to every provider request.
+    result = asyncio.run(
+        asyncio.wait_for(_execute(), timeout=max(1.0, float(client.timeout)))
+    )
+
+    final_output = result.final_output
+    if isinstance(final_output, Mapping):
+        raw = dict(final_output)
+    else:
+        serialized_output = str(final_output or "")
+        if not serialized_output.strip():
+            item_types = [
+                type(item).__name__
+                for item in list(getattr(result, "new_items", []) or [])[:20]
+            ]
+            terminal_actions = [
+                _clean_text(call.get("name"))
+                for call in context.tool_calls
+                if isinstance(call, Mapping) and _clean_text(call.get("name"))
+            ]
+            if terminal_actions:
+                raise ValueError(
+                    "Discovery dialogue SDK produced an empty final output after a terminal "
+                    f"action (run_items={item_types or ['none']}, "
+                    f"terminal_actions={terminal_actions}, "
+                    f"advisor_calls={len(context.advisor_calls)})."
+                )
+            raw = {
+                "action": "advise",
+                "assistant_message": (
+                    "模型这轮没有执行结构化对话工具，当前策略保持不变。"
+                    "我会继续按你的原话检查是否遗漏了明确要求。"
+                ),
+                "turn_interpretation": {"commitments": [], "consultations": []},
+                "tool_calls": [],
+                "_provider_compatibility_recovery": {
+                    "mode": "empty_output_as_non_mutating",
+                    "run_items": item_types,
+                    "advisor_calls": len(context.advisor_calls),
+                },
+            }
+        else:
+            try:
+                raw = _coerce_discovery_dialogue_json(serialized_output)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                # Some OpenAI-compatible providers ignore tool_choice="required"
+                # and return an ordinary assistant message.  Plain prose has no
+                # mutation authority, but it is still usable as a non-mutating
+                # response.  The outer omission auditor may then ask the same
+                # Dialogue Manager to repair a missed commitment.  JSON-looking
+                # malformed output and prose after a real terminal action still
+                # fail closed.
+                looks_like_json = serialized_output.lstrip().startswith(("{", "[", "```"))
+                if context.tool_calls or looks_like_json:
+                    raise ValueError(
+                        "Discovery dialogue SDK produced a non-JSON final output "
+                        f"(type={type(final_output).__name__}, chars={len(serialized_output)})."
+                    ) from exc
+                compatibility_raw: dict[str, Any] = {}
+                if not caller_supplied_model:
+                    try:
+                        compatibility_client = OpenAICompatibleDiscoveryLLM(
+                            api_key=client.api_key,
+                            model=client.model,
+                            base_url=client.base_url,
+                            timeout=max(2.0, float(client.timeout)),
+                        )
+                        compatibility_raw = _run_discovery_dialogue_json_compatibility(
+                            compatibility_client,
+                            system_prompt=system_prompt,
+                            dialogue_history=dialogue_history,
+                            state_prompt=state_prompt,
+                        )
+                    except Exception:
+                        compatibility_raw = {}
+                compatibility_action = _clean_text(
+                    compatibility_raw.get("action") or compatibility_raw.get("mode")
+                ).lower()
+                synthesized_calls: list[dict[str, Any]] = []
+                if compatibility_action == "update_strategy":
+                    candidate_calls = compatibility_raw.get("tool_calls")
+                    update_calls = [
+                        call
+                        for call in candidate_calls
+                        if isinstance(call, Mapping)
+                        and _clean_text(call.get("name") or call.get("tool"))
+                        == "update_strategy"
+                    ] if isinstance(candidate_calls, list) else []
+                    if len(update_calls) == 1:
+                        arguments = update_calls[0].get("arguments")
+                        candidate_patch = (
+                            arguments.get("patch")
+                            if isinstance(arguments, Mapping)
+                            else None
+                        )
+                        if isinstance(candidate_patch, Mapping):
+                            validated_patch, validation_errors = (
+                                _validate_discovery_strategy_patch(
+                                    _json_object(dict(candidate_patch))
+                                )
+                            )
+                            if validated_patch and not validation_errors:
+                                synthesized_calls = [
+                                    {
+                                        "name": "update_strategy",
+                                        "arguments": {"patch": validated_patch},
+                                    }
+                                ]
+                elif compatibility_action == "confirm_strategy":
+                    synthesized_calls = [
+                        {"name": "confirm_strategy", "arguments": {}}
+                    ]
+
+                if compatibility_raw:
+                    raw = compatibility_raw
+                    context.tool_calls = synthesized_calls
+                    raw.setdefault("assistant_message", serialized_output.strip())
+                    raw["_provider_compatibility_recovery"] = {
+                        "mode": "json_action_contract_after_plain_text",
+                        "chars": len(serialized_output),
+                        "action": compatibility_action or "unknown",
+                        "typed_event_synthesized": bool(synthesized_calls),
+                        "advisor_calls": len(context.advisor_calls),
+                    }
+                else:
+                    raw = {
+                        "action": "advise",
+                        "assistant_message": serialized_output.strip(),
+                        "turn_interpretation": {
+                            "commitments": [],
+                            "consultations": [],
+                        },
+                        "tool_calls": [],
+                        "_provider_compatibility_recovery": {
+                            "mode": "plain_text_as_non_mutating",
+                            "chars": len(serialized_output),
+                            "advisor_calls": len(context.advisor_calls),
+                        },
+                    }
+    # Only SDK-executed tools are mutation/confirmation authority. Any textual
+    # tool_calls emitted in the final answer are replaced, never trusted.
+    raw["tool_calls"] = list(context.tool_calls)
+    raw["_agent_runtime"] = "openai_agents"
+    raw["_sdk_session_managed"] = False
+    if context.advisor_calls:
+        raw["_advisor_calls"] = list(context.advisor_calls)
+    return raw
+
+
+def _ground_discovery_patch_verification(
+    verification: Mapping[str, Any],
+    *,
+    user_message: str,
+    intent_snapshot: Mapping[str, Any],
+    proposed_patch: Mapping[str, Any],
+    allow_commitment_recovery: bool = False,
+    preserve_unchanged_fields: set[str] | None = None,
+) -> dict[str, Any]:
+    """Validate a verifier result without any vocabulary or ontology branches."""
+
+    verdict = _clean_text(verification.get("verdict")).lower()
+    canonical_proposed_patch, proposed_errors = _validate_discovery_strategy_patch(
+        dict(proposed_patch)
+    )
+    if proposed_errors:
+        return {}
+    raw_patch = verification.get("patch")
+    if verdict not in {"accept", "repair"} or not isinstance(raw_patch, Mapping):
+        return {}
+    patch, errors = _validate_discovery_strategy_patch(dict(raw_patch))
+    if errors or not patch:
+        return {}
+
+    message_evidence = re.sub(r"\s+", "", user_message).casefold()
+    grounded_fields: set[str] = set()
+    evidence = verification.get("evidence")
+    if isinstance(evidence, list):
+        for item in evidence[:100]:
+            if not isinstance(item, Mapping):
+                continue
+            raw_field = _clean_text(item.get("field"))
+            # Models often cite one member of a structured array as
+            # ``scientific_constraints[0]``.  The evidence still grounds the
+            # canonical top-level field; indices are audit detail, not a new
+            # strategy key.
+            field_root = re.split(r"[.\[]", raw_field, maxsplit=1)[0]
+            field = _DISCOVERY_STRATEGY_PATCH_ALIASES.get(field_root, field_root)
+            source = re.sub(r"\s+", "", _clean_text(item.get("source"))).casefold()
+            if field in patch and source and source in message_evidence:
+                grounded_fields.add(field)
+    # The verifier is allowed to repair only fields for which it supplied an
+    # exact latest-message evidence span.  This keeps the second Agent from
+    # smuggling its own recommended defaults into the card.
+    # The critic may veto or narrow a proposal, never author a new value.  This
+    # is the single-writer boundary recommended by manager-style orchestration:
+    # only the user-facing Dialogue Manager can propose a card mutation.
+    allowed_fields = set(canonical_proposed_patch)
+    grounded_patch = {
+        field: value
+        for field, value in patch.items()
+        if (
+            field in grounded_fields
+            and field in allowed_fields
+            and _json_values_equal(value, canonical_proposed_patch.get(field))
+        )
+    }
+    return _drop_unchanged_discovery_patch_fields(
+        grounded_patch,
+        intent_snapshot,
+        preserve_fields=preserve_unchanged_fields,
+    )
+
+
+def _normalise_discovery_patch_verification_audit(
+    verification: Mapping[str, Any],
+    *,
+    user_message: str,
+    proposed_patch: Mapping[str, Any],
+    grounded_patch: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Make the public verifier audit describe the delta it can authorize.
+
+    Compatible models occasionally label a no-op review as ``repair`` and
+    explain changes that are merely retained in the current strategy.  The
+    mutation boundary already trusts only the evidence-grounded delta; the
+    audit projection must use that same source of truth rather than repeating
+    a contradictory model narrative.
+    """
+
+    proposed, proposed_errors = _validate_discovery_strategy_patch(
+        dict(proposed_patch)
+    )
+    if proposed_errors:
+        proposed = {}
+    effective_patch = dict(grounded_patch)
+    effective_verdict = (
+        "accept" if effective_patch == proposed else "repair"
+    )
+
+    compact_message = re.sub(r"\s+", "", user_message).casefold()
+    evidence_rows: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    raw_evidence = verification.get("evidence")
+    if isinstance(raw_evidence, list):
+        for item in raw_evidence[:100]:
+            if not isinstance(item, Mapping):
+                continue
+            raw_field = _clean_text(item.get("field"))
+            field_root = re.split(r"[.\[]", raw_field, maxsplit=1)[0]
+            field = _DISCOVERY_STRATEGY_PATCH_ALIASES.get(field_root, field_root)
+            source = _clean_text(item.get("source"))
+            if (
+                field not in effective_patch
+                or not source
+                or re.sub(r"\s+", "", source).casefold() not in compact_message
+            ):
+                continue
+            key = (field, source.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            row = {"field": field, "source": source}
+            rationale = _clean_text(item.get("rationale"))[:500]
+            if rationale:
+                row["rationale"] = rationale
+            evidence_rows.append(row)
+
+    model_rationale = _clean_text(verification.get("rationale"))[:1200]
+    if effective_verdict == "accept":
+        rationale = (
+            "Independent semantic verifier confirmed the evidence-grounded "
+            "primary strategy delta."
+        )
+    elif proposed:
+        rationale = (
+            "Independent semantic verifier produced an evidence-grounded "
+            "correction to the primary strategy delta."
+        )
+    else:
+        rationale = (
+            "Independent semantic verifier recovered an evidence-grounded "
+            "strategy delta omitted by the primary turn."
+        )
+    return {
+        "verdict": effective_verdict,
+        "evidence": evidence_rows,
+        "rationale": rationale,
+        "model_rationale": model_rationale,
+    }
+
+
+def _run_discovery_patch_verifier_json_fallback(
+    client: OpenAICompatibleDiscoveryLLM,
+    *,
+    user_message: str,
+    intent_snapshot: Mapping[str, Any],
+    proposed_patch: Mapping[str, Any],
+    selected_decision: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Provider-compatible structured fallback for the read-only critic.
+
+    Some OpenAI-compatible providers ignore required function tools.  A critic
+    has no action authority, so a bounded JSON-object completion is an
+    appropriate compatibility path: its output still passes the same schema,
+    evidence, scope, and single-writer gates as an SDK tool result.
+    """
+
+    omission_mode = not proposed_patch
+    omission_rule = (
+        "The Manager proposed no patch. Classify every punctuation-delimited clause "
+        "independently. A declarative clause stating the user's intended goal, dataset "
+        "use, research topic, or downstream task is a commitment even when another "
+        "clause asks for advice. If any such clause exists, verdict must be repair. "
+        "Report it only in candidate_findings as objects containing canonical field, "
+        "canonical value, exact source quote, and optional rationale. candidate_findings "
+        "are read-only observations for a Manager retry, not a strategy patch. Return no "
+        "patch key in omission mode."
+        if omission_mode
+        else (
+            "The Manager proposed a patch. You may accept it or narrow it, but patch may "
+            "contain only identical proposed fields and values. Never add or change a field."
+        )
+    )
+    output_contract = (
+        "Return exactly one JSON object with keys verdict (repair|reject), "
+        "candidate_findings (array), and rationale (string). Each candidate finding must "
+        "contain field, value, source, and optional rationale."
+        if omission_mode
+        else (
+            "Return exactly one JSON object with keys verdict (accept|repair|reject), patch "
+            "(object), evidence (array of objects with field, source, and optional rationale), "
+            "and rationale (string)."
+        )
+    )
+    system_prompt = (
+        "You are a read-only semantic critic for a proteomics data-discovery Dialogue "
+        "Manager. You cannot update or confirm a strategy and cannot start search. "
+        f"{omission_rule} Recommendations, examples, hypotheticals, questions, and unstated "
+        "defaults are not commitments. A biological research topic belongs in "
+        "special_themes; requirements without a first-class field belong in "
+        "scientific_constraints. For every reported field include an exact source quote "
+        f"from the latest message. {output_contract} Do not wrap it in another object and "
+        "do not return prose outside JSON.\n\n"
+        f"Canonical patch contract: {json.dumps(_DISCOVERY_STRATEGY_PATCH_CONTRACT, ensure_ascii=False)}\n"
+        f"Field meanings: {json.dumps(_DISCOVERY_STRATEGY_FIELD_SEMANTICS, ensure_ascii=False)}"
+    )
+    user_prompt = (
+        f"Latest user message: {user_message}\n"
+        f"Latest clauses: {json.dumps(_discovery_latest_message_clauses(user_message), ensure_ascii=False)}\n"
+        f"Current strategy: {json.dumps(dict(intent_snapshot), ensure_ascii=False)}\n"
+        f"Active selected option: {json.dumps(dict(selected_decision), ensure_ascii=False) if isinstance(selected_decision, Mapping) else 'null'}\n"
+        f"Proposed patch: {json.dumps(dict(proposed_patch), ensure_ascii=False)}\n"
+        "Audit now."
+    )
+    raw = client.complete_json(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
+    if isinstance(raw.get("verification"), Mapping):
+        raw = dict(raw["verification"])
+    if omission_mode and isinstance(raw.get("candidate_findings"), list):
+        candidate_patch: dict[str, Any] = {}
+        evidence: list[dict[str, str]] = []
+        for finding in raw.get("candidate_findings", [])[:100]:
+            if not isinstance(finding, Mapping):
+                continue
+            raw_field = _clean_text(finding.get("field"))
+            field_root = re.split(r"[.\[]", raw_field, maxsplit=1)[0]
+            field = _DISCOVERY_STRATEGY_PATCH_ALIASES.get(field_root, field_root)
+            source = _clean_text(finding.get("source"))
+            if not field or "value" not in finding or not source:
+                continue
+            finding_value = finding.get("value")
+            # A single finding is often serialized as a scalar even when the
+            # canonical strategy field is an array.  Treat it as one reported
+            # item, not as a different semantic value; the normal validator
+            # still canonicalizes and bounds the resulting array.
+            if (
+                field in _DISCOVERY_STRATEGY_ARRAY_FIELDS
+                and finding_value is not None
+                and not isinstance(finding_value, list)
+            ):
+                finding_value = [finding_value]
+            normalized, errors = _validate_discovery_strategy_patch(
+                {field: finding_value}
+            )
+            if errors or field not in normalized:
+                continue
+            value = normalized[field]
+            if field in candidate_patch and not _json_values_equal(
+                candidate_patch[field], value
+            ):
+                continue
+            candidate_patch[field] = value
+            row = {"field": field, "source": source}
+            rationale = _clean_text(finding.get("rationale"))[:500]
+            if rationale:
+                row["rationale"] = rationale
+            evidence.append(row)
+        raw = {
+            **dict(raw),
+            "verdict": "repair" if candidate_patch else "reject",
+            "patch": candidate_patch,
+            "evidence": evidence,
+            "findings_contract": "candidate_findings_v1",
+        }
+    return dict(raw)
+
+
+def _run_discovery_patch_verifier_agents_sdk(
+    client: OpenAICompatibleDiscoveryLLM,
+    *,
+    user_message: str,
+    intent_snapshot: Mapping[str, Any],
+    proposed_patch: Mapping[str, Any],
+    timeout_seconds: float,
+    model: Any | None = None,
+    allow_commitment_recovery: bool = False,
+    use_update_strategy_tool: bool = False,
+    required_fields: set[str] | None = None,
+    preserve_unchanged_fields: set[str] | None = None,
+    selected_decision: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Use a separate SDK Agent to audit high-risk multi-clause updates once."""
+
+    sdk = _load_discovery_dialogue_agents_sdk()
+    caller_supplied_model = model is not None
+    owned_async_client: Any | None = None
+    if model is None:
+        owned_async_client = sdk["AsyncOpenAI"](
+            api_key=client.api_key,
+            base_url=client.base_url,
+            timeout=max(2.0, timeout_seconds),
+            max_retries=1,
+        )
+        model = sdk["OpenAIChatCompletionsModel"](
+            model=client.model,
+            openai_client=owned_async_client,
+            buffer_streamed_tool_calls=True,
+        )
+
+    context = SimpleNamespace(verification=None)
+    # A verifier is a critic, never a second strategy writer.  Keep the legacy
+    # keyword arguments temporarily for call-site compatibility, but do not let
+    # them rename this read-only tool or grant mutation authority.
+    update_strategy_authority = False
+    verifier_tool_name = "verify_strategy_patch"
+    verifier_tool_description = (
+        "Read-only omission audit of the latest user turn. The Manager proposed no "
+        "strategy delta, so identify any explicit user commitments as evidence-grounded "
+        "candidate findings. Classify punctuation-delimited clauses independently: a "
+        "declarative clause stating the user's intended goal, dataset use, or downstream "
+        "task is a commitment even when another clause asks for advice. In that case "
+        "verdict=repair is mandatory. Candidate values are repair feedback only: this tool "
+        "never writes the strategy, confirms it, or starts search."
+        if not proposed_patch
+        else (
+            "Read-only audit of the Manager's proposed strategy delta. Return an "
+            "evidence-grounded view of identical proposed fields only; never add or change "
+            "a field, confirm a strategy, or act as update_strategy authority."
+        )
+    )
+    verifier_tool = sdk["function_tool"](
+        _sdk_discovery_verify_strategy_patch,
+        name_override=verifier_tool_name,
+        description_override=verifier_tool_description,
+        strict_mode=False,
+    )
+    recovery_instructions = (
+        "You have no write authority. If proposed_patch is non-empty, patch may contain only "
+        "identical proposed fields. If proposed_patch is empty but the latest user message "
+        "contains concrete commitments the Manager missed, use verdict=repair and place the "
+        "evidence-grounded candidate values in patch only as non-authoritative critic findings; "
+        "the server will discard those values and ask the user-facing Manager to propose again. "
+        "Use verdict=reject with an empty patch only for a genuinely non-committing consultation.\n\n"
+    )
+    omission_audit_instructions = (
+        "OMISSION-AUDIT PRECEDENCE (mandatory because proposed_patch is empty): First classify "
+        "every supplied C-id independently; do not classify the whole message only by its final "
+        "question or request. A declarative clause in which the user states what they want, plan, "
+        "intend, or need to research/build/use the data for is a strategy commitment to objective "
+        "and to every canonical downstream task explicitly contained in that clause. A separate "
+        "clause asking you to analyze, recommend, explain, or choose the next decision is a "
+        "consultation, but it cannot cancel or reclassify the preceding commitment. If at least "
+        "one clause is a commitment, verdict=reject is forbidden: return verdict=repair, candidate "
+        "values in patch, and an exact source quote per field. Do not add recommended defaults.\n\n"
+        if not proposed_patch
+        else ""
+    )
+    instructions = "".join(
+        [
+        omission_audit_instructions,
+        "You are an independent scientific intent verifier for a proteomics discovery Agent. "
+        "Review only the latest user message, its punctuation-delimited clauses, the current "
+        f"strategy, and the proposed patch. Invoke {verifier_tool_name} exactly once and never "
+        "return plain text. Return the complete corrected delta, not merely the changed part of "
+        "the proposal. For a non-empty proposal, include no field that is absent from "
+        "proposed_patch and do not change a proposed value. For an empty proposal, candidate "
+        "patch values are findings only and require exact evidence. Include no recommendation, "
+        "example, hypothetical value, or unstated default. A biological study topic belongs in "
+        "special_themes rather than only objective. Requirements without a first-class field "
+        "belong in scientific_constraints. Use one canonical English organism/taxon label per "
+        "intended taxon; never list translations or synonyms as separate species. For every "
+        "patch field provide an exact source quote copied from the latest message. A find/review/"
+        "delivery instruction is run_horizon, not task_type; never infer browse_only unless the "
+        "user explicitly chooses browsing/exploration as the downstream use. A numeric project "
+        "target alone is recommended, not fixed, unless the user explicitly says exact/fixed/must. "
+        "A user stating their own intended research goal, dataset purpose, or downstream task "
+        "is a commitment even when the same sentence asks for analysis or a recommendation. "
+        "Do not duplicate already structured fields into notes. Make patch and rationale agree. Use verdict "
+        "accept when the proposal is already complete, repair when you correct it, and reject "
+        "only when the latest message contains no strategy commitment.\n\n",
+        recovery_instructions,
+        f"Canonical patch contract: {json.dumps(_DISCOVERY_STRATEGY_PATCH_CONTRACT, ensure_ascii=False)}\n"
+        f"Field meanings: {json.dumps(_DISCOVERY_STRATEGY_FIELD_SEMANTICS, ensure_ascii=False)}\n"
+        f"Latest user message: {user_message}\n"
+        "Active selected option (server-resolved interaction context; null when the latest "
+        "message did not select an Agent option): "
+        f"{json.dumps(dict(selected_decision), ensure_ascii=False) if isinstance(selected_decision, Mapping) else 'null'}\n"
+        "When an active selected option is present, evaluate the proposed patch against that "
+        "option's id, label, reason, and target_fields rather than treating a numeric/short "
+        "selection_text as context-free. The selection is explicit user authorization for the "
+        "option's meaning. Cite the exact selection_text from the latest message as evidence for "
+        "each correctly mapped target field.\n"
+        f"Latest clauses: {json.dumps(_discovery_latest_message_clauses(user_message), ensure_ascii=False)}\n"
+        f"Current strategy: {json.dumps(dict(intent_snapshot), ensure_ascii=False)}\n"
+        f"Proposed patch: {json.dumps(dict(proposed_patch), ensure_ascii=False)}",
+        ]
+    )
+    agent = sdk["Agent"][SimpleNamespace](
+        name="Discovery Strategy Semantic Verifier",
+        instructions=instructions,
+        model=model,
+        tools=[verifier_tool],
+        model_settings=sdk["ModelSettings"](
+            temperature=0,
+            parallel_tool_calls=False,
+            tool_choice="required",
+        ),
+        tool_use_behavior="stop_on_first_tool",
+    )
+
+    async def _execute() -> Any:
+        try:
+            return await sdk["Runner"].run(
+                starting_agent=agent,
+                input="Audit the latest strategy delta now.",
+                context=context,
+                max_turns=1,
+                run_config=sdk["RunConfig"](
+                    workflow_name="proteomics_discovery_strategy_verifier_v1",
+                    trace_metadata={"workflow": "discovery_strategy_verifier"},
+                    tracing_disabled=True,
+                    trace_include_sensitive_data=False,
+                ),
+            )
+        finally:
+            if owned_async_client is not None:
+                await owned_async_client.close()
+
+    asyncio.run(
+        asyncio.wait_for(_execute(), timeout=max(2.0, float(timeout_seconds)))
+    )
+    raw_verification = (
+        context.verification if isinstance(context.verification, Mapping) else {}
+    )
+    raw_verdict = _clean_text(raw_verification.get("verdict")).lower()
+    if (
+        (not raw_verification or raw_verdict not in {"accept", "repair", "reject"})
+        and not caller_supplied_model
+    ):
+        try:
+            fallback_client = OpenAICompatibleDiscoveryLLM(
+                api_key=client.api_key,
+                model=client.model,
+                base_url=client.base_url,
+                timeout=max(2.0, float(timeout_seconds)),
+            )
+            raw_verification = _run_discovery_patch_verifier_json_fallback(
+                fallback_client,
+                user_message=user_message,
+                intent_snapshot=intent_snapshot,
+                proposed_patch=proposed_patch,
+                selected_decision=selected_decision,
+            )
+            raw_verification["provider_compatibility_recovery"] = {
+                "mode": "json_object_after_missing_sdk_tool",
+                "critic_authority": "read_only",
+            }
+            raw_verdict = _clean_text(raw_verification.get("verdict")).lower()
+        except Exception as exc:
+            return {
+                "verdict": "unavailable",
+                "patch": {},
+                "verified": False,
+                "rationale": (
+                    "Neither the SDK verifier tool nor its bounded JSON compatibility "
+                    "fallback produced a valid result."
+                ),
+                "error": _redact_secrets(str(exc))[:500],
+                "tool_authority": "verify_strategy_patch",
+                "provider_compatibility_recovery": {
+                    "mode": "json_object_after_missing_sdk_tool",
+                    "critic_authority": "read_only",
+                    "status": "failed",
+                },
+            }
+    if not raw_verification or raw_verdict not in {"accept", "repair", "reject"}:
+        # No executed verifier tool is an availability failure, not an
+        # authoritative semantic rejection.  The independently validated
+        # primary update may degrade through this state; an explicit reject or
+        # an evidence-grounding failure below still fails closed.
+        return {
+            "verdict": "unavailable",
+            "patch": {},
+            "verified": False,
+            "rationale": "The independent verifier did not produce a valid tool result.",
+            "tool_authority": (
+                "update_strategy"
+                if update_strategy_authority
+                else "verify_strategy_patch"
+            ),
+        }
+    raw_verification_patch = raw_verification.get("patch")
+    tool_authority = (
+        "update_strategy" if update_strategy_authority else "verify_strategy_patch"
+    )
+    critic_suggested_fields: list[str] = []
+    if isinstance(raw_verification_patch, Mapping):
+        suggested_patch, suggested_errors = _validate_discovery_strategy_patch(
+            dict(raw_verification_patch)
+        )
+        compact_message = re.sub(r"\s+", "", user_message).casefold()
+        grounded_suggestion_fields: set[str] = set()
+        raw_evidence = raw_verification.get("evidence")
+        if isinstance(raw_evidence, list):
+            for item in raw_evidence[:100]:
+                if not isinstance(item, Mapping):
+                    continue
+                raw_field = _clean_text(item.get("field"))
+                field_root = re.split(r"[.\[]", raw_field, maxsplit=1)[0]
+                field = _DISCOVERY_STRATEGY_PATCH_ALIASES.get(field_root, field_root)
+                source = re.sub(
+                    r"\s+", "", _clean_text(item.get("source"))
+                ).casefold()
+                if field in suggested_patch and source and source in compact_message:
+                    grounded_suggestion_fields.add(field)
+        if not suggested_errors:
+            critic_suggested_fields = sorted(grounded_suggestion_fields)
+    if not proposed_patch and raw_verdict == "repair" and critic_suggested_fields:
+        # Findings are audit/repair input only.  The candidate values never
+        # cross the mutation boundary; the Dialogue Manager must issue a new
+        # update_strategy proposal on its bounded retry.
+        return {
+            **dict(raw_verification),
+            "verdict": "repair",
+            "patch": {},
+            "verified": False,
+            "critic_suggested_fields": critic_suggested_fields,
+            "tool_authority": "verify_strategy_patch",
+            "rationale": (
+                "Read-only critic found evidence-grounded commitments omitted by "
+                "the Dialogue Manager; Manager retry required."
+            ),
+        }
+    if (
+        allow_commitment_recovery
+        and not proposed_patch
+        and raw_verdict == "reject"
+        and isinstance(raw_verification_patch, Mapping)
+        and not raw_verification_patch
+    ):
+        # In commitment-recovery mode, this is a positive semantic result: the
+        # independent update-capable Agent executed its tool and confirmed that
+        # the latest message contains no card commitment.
+        return {
+            **dict(raw_verification),
+            "verdict": "accept",
+            "patch": {},
+            "verified": True,
+            "no_commitment_confirmed": True,
+            "tool_authority": tool_authority,
+            "critic_suggested_fields": critic_suggested_fields,
+        }
+    grounded_patch = _ground_discovery_patch_verification(
+        raw_verification,
+        user_message=user_message,
+        intent_snapshot=intent_snapshot,
+        proposed_patch=proposed_patch,
+        allow_commitment_recovery=allow_commitment_recovery,
+        preserve_unchanged_fields=preserve_unchanged_fields,
+    )
+    # Atomic completeness applies to the primary tool delta. Compatible
+    # providers sometimes materialize every omitted optional verifier field as
+    # JSON null; those schema placeholders are neither user-authored clears nor
+    # additional required commitments. Grounded, evidenced recovery fields may
+    # still be added to ``grounded_patch``, but ungrounded verifier-only fields
+    # must not turn an otherwise complete primary delta into a false rejection.
+    atomic_fields = (
+        set(proposed_patch)
+        if required_fields is None
+        else {
+            field
+            for field in required_fields
+            if field in _DISCOVERY_STRATEGY_PATCH_FIELDS
+        }
+    )
+    if raw_verdict == "repair":
+        atomic_fields.difference_update(_DISCOVERY_NON_ATOMIC_CONTEXT_FIELDS)
+    missing_fields = sorted(atomic_fields.difference(grounded_patch))
+    if raw_verdict == "reject" or missing_fields:
+        return {
+            **dict(raw_verification),
+            "verdict": "reject",
+            "patch": {},
+            "verified": False,
+            "missing_fields": missing_fields,
+            "rationale": (
+                "Independent semantic verification did not ground the complete "
+                "proposed strategy delta."
+                if missing_fields
+                else _clean_text(raw_verification.get("rationale"))[:1200]
+            ),
+            "model_verdict": raw_verdict,
+            "tool_authority": tool_authority,
+        }
+    audit = _normalise_discovery_patch_verification_audit(
+        raw_verification,
+        user_message=user_message,
+        proposed_patch=proposed_patch,
+        grounded_patch=grounded_patch,
+    )
+    return {
+        **dict(raw_verification),
+        **audit,
+        "patch": grounded_patch,
+        "verified": bool(grounded_patch),
+        "tool_authority": tool_authority,
+    }
+
+
+def _complete_discovery_dialogue_json(
+    client: Any,
+    *,
+    system_prompt: str,
+    dialogue_history: list[dict[str, str]],
+    user_prompt: str,
+    user_message: str = "",
+    session_id: str = "",
+    advisor_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run one bounded dialogue turn, preferring the Agents SDK in production."""
+    runtime = _clean_text(os.getenv("AGENT_D1_RUNTIME") or "openai_agents").lower()
+    if isinstance(client, OpenAICompatibleDiscoveryLLM) and runtime != "direct":
+        return _run_discovery_dialogue_agents_sdk(
+            client,
+            system_prompt=system_prompt,
+            dialogue_history=dialogue_history,
+            state_prompt=user_prompt,
+            user_message=user_message or user_prompt,
+            session_id=session_id,
+            advisor_context=advisor_context,
+        )
+
+    complete_messages = getattr(client, "complete_json_messages", None)
+    if not callable(complete_messages):
+        raw = client.complete_json(system_prompt=system_prompt, user_prompt=user_prompt)
+        return raw if isinstance(raw, dict) else {}
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        *dialogue_history,
+        {"role": "user", "content": user_prompt},
+    ]
+    raw = complete_messages(messages=messages)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _resolve_discovery_pending_selection(
+    user_message: str,
+    pending_decision: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Resolve a reference to an Agent-generated option without interpreting it.
+
+    The decision itself is dynamic and model-owned.  This helper only keeps the
+    UI/API interaction lossless: a bare 1-based index, exact option id, or exact
+    option label is projected back to the corresponding structured option for
+    the next model turn.  New options already carry their Manager-authored,
+    schema-validated strategy patch; the later model may not reinterpret it.
+    """
+
+    if not isinstance(pending_decision, Mapping):
+        return None
+    options = pending_decision.get("options")
+    if not isinstance(options, list) or not options:
+        return None
+
+    selection_text = _clean_text(user_message)
+    if not selection_text:
+        return None
+
+    selected: Mapping[str, Any] | None = None
+    if re.fullmatch(r"\d+", selection_text):
+        try:
+            option_index = int(selection_text) - 1
+        except ValueError:
+            option_index = -1
+        if 0 <= option_index < len(options) and isinstance(options[option_index], Mapping):
+            selected = options[option_index]
+    else:
+        folded_selection = selection_text.casefold()
+        for option in options:
+            if not isinstance(option, Mapping):
+                continue
+            option_id = _clean_text(option.get("id"))
+            option_label = _clean_text(option.get("label"))
+            if folded_selection in {option_id.casefold(), option_label.casefold()}:
+                selected = option
+                break
+
+    if selected is None:
+        return None
+
+    selected_patch = selected.get("strategy_patch")
+    selected_patch = (
+        dict(selected_patch) if isinstance(selected_patch, Mapping) else None
+    )
+    selected_target_fields = (
+        list(selected_patch)
+        if selected_patch
+        else list(pending_decision.get("target_fields") or [])
+    )
+    return {
+        "focus": _clean_text(pending_decision.get("focus")),
+        "target_fields": selected_target_fields,
+        "question": _clean_text(pending_decision.get("question")),
+        "option": dict(selected),
+        **({"strategy_patch": selected_patch} if selected_patch else {}),
+        "selection_text": selection_text,
+        "explicit_acceptance": True,
+        "instruction": (
+            "The user explicitly accepted this Agent-generated option. "
+            "Apply or acknowledge its meaning now and do not ask the same decision again."
+        ),
+    }
+
+
+def _discovery_selected_option_strategy_patch(
+    selected_decision: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return the immutable mutation contract authored with a UI option.
+
+    The user may accept an option by index, exact id, or exact label.  Those
+    short references contain no standalone field semantics, so the only safe
+    authority is the schema-validated patch persisted with that option when the
+    Manager created it.  A later model call may explain or plan the next step,
+    but it cannot widen or reinterpret this patch.
+    """
+
+    if not isinstance(selected_decision, Mapping):
+        return {}
+    option = selected_decision.get("option")
+    if not isinstance(option, Mapping):
+        return {}
+    raw_patch = option.get("strategy_patch")
+    if not isinstance(raw_patch, Mapping):
+        raw_patch = selected_decision.get("strategy_patch")
+    if not isinstance(raw_patch, Mapping):
+        return {}
+    patch, errors = _validate_discovery_strategy_patch(_json_object(dict(raw_patch)))
+    return {} if errors else patch
+
+
+def _same_discovery_decision(
+    left: Mapping[str, Any] | None,
+    right: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether two dynamic decisions have the same focus and option ids."""
+
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    left_focus = _clean_text(left.get("focus")).casefold()
+    right_focus = _clean_text(right.get("focus")).casefold()
+
+    def _option_ids(decision: Mapping[str, Any]) -> tuple[str, ...]:
+        raw_options = decision.get("options")
+        if not isinstance(raw_options, list):
+            return ()
+        return tuple(
+            _clean_text(option.get("id")).casefold()
+            for option in raw_options
+            if isinstance(option, Mapping) and _clean_text(option.get("id"))
+        )
+
+    left_ids = _option_ids(left)
+    right_ids = _option_ids(right)
+    if not left_ids or not right_ids:
+        return False
+
+    same_options = frozenset(left_ids) == frozenset(right_ids)
+    same_focus = bool(left_focus) and left_focus == right_focus
+    left_fields = {
+        _clean_text(field)
+        for field in left.get("target_fields") or []
+        if _clean_text(field)
+    }
+    right_fields = {
+        _clean_text(field)
+        for field in right.get("target_fields") or []
+        if _clean_text(field)
+    }
+    if left_fields or right_fields:
+        # target_fields is the semantic identity. This preserves harmless
+        # focus paraphrases while preventing generic option ids from making two
+        # unrelated card dimensions collide.
+        return same_options and left_fields == right_fields
+    return same_options and same_focus
+
+
+def _normalise_discovery_decision_memory(raw: Any) -> list[dict[str, Any]]:
+    items = raw if isinstance(raw, list) else []
+    memory: list[dict[str, Any]] = []
+
+    def _identity(
+        record: Mapping[str, Any],
+    ) -> tuple[tuple[str, ...], tuple[str, ...], str]:
+        option_identity = tuple(
+            sorted(
+                _clean_text(value).casefold()
+                for value in record.get("option_ids") or []
+                if _clean_text(value)
+            )
+        )
+        field_identity = tuple(
+            sorted(
+                _clean_text(value)
+                for value in record.get("target_fields") or []
+                if _clean_text(value)
+            )
+        )
+        fallback_focus = (
+            "" if field_identity else _clean_text(record.get("focus")).casefold()
+        )
+        return option_identity, field_identity, fallback_focus
+
+    for item in items[-50:]:
+        if not isinstance(item, Mapping):
+            continue
+        option_ids = item.get("option_ids")
+        if not isinstance(option_ids, list):
+            continue
+        cleaned_ids = list(
+            dict.fromkeys(
+                _clean_text(value)
+                for value in option_ids[:_DISCOVERY_DECISION_MAX_OPTIONS]
+                if _clean_text(value)
+            )
+        )
+        if len(cleaned_ids) < 2:
+            continue
+        focus = _clean_text(item.get("focus"))
+        target_fields = _normalise_discovery_decision_target_fields(
+            item.get("target_fields"),
+            focus=focus,
+            option_ids=cleaned_ids,
+        )
+        record = {
+            "focus": focus,
+            "target_fields": target_fields,
+            "option_ids": cleaned_ids,
+            "selected_option_id": _clean_text(item.get("selected_option_id")),
+            "selected_option_label": _clean_text(item.get("selected_option_label")),
+        }
+        raw_selected_values = item.get("selected_values")
+        if isinstance(raw_selected_values, Mapping):
+            selected_values = {
+                field: _json_safe(raw_selected_values.get(field))
+                for field in target_fields
+                if field in raw_selected_values
+            }
+            if selected_values:
+                record["selected_values"] = selected_values
+        signature = _identity(record)
+        memory = [
+            previous
+            for previous in memory
+            if _identity(previous) != signature
+        ]
+        memory.append(record)
+    return memory
+
+
+def _discovery_resolved_decision_record(
+    pending_decision: Mapping[str, Any] | None,
+    selected_decision: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(pending_decision, Mapping) or not isinstance(selected_decision, Mapping):
+        return None
+    option = selected_decision.get("option")
+    options = pending_decision.get("options")
+    if not isinstance(option, Mapping) or not isinstance(options, list):
+        return None
+    option_ids = [
+        _clean_text(item.get("id"))
+        for item in options
+        if isinstance(item, Mapping) and _clean_text(item.get("id"))
+    ]
+    if len(option_ids) < 2:
+        return None
+    selected_patch = _discovery_selected_option_strategy_patch(selected_decision)
+    return {
+        "focus": _clean_text(pending_decision.get("focus")),
+        "target_fields": (
+            list(selected_patch)
+            if selected_patch
+            else list(pending_decision.get("target_fields") or [])
+        ),
+        "option_ids": option_ids,
+        "selected_option_id": _clean_text(option.get("id")),
+        "selected_option_label": _clean_text(option.get("label")),
+    }
+
+
+def _discovery_explicit_resolution_patch(
+    selected_decision: Mapping[str, Any] | None,
+    *,
+    validated_tool_patch: Mapping[str, Any],
+    commitment_patch: Mapping[str, Any] | None,
+    intent_snapshot: Mapping[str, Any],
+    requested_action: str,
+    agent_runtime: str,
+) -> dict[str, Any]:
+    """Return unchanged target values that carry an explicit resolution.
+
+    This is deliberately narrower than a normal strategy patch.  It requires
+    the authorities that distinguish an intentional open/default choice from a
+    model echo: an SDK-executed ``update_strategy`` call, a schema-valid field
+    whose submitted value equals the live card, and either an active
+    Agent-authored option selected by the user or a separately grounded
+    clause-level commitment for that field.  The latter keeps arbitrary
+    free-text answers first-class without introducing phrase-specific parsers.
+
+    The returned keys are decision-state deltas and may be sent to the client
+    so ``resolved_fields`` advances even though the scientific value itself is
+    unchanged.
+    """
+
+    if (
+        requested_action != "update_strategy"
+        or agent_runtime != "openai_agents"
+        or (
+            not isinstance(selected_decision, Mapping)
+            and not isinstance(commitment_patch, Mapping)
+        )
+    ):
+        return {}
+    target_fields = {
+        _DISCOVERY_STRATEGY_PATCH_ALIASES.get(field, field)
+        for raw_field in selected_decision.get("target_fields") or []
+        if (field := _clean_text(raw_field))
+    } if isinstance(selected_decision, Mapping) else set()
+    return {
+        field: validated_tool_patch[field]
+        for field in validated_tool_patch
+        if (
+            field in intent_snapshot
+            and validated_tool_patch[field] == intent_snapshot.get(field)
+            and (
+                field in target_fields
+                or (
+                    isinstance(commitment_patch, Mapping)
+                    and field in commitment_patch
+                    and commitment_patch[field] == validated_tool_patch[field]
+                )
+            )
+        )
+    }
+
+
+def _discovery_selected_option_was_applied(
+    selected_decision: Mapping[str, Any] | None,
+    *,
+    effective_patch: Mapping[str, Any],
+    validated_tool_patch: Mapping[str, Any],
+    intent_snapshot: Mapping[str, Any],
+    requested_action: str,
+    mutation_valid: bool,
+) -> bool:
+    """Return whether a referenced option actually resolved its card fields.
+
+    A numeric selection only identifies an Agent-authored option. It does not
+    resolve that decision until a validated update emits a target-field delta,
+    or explicitly repeats a target value already equal to the live card.
+    """
+
+    if not isinstance(selected_decision, Mapping) or not mutation_valid:
+        return False
+    target_fields = {
+        _clean_text(field)
+        for field in selected_decision.get("target_fields") or []
+        if _clean_text(field)
+    }
+    if not target_fields or requested_action != "update_strategy":
+        return False
+    if target_fields.intersection(effective_patch):
+        return True
+    return any(
+        field in validated_tool_patch
+        and field in intent_snapshot
+        and validated_tool_patch[field] == intent_snapshot.get(field)
+        for field in target_fields
+    )
+
+
+def _normalise_discovery_resolved_fields(
+    raw: Any,
+    intent_snapshot: Mapping[str, Any],
+) -> set[str]:
+    values = raw if isinstance(raw, list) else intent_snapshot.get("resolved_fields")
+    values = values if isinstance(values, list) else []
+    resolved: set[str] = set()
+    for value in values:
+        name = _clean_text(value)
+        canonical = _DISCOVERY_STRATEGY_PATCH_ALIASES.get(name, name)
+        if canonical in _DISCOVERY_STRATEGY_PATCH_FIELDS:
+            resolved.add(canonical)
+    return resolved
+
+
+_DISCOVERY_UNSET_SENTINELS: dict[str, set[Any]] = {
+    "species_policy": {"open"},
+    "species_coverage": {"none"},
+    "acquisition_mode": {"unknown"},
+    "mixed_acquisition_policy": {"review_mixed"},
+    "labeling_strategy": {"unknown", "any"},
+    "quota_flexibility": {"recommended"},
+    "on_safety_ceiling": {"ask"},
+    "instrument_preference": {"none"},
+    "repository": {"pride"},
+}
+
+
+def _discovery_strategy_field_is_resolved(
+    field: str,
+    intent_snapshot: Mapping[str, Any],
+    resolved_fields: set[str],
+) -> bool:
+    if field in resolved_fields:
+        return True
+    if field not in intent_snapshot:
+        return False
+    value = intent_snapshot.get(field)
+    if value is None or value == "" or value == [] or value == {}:
+        return False
+    try:
+        if value in _DISCOVERY_UNSET_SENTINELS.get(field, set()):
+            return False
+    except TypeError:
+        pass
+    return True
+
+
+def _discovery_decision_was_resolved(
+    decision: Mapping[str, Any] | None,
+    decision_memory: list[dict[str, Any]],
+    *,
+    intent_snapshot: Mapping[str, Any],
+    resolved_fields: set[str],
+) -> bool:
+    if not isinstance(decision, Mapping) or decision.get("revisit_existing") is True:
+        return False
+    option_ids = {
+        _clean_text(option.get("id")).casefold()
+        for option in decision.get("options") or []
+        if isinstance(option, Mapping) and _clean_text(option.get("id"))
+    }
+    target_fields = {
+        _clean_text(field)
+        for field in decision.get("target_fields") or []
+        if _clean_text(field)
+    }
+    focus = _clean_text(decision.get("focus")).casefold()
+    for previous in decision_memory:
+        previous_ids = {
+            _clean_text(value).casefold()
+            for value in previous.get("option_ids") or []
+            if _clean_text(value)
+        }
+        previous_fields = {
+            _clean_text(value)
+            for value in previous.get("target_fields") or []
+            if _clean_text(value)
+        }
+        if target_fields and previous_fields and target_fields == previous_fields:
+            selected_values = previous.get("selected_values")
+            if isinstance(selected_values, Mapping) and target_fields.issubset(
+                selected_values
+            ):
+                return all(
+                    field in intent_snapshot
+                    and intent_snapshot.get(field) == selected_values.get(field)
+                    for field in target_fields
+                )
+            # Backward-compatible records written before selected values were
+            # persisted are trusted only while every target field is still
+            # materially set. Clearing a field reopens the decision.
+            return all(
+                _discovery_strategy_field_is_resolved(
+                    field,
+                    intent_snapshot,
+                    resolved_fields,
+                )
+                for field in target_fields
+            )
+        previous_focus = _clean_text(previous.get("focus")).casefold()
+        if (
+            not target_fields
+            and not previous_fields
+            and option_ids
+            and option_ids == previous_ids
+            and focus
+            and focus == previous_focus
+        ):
+            return True
+    return bool(target_fields) and all(
+        _discovery_strategy_field_is_resolved(
+            field,
+            intent_snapshot,
+            resolved_fields,
+        )
+        for field in target_fields
+    )
+
+
+def _filter_discovery_decision_memory_for_snapshot(
+    decision_memory: list[dict[str, Any]],
+    *,
+    intent_snapshot: Mapping[str, Any],
+    resolved_fields: set[str],
+) -> list[dict[str, Any]]:
+    """Discard remembered choices whose target fields were later changed."""
+
+    current: list[dict[str, Any]] = []
+    for record in decision_memory:
+        target_fields = {
+            _clean_text(field)
+            for field in record.get("target_fields") or []
+            if _clean_text(field)
+        }
+        if not target_fields:
+            current.append(record)
+            continue
+        selected_values = record.get("selected_values")
+        if isinstance(selected_values, Mapping) and target_fields.issubset(
+            selected_values
+        ):
+            if all(
+                field in intent_snapshot
+                and intent_snapshot.get(field) == selected_values.get(field)
+                for field in target_fields
+            ):
+                current.append(record)
+            continue
+        if all(
+            _discovery_strategy_field_is_resolved(
+                field,
+                intent_snapshot,
+                resolved_fields,
+            )
+            for field in target_fields
+        ):
+            current.append(record)
+    return current
+
+
+def _repair_discovery_selected_enum_patch(
+    raw: Mapping[str, Any],
+    selected_decision: Mapping[str, Any] | None,
+    intent_snapshot: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Repair only the shape of an explicit model tool event for a UI choice.
+
+    Some OpenAI-compatible models wrap a selected scalar as
+    ``{"value": ..., "label": ...}``, which correctly fails the normal patch
+    validator.  When (and only when) the model already requested exactly one
+    ``update_strategy`` tool call, an accepted option id may still identify one
+    unique enum field in the public strategy schema.  Reconstructing that one
+    scalar delta is schema-driven; it does not infer vocabulary or authorize a
+    card write without the model's explicit tool event.
+    """
+
+    if not isinstance(selected_decision, Mapping):
+        return {}
+    if _clean_text(raw.get("action") or raw.get("mode")).lower() != "update_strategy":
+        return {}
+    raw_calls = raw.get("tool_calls")
+    if not isinstance(raw_calls, list):
+        return {}
+    update_calls = [
+        call
+        for call in raw_calls
+        if isinstance(call, Mapping)
+        and _clean_text(call.get("name") or call.get("tool")) == "update_strategy"
+    ]
+    if len(update_calls) != 1:
+        return {}
+
+    option = selected_decision.get("option")
+    if not isinstance(option, Mapping):
+        return {}
+    option_id = _clean_text(option.get("id")).lower()
+    if not option_id:
+        return {}
+
+    focus = _clean_text(selected_decision.get("focus"))
+    canonical_focus = _DISCOVERY_STRATEGY_PATCH_ALIASES.get(focus, focus)
+    candidate_fields: list[str] = []
+    if (
+        canonical_focus in _DISCOVERY_STRATEGY_ENUM_FIELDS
+        and option_id in _DISCOVERY_STRATEGY_ENUM_FIELDS[canonical_focus]
+    ):
+        candidate_fields.append(canonical_focus)
+    for field, allowed_values in _DISCOVERY_STRATEGY_ENUM_FIELDS.items():
+        if option_id in allowed_values and field not in candidate_fields:
+            candidate_fields.append(field)
+    if len(candidate_fields) != 1:
+        return {}
+
+    repaired, errors = _validate_discovery_strategy_patch(
+        {candidate_fields[0]: option_id}
+    )
+    if errors:
+        return {}
+    return _drop_unchanged_discovery_patch_fields(repaired, intent_snapshot)
+
+
+def _discovery_latest_message_clauses(user_message: str) -> list[dict[str, str]]:
+    """Expose generic punctuation-delimited clauses as a completeness aid.
+
+    This does not interpret vocabulary or mutate state. It only prevents a
+    long, coordinated user message from being treated as one opaque sentence
+    by smaller chat models.
+    """
+
+    pieces = [
+        piece.strip()
+        for piece in re.split(r"(?<=[,，;；。.!?！？])\s*|[\r\n]+", user_message)
+        if piece.strip()
+    ]
+    if not pieces:
+        pieces = [user_message]
+    return [
+        {"id": f"C{index}", "text": piece}
+        for index, piece in enumerate(pieces[:30], start=1)
+    ]
+
+
+def _discovery_grill_turn_system_prompt() -> str:
+    return (
+        "You are the conversational front of a proteomics data-discovery agent (PRIDE). "
+        "Behave like a real domain agent with tools, not a form wizard: flexible, specific, "
+        "brief, and collaborative. Users may chat or think out loud before committing; do not "
+        "rush them into a card update. You own the dialogue strategy and choose the "
+        "highest-value next decision from the current science context. There is no fixed "
+        "question order. The gap report and any legacy pending question are guidance, not a "
+        "command. Interpret the latest turn together with native dialogue history, respecting "
+        "references, corrections, negation, hypothetical scope, and turn-local instructions. "
+        "Reason by meaning rather than a keyword, species, task, or ontology whitelist. "
+        "Only an explicit update_strategy tool event may change the card. Recommendations stay "
+        "as advice until accepted. Natural-language approval is a separate confirm_strategy "
+        "decision and is valid only for the current snapshot while phase=awaiting_confirm. "
+        "A generic acknowledgement during grilling is not confirmation. You never start PRIDE "
+        "discovery; the server's separate grill_confirmed=true gate remains authoritative. "
+        "Be capability-honest: this surface can execute plan_only (without repository access), "
+        "candidates_only, and candidates_reviewed. ai_ready_table, pre_release, and full_release are "
+        "downstream stages that require a reviewed discovery result and a separate executor. You may "
+        "help plan those stages, but never imply that confirming one will silently run plain discovery "
+        "or that the downstream deliverable is already wired. "
+        "Reply in natural Chinese and always "
+        "return one JSON object matching the turn contract supplied by the user message.\n\n"
+        "Repository scientific guidance:\n"
+        f"{_discovery_agent_guidance()}"
+    )
+
+
+def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
+    """Run one model-owned D1 turn; structural validation is deterministic."""
+    turn_started_at = monotonic()
+    try:
+        manager_repair_attempt = max(0, int(body.get("_manager_repair_attempt") or 0))
+    except (TypeError, ValueError):
+        manager_repair_attempt = 0
+    manager_repair_feedback = (
+        _json_object(body.get("_manager_repair_feedback"))
+        if isinstance(body.get("_manager_repair_feedback"), Mapping)
+        else {}
+    )
+    user_message = _clean_text(body.get("user_message") or body.get("prompt"))
+    if not user_message:
+        raise ValueError("Please enter a message.")
+
+    llm_config = body.get("llm_config") if isinstance(body.get("llm_config"), dict) else {}
+    client = _discovery_llm_client(
+        llm_config,
+        allow_server_default=body.get("allow_server_default") is not False,
+    )
+    if client is None:
+        raise ValueError(
+            "No discovery LLM API key found. Fill API Configuration or set DEEPSEEK_API_KEY."
+        )
+    request_budget_seconds = _bind_discovery_turn_request_budget(client, body)
+
+    phase = _clean_text(body.get("phase") or "grilling").lower() or "grilling"
+    pending = body.get("pending_question") if isinstance(body.get("pending_question"), dict) else None
+    raw_pending_decision = body.get("pending_decision")
+    pending_decision = _normalise_discovery_next_decision(raw_pending_decision)
+    selected_decision = _resolve_discovery_pending_selection(
+        user_message,
+        pending_decision,
+    )
+    intent_snapshot = (
+        _json_object(body.get("intent_snapshot"))
+        if isinstance(body.get("intent_snapshot"), dict)
+        else {}
+    )
+    decision_memory = _normalise_discovery_decision_memory(
+        body.get("decision_memory")
+    )
+    resolved_fields = _normalise_discovery_resolved_fields(
+        body.get("resolved_fields"),
+        intent_snapshot,
+    )
+    candidate_resolved_decision = _discovery_resolved_decision_record(
+        pending_decision,
+        selected_decision,
+    )
+    resolved_decision: dict[str, Any] | None = None
+    answered = body.get("answered") if isinstance(body.get("answered"), dict) else {}
+    turn_kind = _clean_text(body.get("turn_kind") or "answer").lower() or "answer"
+    local_summary = _clean_text(body.get("local_summary"))
+    input_gap_report = (
+        body.get("gap_report") if isinstance(body.get("gap_report"), dict) else {}
+    )
+    session_id = _normalise_discovery_session_id(body.get("session_id"))
+    fallback_history = _normalise_discovery_dialogue_history(body.get("dialogue_history"))
+    dialogue_history, session_decision_memory = _load_discovery_dialogue_session(
+        session_id,
+        fallback_history,
+    )
+    decision_memory = _normalise_discovery_decision_memory(
+        [*session_decision_memory, *decision_memory]
+    )
+    decision_memory = _filter_discovery_decision_memory_for_snapshot(
+        decision_memory,
+        intent_snapshot=intent_snapshot,
+        resolved_fields=resolved_fields,
+    )
+    critical_decision_agenda = _discovery_critical_decision_agenda(
+        intent_snapshot,
+        input_gap_report,
+        resolved_fields,
+    )
+    confirmation_eligible, confirmation_reason, strategy_fingerprint = (
+        _discovery_confirmation_context(
+            body,
+            phase=phase,
+            intent_snapshot=intent_snapshot,
+            gap_report=input_gap_report,
+        )
+    )
+
+    pending_block = "(none - first message or no open question)"
+    if pending:
+        options = pending.get("options") if isinstance(pending.get("options"), list) else []
+        option_lines: list[str] = []
+        for index, option in enumerate(options, start=1):
+            if not isinstance(option, Mapping):
+                continue
+            tag = " [recommended]" if option.get("recommended") else ""
+            option_lines.append(
+                f"{index}. id={_clean_text(option.get('id'))} "
+                f"label={_clean_text(option.get('label'))}{tag}"
+            )
+        pending_block = (
+            f"id: {_clean_text(pending.get('id'))}\n"
+            f"prompt: {_clean_text(pending.get('prompt'))}\n"
+            f"why: {_clean_text(pending.get('why'))}\n"
+            "options:\n"
+            + ("\n".join(option_lines) if option_lines else "(none)")
+        )
+    pending_decision_block = (
+        json.dumps(pending_decision, ensure_ascii=False, indent=2)
+        if pending_decision is not None
+        else "(none)"
+    )
+    selected_decision_block = (
+        json.dumps(selected_decision, ensure_ascii=False, indent=2)
+        if selected_decision is not None
+        else "(none)"
+    )
+
+    confirmation_context = {
+        "eligible": confirmation_eligible,
+        "reason_if_ineligible": confirmation_reason,
+        "strategy_fingerprint": strategy_fingerprint,
+        "rule": (
+            "confirm_strategy is allowed only for an unambiguous approval of this exact "
+            "snapshot while phase=awaiting_confirm; it never starts search itself"
+        ),
+    }
+    field_semantics = json.dumps(
+        _DISCOVERY_STRATEGY_FIELD_SEMANTICS,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    enum_catalog = json.dumps(
+        {field: sorted(values) for field, values in _DISCOVERY_STRATEGY_ENUM_FIELDS.items()},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    latest_clauses = _discovery_latest_message_clauses(user_message)
+    user_prompt = (
+        "Handle one grill dialogue turn for proteomics data discovery.\n\n"
+        f"turn_kind: {turn_kind}\n"
+        f"phase: {phase}\n"
+        f"user_message: {user_message}\n\n"
+        "latest_message_clauses (generic completeness aid; inspect every C-id):\n"
+        f"{json.dumps(latest_clauses, ensure_ascii=False, indent=2)}\n\n"
+        "Critical latest-turn scope rule: a 'discuss only / do not update' instruction inside an older history turn ended with that turn unless explicitly declared persistent. The latest user_message is a new turn; a latest acceptance, adoption, replacement, correction, open, or clear is actionable now.\n\n"
+        "Critical clause rule: apply each concrete choice in the latest message even when another clause asks for explanation or says not to decide the remaining fields. Never ask the user to reconfirm a value they just chose. A keep-unchanged/as-is instruction for a dimension has priority over incidental values mentioned while asking why, comparing, or quoting prior advice; omit that dimension from the patch.\n\n"
+        f"current_intent_snapshot:\n"
+        f"{json.dumps(intent_snapshot, ensure_ascii=False, indent=2)}\n\n"
+        f"answered_flags:\n{json.dumps(answered, ensure_ascii=False)}\n\n"
+        f"pending_question:\n{pending_block}\n\n"
+        f"active_agent_decision:\n{pending_decision_block}\n\n"
+        f"selected_agent_option:\n{selected_decision_block}\n\n"
+        "resolved_decision_memory (authoritative: do not ask these again unless the latest user explicitly reopens one):\n"
+        f"{json.dumps(decision_memory, ensure_ascii=False, indent=2)}\n\n"
+        "explicitly_resolved_strategy_fields (an open/unknown value may be an intentional answer):\n"
+        f"{json.dumps(sorted(resolved_fields), ensure_ascii=False)}\n\n"
+        "gap_report (guidance only - you choose focus; multi-fill is allowed):\n"
+        f"{json.dumps(input_gap_report, ensure_ascii=False, indent=2)}\n\n"
+        "critical_decision_agenda (priority guard, not a fixed questionnaire):\n"
+        f"{json.dumps(critical_decision_agenda, ensure_ascii=False, indent=2)}\n\n"
+        "read_only_critic_feedback_from_previous_attempt (findings only; the Manager must independently re-propose any justified patch):\n"
+        f"{json.dumps(manager_repair_feedback, ensure_ascii=False, indent=2) if manager_repair_feedback else '(none)'}\n\n"
+        "confirmation_context (authoritative structural precondition):\n"
+        f"{json.dumps(confirmation_context, ensure_ascii=False, indent=2)}\n\n"
+        "local_rule_summary (optional helper, may be incomplete):\n"
+        f"{local_summary or '(none)'}\n\n"
+        "Return one JSON object with this primary shape:\n"
+        "{\n"
+        '  "action": "chat|advise|clarify|update_strategy|ready_to_confirm|'
+        'confirm_strategy|refuse_search",\n'
+        '  "assistant_message": "natural Chinese reply",\n'
+        '  "turn_interpretation": {\n'
+        '    "commitments": [{"field": "canonical field", "value": "canonical value", "source": "short exact quote from latest message"}],\n'
+        '    "consultations": ["brief non-committing clause"],\n'
+        '    "clause_audit": [{"clause_id": "C1", "classification": "commitment|consultation|procedural", "decisions": [{"field": "canonical field", "value": "canonical value"}]}],\n'
+        '    "prior_turn_only_instructions_expired": true\n'
+        "  },\n"
+        '  "tool_calls": [{"name": "update_strategy", '
+        '"arguments": {"patch": {"supported_field": "replacement value"}}}],\n'
+        '  "next_decision": {\n'
+        '    "focus": "one semantic focus",\n'
+        '    "target_fields": ["one or more canonical strategy fields"],\n'
+        '    "question": "one personalized scientific decision",\n'
+        '    "recommendation": {"id": "id", "label": "label", "reason": "short reason"},\n'
+        '    "options": [{"id": "id", "label": "label", "reason": "optional", '
+        '"strategy_patch": {"canonical field": "the complete value authorized by this option"}}],\n'
+        '    "option_mode": "focused|expanded",\n'
+        '    "revisit_existing": false,\n'
+        '    "allow_free_text": true\n'
+        "  },\n"
+        '  "gap_report": {"required_missing": [], "optional_missing": [], '
+        '"ready_for_confirm": false},\n'
+        '  "ready_for_confirm": false,\n'
+        '  "intent": "optional legacy projection",\n'
+        '  "answer_text": "optional legacy answer",\n'
+        '  "understanding": "short current understanding"\n'
+        "}\n\n"
+        "Rules:\n"
+        "- Choose the action from meaning and the current science context. There is no fixed question order.\n"
+        "- Only action=update_strategy plus exactly one update_strategy tool call with an explicit object at arguments.patch may change the card. extra_fields, prose, numbers, ontologies, and lexical examples are never mutation authority.\n"
+        "- When SDK tools are available, invoke update_strategy or confirm_strategy as a real function tool. Never simulate a tool call only by writing tool_calls in final JSON; the server injects the calls actually executed by the SDK.\n"
+        "- The patch is a generic schema delta: include every and only choice the user establishes, accepts, replaces, opens, excludes, clears, or explicitly asks you to default.\n"
+        "- A user commitment to one dimension authorizes only that dimension. For example, naming a research topic does not authorize your recommended task, species, quantity, coverage, acquisition, or labeling defaults. State such recommendations as advice and wait for acceptance. A multi-field patch is allowed only when the latest message establishes each field or explicitly accepts a previously presented bundle/default.\n"
+        "- Before choosing the action, split the latest message into clauses. For each clause decide consultation versus commitment, resolve its subject and negation scope, and map every commitment to its canonical field. Check that every committed field appears exactly once in the patch and that no uncommitted field appears.\n"
+        "- Populate turn_interpretation before deriving action and tool_calls. The set of canonical fields in commitments must equal the set of patch fields (one commitment may legitimately map to two tightly coupled fields). Every source must quote the latest user_message, not the snapshot or old history. If commitments is non-empty, action must be update_strategy.\n"
+        "- clause_audit must contain every C-id from latest_message_clauses exactly once. A commitment clause must repeat every affected canonical field and value in decisions; a consultation/procedural clause uses decisions=[]. This deliberate redundancy is required. After clause_audit, scan the complete canonical field list once more before emitting the tool call.\n"
+        "- A direct adoption, replacement, correction, opening, exclusion, or clear is already authorization. Do not ask the user to confirm that individual field again, even if you think another value would be scientifically better; apply it and put the caveat in the same reply.\n"
+        "- Interpret elliptical answers in the active planning context. A short topic, organism, method, labeling family, quantity, or similar choice is a commitment when it naturally answers or advances the current plan, even with conversational hedges such as '吧' or '左右'; only a real question, hypothetical, quotation, or explicit uncertainty stays consultation.\n"
+        "- A user stating their own intended research goal, dataset purpose, or downstream task (including first-person desire/plan language such as wanting, planning, or intending to do X) establishes objective/task commitments. A simultaneous request for your analysis, recommendation, or next-step advice does not cancel those concrete commitments: update them first and then advise.\n"
+        "- Never say that you recorded, set, changed, or remembered a strategy value in assistant_message unless you actually invoke update_strategy for that value in the same turn.\n"
+        "- Scope words locally. An instruction to explain or avoid deciding the remaining recommendations does not cancel a concrete choice made in another clause. Likewise, keep-one-field-unchanged does not block changes to other named fields.\n"
+        "- A value mentioned inside a why/how/comparison question, a quotation, an example, or a reference to prior advice is not a commitment by itself. If the same message says that dimension stays unchanged, no patch for that dimension is allowed.\n"
+        "- Do not silently repair a scientific inconsistency by clearing or rewriting fields the user did not change. Apply the requested delta, preserve the existing potentially conflicting field, and surface the conflict as one next decision or open risk. Scientific advice never creates mutation authority.\n"
+        "- A previous-turn instruction to discuss only or not write the card expires after that turn unless the user explicitly made it persistent. A latest-turn acceptance such as choosing a referenced proposal is a new commitment.\n"
+        "- A consultation, comparison, feasibility question, hypothetical, greeting, or capability question does not update strategy. Recommendations remain advice until accepted.\n"
+        "- A pure social greeting uses action=chat and next_decision=null. Reply naturally and invite free-form discussion; do not turn a greeting into a structured menu.\n"
+        "- Resolve references from native dialogue roles. Prior context disambiguates a commitment but does not authorize unrelated fields.\n"
+        "- When selected_agent_option is present, the user has explicitly accepted that option from the active Agent-generated decision. You must use action=update_strategy and invoke update_strategy; do not use chat/advise/respond. Apply its meaning now. For an intentional open/no-change option, explicitly submit the relevant target field with its canonical open/default/empty value: this is a resolution delta even when the value already matches the card. Never repeat the same focus and option set in next_decision.\n"
+        "- For an accepted option whose active focus is a canonical strategy field and whose option id is a valid field value, write the scalar delta as {focus: option.id}. Never wrap a patch value in an object containing value/label/reason. If the choice intentionally changes several fields, emit each canonical scalar/array value directly.\n"
+        "- Defaults use action=update_strategy. If the resulting card is executable, also set ready_for_confirm=true; this offers confirmation but never confirms or starts search.\n"
+        "- Every first-class strategy field may be null to clear it back to the empty-strategy default. Arrays may also use []. Query/runtime extension fields are cleared by omission, not null.\n"
+        f"- Canonical patch contract: "
+        f"{json.dumps(_DISCOVERY_STRATEGY_PATCH_CONTRACT, ensure_ascii=False, separators=(',', ':'))}.\n"
+        f"- Canonical field meanings: {field_semantics}.\n"
+        f"- Canonical enum option catalog: {enum_catalog}. Use it as a capability catalog, not a fixed questionnaire; retain free text and notes for meaningful values outside first-class fields.\n"
+        "- Preserve every meaningful requirement without a dedicated field in scientific_constraints. "
+        "Choose a stable id, explicit hard/soft strength, project/file/sample/portfolio scope, operator, "
+        "JSON value, and evidence_required=true. notes is context only and must never be the sole home of "
+        "an actionable requirement. This rule is generic: do not wait for a vocabulary-specific branch.\n"
+        "- next_decision must include target_fields (one or more canonical strategy fields) and revisit_existing. Set revisit_existing=true only when the latest user explicitly asks to reconsider an already-set choice.\n"
+        "- Every next_decision option must include a non-empty, schema-valid strategy_patch that completely expresses only that option's mutation meaning. All options in one menu must use this contract. target_fields is derived by the server from these patches and is not mutation authority. A later numeric/id/label selection applies exactly the stored option patch; the later model must not add defaults or reinterpret it.\n"
+        "- critical_decision_agenda is not a questionnaire order, but critical items are readiness blockers. Unless the latest turn is consultation or directly resolves another issue, ask the highest-impact unresolved critical item before lower-impact optional preferences. In particular, executable searches need an explicit project scale (or an explicit open-ended quota); do not skip scale in favor of optional labeling or instrument preferences.\n"
+        "- Ask at most one highest-value scientific decision. Give one recommendation and a short task-specific reason. Usually offer 2-5 useful options; when the user explicitly asks what alternatives exist or requests a comparison, include every materially relevant alternative discussed, up to 8. Never collapse an expanded discussion back to the old two-item menu. Always accept free text.\n"
+        "- option_mode=expanded is exceptional: use it only when the latest user message explicitly asks for alternatives, a comparison, or a fuller option inventory. A greeting, topic declaration, or ordinary answer uses focused.\n"
+        "- Keep next_decision.question to one concise question. Do not embed a second bullet list inside question; the structured options array is rendered separately. Use natural Chinese labels for user-facing options.\n"
+        "- assistant_message must not repeat or enumerate next_decision options; the UI renders the question and options immediately afterward. Use assistant_message for acknowledgement, analysis, and the recommendation rationale only.\n"
+        "- Give decision options stable, semantic ids (for example a task or policy id), not generic yes/no ids. If you revisit the same decision, preserve its focus and option ids; after an option is selected, move on rather than paraphrasing and asking it again.\n"
+        "- ready_to_confirm only presents the current strategy for approval; it is not user approval.\n"
+        "- For natural-language approval, return action=confirm_strategy only when confirmation_context.eligible=true and the user unambiguously approves that exact current strategy. Words such as yes/ok/好的/可以 during grilling or while answering a recommendation are not confirmation.\n"
+        "- confirm_strategy never starts PRIDE. A separate caller may set grill_confirmed=true only after consuming this decision; the backend discovery-start gate remains authoritative.\n"
+        "- If asked to search before confirmation, use refuse_search and explain the one remaining confirmation dependency.\n"
+        "- During grilling PRIDE has not been queried. Do not invent availability, project counts, repository composition, or metadata coverage.\n"
+        "- There is no repository evidence in this turn. The assistant_message must not claim that a project count, availability statement, or repository composition is known from PRIDE. If asked about one, label it as an unverified expectation and say discovery has not checked it yet.\n"
+        "- Immunopeptidomics is not a PTM task. For open-ended exploration, recommend browse-only, human-prioritized, curated around 20; do not silently apply that recommendation.\n"
+        "- Keep prose consistent with the action and tool patch.\n"
+    )
+
+    try:
+        raw = _complete_discovery_dialogue_json(
+            client,
+            system_prompt=_discovery_grill_turn_system_prompt(),
+            dialogue_history=dialogue_history,
+            user_prompt=user_prompt,
+            user_message=user_message,
+            session_id=session_id,
+            advisor_context={
+                "user_message": user_message,
+                "intent_snapshot": intent_snapshot,
+                "critical_decision_agenda": critical_decision_agenda,
+                "gap_report": input_gap_report,
+                "resolved_decision_memory": decision_memory,
+            },
+        )
+    except Exception as exc:
+        raise ValueError(f"Grill dialogue LLM failed: {_redact_secrets(str(exc))}") from exc
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError("Grill dialogue LLM returned an invalid object response.")
+    agent_runtime = _clean_text(raw.pop("_agent_runtime", "")) or "direct_json_adapter"
+    provider_compatibility_recovery = (
+        _json_object(raw.pop("_provider_compatibility_recovery"))
+        if isinstance(raw.get("_provider_compatibility_recovery"), Mapping)
+        else {}
+    )
+    advisor_calls = raw.pop("_advisor_calls", [])
+    if not isinstance(advisor_calls, list):
+        advisor_calls = []
+    # Backward-compatible marker only; the server always owns final session
+    # persistence so raw SDK tool output can never become dialogue memory.
+    raw.pop("_sdk_session_managed", False)
+
+    raw_intent = _clean_text(raw.get("intent")).lower()
+    allowed_legacy_intents = {
+        "answer_question",
+        "explain",
+        "clarify",
+        "multi_fill",
+        "revise",
+        "request_defaults",
+        "request_confirm",
+        "refuse_search",
+        "chitchat",
+    }
+    if raw_intent not in allowed_legacy_intents:
+        raw_intent = ""
+
+    requested_action = _clean_text(raw.get("action") or raw.get("mode")).lower()
+    raw_next_decision = raw.get("next_decision")
+    next_decision = _normalise_discovery_next_decision(raw_next_decision)
+    decision_contract_error = raw_next_decision is not None and next_decision is None
+    if requested_action == "chat":
+        # A social/casual turn stays conversational. Structured choices are
+        # reserved for an actual scientific decision, not appended to greetings.
+        next_decision = None
+        decision_contract_error = False
+    repeated_selected_decision = bool(
+        selected_decision
+        and _same_discovery_decision(pending_decision, next_decision)
+    )
+    selected_option_contract_patch = _discovery_selected_option_strategy_patch(
+        selected_decision
+    )
+    option_resolution_audit: dict[str, Any] | None = None
+    if selected_option_contract_patch:
+        # A numbered/exact option reply accepts the immutable patch authored in
+        # the previous Manager turn.  The current model is still useful for the
+        # acknowledgement and next scientific decision, but it is not allowed
+        # to widen that earlier option (the production failure was
+        # build_training silently adding run_horizon=plan_only).
+        original_action = requested_action
+        original_patch = _discovery_explicit_tool_patch(
+            raw,
+            intent_snapshot={},
+            include_unchanged=True,
+        )
+        discarded_fields = sorted(
+            field
+            for field in original_patch
+            if field not in selected_option_contract_patch
+            or not _json_values_equal(
+                original_patch[field], selected_option_contract_patch.get(field)
+            )
+        )
+        raw["action"] = "update_strategy"
+        raw["tool_calls"] = [
+            {
+                "name": "update_strategy",
+                "arguments": {"patch": dict(selected_option_contract_patch)},
+            }
+        ]
+        # Replace the same-model self-audit as well. Otherwise a hallucinated
+        # extra field in that redundant channel could veto the safe option
+        # contract before deterministic validation sees it.
+        raw["turn_interpretation"] = {
+            "commitments": [
+                {
+                    "field": field,
+                    "value": _json_safe(value),
+                    "source": user_message,
+                }
+                for field, value in selected_option_contract_patch.items()
+            ],
+            "consultations": [],
+        }
+        requested_action = "update_strategy"
+        option = selected_decision.get("option") if selected_decision else None
+        option_resolution_audit = {
+            "contract": "predeclared_v1",
+            "selected_option_id": (
+                _clean_text(option.get("id")) if isinstance(option, Mapping) else ""
+            ),
+            "authorized_patch": _json_safe(selected_option_contract_patch),
+            "model_action_overridden": original_action != "update_strategy",
+            "discarded_model_fields": discarded_fields,
+        }
+    patch, mutation_errors = _discovery_turn_patch(
+        raw,
+        user_message=user_message,
+        intent_snapshot=intent_snapshot,
+    )
+    selected_enum_repair = {}
+    if selected_decision is not None and mutation_errors:
+        selected_enum_repair = _repair_discovery_selected_enum_patch(
+            raw,
+            selected_decision,
+            intent_snapshot,
+        )
+        if selected_enum_repair:
+            patch = selected_enum_repair
+            mutation_errors = []
+    commitment_authority_patch, commitment_authority_errors = (
+        _discovery_turn_commitment_patch(raw, user_message=user_message)
+    )
+    if commitment_authority_errors:
+        commitment_authority_patch = None
+    if agent_runtime == "openai_agents":
+        patch = _drop_uncommitted_discovery_null_placeholders(
+            patch,
+            commitment_authority_patch,
+        )
+    validated_tool_patch = _discovery_explicit_tool_patch(
+        raw,
+        intent_snapshot=intent_snapshot,
+        include_unchanged=True,
+    )
+    explicit_resolution_patch = _discovery_explicit_resolution_patch(
+        selected_decision,
+        validated_tool_patch=validated_tool_patch,
+        commitment_patch=commitment_authority_patch,
+        intent_snapshot=intent_snapshot,
+        requested_action=requested_action,
+        agent_runtime=agent_runtime,
+    )
+    selected_target_fields = {
+        _DISCOVERY_STRATEGY_PATCH_ALIASES.get(field, field)
+        for raw_field in (selected_decision or {}).get("target_fields") or []
+        if (field := _clean_text(raw_field))
+    }
+    selected_option_patch_is_scoped = bool(
+        isinstance(selected_decision, Mapping)
+        and selected_decision.get("explicit_acceptance") is True
+        and agent_runtime == "openai_agents"
+        and requested_action == "update_strategy"
+        and validated_tool_patch
+        and set(validated_tool_patch).issubset(selected_target_fields)
+    )
+    # Legacy/direct dialogue mode can still acknowledge an already-equal
+    # selected value without emitting a client resolution delta.  Production
+    # SDK turns use ``explicit_resolution_patch`` below so resolved_fields is
+    # persisted as part of the strategy event.
+    selected_value_already_applied = bool(explicit_resolution_patch) or any(
+        field in validated_tool_patch
+        and field in intent_snapshot
+        and validated_tool_patch[field] == intent_snapshot.get(field)
+        for field in selected_target_fields
+    )
+    if (
+        selected_value_already_applied
+        and mutation_errors == ["update_strategy patch contains no changed fields"]
+    ):
+        # This is a decision-state delta even though it is not a value delta.
+        # Keeping the explicit keys lets the client mark open/default values as
+        # resolved and prevents the same question from reappearing.
+        patch = dict(explicit_resolution_patch)
+        mutation_errors = []
+    elif explicit_resolution_patch and not mutation_errors:
+        patch.update(explicit_resolution_patch)
+    explicit_tool_patch = _discovery_explicit_tool_patch(
+        raw,
+        intent_snapshot=intent_snapshot,
+    )
+    if not mutation_errors:
+        explicit_tool_patch.update(explicit_resolution_patch)
+    if agent_runtime == "openai_agents":
+        explicit_tool_patch = _drop_uncommitted_discovery_null_placeholders(
+            explicit_tool_patch,
+            commitment_authority_patch,
+        )
+    if (
+        agent_runtime == "openai_agents"
+        and explicit_tool_patch
+        and mutation_errors == ["update_strategy patch contains no changed fields"]
+    ):
+        # A partial optional interpretation may have filtered every SDK field.
+        # Keep the structurally valid tool delta eligible for the independent
+        # completeness review instead of treating that compatibility audit as
+        # authoritative.
+        mutation_errors = []
+    verification_input_patch = dict(explicit_tool_patch)
+    verification_input_patch.update(patch)
+    # The primary tool may include model-authored convenience text that its
+    # independent clause audit correctly did not classify as a user
+    # commitment.  Keep every reconciled commitment atomic, while allowing the
+    # semantic verifier to remove such uncommitted extras.  If the primary
+    # audit is absent, fail closed and require the complete typed tool delta.
+    verification_required_fields = (
+        set(patch)
+        if commitment_authority_patch is not None
+        else set(verification_input_patch)
+    )
+    tool_interpretation_difference = bool(
+        requested_action == "update_strategy" and explicit_tool_patch != patch
+    )
+    semantic_verification: dict[str, Any] | None = None
+    latest_clauses = _discovery_latest_message_clauses(user_message)
+    # A separate semantic Agent is read-only. It may flag a Manager omission,
+    # after which the same user-facing Manager gets one bounded retry. The
+    # critic's candidate values are never applied directly.
+    commitment_recovery_warranted = bool(
+        agent_runtime == "openai_agents"
+        and manager_repair_attempt < 1
+        and selected_decision is None
+        and not patch
+        and not mutation_errors
+        and requested_action in {"chat", "advise", "clarify"}
+        # Short utterances can be complete scientific commitments (for example
+        # one topic, organism, acquisition mode, or quantity).  The old
+        # character-count gate silently excluded exactly those natural Agent
+        # turns.  Skip the omission auditor only for an explicitly classified
+        # social chat turn produced through the normal tool contract; provider
+        # plain-text recovery is always audited because it has no action tool.
+        and (
+            bool(provider_compatibility_recovery)
+            or requested_action != "chat"
+            or raw_intent != "chitchat"
+        )
+    )
+    patch_verification_warranted = bool(
+        agent_runtime == "openai_agents"
+        and verification_input_patch
+        and not mutation_errors
+        and not (
+            explicit_resolution_patch
+            and set(verification_input_patch).issubset(explicit_resolution_patch)
+        )
+        # A bare option index is not context-free text: the server has already
+        # resolved it against exactly one active Agent-authored decision.  When
+        # the executed SDK tool is confined to that decision's target fields,
+        # re-running a stateless semantic Agent can only lose context.  Schema,
+        # action, and field-scope validation above remain authoritative; any
+        # out-of-scope field still takes the verifier/rejection path.
+        and not selected_option_patch_is_scoped
+        and (
+            len(latest_clauses) > 1
+            or len(verification_input_patch) > 1
+            or "scientific_constraints" in verification_input_patch
+            or tool_interpretation_difference
+            or _clean_text(provider_compatibility_recovery.get("mode"))
+            == "json_action_contract_after_plain_text"
+        )
+    )
+    verification_warranted = bool(
+        patch_verification_warranted or commitment_recovery_warranted
+    )
+    if verification_warranted:
+        previous_attempts: list[dict[str, Any]] = []
+        attempts = 0
+        while attempts < _DISCOVERY_SEMANTIC_VERIFIER_MAX_ATTEMPTS:
+            remaining_seconds = request_budget_seconds - (
+                monotonic() - turn_started_at
+            )
+            if remaining_seconds < 4.0:
+                semantic_verification = {
+                    "verified": False,
+                    "verdict": "budget_exhausted",
+                    "patch": {},
+                    "rationale": (
+                        "The primary turn and verifier attempts consumed the "
+                        "bounded dialogue budget."
+                    ),
+                }
+                break
+            attempts += 1
+            try:
+                semantic_verification = _run_discovery_patch_verifier_agents_sdk(
+                    client,
+                    user_message=user_message,
+                    intent_snapshot=intent_snapshot,
+                    proposed_patch=verification_input_patch,
+                    timeout_seconds=min(
+                        remaining_seconds,
+                        _DISCOVERY_SEMANTIC_VERIFIER_ATTEMPT_SECONDS,
+                    ),
+                    allow_commitment_recovery=False,
+                    use_update_strategy_tool=False,
+                    required_fields=verification_required_fields,
+                    preserve_unchanged_fields=set(explicit_resolution_patch),
+                    selected_decision=selected_decision,
+                )
+            except Exception as exc:
+                # The primary typed SDK tool remains usable when both bounded
+                # reviewer attempts are unavailable.  Expose the failure
+                # instead of freezing the conversation or using phrase rules.
+                semantic_verification = {
+                    "verified": False,
+                    "verdict": "unavailable",
+                    "patch": {},
+                    "rationale": "Independent semantic verification was unavailable.",
+                    "error": _redact_secrets(str(exc))[:500],
+                }
+            verification_verdict = _clean_text(
+                semantic_verification.get("verdict")
+            ).lower()
+            if verification_verdict != "unavailable":
+                break
+            if attempts < _DISCOVERY_SEMANTIC_VERIFIER_MAX_ATTEMPTS:
+                previous_attempts.append(
+                    {
+                        "verdict": "unavailable",
+                        "rationale": _clean_text(
+                            semantic_verification.get("rationale")
+                        )[:500],
+                        **(
+                            {
+                                "error": _clean_text(
+                                    semantic_verification.get("error")
+                                )[:500]
+                            }
+                            if _clean_text(semantic_verification.get("error"))
+                            else {}
+                        ),
+                    }
+                )
+        if semantic_verification is not None:
+            semantic_verification["attempts"] = attempts
+            if previous_attempts:
+                semantic_verification["previous_attempts"] = previous_attempts
+        critic_suggested_fields = (
+            semantic_verification.get("critic_suggested_fields")
+            if isinstance(semantic_verification, Mapping)
+            else None
+        )
+        if (
+            commitment_recovery_warranted
+            and isinstance(critic_suggested_fields, list)
+            and critic_suggested_fields
+        ):
+            remaining_seconds = request_budget_seconds - (
+                monotonic() - turn_started_at
+            )
+            if remaining_seconds >= 6.0:
+                retry_body = dict(body)
+                retry_body["_manager_repair_attempt"] = manager_repair_attempt + 1
+                retry_body["_manager_repair_feedback"] = {
+                    "kind": "omitted_commitment",
+                    "suggested_fields": [
+                        _clean_text(field)
+                        for field in critic_suggested_fields
+                        if _clean_text(field)
+                    ],
+                    "evidence": _json_safe(
+                        semantic_verification.get("evidence") or []
+                    ),
+                    "instruction": (
+                        "Re-read every clause. If the critic finding is justified, the "
+                        "Dialogue Manager must invoke update_strategy with all and only "
+                        "the user's commitments. The critic has no write authority."
+                    ),
+                    **(
+                        {
+                            "provider_compatibility_recovery": (
+                                provider_compatibility_recovery
+                            )
+                        }
+                        if provider_compatibility_recovery
+                        else {}
+                    ),
+                }
+                retry_body["request_timeout_seconds"] = min(
+                    remaining_seconds,
+                    request_budget_seconds,
+                )
+                return _run_discovery_grill_turn(retry_body)
+        if semantic_verification is not None and attempts:
+            verified_patch = semantic_verification.get("patch")
+            verification_verdict = _clean_text(
+                semantic_verification.get("verdict")
+            ).lower()
+            if isinstance(verified_patch, Mapping):
+                canonical_verified_patch, verified_patch_errors = (
+                    _validate_discovery_strategy_patch(dict(verified_patch))
+                )
+                if verified_patch_errors:
+                    canonical_verified_patch = {}
+                critic_overreach_fields = sorted(
+                    field
+                    for field, value in canonical_verified_patch.items()
+                    if field not in verification_input_patch
+                    or not _json_values_equal(
+                        value, verification_input_patch.get(field)
+                    )
+                )
+                verified_patch = {
+                    field: value
+                    for field, value in canonical_verified_patch.items()
+                    if field not in critic_overreach_fields
+                }
+                semantic_verification["patch"] = verified_patch
+                if critic_overreach_fields:
+                    semantic_verification["critic_overreach_fields"] = (
+                        critic_overreach_fields
+                    )
+            effective_required_fields = set(verification_required_fields)
+            if verification_verdict == "repair":
+                effective_required_fields.difference_update(
+                    _DISCOVERY_NON_ATOMIC_CONTEXT_FIELDS
+                )
+            missing_verified_fields = (
+                sorted(effective_required_fields.difference(verified_patch))
+                if isinstance(verified_patch, Mapping)
+                else sorted(effective_required_fields)
+            )
+            if (
+                semantic_verification.get("verified") is True
+                and verification_verdict in {"accept", "repair"}
+                and missing_verified_fields
+            ):
+                semantic_verification = {
+                    **semantic_verification,
+                    "verified": False,
+                    "verdict": "reject",
+                    "patch": {},
+                    "missing_fields": missing_verified_fields,
+                    "rationale": (
+                        "Independent semantic verification did not ground the "
+                        "complete primary strategy delta."
+                    ),
+                }
+                patch = {}
+                mutation_errors.append(
+                    "semantic verification returned an incomplete strategy patch: "
+                    + ", ".join(missing_verified_fields)
+                )
+            elif (
+                semantic_verification.get("verified") is True
+                and verification_verdict in {"accept", "repair"}
+                and isinstance(verified_patch, Mapping)
+                and verified_patch
+                and (
+                    not commitment_recovery_warranted
+                    or semantic_verification.get("tool_authority") == "update_strategy"
+                )
+            ):
+                normalized_verified_patch, verified_errors = (
+                    _validate_discovery_strategy_patch(dict(verified_patch))
+                )
+                if verified_errors or not normalized_verified_patch:
+                    patch = {}
+                    mutation_errors.append(
+                        "semantic verification returned an invalid strategy patch"
+                    )
+                else:
+                    removed_uncommitted_fields = sorted(
+                        set(verification_input_patch).difference(verified_patch)
+                    )
+                    if removed_uncommitted_fields:
+                        semantic_verification["removed_uncommitted_fields"] = (
+                            removed_uncommitted_fields
+                        )
+                    patch = _drop_unchanged_discovery_patch_fields(
+                        normalized_verified_patch,
+                        intent_snapshot,
+                        preserve_fields=set(explicit_resolution_patch),
+                    )
+            elif commitment_recovery_warranted and verification_verdict == "reject":
+                # For a non-mutating primary turn, reject means the independent
+                # Agent confirmed that the latest message was consultation, not
+                # that a user-authored strategy patch failed.
+                semantic_verification = {
+                    **semantic_verification,
+                    "verified": True,
+                    "verdict": "accept",
+                    "patch": {},
+                    "no_commitment_confirmed": True,
+                }
+            elif verification_verdict not in {"unavailable", "budget_exhausted"}:
+                # An explicit reject, or an accept/repair verdict whose field
+                # evidence failed deterministic grounding, is authoritative.
+                # Do not let the primary model's raw patch bypass the reviewer.
+                patch = {}
+                if not commitment_recovery_warranted:
+                    mutation_errors.append(
+                        "semantic verification rejected or could not ground the strategy patch"
+                    )
+            elif patch_verification_warranted and explicit_tool_patch:
+                # The typed SDK function call remains the mutation authority
+                # when the bounded independent reviewer is unavailable. Never
+                # degrade to a subset created only by an optional audit.
+                patch = dict(explicit_tool_patch)
+        else:
+            semantic_verification = {
+                "verified": False,
+                "verdict": "budget_exhausted",
+                "patch": {},
+                "rationale": "The primary turn consumed the bounded dialogue budget.",
+            }
+    suppressed_uncommitted_fields: list[str] = []
+    # A successfully executed SDK function call plus the field-generic schema
+    # contract is the normal-path mutation authority.  Do not run that semantic
+    # decision through the old vocabulary-hint filter: doing so silently
+    # dropped perfectly valid phrasings such as an instrument-era preference or
+    # a reviewed-candidate horizon unless they matched a small phrase list.
+    # When the model supplies a grounded turn_interpretation,
+    # _discovery_turn_patch already reconciles the tool patch against it.  When
+    # a provider omits that optional audit, keep the validated SDK tool delta
+    # rather than replacing model reasoning with keyword rules.
+    patch_was_reconciled = bool(patch) and patch != explicit_tool_patch
+    contract_errors = list(mutation_errors)
+    blocking_contract_error = bool(mutation_errors)
+    action = _normalise_discovery_turn_action(
+        raw,
+        legacy_intent=raw_intent,
+        patch=patch,
+        next_decision=next_decision,
+    )
+    assistant_message = _clean_text(raw.get("assistant_message") or raw.get("reply"))
+    if not assistant_message:
+        assistant_message = "我在听。你可以继续说明需求，当前策略保持不变。"
+
+    if option_resolution_audit is not None and patch and not mutation_errors:
+        assistant_message = _format_discovery_reconciled_update_message(patch)
+    elif patch_was_reconciled and not mutation_errors:
+        assistant_message = _format_discovery_reconciled_update_message(patch)
+
+    if requested_action not in _DISCOVERY_TURN_ACTIONS:
+        contract_errors.append("missing or unsupported D1 action")
+        blocking_contract_error = True
+        patch = {}
+        action = "clarify" if next_decision is not None else "advise"
+        assistant_message = (
+            "模型返回的动作契约不完整，本轮策略保持不变。"
+            "你可以直接重试，或继续用自然语言说明你的判断。"
+        )
+
+    raw_calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
+    has_update_tool = any(
+        isinstance(call, Mapping)
+        and _clean_text(call.get("name") or call.get("tool")) == "update_strategy"
+        for call in raw_calls
+    )
+    has_confirm_tool = any(
+        isinstance(call, Mapping)
+        and _clean_text(call.get("name") or call.get("tool")) == "confirm_strategy"
+        for call in raw_calls
+    )
+    if requested_action != "update_strategy" and has_update_tool:
+        contract_errors.append(
+            "update_strategy tool call ignored because action is not update_strategy"
+        )
+        blocking_contract_error = True
+        patch = {}
+        if action == "ready_to_confirm":
+            action = "clarify" if next_decision is not None else "advise"
+            assistant_message = (
+                "这轮同时给出了确认提示和策略修改，契约不一致；"
+                "为避免确认旧策略，本轮策略保持不变。"
+            )
+
+    if has_confirm_tool and requested_action != "confirm_strategy":
+        contract_errors.append(
+            "confirm_strategy tool call ignored because action is not confirm_strategy"
+        )
+        blocking_contract_error = True
+        if requested_action == "update_strategy":
+            patch = {}
+            action = "advise"
+            assistant_message = (
+                "同一轮不能既修改策略又确认策略；为避免越过确认边界，"
+                "本轮两种动作都没有生效。"
+            )
+
+    if requested_action == "update_strategy" and (mutation_errors or has_confirm_tool):
+        patch = {}
+        action = "clarify" if next_decision is not None else "advise"
+        assistant_message = (
+            "这轮没有产生可验证的策略修改，当前策略保持不变。"
+            "你可以继续用自然语言说明要改什么。"
+        )
+
+    confirmation_rejected_reason = ""
+    if requested_action == "confirm_strategy":
+        if confirmation_eligible and not blocking_contract_error:
+            action = "confirm_strategy"
+            patch = {}
+        else:
+            confirmation_rejected_reason = (
+                confirmation_reason or "confirmation action failed structural validation"
+            )
+            action = "clarify" if next_decision is not None else "advise"
+            patch = {}
+            assistant_message = (
+                "当前不能确认：只有在待确认阶段、且对应当前展示的完整策略时，"
+                "自然语言批准才有效；本轮没有启动搜索。"
+            )
+
+    if decision_contract_error:
+        contract_errors.append(
+            "next_decision requires a question, a recommendation reason, and 2-8 options"
+        )
+        if action == "clarify":
+            action = "advise"
+            assistant_message = (
+                "模型给出的下一问缺少完整推荐理由或至少两个可选方向，"
+                "所以本轮不把它当作有效提问；当前策略保持不变。"
+            )
+        elif action == "update_strategy":
+            assistant_message = (
+                f"{assistant_message}\n\n"
+                "策略修改已按工具事件处理；但下一问结构不完整，已明确忽略。"
+            )
+
+    selection_was_applied = _discovery_selected_option_was_applied(
+        selected_decision,
+        effective_patch=patch,
+        validated_tool_patch=validated_tool_patch,
+        intent_snapshot=intent_snapshot,
+        requested_action=requested_action,
+        mutation_valid=not blocking_contract_error and not confirmation_rejected_reason,
+    )
+    if selection_was_applied and candidate_resolved_decision is not None:
+        resolved_decision = dict(candidate_resolved_decision)
+        selected_values: dict[str, Any] = {}
+        for field in resolved_decision.get("target_fields") or []:
+            canonical_field = _clean_text(field)
+            if canonical_field in patch:
+                selected_values[canonical_field] = _json_safe(patch[canonical_field])
+            elif canonical_field in intent_snapshot:
+                selected_values[canonical_field] = _json_safe(
+                    intent_snapshot.get(canonical_field)
+                )
+        if selected_values:
+            resolved_decision["selected_values"] = selected_values
+        decision_memory = _normalise_discovery_decision_memory(
+            [*decision_memory, resolved_decision]
+        )
+        if repeated_selected_decision:
+            next_decision = None
+
+    # A consultation asking for alternatives must not be collapsed back to a
+    # two-item menu merely because the provider omitted enum entries from the
+    # structured response. Expand from the canonical schema only for an open
+    # (not already selected) Agent decision; accepted decisions must move on.
+    if selected_decision is None:
+        next_decision = _expand_discovery_enum_decision_options(
+            next_decision,
+            assistant_message,
+        )
+
+    input_gap = _normalise_discovery_gap_report(input_gap_report)
+    redundant_next_decision = False
+    if not (
+        selected_decision is not None
+        and resolved_decision is None
+        and _same_discovery_decision(pending_decision, next_decision)
+    ):
+        redundant_next_decision = _discovery_decision_was_resolved(
+            next_decision,
+            decision_memory,
+            intent_snapshot=intent_snapshot,
+            resolved_fields=resolved_fields.union(explicit_resolution_patch),
+        )
+    if redundant_next_decision:
+        next_decision = None
+        if action == "clarify":
+            action = (
+                "ready_to_confirm"
+                if input_gap["ready_for_confirm"] and not input_gap["required_missing"]
+                else "advise"
+            )
+        resolved_notice = (
+            "这项决定已经记录在当前策略和会话记忆里，我不会重复询问。"
+            + (
+                "当前策略已足够执行，请确认后再开始搜索。"
+                if action == "ready_to_confirm"
+                else "你可以继续讨论、主动修改任意条件，或在策略完整后确认。"
+            )
+        )
+        if action == "update_strategy":
+            # Suppressing a stale/repeated next question must never erase the
+            # acknowledgement of the strategy delta that was just committed.
+            assistant_message = f"{assistant_message}\n\n{resolved_notice}"
+        else:
+            assistant_message = resolved_notice
+    if resolved_decision is not None and not patch:
+        selected_option = selected_decision.get("option")
+        selected_label = (
+            _clean_text(selected_option.get("label"))
+            if isinstance(selected_option, Mapping)
+            else ""
+        )
+        selection_name = selected_label or _clean_text(
+            selected_decision.get("selection_text")
+        )
+        if input_gap["ready_for_confirm"] and not input_gap["required_missing"]:
+            action = "ready_to_confirm"
+            next_decision = None
+            assistant_message = (
+                f"已记录你选择「{selection_name}」。"
+                "当前策略已经足够执行，我不会重复追问同一项；请确认是否按当前策略开始搜索。"
+            )
+        elif repeated_selected_decision:
+            action = "advise"
+            next_decision = None
+            assistant_message = (
+                f"已记录你选择「{selection_name}」。"
+                "这个决定不需要再次回答；当前策略保持不变，你可以继续说明下一项需求。"
+            )
+
+    response_gap_source = (
+        raw.get("gap_report")
+        if isinstance(raw.get("gap_report"), Mapping)
+        else input_gap_report
+    )
+    response_gap = _normalise_discovery_gap_report(response_gap_source)
+    projected_snapshot = dict(intent_snapshot)
+    projected_snapshot.update(patch)
+    projected_resolved_fields = resolved_fields.union(patch)
+    remaining_decision_agenda = _discovery_critical_decision_agenda(
+        projected_snapshot,
+        response_gap,
+        projected_resolved_fields,
+    )
+    remaining_critical_decisions = [
+        item for item in remaining_decision_agenda if item.get("critical") is True
+    ]
+    ready_for_confirm = bool(
+        action in {"ready_to_confirm", "confirm_strategy"}
+        or raw.get("ready_for_confirm") is True
+        or response_gap["ready_for_confirm"]
+    )
+    if (
+        blocking_contract_error
+        or confirmation_rejected_reason
+        or remaining_critical_decisions
+    ):
+        ready_for_confirm = False
+    if remaining_critical_decisions:
+        response_gap = {**response_gap, "ready_for_confirm": False}
+    if action == "ready_to_confirm" and remaining_critical_decisions:
+        action = "clarify" if next_decision is not None else "advise"
+        if next_decision is None:
+            assistant_message = (
+                "当前策略还缺少会实质影响搜索或科学可用性的关键决定："
+                + "、".join(
+                    _clean_text(item.get("id")) for item in remaining_critical_decisions
+                )
+                + "。我不会跳过这些问题直接让你确认。"
+            )
+
+    if action == "update_strategy" and patch:
+        tool_calls = [
+            {"name": "update_strategy", "arguments": {"patch": patch}}
+        ]
+    elif action == "confirm_strategy":
+        tool_calls = [
+            {
+                "name": "confirm_strategy",
+                "arguments": {"strategy_fingerprint": strategy_fingerprint},
+            }
+        ]
+    else:
+        tool_calls = []
+
+    if action != "update_strategy":
+        patch = {}
+    intent = _legacy_discovery_turn_intent(action, raw_intent)
+    answer_text = _clean_text(raw.get("answer_text") or raw.get("mapped_answer"))
+    understanding = _clean_text(raw.get("understanding"))
+    next_focus = (
+        _clean_text((next_decision or {}).get("focus"))
+        or _clean_text(raw.get("next_focus"))
+        or None
+    )
+    result: dict[str, Any] = {
+        "action": action,
+        "mode": action,
+        "assistant_message": assistant_message,
+        "tool_calls": tool_calls,
+        "gap_report": response_gap,
+        "intent": intent,
+        "advance": action == "update_strategy",
+        "answer_text": answer_text,
+        "extra_fields": patch,
+        "understanding": understanding,
+        "next_focus": next_focus,
+        "ready_for_confirm": ready_for_confirm,
+        "phase": phase,
+        "pending_question_id": _clean_text((pending or {}).get("id")),
+        "strategy_fingerprint": strategy_fingerprint,
+        "status": "completed",
+        "parser": "agents_sdk_grill" if agent_runtime == "openai_agents" else "llm_grill",
+        "agent_runtime": agent_runtime,
+        "llm_used": True,
+        "request_budget_seconds": request_budget_seconds,
+        "decision_memory": decision_memory,
+        "decision_agenda": remaining_decision_agenda,
+        "session_id": session_id,
+    }
+    if advisor_calls:
+        result["specialist_consultations"] = advisor_calls[:4]
+    if provider_compatibility_recovery:
+        result["provider_compatibility_recovery"] = (
+            provider_compatibility_recovery
+        )
+    if manager_repair_feedback:
+        result["manager_repair"] = {
+            "attempt": manager_repair_attempt,
+            "trigger": manager_repair_feedback,
+            "writer": "dialogue_manager",
+            "critic_authority": "read_only",
+        }
+    if resolved_decision is not None:
+        result["resolved_decision"] = resolved_decision
+    if next_decision is not None and action != "confirm_strategy":
+        result["next_decision"] = next_decision
+    if contract_errors:
+        result["contract_errors"] = list(dict.fromkeys(contract_errors))
+    if confirmation_rejected_reason:
+        result["confirmation_rejected_reason"] = confirmation_rejected_reason
+    if suppressed_uncommitted_fields:
+        result["suppressed_uncommitted_fields"] = suppressed_uncommitted_fields
+    if semantic_verification is not None:
+        result["semantic_verification"] = semantic_verification
+    if option_resolution_audit is not None:
+        result["option_resolution"] = option_resolution_audit
+    _store_discovery_dialogue_session_turn(
+        session_id,
+        user_message=user_message,
+        assistant_message=assistant_message,
+        action=action,
+        patch=patch,
+        next_decision=next_decision,
+        resolved_decision=resolved_decision,
+    )
+    return result
+
+def _project_delivery_quality(
+    project: Mapping[str, Any],
+    judgment: Mapping[str, Any],
+    project_files: list[Mapping[str, Any]],
+    *,
+    actually_selected: bool,
+    review_provenance: str = "agent_judgment_legacy_or_unaudited",
+) -> dict[str, Any]:
+    usable_files = [
+        file
+        for file in project_files
+        if str(file.get("validity_status") or "") in {"valid", "weak_keep"}
+        and not bool(file.get("needs_review"))
+    ]
+    review_files = [
+        file
+        for file in project_files
+        if bool(file.get("needs_review"))
+        or str(file.get("validity_status") or "") == "needs_review"
+    ]
+    judgment_qualified = bool(
+        judgment
+        and str(judgment.get("evidence_stage") or "") == "inspection"
+        and str(judgment.get("status") or "") == "evidence_backed"
+        and str(judgment.get("hard_gate") or "") == "pass"
+        and judgment.get("grade") in (2, 3, "2", "3")
+        and str(judgment.get("decision") or "") == "include"
+        and str(judgment.get("explanation") or "").strip()
+    )
+    project_validity_status = _clean_text(project.get("validity_status")).lower()
+    project_needs_review = bool(project.get("needs_review")) or project_validity_status in {
+        "needs_review",
+        "exclude",
+    }
+    usable_for_delivery = bool(
+        actually_selected
+        and review_provenance == "agent_judgment_with_server_quality_audit"
+        and judgment_qualified
+        and not project_needs_review
+        and usable_files
+    )
+    return {
+        "actual_final_selection": actually_selected,
+        "judgment_qualified": judgment_qualified,
+        "project_needs_review": project_needs_review,
+        "usable_file_count": len(usable_files),
+        "needs_review_file_count": len(review_files),
+        "usable_for_delivery": usable_for_delivery,
+    }
+
+
+def _discovery_review_provenance(
+    summary: Mapping[str, Any],
+    *,
+    run_id: str,
+) -> str:
+    """Describe the actual review chain without inventing an audit.
+
+    Historical and deterministic/local manifests may contain project
+    judgments but no server quality audit.  Only a matching, schema-valid,
+    selection-ready audit earns the passing provenance label.
+    """
+
+    audit = summary.get("latest_discovery_audit")
+    if not isinstance(audit, Mapping):
+        return "agent_judgment_legacy_or_unaudited"
+    try:
+        validated = DiscoveryQualityAudit.model_validate(dict(audit))
+    except Exception:
+        return "agent_judgment_legacy_or_unaudited"
+    if validated.schema_version != "discovery-quality-audit/v1" or (
+        validated.run_id != _clean_text(run_id)
+    ):
+        return "agent_judgment_legacy_or_unaudited"
+    if (
+        validated.status == "ready"
+        and validated.ready_for_selection is True
+    ):
+        return "agent_judgment_with_server_quality_audit"
+    return "agent_judgment_with_nonpassing_server_quality_audit"
+
+
+def _merge_discovery_project_judgments(
+    *sources: Any,
+) -> dict[str, dict[str, Any]]:
+    """Merge judgment maps by accession; later, more final sources win."""
+    merged: dict[str, dict[str, Any]] = {}
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key, value in source.items():
+            accession = _clean_text(key).upper()
+            if accession and isinstance(value, Mapping):
+                merged[accession] = dict(value)
+    return merged
+
+
+def _ensure_discovery_review_artifacts(output_dir: Path) -> dict[str, Path]:
+    """Always materialize project-level judgment review tables for a discovery run.
+
+    This is a product feature: every finished discovery run must expose a
+    downloadable project table with selection, 0-3 grade, reason, and evidence.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    produced: dict[str, Path] = {}
+    control_summary = _read_json_if_exists(output_dir / "agents_discovery_summary.json")
+    selected_manifest_path = output_dir / "final_selection" / "dataset_manifest.json"
+    if not selected_manifest_path.exists():
+        selected_manifest_path = output_dir / "dataset_manifest.json"
+    if not selected_manifest_path.exists():
+        return produced
+
+    try:
+        selected_payload = json.loads(selected_manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return produced
+
+    selected_projects = selected_payload.get("projects") or []
+    selected_run_id = _clean_text(selected_payload.get("run_id"))
+    review_provenance = _discovery_review_provenance(
+        control_summary,
+        run_id=selected_run_id,
+    )
+    selected_accessions = {
+        str(project.get("project_accession") or "").upper()
+        for project in selected_projects
+        if isinstance(project, dict) and str(project.get("project_accession") or "").strip()
+    }
+    candidate_path_value = control_summary.get("candidate_pool_manifest_path")
+    candidate_manifest_path = (
+        Path(str(candidate_path_value))
+        if candidate_path_value
+        else output_dir / "candidate_pool" / "dataset_manifest.json"
+    )
+    candidate_payload = selected_payload
+    if candidate_manifest_path.exists() and candidate_manifest_path.is_file():
+        candidate_payload = _read_json_if_exists(candidate_manifest_path) or selected_payload
+
+    projects = candidate_payload.get("projects") or []
+    if not isinstance(projects, list):
+        projects = []
+    candidate_files = candidate_payload.get("files") or []
+    if not isinstance(candidate_files, list):
+        candidate_files = []
+    summary = (
+        selected_payload.get("summary")
+        if isinstance(selected_payload.get("summary"), dict)
+        else {}
+    )
+    judgments = _merge_discovery_project_judgments(
+        control_summary.get("project_judgments"),
+        summary.get("project_judgments"),
+    )
+    if not judgments:
+        judgments = _merge_discovery_project_judgments(
+            _read_json_if_exists(output_dir / "project_judgments.json")
+        )
+    projects_by_accession = {
+        str(project.get("project_accession") or "").upper(): dict(project)
+        for project in projects
+        if isinstance(project, dict) and str(project.get("project_accession") or "").strip()
+    }
+    for accession in judgments:
+        projects_by_accession.setdefault(
+            accession,
+            {"project_accession": accession, "project_title": ""},
+        )
+    files_by_accession: dict[str, list[dict[str, Any]]] = {}
+    for file in candidate_files:
+        if not isinstance(file, dict):
+            continue
+        accession = str(file.get("project_accession") or "").upper()
+        if accession:
+            files_by_accession.setdefault(accession, []).append(file)
+    # Normalize project payloads for the writer.
+    normalized_projects: list[dict[str, Any]] = []
+    for accession, project in projects_by_accession.items():
+        item = dict(project)
+        judgment = judgments.get(accession) or {}
+        item["project_accession"] = accession
+        item["final_grade"] = judgment.get("grade", item.get("final_grade"))
+        item["hard_gate"] = judgment.get("hard_gate", item.get("hard_gate"))
+        item["judgment_status"] = judgment.get("status", item.get("judgment_status"))
+        item["judgment_decision"] = judgment.get("decision", item.get("judgment_decision"))
+        item["judgment_confidence"] = judgment.get("confidence", item.get("judgment_confidence"))
+        item["judgment_explanation"] = judgment.get("explanation", item.get("judgment_explanation") or "")
+        item["judgment_evidence_stage"] = judgment.get(
+            "evidence_stage", item.get("judgment_evidence_stage")
+        )
+        item["missing_information"] = judgment.get(
+            "missing_information", item.get("missing_information") or []
+        )
+        item["has_project_judgment"] = bool(judgment)
+        item.update(
+            _project_delivery_quality(
+                item,
+                judgment,
+                files_by_accession.get(accession, []),
+                actually_selected=accession in selected_accessions,
+                review_provenance=review_provenance,
+            )
+        )
+        item["selection_rationale"] = control_summary.get("selection_rationale") or ""
+        item["review_provenance"] = review_provenance
+        # File count fallback from nested files if needed.
+        if not item.get("selected_file_count"):
+            item["selected_file_count"] = len(files_by_accession.get(accession, []))
+        normalized_projects.append(item)
+
+    table_path = _write_discovery_project_judgment_table(
+        output_dir,
+        normalized_projects,
+        judgments,
+        selected_accessions=selected_accessions,
+        files=candidate_files,
+        selection_rationale=str(control_summary.get("selection_rationale") or ""),
+        review_provenance=review_provenance,
+    )
+    produced["project_judgments_table_csv"] = table_path
+    selected_csv = output_dir / "selected_projects_review.csv"
+    selected_json = output_dir / "selected_projects_review.json"
+    judgments_json = output_dir / "project_judgments.json"
+    if selected_csv.exists():
+        produced["selected_projects_review_csv"] = selected_csv
+    if selected_json.exists():
+        produced["selected_projects_review_json"] = selected_json
+    if judgments_json.exists():
+        produced["project_judgments_json"] = judgments_json
+    return produced
+
+
 def _public_discovery_record(
     *,
     discovery_id: str,
@@ -1778,36 +7414,209 @@ def _public_discovery_record(
         key: output_dir / filename
         for key, (filename, _media_type) in _DISCOVERY_DOWNLOAD_FILES.items()
     }
+    # Prefer live judgment payload from summary / control-plane artifacts.
+    # Always materialize project review tables for downloadable audit.
+    try:
+        _ensure_discovery_review_artifacts(output_dir)
+    except Exception:
+        pass
+    control_summary = _read_json_if_exists(output_dir / "agents_discovery_summary.json")
+    provenance_summary = dict(control_summary)
+    if isinstance(manifest.summary, Mapping) and isinstance(
+        manifest.summary.get("latest_discovery_audit"), Mapping
+    ):
+        provenance_summary["latest_discovery_audit"] = manifest.summary.get(
+            "latest_discovery_audit"
+        )
+    review_provenance = _discovery_review_provenance(
+        provenance_summary,
+        run_id=manifest.run_id,
+    )
+    summary_run_id = _clean_text(provenance_summary.get("run_id"))
+    summary_matches_run = not summary_run_id or summary_run_id == manifest.run_id
+    latest_discovery_audit = provenance_summary.get("latest_discovery_audit")
+    if not summary_matches_run or not isinstance(latest_discovery_audit, Mapping):
+        latest_discovery_audit = None
+    else:
+        try:
+            validated_audit = DiscoveryQualityAudit.model_validate(
+                dict(latest_discovery_audit)
+            )
+        except Exception:
+            latest_discovery_audit = None
+        else:
+            latest_discovery_audit = (
+                validated_audit.model_dump(mode="json")
+                if validated_audit.run_id == manifest.run_id
+                else None
+            )
+    runtime_provenance = provenance_summary.get("runtime_provenance")
+    if not summary_matches_run or not isinstance(runtime_provenance, Mapping):
+        runtime_provenance = None
+    else:
+        try:
+            runtime_provenance = RuntimeProvenance.model_validate(
+                dict(runtime_provenance)
+            ).model_dump(mode="json")
+        except Exception:
+            runtime_provenance = None
+    judgments = _merge_discovery_project_judgments(
+        control_summary.get("project_judgments"),
+        (
+            manifest.summary.get("project_judgments")
+            if isinstance(manifest.summary, dict)
+            else None
+        ),
+    )
+    if not judgments:
+        judgments = _merge_discovery_project_judgments(
+            _read_json_if_exists(output_dir / "project_judgments.json")
+        )
+    judgment_summary = (
+        (manifest.summary.get("project_judgment_summary") if isinstance(manifest.summary, dict) else None)
+        or control_summary.get("project_judgment_summary")
+        or {}
+    )
     files = [
         file.model_dump(mode="json", exclude={"raw_record"})
         for file in manifest.files
     ]
-    projects = [
-        project.model_dump(mode="json", exclude={"raw_metadata"})
-        for project in manifest.projects
-    ]
-    needs_review_count = sum(1 for file in manifest.files if file.needs_review)
+    files_by_accession: dict[str, list[dict[str, Any]]] = {}
+    for file in files:
+        accession = str(file.get("project_accession") or "").upper()
+        if accession:
+            files_by_accession.setdefault(accession, []).append(file)
+    agent_selection_committed = agent is None or (
+        agent.get("selected_round_index") is not None
+        and status in {"completed", "completed_with_review"}
+    )
+    final_accessions = (
+        {project.project_accession.upper() for project in manifest.projects}
+        if agent_selection_committed
+        else set()
+    )
+    projects = []
+    for project in manifest.projects:
+        payload = project.model_dump(mode="json", exclude={"raw_metadata"})
+        accession = str(payload.get("project_accession") or "").upper()
+        judgment = judgments.get(accession) or {}
+        payload["final_grade"] = judgment.get("grade")
+        payload["judgment_status"] = judgment.get("status")
+        payload["hard_gate"] = judgment.get("hard_gate")
+        payload["judgment_decision"] = judgment.get("decision")
+        payload["judgment_confidence"] = judgment.get("confidence")
+        payload["judgment_explanation"] = judgment.get("explanation") or ""
+        payload["judgment_evidence_stage"] = judgment.get("evidence_stage")
+        payload["missing_information"] = judgment.get("missing_information") or []
+        payload["next_action"] = judgment.get("next_action")
+        payload["has_project_judgment"] = bool(judgment)
+        payload["judgment_evidence_refs"] = judgment.get("evidence_refs") or []
+        payload["judgment_constraint_assessments"] = (
+            judgment.get("constraint_assessments") or []
+        )
+        payload["judgment_limitations"] = judgment.get("limitations") or []
+        payload["judgment_rubric_version"] = judgment.get("rubric_version") or ""
+        payload["review_provenance"] = review_provenance
+        payload.update(
+            _project_delivery_quality(
+                payload,
+                judgment,
+                files_by_accession.get(accession, []),
+                actually_selected=accession in final_accessions,
+                review_provenance=review_provenance,
+            )
+        )
+        # Keep legacy retrieval scores under explicit names for debugging only.
+        payload["retrieval_project_score"] = payload.get("project_score")
+        payload["retrieval_confidence"] = payload.get("confidence")
+        payload["retrieval_trust_score"] = payload.get("trust_score")
+        projects.append(payload)
+    # Ensure a durable project-level judgment table exists for every finished run.
+    # Fall back to the live manifest only when no persisted review table can be
+    # materialized; never overwrite a candidate-wide table with final selection.
+    try:
+        review_paths = _ensure_discovery_review_artifacts(output_dir)
+        if "project_judgments_table_csv" not in review_paths:
+            _write_discovery_project_judgment_table(
+                output_dir,
+                projects,
+                judgments,
+                selected_accessions=final_accessions,
+                files=files,
+                selection_rationale=str(
+                    (agent or {}).get("selection_rationale")
+                    or manifest.summary.get("selection_rationale")
+                    or ""
+                ),
+                review_provenance=review_provenance,
+            )
+        for key, path in review_paths.items():
+            download_files[key] = path
+    except Exception:
+        pass
+    # Register generated review artifacts into downloads.
+    for key, (filename, _media) in _DISCOVERY_DOWNLOAD_FILES.items():
+        candidate = output_dir / filename
+        if candidate.exists():
+            download_files[key] = candidate
+    needs_review_count = sum(
+        file.needs_review or file.validity_status == "needs_review"
+        for file in manifest.files
+    )
     valid_count = sum(1 for file in manifest.files if file.validity_status == "valid")
     weak_keep_count = sum(1 for file in manifest.files if file.validity_status == "weak_keep")
-    usable_count = valid_count + weak_keep_count
+    usable_count = sum(
+        file.validity_status in {"valid", "weak_keep"} and not file.needs_review
+        for file in manifest.files
+    )
+    graded_projects = sum(1 for item in projects if item.get("has_project_judgment"))
+    deliverable_projects = sum(1 for item in projects if item.get("usable_for_delivery"))
+    ungraded_projects = max(0, len(projects) - graded_projects)
+    selected_file_count = sum(
+        1
+        for file in files
+        if str(file.get("project_accession") or "").upper() in final_accessions
+    )
     return {
         "discovery_id": discovery_id,
         "run_id": manifest.run_id,
         "status": status,
         "runtime": runtime,
         "agent": agent,
+        "latest_discovery_audit": latest_discovery_audit,
+        "runtime_provenance": runtime_provenance,
         "request": manifest.request.model_dump(mode="json"),
         "summary": {
             **manifest.summary,
+            **(
+                {"latest_discovery_audit": latest_discovery_audit}
+                if latest_discovery_audit is not None
+                else {}
+            ),
+            **(
+                {"runtime_provenance": runtime_provenance}
+                if runtime_provenance is not None
+                else {}
+            ),
             "valid_files": valid_count,
             "weak_keep_files": weak_keep_count,
             "usable_files": usable_count,
             "needs_review_files": needs_review_count,
             "memory_saved": memory_saved,
+            "project_judgment_summary": judgment_summary,
+            "graded_projects": graded_projects,
+            "deliverable_projects": deliverable_projects,
+            "ungraded_projects": ungraded_projects,
+            "candidate_projects": len(projects),
+            "candidate_files": len(files),
+            "selected_projects": len(final_accessions),
+            "selected_files": selected_file_count,
+            "requires_project_judgments": True,
         },
         "project_count": len(projects),
         "file_count": len(files),
         "projects": projects,
+        "project_judgments": judgments,
         "files": files,
         "output_dir": str(output_dir),
         "downloads": {
@@ -1816,6 +7625,509 @@ def _public_discovery_record(
             if path.exists()
         },
     }
+
+
+def _write_discovery_project_judgment_table(
+    output_dir: Path,
+    projects: list[dict[str, Any]],
+    judgments: Mapping[str, Any],
+    *,
+    selected_accessions: set[str] | None = None,
+    files: list[dict[str, Any]] | None = None,
+    selection_rationale: str = "",
+    review_provenance: str = "agent_judgment_legacy_or_unaudited",
+) -> Path:
+    """Persist a project-level review table: selection, 0-3 grade, and evidence/reason."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "project_judgments_table.csv"
+    selected_path = output_dir / "selected_projects_review.csv"
+    columns = [
+        "actual_final_selection",
+        "selected_for_delivery",
+        "project_accession",
+        "project_title",
+        "final_grade",
+        "hard_gate",
+        "judgment_status",
+        "judgment_decision",
+        "judgment_confidence",
+        "judgment_evidence_stage",
+        "judgment_explanation",
+        "judgment_evidence_refs",
+        "judgment_constraint_assessments",
+        "judgment_limitations",
+        "judgment_rubric_version",
+        "missing_information",
+        "next_action",
+        "species",
+        "canonical_species",
+        "organism_taxon_id",
+        "acquisition_mode",
+        "labeling_strategy",
+        "immunopeptide_scope",
+        "immunopeptide_evidence_terms",
+        "hla_class",
+        "hla_alleles",
+        "ptm_type",
+        "selected_file_count",
+        "usable_file_count",
+        "needs_review_file_count",
+        "project_needs_review",
+        "usable_for_delivery",
+        "has_project_judgment",
+        "retrieval_project_score",
+        "retrieval_confidence",
+        "retrieval_trust_score",
+        "evidence_terms",
+        "sample_file_names",
+        "download_urls_sample",
+        "selection_rationale",
+        "review_provenance",
+    ]
+
+    def _join(values: Any) -> str:
+        if values is None:
+            return ""
+        if isinstance(values, str):
+            return values
+        if isinstance(values, (list, tuple, set)):
+            return ";".join(str(item).strip() for item in values if str(item).strip())
+        return str(values)
+
+    # Optional file-level context for evidence preview.
+    files_by_project: dict[str, list[dict[str, Any]]] = {}
+    file_payloads = files
+    if file_payloads is None:
+        manifest_path = output_dir / "candidate_pool" / "dataset_manifest.json"
+        if not manifest_path.exists():
+            manifest_path = output_dir / "dataset_manifest.json"
+        if not manifest_path.exists() and (output_dir / "final_selection" / "dataset_manifest.json").exists():
+            manifest_path = output_dir / "final_selection" / "dataset_manifest.json"
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+            file_payloads = payload.get("files") or []
+        except Exception:
+            file_payloads = []
+    for file in file_payloads or []:
+        if not isinstance(file, dict):
+            continue
+        acc = str(file.get("project_accession") or "").upper()
+        if not acc:
+            continue
+        files_by_project.setdefault(acc, []).append(file)
+
+    normalized_selected_accessions = {
+        str(accession).upper() for accession in (selected_accessions or set())
+    }
+
+    rows: list[dict[str, Any]] = []
+    for project in projects:
+        accession = str(project.get("project_accession") or "").upper()
+        judgment = judgments.get(accession) if isinstance(judgments, Mapping) else {}
+        if not isinstance(judgment, Mapping):
+            judgment = {}
+        project_files = files_by_project.get(accession) or []
+        evidence_terms: list[str] = []
+        for key in (
+            "immunopeptide_evidence_terms",
+            "ptm_evidence_terms",
+            "hla_class",
+            "hla_alleles",
+        ):
+            evidence_terms.extend(
+                str(item)
+                for item in (
+                    project.get(key)
+                    or judgment.get(key)
+                    or []
+                )
+                if str(item).strip()
+            )
+        # Light evidence from top files.
+        for file in project_files[:8]:
+            for key in ("immunopeptide_evidence_terms", "ptm_evidence_terms", "matched_intent_terms"):
+                evidence_terms.extend(
+                    str(item) for item in (file.get(key) or []) if str(item).strip()
+                )
+        # unique keep order
+        seen: set[str] = set()
+        evidence_unique: list[str] = []
+        for term in evidence_terms:
+            low = term.casefold()
+            if low in seen:
+                continue
+            seen.add(low)
+            evidence_unique.append(term)
+        sample_names = [str(file.get("file_name") or "") for file in project_files[:12] if file.get("file_name")]
+        sample_urls = [
+            str(file.get("download_url") or "")
+            for file in project_files[:8]
+            if file.get("download_url")
+        ]
+        grade = judgment.get("grade", project.get("final_grade", ""))
+        decision = judgment.get("decision", project.get("judgment_decision", ""))
+        hard_gate = judgment.get("hard_gate", project.get("hard_gate", ""))
+        explanation = judgment.get("explanation", project.get("judgment_explanation", ""))
+        actual_selected = (
+            accession in normalized_selected_accessions
+            if selected_accessions is not None
+            else bool(project.get("actual_final_selection"))
+        )
+        delivery = _project_delivery_quality(
+            project,
+            judgment,
+            project_files,
+            actually_selected=actual_selected,
+            review_provenance=review_provenance,
+        )
+        selected = bool(delivery["usable_for_delivery"])
+        rows.append(
+            {
+                "actual_final_selection": "yes" if actual_selected else "no",
+                "selected_for_delivery": "yes" if selected else "no",
+                "project_accession": accession,
+                "project_title": project.get("project_title") or "",
+                "final_grade": grade,
+                "hard_gate": hard_gate,
+                "judgment_status": judgment.get("status", project.get("judgment_status", "")),
+                "judgment_decision": decision,
+                "judgment_confidence": judgment.get(
+                    "confidence", project.get("judgment_confidence", "")
+                ),
+                "judgment_evidence_stage": judgment.get(
+                    "evidence_stage", project.get("judgment_evidence_stage", "")
+                ),
+                "judgment_explanation": explanation,
+                "judgment_evidence_refs": _join(judgment.get("evidence_refs") or []),
+                "judgment_constraint_assessments": json.dumps(
+                    judgment.get("constraint_assessments") or [],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                "judgment_limitations": _join(judgment.get("limitations") or []),
+                "judgment_rubric_version": judgment.get("rubric_version") or "",
+                "missing_information": _join(
+                    judgment.get("missing_information")
+                    or project.get("missing_information")
+                    or []
+                ),
+                "next_action": judgment.get("next_action", project.get("next_action", "")),
+                "species": _join(project.get("species") or []),
+                "canonical_species": _join(project.get("canonical_species") or []),
+                "organism_taxon_id": _join(project.get("organism_taxon_id") or []),
+                "acquisition_mode": project.get("acquisition_mode") or "",
+                "labeling_strategy": project.get("labeling_strategy") or "",
+                "immunopeptide_scope": project.get("immunopeptide_scope") or "",
+                "immunopeptide_evidence_terms": _join(
+                    project.get("immunopeptide_evidence_terms") or []
+                ),
+                "hla_class": _join(project.get("hla_class") or []),
+                "hla_alleles": _join(project.get("hla_alleles") or []),
+                "ptm_type": project.get("ptm_type") or "",
+                "selected_file_count": project.get("selected_file_count")
+                or project.get("file_count")
+                or len(project_files)
+                or 0,
+                "usable_file_count": delivery["usable_file_count"],
+                "needs_review_file_count": delivery["needs_review_file_count"],
+                "project_needs_review": "yes" if delivery["project_needs_review"] else "no",
+                "usable_for_delivery": "yes" if selected else "no",
+                "has_project_judgment": "yes"
+                if (
+                    project.get("has_project_judgment")
+                    or judgment
+                )
+                else "no",
+                "retrieval_project_score": project.get("retrieval_project_score")
+                or project.get("project_score")
+                or "",
+                "retrieval_confidence": project.get("retrieval_confidence")
+                or project.get("confidence")
+                or "",
+                "retrieval_trust_score": project.get("retrieval_trust_score")
+                or project.get("trust_score")
+                or "",
+                "evidence_terms": _join(evidence_unique[:30]),
+                "sample_file_names": _join(sample_names),
+                "download_urls_sample": _join(sample_urls),
+                "selection_rationale": selection_rationale
+                or str(project.get("selection_rationale") or ""),
+                "review_provenance": review_provenance
+                or str(project.get("review_provenance") or ""),
+            }
+        )
+
+    # Stable order: selected first, then grade desc.
+    def _sort_key(row: dict[str, Any]) -> tuple:
+        selected = 1 if row.get("selected_for_delivery") == "yes" else 0
+        try:
+            grade = int(row.get("final_grade"))
+        except Exception:
+            grade = -1
+        return (-selected, -grade, str(row.get("project_accession") or ""))
+
+    rows.sort(key=_sort_key)
+
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    # Convenience: only selected projects.
+    selected_rows = [row for row in rows if row.get("actual_final_selection") == "yes"]
+    with selected_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for row in selected_rows:
+            writer.writerow(row)
+
+    # JSON companion for APIs/UI.
+    write_json(
+        output_dir / "project_judgments.json",
+        {
+            str(key).upper(): value
+            for key, value in (judgments or {}).items()
+            if isinstance(value, Mapping)
+        },
+    )
+    write_json(
+        output_dir / "selected_projects_review.json",
+        {
+            "selected_count": len(selected_rows),
+            "deliverable_count": sum(
+                row.get("usable_for_delivery") == "yes" for row in selected_rows
+            ),
+            "total_projects": len(rows),
+            "projects": selected_rows,
+        },
+    )
+    return path
+
+
+def _discovery_history_record_from_run_dir(run_dir: Path) -> dict[str, Any] | None:
+    if not run_dir.exists() or not run_dir.is_dir():
+        return None
+    discovery_id = run_dir.name
+    request = _read_json_if_exists(run_dir / "dataset_request.json")
+    summary = _read_json_if_exists(run_dir / "discovery_summary.json") or _read_json_if_exists(
+        run_dir / "agents_discovery_summary.json"
+    )
+    final_manifest = run_dir / "final_selection" / "dataset_manifest.json"
+    root_manifest = run_dir / "dataset_manifest.json"
+    manifest_path = final_manifest if final_manifest.exists() else root_manifest
+    project_count = 0
+    file_count = 0
+    status = "completed" if manifest_path.exists() else "partial"
+    if summary:
+        project_count = int(summary.get("selected_projects") or summary.get("qualified_projects") or 0)
+        file_count = int(summary.get("selected_files") or 0)
+        status = _clean_text(summary.get("status") or status) or status
+    if manifest_path.exists():
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            project_count = len(payload.get("projects") or project_count or [])
+            file_count = len(payload.get("files") or file_count or [])
+        except Exception:
+            pass
+    prompt = ""
+    if isinstance(request, Mapping):
+        # request may not include prompt; leave empty
+        pass
+    # Prefer job linkage if present in summary.
+    job_id = _clean_text((summary or {}).get("job_id") or (summary or {}).get("source_job_id"))
+    goal = _clean_text((request or {}).get("goal") if isinstance(request, Mapping) else "")
+    display = goal or discovery_id
+    if prompt:
+        display = prompt[:80]
+    elif goal:
+        display = f"Discovery · {goal}"
+    else:
+        display = f"Discovery · {discovery_id}"
+    mtime = run_dir.stat().st_mtime
+    finished_at = datetime.fromtimestamp(mtime, tz=_APP_TZ).isoformat()
+    bundle = run_dir / "discovery_run_bundle.zip"
+    size_bytes = 0
+    try:
+        size_bytes = sum(p.stat().st_size for p in run_dir.rglob("*") if p.is_file())
+    except Exception:
+        size_bytes = bundle.stat().st_size if bundle.exists() else 0
+    record = {
+        "kind": "discovery",
+        "history_id": f"discovery-{discovery_id}",
+        "discovery_id": discovery_id,
+        "run_id": discovery_id,
+        "result_id": discovery_id,
+        "name": discovery_id,
+        "display_name": display,
+        "input_value": display,
+        "status": status,
+        "repository": _clean_text((request or {}).get("repository") if isinstance(request, Mapping) else "")
+        or "pride",
+        "run_mode": "discovery",
+        "project_count": project_count,
+        "file_count": file_count,
+        "size_bytes": size_bytes,
+        "output_dir": str(run_dir),
+        "can_download": manifest_path.exists() or bundle.exists(),
+        "primary_action": "open_discovery",
+        "created_at": finished_at,
+        "updated_at": finished_at,
+        "finished_at": finished_at,
+        "history_time": finished_at,
+        "submitter": "discovery",
+        "downloads": {
+            "dataset_manifest_csv": f"/api/discovery/{discovery_id}/download?file=dataset_manifest_csv",
+            "discovery_run_bundle_zip": f"/api/discovery/{discovery_id}/download?file=discovery_run_bundle_zip",
+        }
+        if (manifest_path.exists() or bundle.exists())
+        else {},
+        "job_id": job_id or None,
+        "goal": goal or None,
+    }
+    return _decorate_history_item(record)
+
+
+def _list_discovery_history_records(limit: int = 100) -> list[dict[str, Any]]:
+    root = _discovery_root_dir()
+    if not root.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    # Prefer job index for status fidelity.
+    jobs_dir = _discovery_jobs_dir()
+    seen_dirs: set[str] = set()
+    if jobs_dir.exists():
+        for path in sorted(jobs_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            job = _read_json_if_exists(path)
+            if not job:
+                continue
+            record = job.get("record") if isinstance(job.get("record"), Mapping) else {}
+            run_dir = None
+            for key in ("output_dir", "run_id", "discovery_id"):
+                raw = _clean_text((record or {}).get(key) or job.get(key))
+                if not raw:
+                    continue
+                candidate = Path(raw)
+                if candidate.exists() and candidate.is_dir():
+                    run_dir = candidate
+                    break
+                candidate = root / safe_output_stem(raw)
+                if candidate.exists() and candidate.is_dir():
+                    run_dir = candidate
+                    break
+            if run_dir is None:
+                # Job without materialized run still shown as history shell.
+                prompt = _clean_text((job.get("body") or {}).get("prompt")) if isinstance(job.get("body"), Mapping) else ""
+                item = {
+                    "kind": "discovery",
+                    "history_id": f"discovery-job-{job.get('job_id')}",
+                    "job_id": job.get("job_id"),
+                    "discovery_id": None,
+                    "run_id": job.get("job_id"),
+                    "result_id": job.get("job_id"),
+                    "name": job.get("job_id"),
+                    "display_name": (prompt[:80] if prompt else f"Discovery job {job.get('job_id')}"),
+                    "input_value": prompt or job.get("job_id"),
+                    "status": job.get("status") or "unknown",
+                    "repository": "pride",
+                    "run_mode": "discovery",
+                    "project_count": (record or {}).get("project_count") or 0,
+                    "file_count": (record or {}).get("file_count") or 0,
+                    "size_bytes": 0,
+                    "output_dir": "",
+                    "can_download": False,
+                    "primary_action": "open_discovery_job",
+                    "created_at": job.get("created_at"),
+                    "updated_at": job.get("finished_at") or job.get("started_at") or job.get("created_at"),
+                    "finished_at": job.get("finished_at"),
+                    "history_time": job.get("finished_at") or job.get("started_at") or job.get("created_at"),
+                    "submitter": "discovery",
+                    "error": job.get("error"),
+                }
+                records.append(_decorate_history_item(item))
+                continue
+            seen_dirs.add(str(run_dir.resolve()))
+            item = _discovery_history_record_from_run_dir(run_dir)
+            if item is None:
+                continue
+            item["job_id"] = job.get("job_id")
+            item["status"] = job.get("status") or item.get("status")
+            item["error"] = job.get("error")
+            if job.get("finished_at"):
+                item["finished_at"] = job.get("finished_at")
+                item["history_time"] = job.get("finished_at")
+            item["primary_action"] = "open_discovery"
+            records.append(item)
+            if len(records) >= limit:
+                return records
+    # Include run dirs not linked from jobs.
+    for path in sorted(root.glob("agents_*"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if not path.is_dir():
+            continue
+        key = str(path.resolve())
+        if key in seen_dirs:
+            continue
+        item = _discovery_history_record_from_run_dir(path)
+        if item is None:
+            continue
+        records.append(item)
+        if len(records) >= limit:
+            break
+    records.sort(key=lambda item: str(item.get("history_time") or item.get("finished_at") or ""), reverse=True)
+    return records[:limit]
+
+
+def _upsert_discovery_history_record(record: Mapping[str, Any] | None, output_dir: Path | None = None) -> None:
+    """Ensure finished discovery runs appear in project history."""
+    try:
+        history_item = None
+        if isinstance(record, Mapping) and record.get("discovery_id"):
+            discovery_id = _clean_text(record.get("discovery_id"))
+            run_dir = Path(str(record.get("output_dir") or output_dir or (_discovery_root_dir() / discovery_id)))
+            history_item = {
+                "kind": "discovery",
+                "history_id": f"discovery-{discovery_id}",
+                "discovery_id": discovery_id,
+                "run_id": _clean_text(record.get("run_id") or discovery_id),
+                "result_id": discovery_id,
+                "name": discovery_id,
+                "display_name": (
+                    _clean_text((record.get("request") or {}).get("goal"))
+                    and f"Discovery · {_clean_text((record.get('request') or {}).get('goal'))}"
+                )
+                or discovery_id,
+                "input_value": _clean_text((record.get("request") or {}).get("goal")) or discovery_id,
+                "status": _clean_text(record.get("status")) or "completed",
+                "repository": _clean_text((record.get("request") or {}).get("repository")) or "pride",
+                "run_mode": "discovery",
+                "project_count": int(record.get("project_count") or 0),
+                "file_count": int(record.get("file_count") or 0),
+                "size_bytes": 0,
+                "output_dir": str(run_dir),
+                "can_download": True,
+                "primary_action": "open_discovery",
+                "created_at": _now_app_iso(),
+                "updated_at": _now_app_iso(),
+                "finished_at": _now_app_iso(),
+                "history_time": _now_app_iso(),
+                "submitter": "discovery",
+                "downloads": record.get("downloads") or {},
+                "goal": _clean_text((record.get("request") or {}).get("goal")) or None,
+            }
+            # Fill size if possible.
+            if run_dir.exists():
+                try:
+                    history_item["size_bytes"] = sum(
+                        p.stat().st_size for p in run_dir.rglob("*") if p.is_file()
+                    )
+                except Exception:
+                    pass
+        elif output_dir is not None:
+            history_item = _discovery_history_record_from_run_dir(output_dir)
+        if history_item:
+            _upsert_history_index(history_item)
+    except Exception:
+        return
 
 
 _LOCAL_SPECIES_TOKENS = {
@@ -2334,12 +8646,89 @@ def _local_discovery_manifest(
     return DatasetManifest(request=request, projects=final_projects if files else [], files=files, summary=summary)
 
 
+def _discovery_confirmation_rejection(
+    body: Mapping[str, Any],
+) -> dict[str, str] | None:
+    if body.get("grill_confirmed") is not True:
+        return {
+            "status": "rejected",
+            "code": "grill_confirmation_required",
+            "error": "Explicit strategy confirmation is required: grill_confirmed must be true.",
+        }
+    supplied_fingerprint = _clean_text(body.get("strategy_fingerprint")).lower()
+    if supplied_fingerprint:
+        supplied_canonical = body.get("strategy_fingerprint_payload")
+        expected_fingerprint = ""
+        canonical_matches_payload = True
+        if supplied_canonical is not None:
+            canonical_text = str(supplied_canonical)
+            if not canonical_text or len(canonical_text.encode("utf-8")) > 200_000:
+                canonical_matches_payload = False
+            else:
+                try:
+                    canonical_snapshot = json.loads(canonical_text)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    canonical_matches_payload = False
+                else:
+                    canonical_matches_payload = _json_values_equal(
+                        canonical_snapshot,
+                        _discovery_execution_snapshot(body),
+                    )
+                    if canonical_matches_payload:
+                        expected_fingerprint = hashlib.sha256(
+                            canonical_text.encode("utf-8")
+                        ).hexdigest()
+        else:
+            expected_fingerprint = _discovery_execution_fingerprint(body)
+        if (
+            not canonical_matches_payload
+            or re.fullmatch(r"[0-9a-f]{64}", supplied_fingerprint) is None
+            or not expected_fingerprint
+            or not secrets.compare_digest(supplied_fingerprint, expected_fingerprint)
+        ):
+            return {
+                "status": "rejected",
+                "code": "strategy_confirmation_mismatch",
+                "error": (
+                    "The confirmation fingerprint does not match the exact discovery "
+                    "payload. Reconfirm the current strategy before starting search."
+                ),
+            }
+    run_horizon = _clean_text(body.get("run_horizon")).lower()
+    if run_horizon == "plan_only":
+        return {
+            "status": "rejected",
+            "code": "discovery_plan_only",
+            "error": "run_horizon=plan_only records a plan and does not authorize repository search.",
+        }
+    if run_horizon in {"ai_ready_table", "pre_release", "full_release"}:
+        return {
+            "status": "rejected",
+            "code": "discovery_downstream_horizon_required",
+            "error": (
+                f"run_horizon={run_horizon} requires its downstream executor; "
+                "plain repository discovery will not be substituted silently."
+            ),
+        }
+    return None
+
+
+def _require_discovery_confirmation(body: Mapping[str, Any]) -> None:
+    rejection = _discovery_confirmation_rejection(body)
+    if rejection is not None:
+        raise ValueError(rejection["error"])
+
+
 def _run_web_discovery(
     body: dict[str, Any],
     report: Callable[[str], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
     agent_event_callback: Callable[[AgentEvent], None] | None = None,
 ) -> dict[str, Any]:
+    # Keep this at the execution boundary as well as every HTTP entry point so
+    # legacy routes and internal callers cannot accidentally bypass grilling.
+    _require_discovery_confirmation(body)
+
     def _report(message: str) -> None:
         if report is not None:
             report(message)
@@ -2363,7 +8752,11 @@ def _run_web_discovery(
             report=_report,
             should_cancel=should_cancel,
         )
-        task_type = _clean_text(body.get("task_type"))
+        raw_task_type = _clean_text(body.get("task_type"))
+        try:
+            task_type = normalize_task_type(raw_task_type) if raw_task_type else None
+        except ValueError:
+            task_type = None
         if task_type:
             _report(f"Annotating task readiness: {task_type}")
             manifest = annotate_manifest_task_readiness(manifest, task_type)
@@ -2384,7 +8777,12 @@ def _run_web_discovery(
     agentic_plan = None
     agentic_round_records = []
     agentic_fallback: dict[str, Any] | None = None
-    task_type = _clean_text(body.get("task_type"))
+    raw_task_type = _clean_text(body.get("task_type"))
+    # browse_only / empty / unknown → no task profile (data-only discovery).
+    try:
+        task_type = normalize_task_type(raw_task_type) if raw_task_type else None
+    except ValueError:
+        task_type = None
     task_profile = get_task_profile(task_type) if task_type else None
 
     def _discover_for_web(
@@ -2437,7 +8835,7 @@ def _run_web_discovery(
             f"agents_{datetime.now(_APP_TZ).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         )
         output_dir = _discovery_root_dir() / discovery_id
-        normalized_task_type = normalize_task_type(task_type) if task_type else None
+        normalized_task_type = task_type
         discovery_mode, budget, dynamic_limits = _agent_discovery_configuration(body)
 
         def _agent_discovery_func(
@@ -2516,6 +8914,17 @@ def _run_web_discovery(
             "no_gain_actions": int(control_summary.get("no_gain_action_count") or 0),
             "latest_metrics": control_summary.get("latest_metrics") or {},
             "model_usage": control_summary.get("model_usage") or {},
+            "sdk_turn_count": int(result.sdk_turn_count),
+            "runtime_provenance": (
+                result.runtime_provenance.model_dump(mode="json")
+                if result.runtime_provenance is not None
+                else control_summary.get("runtime_provenance")
+            ),
+            "latest_discovery_audit": (
+                result.latest_discovery_audit.model_dump(mode="json")
+                if result.latest_discovery_audit is not None
+                else control_summary.get("latest_discovery_audit")
+            ),
             "quality_budget_tier": _clean_text(budget_audit.get("quality_budget_tier")),
             "tool_calls": int(control_summary.get("tool_call_count") or 0),
             "stop_reason": _clean_text(control_summary.get("stop_reason") or result.status),
@@ -2576,17 +8985,57 @@ def _run_web_discovery(
             or output_dir / "dataset_manifest.json"
         )
         if not manifest_path.exists():
-            raise RuntimeError("OpenAI Agents discovery finished without a persisted dataset manifest.")
+            detail = _clean_text(
+                agent_summary.get("stop_reason")
+                or agent_summary.get("search_stop_reason")
+                or "no_persisted_dataset_manifest"
+            )
+            blockers = agent_summary.get("blockers") if isinstance(agent_summary.get("blockers"), list) else []
+            blocker_text = ", ".join(str(item) for item in blockers[:5] if str(item).strip())
+            message = (
+                "OpenAI Agents discovery finished without a persisted dataset manifest"
+                f" (stop_reason={detail}"
+                + (f"; blockers={blocker_text}" if blocker_text else "")
+                + ")."
+            )
+            raise RuntimeError(message)
         manifest = DatasetManifest.model_validate(json.loads(manifest_path.read_text(encoding="utf-8")))
-        save_memory = body.get("save_memory", True) is not False
+        selection_committed = (
+            result.selected_round_index is not None
+            and result.status in {"completed", "completed_with_review"}
+        )
+        # Candidate pools from blocked runs remain auditable artifacts, but they
+        # must not enter successful-discovery memory as if they were delivered.
+        save_memory = body.get("save_memory", True) is not False and selection_committed
         agent_summary["pooled_selected_files"] = int(
             manifest.summary.get("selected_files") or len(manifest.files)
         )
+        agent_summary["candidate_projects"] = len(manifest.projects)
+        agent_summary["candidate_files"] = len(manifest.files)
         summary = {
             **manifest.summary,
             "run_id": result.run_id,
             "memory_used": use_memory,
             "memory_saved": save_memory,
+            **(
+                {
+                    "runtime_provenance": result.runtime_provenance.model_dump(
+                        mode="json"
+                    )
+                }
+                if result.runtime_provenance is not None
+                else {}
+            ),
+            **(
+                {
+                    "latest_discovery_audit": result.latest_discovery_audit.model_dump(
+                        mode="json"
+                    )
+                }
+                if result.latest_discovery_audit is not None
+                else {}
+            ),
+            "sdk_turn_count": int(result.sdk_turn_count),
             "agent_runtime": agent_summary,
         }
         manifest = manifest.model_copy(update={"run_id": result.run_id, "summary": summary})
@@ -4428,13 +10877,8 @@ def _public_llm_config() -> dict[str, Any]:
 
 
 def _review_developer_allowed(request: Request) -> bool:
-    token = (os.getenv("AGENT_EXPERT_REVIEW_DEVELOPER_TOKEN") or "").strip()
-    supplied = (request.headers.get("x-expert-review-token") or "").strip()
-    if token:
-        return bool(supplied and secrets.compare_digest(token, supplied))
-    allow_local = (os.getenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER") or "").strip().lower() in {"1", "true", "yes", "on"}
-    client_host = str(getattr(request.client, "host", "") or "")
-    return allow_local and client_host in {"127.0.0.1", "::1", "localhost", "testclient"}
+    # Developer gates removed by product request: all local/web callers may use LLM/config/tools.
+    return True
 
 
 def _request_review_mode(request: Request, raw: Any) -> str:
@@ -4682,7 +11126,18 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
                     output_language=output_language,
                 )
             ) from exc
-        if is_immunopeptidomics_goal(prompt):
+        broad_human = bool(
+            re.search(
+                r"(proteomics|proteome|peptidomics|蛋白质组|肽组|蛋白肽|shotgun|bottom[\s-]?up)",
+                prompt,
+                re.IGNORECASE,
+            )
+        ) and not re.search(
+            r"(immunopeptidom|hla\b|mhc\b|ligandome|免疫肽)",
+            prompt,
+            re.IGNORECASE,
+        )
+        if is_immunopeptidomics_goal(prompt) and not broad_human:
             parsed = {
                 "parser": "ontology_fallback",
                 "fields": {
@@ -4702,6 +11157,39 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
                     "根据已知免疫肽/HLA 语义生成英文仓库检索词。"
                     if output_language == "zh-CN"
                     else "Generated English repository terms from known immunopeptidomics/HLA semantics."
+                ),
+            }
+        elif broad_human or re.search(r"(人类|人源|human).{0,12}(蛋白|肽|proteom|peptid)", prompt, re.IGNORECASE):
+            parsed = {
+                "parser": "broad_human_proteomics_fallback",
+                "fields": {
+                    "repository": "pride",
+                    "goal": "general",
+                    "species": ["human"],
+                    "species_policy": "include_only",
+                    "acquisition_mode": "unknown",
+                    "labeling_strategy": "unknown",
+                    "query_terms": [
+                        "human proteomics",
+                        "shotgun proteomics",
+                        "label free quantitation",
+                        "TMT proteomics",
+                        "DIA proteomics",
+                        "phosphoproteomics",
+                        "plasma proteomics",
+                        "affinity purification mass spectrometry",
+                    ],
+                    "scale_mode": _normalise_pool_build_scale("", prompt=prompt, allow_auto=False),
+                },
+                "warnings": [
+                    "未配置评审池构建模型，已使用广义人类蛋白质组降级解析。"
+                    if output_language == "zh-CN"
+                    else "No review-pool builder model was configured; a broad human-proteomics fallback was used."
+                ],
+                "reasoning": (
+                    "将“人类蛋白/肽数据，越多越好”解释为广义人类蛋白质组/肽组检索，而不是免疫肽组。"
+                    if output_language == "zh-CN"
+                    else "Interpreted the request as broad human proteomics/peptidomics rather than immunopeptidomics."
                 ),
             }
         elif _contains_cjk(prompt):
@@ -4755,6 +11243,49 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
     parser_identity = None
     if str(parsed.get("parser") or "").casefold() == "llm":
         parser_identity = _prompt_parser_generation_identity(parser_config)
+    # Never let a free-text broad human proteomics request collapse into immunopeptidomics.
+    goal = _clean_text(request.get("goal") or parsed_fields.get("goal") or "general").casefold()
+    if goal == "immunopeptidomics" and re.search(
+        r"(proteomics|proteome|peptidomics|蛋白质组|肽组|蛋白肽|shotgun|bottom[\s-]?up)",
+        prompt,
+        re.IGNORECASE,
+    ) and not re.search(
+        r"(immunopeptidom|hla\b|mhc\b|ligandome|免疫肽)",
+        prompt,
+        re.IGNORECASE,
+    ):
+        goal = "general"
+        request["goal"] = "general"
+        request["immunopeptide_scope"] = None
+        request["immunopeptide_evidence_terms"] = []
+        request["immunopeptide_enrichment_methods"] = []
+        request["hla_class"] = []
+        request["hla_alleles"] = []
+        request["immunopeptide_metadata_confidence"] = 0.0
+    if goal not in {"general", "ptm", "immunopeptidomics"}:
+        goal = "general"
+        request["goal"] = "general"
+    # Human-only when the request is clearly about human proteomics data.
+    species = request.get("species") if isinstance(request.get("species"), list) else []
+    if not species and re.search(r"(human|homo sapiens|人类|人源|智人)", prompt, re.IGNORECASE):
+        species = ["human"]
+        request["species"] = species
+    if species == ["human"] or (
+        isinstance(species, list) and {str(item).casefold() for item in species} == {"human"}
+    ):
+        if re.search(r"(人类|人源|human)", prompt, re.IGNORECASE):
+            request["species_policy"] = "include_only"
+    # Soft defaults for acquisition/labeling unless user forced them.
+    if _clean_text(request.get("acquisition_mode")).casefold() in {"", "dda"} and not re.search(
+        r"\bdda\b|data[\s-]?dependent", prompt, re.IGNORECASE
+    ):
+        if re.search(r"(proteomics|蛋白质组|肽组|越多越好|尽可能多)", prompt, re.IGNORECASE):
+            request["acquisition_mode"] = "unknown"
+    if _clean_text(request.get("labeling_strategy")).casefold() in {"", "label_free", "label-free"} and not re.search(
+        r"label[\s-]?free|lfq", prompt, re.IGNORECASE
+    ):
+        if re.search(r"(proteomics|蛋白质组|肽组|越多越好|尽可能多)", prompt, re.IGNORECASE):
+            request["labeling_strategy"] = "unknown"
     request.update(
         {
             "prompt": prompt,
@@ -4769,11 +11300,90 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
             "max_candidate_projects": _bounded_int(original.get("max_candidate_projects"), default=preset["max_candidate_projects"], minimum=1, maximum=1000),
             "max_files": _bounded_int(original.get("max_files"), default=preset["max_files"], minimum=1, maximum=10000),
             "max_files_per_project": _bounded_int(original.get("max_files_per_project"), default=preset["max_files_per_project"], minimum=1, maximum=200),
+            "hard_constraint_fields": list(
+                dict.fromkeys(
+                    ["repository"]
+                    + (
+                        ["species", "species_policy"]
+                        if str(request.get("species_policy") or "") == "include_only"
+                        else []
+                    )
+                    + (
+                        ["goal"]
+                        if goal in {"ptm", "immunopeptidomics"}
+                        and re.search(r"(immunopeptidom|hla\b|mhc\b|ligandome|ptm|磷酸化|乙酰)", prompt, re.IGNORECASE)
+                        else []
+                    )
+                )
+            ),
+            "constraint_provenance": {
+                "repository": "user",
+                "goal": "user" if goal in {"ptm", "immunopeptidomics"} else "inferred",
+                "species": "user" if species else "inferred",
+                "species_policy": "user" if str(request.get("species_policy") or "") == "include_only" else "inferred",
+                "acquisition_mode": "inferred",
+                "labeling_strategy": "inferred",
+            },
         }
     )
+    if goal == "general" and not request.get("query_terms"):
+        request["query_terms"] = _english_discovery_query_terms(
+            [
+                "human proteomics",
+                "shotgun proteomics",
+                "label free quantitation",
+                "TMT proteomics",
+                "DIA proteomics",
+                "phosphoproteomics",
+                "plasma proteomics",
+                "affinity purification mass spectrometry",
+            ]
+        )
     task_semantics = interpret_review_task(prompt, request)
     request["quantity_scope"] = task_semantics["quantity_scope"]
     request["portfolio_size_preference"] = task_semantics["portfolio_size_preference"]
+    # "越多越好" = harvest every evidence-backed quality project within safety ceilings.
+    # max_projects is a soft ambition / progress target, never a "stop and keep only N" knife.
+    maximize = (
+        request.get("quantity_scope") == "portfolio"
+        or str(request.get("portfolio_size_preference") or "").startswith("maximize")
+        or bool(
+            re.search(
+                r"(越多越好|尽可能多|尽量多|as many as possible|maximize)",
+                prompt,
+                re.IGNORECASE,
+            )
+        )
+    )
+    if maximize:
+        request["quantity_scope"] = "portfolio"
+        request["portfolio_size_preference"] = (
+            request.get("portfolio_size_preference") or "maximize_qualified_projects"
+        )
+        request["harvest_all_qualified"] = True
+        scale_mode = "exhaustive"
+        request["scale_mode"] = "exhaustive"
+        preset = _POOL_BUILD_SCALE_PRESETS["exhaustive"]
+        request["max_projects"] = max(
+            int(request.get("max_projects") or 0),
+            int(preset["max_projects"]),
+            2000,
+        )
+        request["max_candidate_projects"] = max(
+            int(request.get("max_candidate_projects") or 0),
+            int(preset["max_candidate_projects"]),
+            5000,
+        )
+        request["max_files"] = max(
+            int(request.get("max_files") or 0),
+            int(preset["max_files"]),
+            100000,
+        )
+        request["max_files_per_project"] = max(
+            int(request.get("max_files_per_project") or 0),
+            int(preset["max_files_per_project"]),
+            500,
+        )
     minimum = task_semantics.get("per_project_minimum")
     if isinstance(minimum, Mapping):
         if minimum.get("unit") == "files":
@@ -4790,6 +11400,12 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
     scale_warning = _pool_build_scale_warning(scale_mode, output_language)
     if scale_warning:
         warnings.append(scale_warning)
+    if maximize:
+        warnings.append(
+            "“越多越好”按合格项目尽量多收：只保留检查充分、硬门通过、2–3 分项目；不设 20/300 之类的最终数量硬砍。"
+            if output_language == "zh-CN"
+            else "Maximize mode harvests every evidence-backed grade 2-3 project within safety ceilings; fixed 20/300 final caps are not applied."
+        )
     return {
         "request": request,
         "parser": str(parsed.get("parser") or "llm"),
@@ -5272,14 +11888,21 @@ def _start_result_cleanup_worker() -> None:
     threading.Thread(target=_cleanup_loop, name="result-cleanup", daemon=True).start()
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index():
+@app.get("/workbench-legacy", response_class=HTMLResponse)
+async def workbench_legacy():
     return (_templates_dir / "index.html").read_text(encoding="utf-8")
 
 
-@app.get("/benchmark-review", response_class=HTMLResponse)
+@app.get("/benchmark-review-legacy", response_class=HTMLResponse)
 async def benchmark_review():
     return (_templates_dir / "benchmark_review.html").read_text(encoding="utf-8")
+
+
+@app.get("/benchmark-review", response_class=FileResponse)
+@app.get("/benchmark-review-next", response_class=FileResponse)
+@app.get("/", response_class=FileResponse)
+async def carbon_workbench():
+    return FileResponse(_benchmark_review_next_dir / "index.html", media_type="text/html")
 
 
 @app.get("/api/expert-review/status")
@@ -5480,8 +12103,6 @@ async def export_expert_review_workspace(
 ):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     try:
         path, _manifest = export_workspace_archive(
             _expert_pool_registry(),
@@ -5502,8 +12123,6 @@ async def export_expert_review_workspace(
 async def import_expert_review_workspace(request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -5535,8 +12154,6 @@ async def import_expert_review_workspace(request: Request):
 
 @app.get("/api/expert-review/calibration/status")
 async def discovery_calibration_status(request: Request):
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     from agent.discovery.calibration import DiscoveryCalibrationStore, fit_scoring_calibration
 
     preview = fit_scoring_calibration(_discovery_calibration_candidates())
@@ -5549,8 +12166,6 @@ async def discovery_calibration_status(request: Request):
 
 @app.post("/api/expert-review/calibration/preview")
 async def preview_discovery_calibration(request: Request):
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     from agent.discovery.calibration import DiscoveryCalibrationStore, fit_scoring_calibration
 
     return {
@@ -5562,8 +12177,6 @@ async def preview_discovery_calibration(request: Request):
 
 @app.post("/api/expert-review/calibration/activate")
 async def activate_discovery_calibration(request: Request, body: dict[str, Any] | None = None):
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     from agent.discovery.calibration import DiscoveryCalibrationStore, fit_scoring_calibration
 
     preview = fit_scoring_calibration(_discovery_calibration_candidates())
@@ -5581,8 +12194,6 @@ async def activate_discovery_calibration(request: Request, body: dict[str, Any] 
 
 @app.post("/api/expert-review/impact/session")
 async def bind_expert_impact_session(body: dict[str, Any], request: Request):
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     mode = _request_review_mode(request, body.get("mode") or "test")
     if mode != "test":
         return {"ok": False, "error": "impact_requires_test_mode"}
@@ -5615,8 +12226,6 @@ async def bind_expert_impact_session(body: dict[str, Any], request: Request):
 async def expert_review_impact(pool_id: str, body: dict[str, Any], request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     mode = _request_review_mode(request, body.get("mode") or "test")
     if mode != "test":
         return {"ok": False, "error": "impact_requires_test_mode"}
@@ -5678,8 +12287,6 @@ async def expert_review_impact(pool_id: str, body: dict[str, Any], request: Requ
 async def list_expert_judge_jobs(request: Request, pool_id: str | None = None):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled", "jobs": []}
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required", "jobs": []}
     return {"ok": True, "jobs": _expert_job_manager().list_jobs(pool_id=pool_id)}
 
 
@@ -5687,8 +12294,6 @@ async def list_expert_judge_jobs(request: Request, pool_id: str | None = None):
 async def start_expert_judge_job(body: dict[str, Any], request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     mode = _request_review_mode(request, body.get("mode") or "developer")
     if mode == "expert":
         return {"ok": False, "error": "jobs_forbidden_in_expert_mode"}
@@ -5735,8 +12340,6 @@ async def start_expert_judge_job(body: dict[str, Any], request: Request):
 async def get_expert_judge_job(job_id: str, request: Request, detail: int = 0):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     job = _expert_job_manager().get_job(job_id, detail=bool(detail))
     if job is None:
         return {"ok": False, "error": "job_not_found"}
@@ -5747,8 +12350,6 @@ async def get_expert_judge_job(job_id: str, request: Request, detail: int = 0):
 async def delete_expert_judge_job(job_id: str, request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     try:
         job = _expert_job_manager().delete_job(job_id)
     except ValueError as exc:
@@ -5762,8 +12363,6 @@ async def delete_expert_judge_job(job_id: str, request: Request):
 async def cancel_expert_judge_job(job_id: str, request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     job = _expert_job_manager().cancel_job(job_id)
     if job is None:
         return {"ok": False, "error": "job_not_found"}
@@ -5774,8 +12373,6 @@ async def cancel_expert_judge_job(job_id: str, request: Request):
 async def resume_expert_judge_job(job_id: str, request: Request, body: dict[str, Any] | None = None):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     try:
         raw_workers = body.get("workers") if isinstance(body, dict) else None
         workers = None if raw_workers is None or raw_workers == "" else raw_workers
@@ -5791,8 +12388,6 @@ async def resume_expert_judge_job(job_id: str, request: Request, body: dict[str,
 async def retry_expert_judge_job(job_id: str, request: Request, body: dict[str, Any] | None = None):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     try:
         raw_workers = body.get("workers") if isinstance(body, dict) else None
         workers = None if raw_workers is None or raw_workers == "" else raw_workers
@@ -5806,8 +12401,6 @@ async def retry_expert_judge_job(job_id: str, request: Request, body: dict[str, 
 
 @app.get("/api/benchmark-review/build-llm-config")
 async def get_pool_build_llm_config(request: Request):
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     profile = _pool_build_llm_config_store().get_profile(
         _POOL_BUILD_LLM_PROFILE_ID,
         include_secrets=False,
@@ -5821,8 +12414,6 @@ async def get_pool_build_llm_config(request: Request):
 
 @app.put("/api/benchmark-review/build-llm-config")
 async def save_pool_build_llm_config(body: dict[str, Any], request: Request):
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     payload = body.get("profile", body)
     if not isinstance(payload, dict):
         return {"ok": False, "error": "profile payload must be an object"}
@@ -5923,8 +12514,6 @@ def _safe_pool_build_llm_operation_message(message: Any, *, api_key: str) -> str
 
 @app.post("/api/benchmark-review/build-llm-config/models")
 async def list_pool_build_llm_models(body: dict[str, Any], request: Request):
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required", "models": []}
     config, error, selected_model = _pool_build_llm_operation_config(
         body,
         require_model=False,
@@ -5952,8 +12541,6 @@ async def list_pool_build_llm_models(body: dict[str, Any], request: Request):
 
 @app.post("/api/benchmark-review/build-llm-config/check")
 async def check_pool_build_llm_config(body: dict[str, Any], request: Request):
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     config, error, _selected_model = _pool_build_llm_operation_config(
         body,
         require_model=True,
@@ -5975,8 +12562,6 @@ async def check_pool_build_llm_config(body: dict[str, Any], request: Request):
 async def list_expert_pool_builds(request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled", "builds": []}
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required", "builds": []}
     builds = _expert_pool_build_manager().list_builds()
     jobs = _expert_job_manager().list_jobs() if any(build.get("review_job_id") for build in builds) else []
     return {"ok": True, "builds": attach_review_progress(builds, jobs)}
@@ -5987,8 +12572,6 @@ async def list_expert_pool_builds(request: Request):
 async def start_expert_pool_build(body: dict[str, Any], request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     prompt = _clean_text(body.get("prompt"))
     if not prompt:
         return {"ok": False, "error": "prompt_required"}
@@ -6037,8 +12620,6 @@ async def start_expert_pool_build(body: dict[str, Any], request: Request):
 async def get_expert_pool_build(build_id: str, request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     build = _expert_pool_build_manager().get_build(build_id)
     if build is None:
         return {"ok": False, "error": "build_not_found"}
@@ -6052,8 +12633,6 @@ async def get_expert_pool_build(build_id: str, request: Request):
 async def cancel_expert_pool_build(build_id: str, request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     build = _expert_pool_build_manager().cancel_build(build_id)
     if build is None:
         return {"ok": False, "error": "build_not_found"}
@@ -6065,8 +12644,6 @@ async def cancel_expert_pool_build(build_id: str, request: Request):
 async def reconcile_expert_pool_build(build_id: str, request: Request):
     if not expert_review_enabled():
         return {"ok": False, "error": "expert_review_disabled"}
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     build = _expert_pool_build_manager().reconcile_review(build_id)
     if build is None:
         return {"ok": False, "error": "build_not_found"}
@@ -6113,8 +12690,6 @@ async def get_llm_config(request: Request):
 
 @app.put("/api/llm/config")
 async def save_llm_config(body: dict[str, Any], request: Request):
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     payload = body.get("llm_config", body)
     if not isinstance(payload, dict):
         payload = {}
@@ -6122,8 +12697,6 @@ async def save_llm_config(body: dict[str, Any], request: Request):
     api_key = _clean_text(payload.get("api_key")) or existing.get("api_key", "")
     requested_base = _clean_text(payload.get("base_url")).rstrip("/")
     existing_base = str(existing.get("base_url") or "").rstrip("/")
-    if not _review_developer_allowed(request) and api_key == existing.get("api_key") and requested_base and requested_base != existing_base:
-        return {"ok": False, "error": "developer_access_required_for_base_url_change"}
     if not api_key:
         return {"ok": False, "error": "API Key is required before saving configuration."}
     config, error = _build_llm_config({**existing, **payload, "api_key": api_key})
@@ -6143,15 +12716,11 @@ async def delete_llm_config(request: Request):
 
 @app.get("/api/llm/profiles")
 async def list_llm_profiles(request: Request):
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required", "profiles": []}
     return {"ok": True, "profiles": _llm_config_store().list_profiles(include_secrets=False)}
 
 
 @app.post("/api/llm/profiles")
 async def create_llm_profile(body: dict[str, Any], request: Request):
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     payload = body.get("profile", body)
     if not isinstance(payload, dict):
         return {"ok": False, "error": "profile payload must be an object"}
@@ -6165,8 +12734,6 @@ async def create_llm_profile(body: dict[str, Any], request: Request):
 
 @app.put("/api/llm/profiles/{profile_id}")
 async def update_llm_profile(profile_id: str, body: dict[str, Any], request: Request):
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     payload = body.get("profile", body)
     if not isinstance(payload, dict):
         return {"ok": False, "error": "profile payload must be an object"}
@@ -6181,8 +12748,6 @@ async def update_llm_profile(profile_id: str, body: dict[str, Any], request: Req
 
 @app.delete("/api/llm/profiles/{profile_id}")
 async def delete_llm_profile(profile_id: str, request: Request):
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required"}
     deleted = _llm_config_store().delete_profile(profile_id)
     if not deleted:
         return {"ok": False, "error": "profile_not_found"}
@@ -6191,8 +12756,6 @@ async def delete_llm_profile(profile_id: str, request: Request):
 
 @app.post("/api/llm/models")
 async def list_llm_models(body: dict[str, Any], request: Request):
-    if not _review_developer_allowed(request):
-        return {"ok": False, "error": "developer_access_required", "models": []}
     payload = body.get("llm_config", body)
     if not isinstance(payload, dict):
         payload = {}
@@ -6242,8 +12805,6 @@ async def check_llm(body: dict[str, Any], request: Request):
     requested_base = _clean_text(llm_config.get("base_url")).rstrip("/")
     existing_base = str(existing.get("base_url") or "").rstrip("/")
     explicit_key = _clean_text(llm_config.get("api_key"))
-    if not _review_developer_allowed(request) and not explicit_key and requested_base and requested_base != existing_base:
-        return {"ok": False, "error": "developer_access_required_for_base_url_change"}
     config, error = _build_llm_config(llm_config)
     if error or config is None:
         return {"ok": False, "error": error}
@@ -6276,7 +12837,14 @@ async def list_project_history(fast: bool = True, refresh: bool = False):
                 if task.get("status") in _ACTIVE_STATUSES
             ]
         active_tasks.extend(batch for batch in _list_parameter_batch_history_records(include_file_stats=True) if batch.get("status") in _ACTIVE_STATUSES)
-        active_tasks.sort(key=lambda item: str(item.get("created_at") or ""))
+        # Discovery jobs that are still running should also appear in history.
+        try:
+            for item in _list_discovery_history_records(limit=50):
+                if str(item.get("status") or "").lower() in _ACTIVE_STATUSES:
+                    active_tasks.append(item)
+        except Exception:
+            pass
+        active_tasks.sort(key=lambda item: str(item.get("created_at") or item.get("history_time") or ""))
         active_task_ids = {str(item.get("task_id") or "") for item in active_tasks}
         active_history_ids = {str(item.get("history_id") or "") for item in active_tasks}
         active_history_ids.update(str(item.get("output_dir") or "") for item in active_tasks)
@@ -6284,7 +12852,26 @@ async def list_project_history(fast: bool = True, refresh: bool = False):
         active_task_ids.discard("")
         active_history_ids.discard("")
         results = []
-        for item in _list_project_history_records_fast():
+        # Merge ordinary task history with discovery run history.
+        combined = list(_list_project_history_records_fast())
+        try:
+            combined.extend(_list_discovery_history_records(limit=100))
+        except Exception:
+            pass
+        # de-dupe by history_id/run_id
+        seen: set[str] = set()
+        ordered: list[dict[str, Any]] = []
+        for item in sorted(
+            combined,
+            key=lambda row: str(row.get("history_time") or row.get("finished_at") or row.get("created_at") or ""),
+            reverse=True,
+        ):
+            key = str(item.get("history_id") or item.get("run_id") or item.get("result_id") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            ordered.append(item)
+        for item in ordered:
             task_ids = {str(item.get("task_id") or ""), *(str(value or "") for value in item.get("task_ids") or [])}
             history_ids = {
                 str(item.get("history_id") or ""),
@@ -7324,6 +13911,7 @@ def _localize_discovery_message(message: Any, output_language: str) -> str:
         "Discovery job started.": "数据发现任务已开始。",
         "Discovery job completed.": "数据发现任务已完成。",
         "Discovery job failed with retained audits.": "数据发现失败，已保留审计记录。",
+        "Discovery job stopped at the quality gate; candidate evidence and audits were retained.": "数据发现已停止在质量闸门：候选证据与审计记录均已保留。",
         "Discovery job cancelled.": "数据发现任务已取消。",
         "Discovery cancelled.": "数据发现任务已取消。",
         "Running diversity-aware selection.": "正在执行多样性选择。",
@@ -7348,9 +13936,28 @@ def _localize_discovery_message(message: Any, output_language: str) -> str:
         return "推理摘要：已根据当前证据更新检索决策。"
     if text.startswith("Act:"):
         return "执行：正在进行下一步受控数据发现操作。"
+    # Common agent-event English → short Chinese for live trajectory
+    agent_patterns = (
+        (r"^Searching repository with (\d+) query plan\(s\): (.+)$", r"按 \1 组查询检索仓库：\2"),
+        (r"^Search observed (\d+) candidate project\(s\), (\d+) new and (\d+) high-relevance; semantic coverage ([0-9.]+%)\.$",
+         r"检索观察到 \1 个候选项目（新增 \2，高相关 \3），语义覆盖 \4。"),
+        (r"^Inspecting (\d+) candidate project\(s\): (.+)$", r"正在审查 \1 个候选项目：\2"),
+        (r"^Inspection produced (\d+) selected project\(s\) and (\d+) selected file\(s\); next action: (.+)\.$",
+         r"审查入选 \1 个项目、\2 个文件；下一步：\3。"),
+        (r"^Discovery job started\.$", "数据发现任务已开始。"),
+        (r"^Discovery job completed\.$", "数据发现任务已完成。"),
+    )
+    for pattern, replacement in agent_patterns:
+        if re.match(pattern, text):
+            return re.sub(pattern, replacement, text)
+    # Errors: never collapse to a generic progress fallback — keep forensic detail.
+    if text.startswith("Discovery failed:"):
+        detail = text[len("Discovery failed:") :].strip() or text
+        return f"数据发现失败：{detail}"
     if "failed" in text.casefold() or "error" in text.casefold():
-        return "数据发现遇到错误，详细原因已记录。"
-    return "数据发现进度已更新。"
+        return f"数据发现失败：{text}"
+    # Unknown non-error English: keep original (better than fake progress).
+    return text
 
 
 def _discovery_jobs_dir() -> Path:
@@ -7361,16 +13968,259 @@ def _discovery_job_path(job_id: str) -> Path:
     return _discovery_jobs_dir() / f"{safe_output_stem(job_id)}.json"
 
 
+def _discovery_job_persist_payload(job: dict[str, Any]) -> dict[str, Any]:
+    """Serialize job for disk with raw English logs/error (API localizes on read).
+
+    Credentials must never be written; mirror the in-worker body sanitization.
+    """
+    body = job.get("body") if isinstance(job.get("body"), dict) else {}
+    safe_body = _sanitize_log_payload(dict(body))
+    if isinstance(safe_body, dict):
+        llm = safe_body.get("llm_config")
+        if isinstance(llm, dict):
+            safe_body["llm_config"] = {
+                k: v for k, v in llm.items() if str(k).casefold() not in {"api_key", "authorization"}
+            }
+    logs: list[Any] = []
+    for raw in job.get("logs") or []:
+        if isinstance(raw, dict):
+            logs.append(_sanitize_log_payload(dict(raw)))
+        else:
+            logs.append(raw)
+    return {
+        "job_id": job.get("job_id"),
+        "idempotency_key": job.get("idempotency_key"),
+        "status": job.get("status"),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "cancel_requested": bool(job.get("cancel_requested")),
+        "output_language": job.get("output_language"),
+        "logs": logs,
+        "body": safe_body,
+        "record": job.get("record"),
+        # Raw error string for forensics; _discovery_job_public localizes for clients.
+        "error": _redact_secrets(job.get("error")) if job.get("error") else None,
+        "detail": "full",
+    }
+
+
 def _persist_discovery_job(job: dict[str, Any]) -> None:
     try:
-        # Persist the full record so restart recovery can rehydrate UI detail views.
+        # Persist raw (English) job state so restart recovery keeps real error text.
         write_json(
             _discovery_job_path(str(job.get("job_id") or "")),
-            _discovery_job_public(job, detail=True),
+            _discovery_job_persist_payload(job),
         )
+        # Also keep a line-oriented log for forensic debugging of long runs.
+        _write_discovery_job_log_file(job)
     except Exception:
         # Job status persistence is best-effort; the in-memory job remains authoritative.
         return
+
+
+def _discovery_run_dir_from_job(job: Mapping[str, Any] | None) -> Path | None:
+    if not isinstance(job, Mapping):
+        return None
+    record = job.get("record") if isinstance(job.get("record"), Mapping) else {}
+    for key in ("output_dir", "run_id", "discovery_id"):
+        raw = _clean_text((record or {}).get(key) or job.get(key))
+        if not raw:
+            continue
+        path = Path(raw)
+        if path.exists() and path.is_dir():
+            return path
+        candidate = _discovery_root_dir() / safe_output_stem(raw)
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    return None
+
+
+def _write_discovery_job_log_file(job: Mapping[str, Any]) -> None:
+    run_dir = _discovery_run_dir_from_job(job)
+    if run_dir is None:
+        return
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / "discovery_job.jsonl"
+    lines: list[str] = []
+    for item in job.get("logs") or []:
+        if not isinstance(item, Mapping):
+            continue
+        payload = {
+            "ts": item.get("ts"),
+            "level": item.get("level") or "info",
+            "actor": item.get("actor") or "Discovery Agent",
+            "type": item.get("type") or "job_message",
+            "message": item.get("message") or "",
+            "metrics": item.get("metrics") or {},
+            "payload": item.get("payload") or {},
+            "job_id": job.get("job_id"),
+            "status": job.get("status"),
+        }
+        lines.append(json.dumps(payload, ensure_ascii=False, default=str))
+    log_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    # Human-readable short log as well.
+    text_lines = []
+    for item in job.get("logs") or []:
+        if not isinstance(item, Mapping):
+            continue
+        text_lines.append(
+            f"{item.get('ts') or ''} [{item.get('level') or 'info'}] {item.get('message') or ''}".strip()
+        )
+    (logs_dir / "discovery_job.log").write_text(
+        "\n".join(text_lines) + ("\n" if text_lines else ""),
+        encoding="utf-8",
+    )
+
+
+def _package_discovery_run_bundle(
+    *,
+    job: Mapping[str, Any] | None = None,
+    run_dir: Path | None = None,
+) -> Path | None:
+    """Package one discovery run's state/logs/results into a single zip for forensics."""
+    target = run_dir or _discovery_run_dir_from_job(job)
+    if target is None or not target.exists():
+        return None
+    bundle_path = target / "discovery_run_bundle.zip"
+    include_names = {
+        "dataset_manifest.json",
+        "dataset_manifest.csv",
+        "dataset_manifest_valid.csv",
+        "dataset_manifest_usable.csv",
+        "dataset_request.json",
+        "discovery_summary.json",
+        "quality_report.json",
+        "candidate_search_state.json",
+        "agents_discovery_summary.json",
+        "agents_discovery_events.json",
+        "agents_discovery_report.md",
+        "agents_discovery_budget.json",
+        "agent_control.sqlite",
+        "agents_sdk_trace.jsonl",
+        "project_judgments.json",
+        "project_judgments_table.csv",
+        "selected_projects_review.csv",
+        "selected_projects_review.json",
+        "candidate_projects.json",
+        "batch_inputs.txt",
+        "project_accessions.txt",
+        "recovery_summary.json",
+    }
+    include_dirs = {
+        "logs",
+        "final_selection",
+        "candidate_pool",
+        "recovered_final_selection",
+    }
+    # Keep rounds, but only their small summary/request files when possible.
+    try:
+        with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            # Always embed a compact job snapshot when available.
+            if isinstance(job, Mapping):
+                snapshot = {
+                    "job_id": job.get("job_id"),
+                    "status": job.get("status"),
+                    "created_at": job.get("created_at"),
+                    "started_at": job.get("started_at"),
+                    "finished_at": job.get("finished_at"),
+                    "error": job.get("error"),
+                    "detail": job.get("detail"),
+                    "output_language": job.get("output_language"),
+                    "request": (job.get("body") or {}).get("prompt")
+                    if isinstance(job.get("body"), Mapping)
+                    else None,
+                    "body_prompt": _clean_text((job.get("body") or {}).get("prompt"))
+                    if isinstance(job.get("body"), Mapping)
+                    else "",
+                    "record_summary": {
+                        k: (job.get("record") or {}).get(k)
+                        for k in (
+                            "discovery_id",
+                            "run_id",
+                            "status",
+                            "project_count",
+                            "file_count",
+                            "output_dir",
+                        )
+                    }
+                    if isinstance(job.get("record"), Mapping)
+                    else {},
+                    "log_count": len(job.get("logs") or []),
+                }
+                zf.writestr(
+                    "job_snapshot.json",
+                    json.dumps(snapshot, ensure_ascii=False, indent=2, default=str),
+                )
+                # Full logs separately for readability.
+                zf.writestr(
+                    "job_logs.json",
+                    json.dumps(job.get("logs") or [], ensure_ascii=False, indent=2, default=str),
+                )
+            for path in target.rglob("*"):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(target)
+                rel_s = rel.as_posix()
+                # Skip previous giant bundles and sqlite journals.
+                if path.name.endswith((".zip", "-wal", "-shm")) and path.name != "discovery_run_bundle.zip":
+                    if path.name != bundle_path.name:
+                        continue
+                if path.name == bundle_path.name:
+                    continue
+                top = rel.parts[0] if rel.parts else ""
+                if top in include_dirs or path.name in include_names or rel_s.startswith("logs/"):
+                    # Bound oversized evidence-heavy CSVs/json if needed later; include by default.
+                    zf.write(path, arcname=rel_s)
+                elif top.startswith("round_") and path.name in {
+                    "dataset_request.json",
+                    "discovery_summary.json",
+                    "dataset_manifest.json",
+                    "quality_report.json",
+                }:
+                    zf.write(path, arcname=rel_s)
+        return bundle_path if bundle_path.exists() else None
+    except Exception:
+        return None
+
+
+def _archive_discovery_job_artifacts(job_id: str) -> Path | None:
+    with _discovery_jobs_lock:
+        job = _discovery_jobs.get(job_id) or _load_discovery_job(job_id)
+    if not job:
+        return None
+    # Ensure latest line logs are flushed before packaging.
+    _write_discovery_job_log_file(job)
+    run_dir = _discovery_run_dir_from_job(job)
+    if run_dir is not None:
+        try:
+            _ensure_discovery_review_artifacts(run_dir)
+        except Exception:
+            pass
+    bundle = _package_discovery_run_bundle(job=job)
+    if bundle is not None:
+        with _discovery_jobs_lock:
+            live = _discovery_jobs.get(job_id)
+            if live is not None:
+                live["bundle_path"] = str(bundle)
+                record = live.get("record") if isinstance(live.get("record"), dict) else {}
+                if record is not None:
+                    record = dict(record)
+                    record["bundle_path"] = str(bundle)
+                    downloads = dict(record.get("downloads") or {})
+                    downloads["discovery_run_bundle_zip"] = str(bundle)
+                    # Expose review tables if present.
+                    if run_dir is not None:
+                        for key, (filename, _media) in _DISCOVERY_DOWNLOAD_FILES.items():
+                            candidate = Path(run_dir) / filename
+                            if candidate.exists():
+                                downloads[key] = f"/api/discovery/{Path(run_dir).name}/download?file={key}"
+                    record["downloads"] = downloads
+                    live["record"] = record
+                _persist_discovery_job(live)
+        return bundle
+    return None
 
 
 def _load_discovery_job(job_id: str) -> dict[str, Any] | None:
@@ -7460,6 +14310,10 @@ def _event_actor(event_type: str) -> str:
         return "Repository Search"
     if event_type.startswith("candidate_inspection_"):
         return "Candidate Inspector"
+    if event_type.startswith("discovery_quality_"):
+        return "Quality Auditor"
+    if event_type == "project_judgments_recorded":
+        return "Project Judge"
     if event_type.startswith("tool_") or event_type == "repository_request_started":
         return "Repository tool"
     return "Discovery Agent"
@@ -7501,6 +14355,38 @@ def _event_message(event: AgentEvent) -> str:
             f"{int(observation.get('selected_projects') or 0)} selected project(s) and "
             f"{int(observation.get('selected_files') or 0)} selected file(s); "
             f"next action: {observation.get('recommended_action') or 'reassess evidence'}."
+        )
+    if event.event_type == "project_judgments_recorded":
+        summary = payload.get("project_judgment_summary") or payload
+        return (
+            "Project scoring recorded for "
+            f"{int(summary.get('assessed_projects') or 0)} project(s); "
+            f"{int(summary.get('qualified_projects') or 0)} currently delivery-qualified."
+        )
+    if event.event_type == "discovery_quality_audited":
+        counts = payload.get("counts") or {}
+        return (
+            f"Quality audit {payload.get('status') or 'completed'}: "
+            f"{int(counts.get('delivery_eligible_projects') or 0)} delivery-eligible project(s), "
+            f"{int(counts.get('usable_files') or 0)} usable file(s), "
+            f"{len(payload.get('issues') or [])} visible issue(s)."
+        )
+    if event.event_type == "discovery_quality_repair_started":
+        audit = payload.get("audit") or {}
+        return (
+            "Quality audit found repairable gaps; the Agent is continuing with "
+            f"{len(audit.get('repair_actions') or [])} bounded repair action(s)."
+        )
+    if event.event_type == "discovery_quality_repair_completed":
+        counts = payload.get("counts") or {}
+        return (
+            "Autonomous quality repair completed; "
+            f"{int(counts.get('delivery_eligible_projects') or 0)} project(s) now pass delivery gates."
+        )
+    if event.event_type == "manifest_selected":
+        return (
+            f"Final selection retained {int(payload.get('selected_projects') or 0)} project(s) "
+            f"and {int(payload.get('selected_files') or 0)} file record(s)."
         )
     return _redact_secrets(
         str(
@@ -7599,6 +14485,8 @@ def _run_discovery_job(job_id: str) -> None:
             terminal_status = "cancelled"
         elif record_status == "failed":
             terminal_status = "failed"
+        elif record_status == "blocked":
+            terminal_status = "blocked"
         else:
             terminal_status = "completed"
         with _discovery_jobs_lock:
@@ -7618,16 +14506,45 @@ def _run_discovery_job(job_id: str) -> None:
         finish_message = {
             "completed": "Discovery job completed.",
             "failed": "Discovery job failed with retained audits.",
+            "blocked": "Discovery job stopped at the quality gate; candidate evidence and audits were retained.",
             "cancelled": "Discovery job cancelled.",
         }[terminal_status]
         finish_level = (
             "info"
             if terminal_status == "completed"
-            else "warning"
-            if terminal_status == "cancelled"
             else "error"
+            if terminal_status == "failed"
+            else "warning"
         )
         _append_discovery_job_log(job_id, finish_level, finish_message)
+        # Ensure finished discovery runs appear in the main history panel.
+        try:
+            with _discovery_jobs_lock:
+                finished_job = _discovery_jobs.get(job_id) or {}
+                finished_record = finished_job.get("record") if isinstance(finished_job.get("record"), dict) else None
+            if finished_record:
+                _upsert_discovery_history_record(finished_record)
+            else:
+                # fall back to packaging path discovery
+                run_dir = _discovery_run_dir_from_job(finished_job)
+                if run_dir is not None:
+                    _upsert_discovery_history_record(None, output_dir=run_dir)
+        except Exception:
+            pass
+        try:
+            bundle = _archive_discovery_job_artifacts(job_id)
+            if bundle is not None:
+                _append_discovery_job_log(
+                    job_id,
+                    "info",
+                    f"Discovery run package saved: {bundle.name}",
+                )
+        except Exception as archive_exc:  # pragma: no cover - packaging must not fail the job
+            _append_discovery_job_log(
+                job_id,
+                "warning",
+                f"Discovery run packaging skipped: {_redact_secrets(str(archive_exc))}",
+            )
     except InterruptedError as exc:
         with _discovery_jobs_lock:
             job = _discovery_jobs.get(job_id)
@@ -7637,6 +14554,10 @@ def _run_discovery_job(job_id: str) -> None:
                 job["finished_at"] = _now_app_iso()
                 _persist_discovery_job(job)
         _append_discovery_job_log(job_id, "warning", str(exc))
+        try:
+            _archive_discovery_job_artifacts(job_id)
+        except Exception:
+            pass
     except Exception as exc:  # pragma: no cover - defensive job boundary
         with _discovery_jobs_lock:
             job = _discovery_jobs.get(job_id)
@@ -7646,6 +14567,10 @@ def _run_discovery_job(job_id: str) -> None:
                 job["finished_at"] = _now_app_iso()
                 _persist_discovery_job(job)
         _append_discovery_job_log(job_id, "error", f"Discovery failed: {exc}")
+        try:
+            _archive_discovery_job_artifacts(job_id)
+        except Exception:
+            pass
 
 
 def _start_discovery_job_thread(job_id: str) -> None:
@@ -7655,6 +14580,9 @@ def _start_discovery_job_thread(job_id: str) -> None:
 
 @app.post("/api/discovery/jobs")
 async def start_discovery_job(body: dict[str, Any], background_tasks: BackgroundTasks = None):
+    rejection = _discovery_confirmation_rejection(body)
+    if rejection is not None:
+        return rejection
     request_key = _clean_text(body.get("idempotency_key"))
     with _discovery_jobs_lock:
         existing = _find_discovery_job_by_idempotency_key(request_key)
@@ -7711,7 +14639,7 @@ async def cancel_discovery_job(job_id: str):
             _discovery_jobs[job_id] = job
             _persist_discovery_job(job)
             return _discovery_job_public(job)
-        if job.get("status") in {"completed", "failed", "cancelled"}:
+        if job.get("status") in {"completed", "failed", "blocked", "cancelled"}:
             return _discovery_job_public(job)
         job["cancel_requested"] = True
         _persist_discovery_job(job)
@@ -7722,6 +14650,9 @@ async def cancel_discovery_job(job_id: str):
 
 @app.post("/api/discovery")
 async def create_discovery(body: dict[str, Any]):
+    rejection = _discovery_confirmation_rejection(body)
+    if rejection is not None:
+        return rejection
     try:
         return await asyncio.to_thread(_run_web_discovery, body)
     except Exception as exc:
@@ -7734,6 +14665,34 @@ async def parse_discovery_goal(body: dict[str, Any]):
         return await asyncio.to_thread(_run_discovery_goal_parse, body)
     except Exception as exc:
         return {"error": _redact_secrets(str(exc))}
+
+
+@app.post("/api/discovery/grill-turn")
+async def discovery_grill_turn(body: dict[str, Any]):
+    """Conversational grill turn (LLM phrasing + mapping). Does not start discovery."""
+    try:
+        return await asyncio.to_thread(_run_discovery_grill_turn, body)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "parser": "llm_grill",
+            "llm_used": False,
+            "action": "advise",
+            "mode": "advise",
+            "assistant_message": (
+                "模型本轮不可用或返回无效结果，当前策略保持不变。"
+                "你可以直接重试；系统不会用关键词规则替你写卡。"
+            ),
+            "tool_calls": [],
+            "extra_fields": {},
+            "gap_report": {
+                "required_missing": [],
+                "optional_missing": [],
+                "ready_for_confirm": False,
+            },
+            "ready_for_confirm": False,
+            "failure_reason": _redact_secrets(str(exc)),
+        }
 
 
 @app.get("/api/discovery/{discovery_id}")

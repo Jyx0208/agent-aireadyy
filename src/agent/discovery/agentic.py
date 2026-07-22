@@ -76,13 +76,22 @@ class OpenAICompatibleDiscoveryLLM:
         self.timeout = timeout
 
     def complete_json(self, *, system_prompt: str, user_prompt: str) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "response_format": {"type": "json_object"},
-            "messages": [
+        return self.complete_json_messages(
+            messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
-            ],
+            ]
+        )
+
+    def complete_json_messages(self, *, messages: list[dict[str, str]]) -> dict[str, Any]:
+        """Complete JSON while preserving real conversation-role boundaries."""
+        payload: dict[str, Any] = {
+            "model": self.model,
+            # Structured agent/tool contracts should be stable across retries;
+            # flexibility comes from the prompt and dialogue, not sampling noise.
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "messages": messages,
         }
         response = httpx.post(
             f"{self.base_url}/chat/completions",

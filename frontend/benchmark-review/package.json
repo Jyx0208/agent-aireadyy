@@ -1,0 +1,29 @@
+{
+  "name": "pride-proteomics-agent-workbench",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@carbon/ai-chat": "1.17.0",
+    "@carbon/icons-react": "11.84.0",
+    "@carbon/react": "1.112.0",
+    "@carbon/web-components": "2.56.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "devDependencies": {
+    "@testing-library/react": "16.3.2",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.1",
+    "jsdom": "28.1.0",
+    "typescript": "5.9.3",
+    "vite": "8.1.5",
+    "vitest": "4.1.0"
+  }
+}

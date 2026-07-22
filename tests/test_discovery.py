@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -137,12 +138,12 @@ def test_discovery_executes_high_recall_queries_with_balanced_page_sizes():
     )
 
     assert client.calls == [
-        ("human", 20),
-        ("HeLa", 20),
-        ("HEK293", 20),
-        ("DDA", 20),
-        ("label-free", 20),
-        ("Orbitrap", 20),
+        ("human", 100),
+        ("HeLa", 100),
+        ("HEK293", 100),
+        ("DDA", 100),
+        ("label-free", 100),
+        ("Orbitrap", 100),
     ]
 
 
@@ -243,7 +244,10 @@ def test_general_discovery_scores_text_evidence_without_ptm_requirement():
 
 
 def test_scoring_excludes_dia_when_dda_requested():
-    request = DatasetRequest(acquisition_mode="dda")
+    request = DatasetRequest(
+        acquisition_mode="dda",
+        hard_constraint_fields=["repository", "acquisition_mode"],
+    )
     dia_project = {
         "accession": "PXD000003",
         "title": "Human phosphoproteomics DIA SWATH",
@@ -261,21 +265,28 @@ def test_scoring_excludes_dia_when_dda_requested():
 
 
 def test_scoring_keeps_mixed_dda_dia_project_for_file_level_review():
-    request = DatasetRequest(acquisition_mode="dda")
+    request = DatasetRequest(
+        acquisition_mode="dda",
+        hard_constraint_fields=["repository", "acquisition_mode"],
+    )
     mixed_project = _project("PXD000004", title="Human phosphoproteomics DDA and DIA SWATH")
 
     score = score_project(mixed_project, request)
     project = build_discovered_project(mixed_project, request, score)
 
     assert not score.excluded
-    assert score.needs_review
+    assert not score.needs_review
     assert any(item.source == "mixed_acquisition" for item in score.evidence)
-    assert project.validity_status == "needs_review"
+    assert project.validity_status == "weak_keep"
+    assert project.needs_review is False
     assert "mixed_acquisition_project" in project.validity_reasons
 
 
 def test_file_level_acquisition_resolves_mixed_project_candidates():
-    request = DatasetRequest(acquisition_mode="dda")
+    request = DatasetRequest(
+        acquisition_mode="dda",
+        hard_constraint_fields=["repository", "acquisition_mode"],
+    )
     mixed_project = _project("PXD000005", title="Human phosphoproteomics DDA and DIA SWATH")
     score = score_project(mixed_project, request)
     project = build_discovered_project(mixed_project, request, score)
@@ -287,6 +298,7 @@ def test_file_level_acquisition_resolves_mixed_project_candidates():
 
     assert dda_file is not None
     assert dda_file.validity_status != "exclude"
+    assert dda_file.needs_review is False
     assert "needs_file_level_acquisition_confirmation" not in dda_file.validity_reasons
     assert unknown_file is not None
     assert unknown_file.validity_status == "needs_review"
@@ -312,7 +324,7 @@ def test_file_filter_keeps_raw_mzml_and_excludes_result_tables():
 
 def test_file_role_classifies_raw_peaklist_and_metadata():
     assert classify_file_role("HeLa_01.raw").role == "raw_acquisition"
-    assert classify_file_role("HeLa_01.mzML").role == "raw_acquisition"
+    assert classify_file_role("HeLa_01.mzML").role == "converted_peaklist"
     assert classify_file_role("sample.d.zip").role == "raw_acquisition"
     assert classify_file_role("fraction_01.MGF").role == "converted_peaklist"
     assert classify_file_role("PXD000001.sdrf.tsv").role == "metadata"
@@ -408,12 +420,17 @@ def test_discovery_extracts_instrument_and_fragmentation_from_metadata():
 
     file = manifest.files[0]
 
-    assert "Q Exactive HF" in file.instrument_names
-    assert "orbitrap" in file.instrument_families
+    project = manifest.projects[0]
+    assert "Q Exactive HF" in project.instrument_names
+    assert "orbitrap" in project.instrument_families
+    assert "HCD" in project.fragmentation_methods
+    # Project-level instrument metadata must not be broadcast to every file.
+    assert file.instrument_names == []
+    assert file.instrument_families == []
     assert "HCD" in file.fragmentation_methods
     assert file.lc_gradient_minutes == 90.0
     assert file.trust_score > 0
-    assert "instrument:orbitrap" in file.diversity_tags
+    assert "instrument:orbitrap" in project.diversity_tags
     assert file.validity_status == "weak_keep"
     assert file.evidence_level == "project"
     assert "project_level_evidence_only" in file.validity_reasons
@@ -473,8 +490,12 @@ class FakeSdrfPrideClient(FakePrideClient):
 
     def download_text(self, url: str) -> str:
         return (
-            "comment[data file]\tcomment[instrument]\tcomment[fragmentation method]\tcomment[LC gradient]\n"
-            "HeLa_01.raw\tOrbitrap Fusion Lumos\tCID\t120 min\n"
+            "comment[data file]\tcharacteristics[cell line]\tcharacteristics[organism]"
+            "\tcharacteristics[disease]\tfactor value[treatment]\tcomment[data acquisition method]"
+            "\tcomment[fraction identifier]\tcomment[instrument]\tcomment[fragmentation method]"
+            "\tcomment[LC gradient]\n"
+            "HeLa_01.raw\tHeLa\tHomo sapiens\tcervical cancer\tDMSO\tDDA\t1"
+            "\tOrbitrap Fusion Lumos\tCID\t120 min\n"
         )
 
 
@@ -488,6 +509,43 @@ def test_discovery_extracts_file_level_sdrf_features():
     assert "orbitrap" in file.instrument_families
     assert file.fragmentation_methods == ["CID"]
     assert file.lc_gradient_minutes == 120.0
+    summary = manifest.projects[0].sdrf_summary
+    expected_text = FakeSdrfPrideClient().download_text("unused")
+    assert summary["status"] == "available"
+    assert summary["content_sha256"] == sha256(expected_text.encode("utf-8")).hexdigest()
+    assert summary["row_count"] == 1
+    assert summary["match_status_counts"] == {
+        "matched": 1,
+        "no_file_match": 0,
+        "no_sdrf": 0,
+    }
+    assert summary["canonical_fields"]["cell_line"] == ["HeLa"]
+    assert summary["canonical_fields"]["disease"] == ["cervical cancer"]
+    assert summary["canonical_fields"]["treatment"] == ["DMSO"]
+    assert summary["canonical_fields"]["assay"] == ["DDA"]
+    assert summary["file_match_examples"][0] == {
+        "file_name": "HeLa_01.raw",
+        "status": "matched",
+        "matched_row_count": 1,
+    }
+
+
+def test_discovery_surfaces_sdrf_parse_errors_without_losing_project() -> None:
+    class BrokenSdrfPrideClient(FakeSdrfPrideClient):
+        def download_text(self, url: str) -> str:
+            return ""
+
+    manifest = discover_pride_dataset(
+        DatasetRequest(max_projects=1, max_files=1),
+        client=BrokenSdrfPrideClient(),
+    )
+
+    summary = manifest.projects[0].sdrf_summary
+    assert summary["status"] == "parse_error"
+    assert summary["content_sha256"] == sha256(b"").hexdigest()
+    assert summary["row_count"] == 0
+    assert summary["match_status_counts"]["no_sdrf"] == 1
+    assert summary["errors"]
 
 
 def test_memory_prior_is_neutral_for_unseen_project(tmp_path: Path):
@@ -566,6 +624,66 @@ def test_diversity_selector_prefers_new_instrument_family_when_scores_are_close(
 
     assert "B1.raw" in selected_files
     assert len(selected_files) == 2
+
+
+def test_instrument_preference_changes_ranking_using_observed_instrument_generation():
+    newer_project = DiscoveredProject(
+        project_accession="PXD_NEW",
+        project_score=80,
+        trust_score=0.9,
+        instrument_generation_score=0.95,
+        instrument_generation_label="current",
+    )
+    classic_project = DiscoveredProject(
+        project_accession="PXD_CLASSIC",
+        project_score=80,
+        trust_score=0.9,
+        instrument_generation_score=0.15,
+        instrument_generation_label="legacy",
+    )
+    newer_file = DiscoveredFile(
+        project_accession="PXD_NEW",
+        file_name="new.raw",
+        file_type=".raw",
+        file_score=60,
+        trust_score=0.9,
+        validity_status="valid",
+        instrument_generation_score=0.95,
+        instrument_generation_label="current",
+    )
+    classic_file = DiscoveredFile(
+        project_accession="PXD_CLASSIC",
+        file_name="classic.raw",
+        file_type=".raw",
+        file_score=60,
+        trust_score=0.9,
+        validity_status="valid",
+        instrument_generation_score=0.15,
+        instrument_generation_label="legacy",
+    )
+    items = [(newer_project, [newer_file]), (classic_project, [classic_file])]
+
+    newer = select_diverse_items(
+        items,
+        DatasetRequest(
+            max_projects=1,
+            max_files=1,
+            max_files_per_project=1,
+            instrument_preference="newer",
+        ),
+    )
+    classic = select_diverse_items(
+        items,
+        DatasetRequest(
+            max_projects=1,
+            max_files=1,
+            max_files_per_project=1,
+            instrument_preference="classic",
+        ),
+    )
+
+    assert newer[0][0].project_accession == "PXD_NEW"
+    assert classic[0][0].project_accession == "PXD_CLASSIC"
 
 
 def test_diversity_selector_respects_limits():
@@ -678,7 +796,7 @@ def test_manifest_includes_trust_and_diversity_fields(tmp_path: Path):
 
     with paths["dataset_manifest_csv"].open("r", encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
-    assert "trust_score" in rows[0]
+    assert "retrieval_trust_score" in rows[0]
     assert "file_role" in rows[0]
     assert "file_role_reasons" in rows[0]
     assert "sdrf_match_status" in rows[0]
@@ -755,11 +873,19 @@ def test_manifest_writer_outputs_valid_and_usable_subsets(tmp_path: Path):
         validity_reasons=["missing_species_evidence"],
         needs_review=True,
     )
+    weak_review_file = DiscoveredFile(
+        project_accession=project.project_accession,
+        file_name="weak-review.raw",
+        file_type=".raw",
+        validity_status="weak_keep",
+        validity_reasons=["project_level_evidence_only"],
+        needs_review=True,
+    )
     manifest = DatasetManifest(
         request=request,
         projects=[project],
-        files=[valid_file, weak_file, review_file],
-        summary={"selected_projects": 1, "selected_files": 3, "excluded_files": 2},
+        files=[valid_file, weak_file, review_file, weak_review_file],
+        summary={"selected_projects": 1, "selected_files": 4, "excluded_files": 2},
     )
 
     paths = write_dataset_manifest(manifest, tmp_path)
@@ -776,5 +902,7 @@ def test_manifest_writer_outputs_valid_and_usable_subsets(tmp_path: Path):
     assert paths["batch_inputs_usable"].read_text(encoding="utf-8").splitlines() == ["valid.raw", "weak.mzML"]
     assert quality["valid_files"] == 1
     assert quality["usable_files"] == 2
-    assert quality["needs_review_files"] == 1
+    assert quality["needs_review_files"] == 2
     assert quality["excluded_files"] == 2
+    assert quality["task_readiness_applicability"] == "not_applicable_task_undecided"
+    assert "task_ready_manifest_csv" not in quality["recommended_outputs"]

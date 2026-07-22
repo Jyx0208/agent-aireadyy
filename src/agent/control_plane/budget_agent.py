@@ -82,7 +82,7 @@ async def run_budget_agent_review(
     )
     result = await sdk["Runner"].run(
         starting_agent=agent,
-        input=_budget_input(proposal, metrics),
+        input=_budget_input(proposal, metrics, governor=governor),
         context=context,
         max_turns=max_turns,
         run_config=sdk["RunConfig"](
@@ -109,23 +109,32 @@ def _budget_instructions() -> str:
     return (
         "Objective: allocate additional Discovery search budget when it has credible expected "
         "scientific value. Quality takes priority over saving requests within the hard limits. "
-        "Review only the supplied SearchProposal and deterministic RoundMetrics. Grant all queries, "
-        "grant a true subset, request replanning, or stop. Favor proposals that target unresolved "
-        "semantic coverage, hard-constraint evidence, or metadata gaps with materially novel queries. "
-        "Repeated queries, high duplicate rate, consecutive no-gain actions, or proposals without a "
-        "specific expected quality gain should be replanned or stopped. Never invent, rewrite, or "
-        "execute queries and never change species, acquisition mode, labeling, task type, PTM scope, "
-        "or repository policy. Submit one valid decision with a concise public reasoning_summary. "
-        "A stop decision must include unresolved_gaps, unexplored_strategies, and why_not_continue."
+        "Review only the supplied SearchProposal, deterministic RoundMetrics, and grant_execution "
+        "conversion signals. Grant all queries, grant a true subset, request replanning, or stop. "
+        "Favor proposals that target unresolved semantic coverage, hard-constraint evidence, or "
+        "metadata gaps with materially novel queries. Repeated queries, high duplicate rate, "
+        "consecutive no-gain actions, or proposals without a specific expected quality gain should "
+        "be replanned or stopped. If grants were issued but search_batches is still zero, do not "
+        "stop; replan so the Discovery Agent can execute the outstanding grant or a replacement. "
+        "Never invent, rewrite, or execute queries and never change species, acquisition mode, "
+        "labeling, task type, PTM scope, or repository policy. Submit one valid decision with a "
+        "concise public reasoning_summary. A stop decision must include unresolved_gaps, "
+        "unexplored_strategies, and why_not_continue."
     )
 
 
-def _budget_input(proposal: SearchProposalRecord, metrics: RoundMetrics) -> str:
-    return json.dumps(
-        {
-            "proposal": proposal.model_dump(mode="json"),
-            "metrics": metrics.model_dump(mode="json"),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-    )
+def _budget_input(
+    proposal: SearchProposalRecord,
+    metrics: RoundMetrics,
+    *,
+    governor: BudgetGovernor | None = None,
+) -> str:
+    payload: dict[str, Any] = {
+        "proposal": proposal.model_dump(mode="json"),
+        "metrics": metrics.model_dump(mode="json"),
+    }
+    if governor is not None:
+        from agent.control_plane.budget_governor import grant_execution_summary
+
+        payload["grant_execution"] = grant_execution_summary(governor.store, governor.run_id)
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)

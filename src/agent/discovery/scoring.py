@@ -26,20 +26,38 @@ from agent.discovery.ontology import (
     species_aliases,
     species_from_text,
 )
-from agent.discovery.validity import assess_file_validity, assess_project_validity
+from agent.discovery.validity import (
+    assess_file_validity,
+    assess_project_validity,
+    normalize_acquisition_mode,
+)
 from agent.pride.client import PrideClient
 
 
 DDA_TERMS = ("dda", "data dependent", "data-dependent", "shotgun")
-DIA_TARGETED_TERMS = (
+DIA_TERMS = (
     "dia",
     "swath",
     "data independent",
     "data-independent",
+    "diapasef",
+    "dia-pasef",
+)
+TARGETED_TERMS = (
     "prm",
     "srm",
     "mrm",
+    "targeted acquisition",
+    "targeted proteomics",
+    "parallel reaction monitoring",
+    "selected reaction monitoring",
+    "multiple reaction monitoring",
 )
+ACQUISITION_TERMS = {
+    "dda": DDA_TERMS,
+    "dia": DIA_TERMS,
+    "targeted": TARGETED_TERMS,
+}
 RAW_FILE_SUFFIXES = (".raw", ".mzml", ".mzxml", ".mgf", ".wiff", ".d")
 RAW_DIRECTORY_SUFFIXES = (".d.zip", ".d.tar", ".d.tar.gz")
 RESULT_FILE_SUFFIXES = (
@@ -136,6 +154,18 @@ def _entry_text(value: Any) -> str:
     return str(value)
 
 
+def _dedupe_evidence(values: list[DiscoveryEvidence]) -> list[DiscoveryEvidence]:
+    result: list[DiscoveryEvidence] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in values:
+        key = (item.field, item.source, item.text)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
 def _project_fields(project: dict[str, Any]) -> list[tuple[str, str]]:
     return [
         ("title", _entry_text(project.get("title"))),
@@ -183,6 +213,29 @@ def _keyword_evidence(fields: list[tuple[str, str]], terms: tuple[str, ...], sou
     return evidence
 
 
+def _acquisition_evidence_by_mode(
+    fields: list[tuple[str, str]],
+    *,
+    weight: float,
+) -> dict[str, list[DiscoveryEvidence]]:
+    return {
+        mode: _keyword_evidence(fields, terms, "acquisition", weight)
+        for mode, terms in ACQUISITION_TERMS.items()
+    }
+
+
+def _select_observed_acquisition_mode(
+    evidence_by_mode: dict[str, list[DiscoveryEvidence]],
+    requested_mode: str,
+) -> str | None:
+    observed_modes = {mode for mode, evidence in evidence_by_mode.items() if evidence}
+    if len(observed_modes) == 1:
+        return next(iter(observed_modes))
+    if requested_mode in observed_modes:
+        return requested_mode
+    return None
+
+
 def _requested_species_aliases(request: DatasetRequest) -> dict[str, tuple[str, ...]]:
     aliases: dict[str, tuple[str, ...]] = {}
     for species in request.species:
@@ -190,17 +243,86 @@ def _requested_species_aliases(request: DatasetRequest) -> dict[str, tuple[str, 
     return aliases
 
 
+def _structured_project_species(project: dict[str, Any]) -> tuple[list[str], list[str], list[DiscoveryEvidence]]:
+    """Prefer official structured organisms/TaxIDs over free-text abstract hits."""
+    structured_values: list[str] = []
+    evidence: list[DiscoveryEvidence] = []
+    for key in (
+        "organisms",
+        "organism",
+        "species",
+        "speciesList",
+        "taxonomies",
+        "taxonomy",
+        "organismTaxonomies",
+    ):
+        raw = project.get(key)
+        if raw is None:
+            continue
+        items = raw if isinstance(raw, list) else [raw]
+        for item in items:
+            if isinstance(item, dict):
+                for field in (
+                    "name",
+                    "organism",
+                    "scientificName",
+                    "commonName",
+                    "taxon",
+                    "taxId",
+                    "taxonomyId",
+                    "accession",
+                    "id",
+                ):
+                    value = item.get(field)
+                    if value is not None and str(value).strip():
+                        structured_values.append(str(value).strip())
+                        evidence.append(
+                            DiscoveryEvidence(
+                                field=f"structured:{key}.{field}",
+                                source="species",
+                                text=str(value).strip(),
+                                weight=28,
+                            )
+                        )
+            elif str(item).strip():
+                structured_values.append(str(item).strip())
+                evidence.append(
+                    DiscoveryEvidence(
+                        field=f"structured:{key}",
+                        source="species",
+                        text=str(item).strip(),
+                        weight=28,
+                    )
+                )
+    canonical, taxa = normalize_species_values(structured_values)
+    if not canonical and taxa:
+        # TaxIDs alone may not reverse-map if only numeric strings were provided.
+        for taxon in taxa:
+            if str(taxon) == "9606":
+                canonical.append("human")
+            elif str(taxon) == "10090":
+                canonical.append("mouse")
+    return sorted(set(canonical)), sorted(set(taxa)), evidence
+
+
 def _matched_species(project: dict[str, Any], request: DatasetRequest) -> tuple[list[str], list[DiscoveryEvidence]]:
     fields = _project_fields(project)
     matches: list[str] = []
     evidence: list[DiscoveryEvidence] = []
-    if request.species_policy == "open":
+
+    structured_species, structured_taxa, structured_evidence = _structured_project_species(project)
+    if structured_species:
+        matches.extend(structured_species)
+        evidence.extend(structured_evidence)
+    else:
+        # Fall back to free-text only when structured organisms are absent.
         detected_species, _detected_taxa = species_from_text(_combined_project_text(project))
         for species in detected_species:
             aliases = species_aliases(species)
             alias = next((item for item in aliases if _matches(_combined_project_text(project), item)), species)
             matches.append(species)
-            evidence.append(DiscoveryEvidence(field="semantic_metadata", source="species", text=alias, weight=12))
+            evidence.append(DiscoveryEvidence(field="semantic_metadata", source="species", text=alias, weight=8))
+
     for requested, aliases in _requested_species_aliases(request).items():
         for field, text in fields:
             if not text:
@@ -211,6 +333,13 @@ def _matched_species(project: dict[str, Any], request: DatasetRequest) -> tuple[
             matches.append(requested)
             evidence.append(DiscoveryEvidence(field=field, source="species", text=alias, weight=20))
             break
+
+    # Keep structured TaxIDs visible even when free text adds noise.
+    if structured_taxa:
+        for taxon in structured_taxa:
+            evidence.append(
+                DiscoveryEvidence(field="structured:taxon", source="species", text=str(taxon), weight=30)
+            )
     return sorted(set(matches)), evidence
 
 
@@ -218,6 +347,7 @@ def score_project(project: dict[str, Any], request: DatasetRequest) -> ProjectSc
     fields = _project_fields(project)
     combined_text = _combined_project_text(project)
     requested_ptm = normalize_ptm_type(request.ptm_type)
+    requested_acquisition = normalize_acquisition_mode(request.acquisition_mode)
     requested_labeling = normalize_labeling_strategy(request.labeling_strategy)
     requested_immunopeptidomics = is_immunopeptidomics_goal(request.goal)
     general_goal = str(request.goal or "").casefold() == "general"
@@ -232,15 +362,40 @@ def score_project(project: dict[str, Any], request: DatasetRequest) -> ProjectSc
         DiscoveryEvidence(field="semantic_metadata", source="immunopeptidomics", text=term, weight=18)
         for term in immuno_semantic.evidence_terms
     ]
-    dda_evidence = _keyword_evidence(fields, DDA_TERMS, "acquisition", 8)
-    raw_negative_evidence = _keyword_evidence(fields, DIA_TARGETED_TERMS, "unsupported_acquisition", -100)
+    acquisition_evidence_by_mode = _acquisition_evidence_by_mode(fields, weight=8)
+    observed_acquisition_modes = {
+        mode for mode, evidence in acquisition_evidence_by_mode.items() if evidence
+    }
+    acquisition_mode = _select_observed_acquisition_mode(
+        acquisition_evidence_by_mode,
+        requested_acquisition,
+    )
+    acquisition_evidence = [
+        item
+        for mode_evidence in acquisition_evidence_by_mode.values()
+        for item in mode_evidence
+    ]
     mixed_acquisition_evidence = [
-        DiscoveryEvidence(field=item.field, source="mixed_acquisition", text=item.text, weight=-20)
-        for item in raw_negative_evidence
-    ] if dda_evidence and raw_negative_evidence else []
-    negative_evidence = [] if mixed_acquisition_evidence else raw_negative_evidence
-    labeling_evidence = _keyword_evidence(fields, labeling_aliases(requested_labeling), "labeling", 8)
+        DiscoveryEvidence(
+            field=item.field,
+            source="mixed_acquisition",
+            text=item.text,
+            weight=-20,
+        )
+        for item in acquisition_evidence
+    ] if len(observed_acquisition_modes) > 1 else []
     detected_labeling = labeling_from_text(combined_text)
+    labeling_evidence = (
+        _keyword_evidence(fields, labeling_aliases(detected_labeling), "labeling", 8)
+        if detected_labeling
+        else []
+    )
+    labeling_matches_request = (
+        requested_labeling != "unknown"
+        and detected_labeling is not None
+        and normalize_labeling_strategy(detected_labeling) == requested_labeling
+        and bool(labeling_evidence)
+    )
     species, species_evidence = _matched_species(project, request)
     canonical_species, taxon_ids = normalize_species_values(species)
 
@@ -253,35 +408,78 @@ def score_project(project: dict[str, Any], request: DatasetRequest) -> ProjectSc
         score += min(50.0, 20.0 + 6.0 * len({item.text.casefold() for item in ptm_evidence}))
     if species:
         score += 20.0
-    if dda_evidence:
+    matching_acquisition_evidence = acquisition_evidence_by_mode.get(
+        requested_acquisition,
+        [],
+    )
+    if matching_acquisition_evidence:
         score += 10.0
-    if requested_labeling in {"TMT", "iTRAQ"} and labeling_evidence:
+    elif requested_acquisition == "unknown" and acquisition_evidence:
+        score += 5.0
+    if labeling_matches_request:
         score += 8.0
-    elif requested_labeling == "label_free":
-        score += 2.0
 
     populated_fields = sum(1 for _, text in fields if text.strip())
     score += min(10.0, populated_fields * 1.5)
 
-    excluded = (
+    hard_acquisition = (
         request.is_hard_constraint("acquisition_mode")
-        and request.acquisition_mode == "dda"
-        and bool(negative_evidence)
+        and requested_acquisition != "unknown"
     )
-    labeling_missing = requested_labeling in {"TMT", "iTRAQ"} and not labeling_evidence
+    excluded = bool(
+        hard_acquisition
+        and observed_acquisition_modes
+        and requested_acquisition not in observed_acquisition_modes
+    )
+    exclusion_reason = (
+        (
+            f"Observed acquisition modes {sorted(observed_acquisition_modes)} "
+            f"conflict with requested {requested_acquisition}."
+        )
+        if excluded
+        else None
+    )
+    labeling_missing = (
+        request.is_hard_constraint("labeling_strategy")
+        and requested_labeling != "unknown"
+        and not labeling_matches_request
+    )
     species_required = request.species_policy == "include_only"
+    # Prefer structured organisms/TaxIDs over free-text abstract mentions.
+    structured_species, structured_taxa, _structured_species_evidence = _structured_project_species(project)
+    effective_species = structured_species or canonical_species
+    requested_canonical, requested_taxa = normalize_species_values(request.species)
+    needs_species_review = False
+    if species_required and requested_canonical:
+        allowed = set(requested_canonical)
+        observed = set(effective_species)
+        if observed and observed.isdisjoint(allowed):
+            excluded = True
+            exclusion_reason = (
+                f"Structured species {sorted(observed)} do not include required "
+                f"{sorted(allowed)}."
+            )
+        elif structured_taxa and requested_taxa and set(structured_taxa).isdisjoint(set(requested_taxa)):
+            excluded = True
+            exclusion_reason = (
+                f"Structured TaxIDs {sorted(structured_taxa)} do not include required "
+                f"{sorted(requested_taxa)}."
+            )
+        elif not observed and not structured_taxa:
+            # No usable species evidence under a strict filter.
+            needs_species_review = True
+    elif species_required and not species:
+        needs_species_review = True
     ptm_required = not general_goal and not requested_immunopeptidomics and requested_ptm != "unknown_ptm"
     immuno_missing = requested_immunopeptidomics and not immuno_evidence
     needs_review = (
         (ptm_required and not ptm_evidence)
         or immuno_missing
-        or (species_required and not species)
+        or needs_species_review
         or (
-            request.is_hard_constraint("acquisition_mode")
-            and request.acquisition_mode == "dda"
-            and not dda_evidence
+            hard_acquisition
+            and requested_acquisition not in observed_acquisition_modes
         )
-        or bool(mixed_acquisition_evidence)
         or labeling_missing
     )
     confidence = max(0.0, min(1.0, score / 90.0))
@@ -290,20 +488,19 @@ def score_project(project: dict[str, Any], request: DatasetRequest) -> ProjectSc
         + immuno_evidence
         + ptm_evidence
         + species_evidence
-        + dda_evidence
+        + acquisition_evidence
         + labeling_evidence
         + mixed_acquisition_evidence
-        + negative_evidence
     )
     return ProjectScore(
         project_score=round(score, 2),
         confidence=round(confidence, 3),
         needs_review=needs_review or excluded,
         excluded=excluded,
-        species=species,
-        canonical_species=canonical_species,
-        organism_taxon_id=taxon_ids,
-        acquisition_mode="dda" if dda_evidence else None,
+        species=effective_species or species,
+        canonical_species=effective_species or canonical_species,
+        organism_taxon_id=structured_taxa or taxon_ids,
+        acquisition_mode=acquisition_mode,
         ptm_type=ptm_semantic.canonical if ptm_evidence else None,
         ptm_subtype=";".join(ptm_semantic.subtypes) or None,
         ptm_evidence_terms=list(ptm_semantic.evidence_terms),
@@ -317,9 +514,9 @@ def score_project(project: dict[str, Any], request: DatasetRequest) -> ProjectSc
         immunopeptide_evidence_terms=list(immuno_semantic.evidence_terms),
         immunopeptide_enrichment_methods=list(immuno_semantic.enrichment_methods),
         immunopeptide_metadata_confidence=immuno_semantic.confidence,
-        labeling_strategy=detected_labeling or (requested_labeling if labeling_evidence else None),
+        labeling_strategy=detected_labeling,
         evidence=evidence,
-        exclusion_reason="DIA/targeted evidence conflicts with DDA request." if excluded else None,
+        exclusion_reason=exclusion_reason,
     )
 
 
@@ -434,9 +631,19 @@ def build_discovered_project(
     feature_summary = features or DiscoveryFeatureSummary()
     completeness = _project_completeness(score, feature_summary)
     trust = _trust_score(score.confidence, completeness, memory_prior, score.needs_review)
-    general_goal = str(request.goal or "").casefold() == "general"
-    request_ptm = None if general_goal else request.ptm_type
-    request_modification_scope = None if general_goal else (request.modification_scope or normalize_ptm_type(request.ptm_type))
+    goal = str(request.goal or "").casefold()
+    ptm_goal = goal == "ptm" or bool(request.ptm_types)
+    # Immunopeptidomics is not itself a PTM.  Do not promote incidental words
+    # such as "acetylation" from a long protocol into the project's primary
+    # scientific scope unless the user explicitly requested a PTM dimension.
+    request_ptm = request.ptm_type if ptm_goal else None
+    request_modification_scope = (
+        request.modification_scope or normalize_ptm_type(request.ptm_type)
+        if ptm_goal
+        else None
+    )
+    observed_ptm = score.ptm_type if ptm_goal else None
+    observed_modification_scope = score.modification_scope if ptm_goal else None
     project_model = DiscoveredProject(
         repository=request.repository,
         project_accession=_project_accession(project),
@@ -448,21 +655,21 @@ def build_discovered_project(
         species_policy=request.species_policy,
         canonical_species=score.canonical_species,
         organism_taxon_id=score.organism_taxon_id,
-        acquisition_mode=score.acquisition_mode or request.acquisition_mode,
-        ptm_type=score.ptm_type or request_ptm,
-        modification_scope=score.modification_scope or request_modification_scope,
+        acquisition_mode=score.acquisition_mode,
+        ptm_type=observed_ptm or request_ptm,
+        modification_scope=observed_modification_scope or request_modification_scope,
         ptm_subtype=score.ptm_subtype,
-        ptm_evidence_terms=score.ptm_evidence_terms,
-        ptm_enrichment_methods=score.ptm_enrichment_methods,
-        semantic_metadata_confidence=score.semantic_metadata_confidence,
-        semantic_interpretation_trace=score.semantic_interpretation_trace,
+        ptm_evidence_terms=score.ptm_evidence_terms if ptm_goal else [],
+        ptm_enrichment_methods=score.ptm_enrichment_methods if ptm_goal else [],
+        semantic_metadata_confidence=score.semantic_metadata_confidence if ptm_goal else 0.0,
+        semantic_interpretation_trace=score.semantic_interpretation_trace if ptm_goal else [],
         immunopeptide_scope=score.immunopeptide_scope or request.immunopeptide_scope,
         hla_class=score.hla_class or request.hla_class,
         hla_alleles=score.hla_alleles or request.hla_alleles,
         immunopeptide_evidence_terms=score.immunopeptide_evidence_terms or request.immunopeptide_evidence_terms,
         immunopeptide_enrichment_methods=score.immunopeptide_enrichment_methods or request.immunopeptide_enrichment_methods,
         immunopeptide_metadata_confidence=max(score.immunopeptide_metadata_confidence, request.immunopeptide_metadata_confidence),
-        labeling_strategy=score.labeling_strategy or request.labeling_strategy,
+        labeling_strategy=score.labeling_strategy,
         project_score=score.project_score,
         confidence=score.confidence,
         trust_score=trust,
@@ -470,9 +677,13 @@ def build_discovered_project(
         memory_prior=round(memory_prior, 3),
         memory_feedback=memory_feedback or {},
         needs_review=score.needs_review,
-        evidence=score.evidence + feature_summary.evidence,
+        evidence=_dedupe_evidence(score.evidence + feature_summary.evidence),
         instrument_names=feature_summary.instrument_names,
         instrument_families=feature_summary.instrument_families,
+        instrument_generation_score=feature_summary.instrument_generation_score,
+        instrument_generation_label=feature_summary.instrument_generation_label,
+        project_publication_date=str(project.get("publicationDate") or "") or None,
+        project_submission_date=str(project.get("submissionDate") or "") or None,
         fragmentation_methods=feature_summary.fragmentation_methods,
         lc_gradient=feature_summary.lc_gradient,
         lc_gradient_minutes=feature_summary.lc_gradient_minutes,
@@ -481,9 +692,9 @@ def build_discovered_project(
             instrument_families=feature_summary.instrument_families,
             fragmentation_methods=feature_summary.fragmentation_methods,
             lc_gradient_minutes=feature_summary.lc_gradient_minutes,
-            modification_scope=score.modification_scope or request_modification_scope,
+            modification_scope=observed_modification_scope or request_modification_scope,
             immunopeptide_scope=score.immunopeptide_scope or request.immunopeptide_scope,
-            labeling_strategy=score.labeling_strategy or request.labeling_strategy,
+            labeling_strategy=score.labeling_strategy,
         ),
         raw_metadata=project,
     )
@@ -540,6 +751,9 @@ def classify_file_role(file_name: str) -> FileRoleDecision:
     if file_type == ".mgf":
         return FileRoleDecision("converted_peaklist", file_type, ["peaklist_suffix"])
 
+    if file_type == ".mzml":
+        return FileRoleDecision("converted_peaklist", file_type, ["open_spectrum_mzml"])
+
     if file_type is not None:
         if file_type == ".d" and any(lower.endswith(suffix) for suffix in RAW_DIRECTORY_SUFFIXES):
             reasons.append("vendor_directory_archive")
@@ -560,6 +774,19 @@ def is_result_or_report_file(file_name: str) -> bool:
         return True
     lower = file_name.casefold()
     return role == "unknown" and any(token in lower for token in RESULT_NAME_TOKENS)
+
+
+def _file_level_labeling(file_name: str, project_labeling: str | None) -> str | None:
+    lower = str(file_name or "").casefold()
+    if "silac" in lower:
+        return "SILAC"
+    if re.search(r"(^|[_\-\s.])tmt([_\-\s.]|$)|tmt\d+", lower):
+        return "TMT"
+    if "itraq" in lower:
+        return "iTRAQ"
+    if re.search(r"label[\s\-_]?free|lfq", lower):
+        return "label_free"
+    return project_labeling
 
 
 def _file_name(file_record: dict[str, Any]) -> str:
@@ -608,7 +835,12 @@ def score_file(
     project_evidence = list(project.evidence)
     requested_ptm = normalize_ptm_type(project.ptm_type or request.ptm_type)
     general_goal = str(request.goal or "").casefold() == "general"
-    file_semantic = interpret_ptm_metadata(" ".join(text for _, text in fields), requested_ptm)
+    ptm_goal = str(request.goal or "").casefold() == "ptm" or bool(request.ptm_types)
+    file_semantic = (
+        interpret_ptm_metadata(" ".join(text for _, text in fields), requested_ptm)
+        if ptm_goal
+        else interpret_ptm_metadata("", None)
+    )
     file_immuno = interpret_immunopeptide_metadata(" ".join(text for _, text in fields))
     general_file_evidence = _keyword_evidence(fields, tuple(request.query_terms), "general_query", 6) if general_goal else []
     file_evidence = [
@@ -619,15 +851,38 @@ def score_file(
         DiscoveryEvidence(field="file_name", source="immunopeptidomics", text=term, weight=9)
         for term in file_immuno.evidence_terms
     ]
-    dda_evidence = _keyword_evidence(fields, DDA_TERMS, "file_name", 4)
-    negative_evidence = _keyword_evidence(fields, DIA_TARGETED_TERMS, "unsupported_acquisition", -100)
+    requested_acquisition = normalize_acquisition_mode(request.acquisition_mode)
+    acquisition_evidence_by_mode = _acquisition_evidence_by_mode(fields, weight=4)
+    observed_file_acquisition_modes = {
+        mode for mode, evidence in acquisition_evidence_by_mode.items() if evidence
+    }
+    file_acquisition_evidence = [
+        item
+        for mode_evidence in acquisition_evidence_by_mode.values()
+        for item in mode_evidence
+    ]
+    file_acquisition_mode = _select_observed_acquisition_mode(
+        acquisition_evidence_by_mode,
+        requested_acquisition,
+    ) or project.acquisition_mode
     requested_labeling = normalize_labeling_strategy(request.labeling_strategy)
-    labeling_evidence = _keyword_evidence(fields, labeling_aliases(requested_labeling), "labeling", 4)
     detected_labeling = labeling_from_text(" ".join(text for _, text in fields))
+    labeling_evidence = (
+        _keyword_evidence(fields, labeling_aliases(detected_labeling), "labeling", 4)
+        if detected_labeling
+        else []
+    )
+    labeling_matches_request = (
+        requested_labeling != "unknown"
+        and detected_labeling is not None
+        and normalize_labeling_strategy(detected_labeling) == requested_labeling
+        and bool(labeling_evidence)
+    )
     if (
         request.is_hard_constraint("acquisition_mode")
-        and request.acquisition_mode == "dda"
-        and negative_evidence
+        and requested_acquisition != "unknown"
+        and observed_file_acquisition_modes
+        and requested_acquisition not in observed_file_acquisition_modes
     ):
         return None
 
@@ -642,14 +897,23 @@ def score_file(
         score += min(20.0, 8.0 + 4.0 * len(file_evidence))
     if immuno_file_evidence:
         score += min(22.0, 10.0 + 4.0 * len(immuno_file_evidence))
-    if dda_evidence:
+    matching_acquisition_evidence = acquisition_evidence_by_mode.get(
+        requested_acquisition,
+        [],
+    )
+    if matching_acquisition_evidence:
         score += 5.0
-    if requested_labeling in {"TMT", "iTRAQ"} and labeling_evidence:
+    elif requested_acquisition == "unknown" and file_acquisition_evidence:
+        score += 2.0
+    if labeling_matches_request:
         score += 5.0
 
     download_url = PrideClient.first_download_url(file_record)
     expected_size_bytes = _file_size(file_record)
-    needs_review = project.needs_review or not download_url or expected_size_bytes is None
+    # File review is owned by file evidence. Inheriting a project-level mixed
+    # acquisition flag makes it impossible for file-level DDA/DIA/targeted
+    # evidence to resolve the exact asset, defeating review_mixed semantics.
+    needs_review = not download_url or expected_size_bytes is None
     confidence = max(0.0, min(1.0, (project.project_score + score) / 150.0))
     feature_summary = features or DiscoveryFeatureSummary()
     completeness = _file_completeness(
@@ -659,7 +923,14 @@ def score_file(
         features=feature_summary,
     )
     trust = _trust_score(confidence, completeness, memory_prior, needs_review)
-    file_context_evidence = general_file_evidence + immuno_file_evidence + file_evidence + dda_evidence + labeling_evidence + feature_summary.evidence
+    file_context_evidence = (
+        general_file_evidence
+        + immuno_file_evidence
+        + file_evidence
+        + file_acquisition_evidence
+        + labeling_evidence
+        + feature_summary.evidence
+    )
     evidence_level, file_level_count, project_level_count, evidence_warnings = _file_context_from_evidence(
         project_evidence=project_evidence,
         file_evidence=file_context_evidence,
@@ -695,7 +966,7 @@ def score_file(
         species_policy=request.species_policy,
         canonical_species=project.canonical_species,
         organism_taxon_id=project.organism_taxon_id,
-        acquisition_mode=project.acquisition_mode,
+        acquisition_mode=file_acquisition_mode,
         ptm_type=project.ptm_type,
         ptm_subtype=file_semantic.subtypes[0] if file_semantic.subtypes else project.ptm_subtype,
         ptm_evidence_terms=list(dict.fromkeys([*project.ptm_evidence_terms, *file_semantic.evidence_terms])),
@@ -709,7 +980,7 @@ def score_file(
         immunopeptide_evidence_terms=list(dict.fromkeys([*project.immunopeptide_evidence_terms, *file_immuno.evidence_terms])),
         immunopeptide_enrichment_methods=list(dict.fromkeys([*project.immunopeptide_enrichment_methods, *file_immuno.enrichment_methods])),
         immunopeptide_metadata_confidence=max(project.immunopeptide_metadata_confidence, file_immuno.confidence),
-        labeling_strategy=detected_labeling or project.labeling_strategy,
+        labeling_strategy=_file_level_labeling(file_name, detected_labeling or project.labeling_strategy),
         project_score=project.project_score,
         file_score=round(score, 2),
         confidence=round(confidence, 3),
@@ -718,9 +989,11 @@ def score_file(
         memory_prior=round(memory_prior, 3),
         memory_feedback=memory_feedback or {},
         needs_review=needs_review,
-        evidence=project_evidence + file_context_evidence,
+        evidence=_dedupe_evidence(project_evidence + file_context_evidence),
         instrument_names=feature_summary.instrument_names,
         instrument_families=feature_summary.instrument_families,
+        instrument_generation_score=feature_summary.instrument_generation_score,
+        instrument_generation_label=feature_summary.instrument_generation_label,
         fragmentation_methods=feature_summary.fragmentation_methods,
         lc_gradient=feature_summary.lc_gradient,
         lc_gradient_minutes=feature_summary.lc_gradient_minutes,
@@ -731,7 +1004,7 @@ def score_file(
             lc_gradient_minutes=feature_summary.lc_gradient_minutes,
             modification_scope=project.modification_scope,
             immunopeptide_scope=file_immuno.scope if immuno_file_evidence else project.immunopeptide_scope,
-            labeling_strategy=detected_labeling or project.labeling_strategy,
+            labeling_strategy=_file_level_labeling(file_name, detected_labeling or project.labeling_strategy),
         ),
         raw_record=file_record,
     )

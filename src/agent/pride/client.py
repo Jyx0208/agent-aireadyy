@@ -10,6 +10,92 @@ import httpx
 from agent.repositories.metering import record_repository_request
 
 
+class PrideInvalidResponseError(ValueError):
+    """PRIDE returned HTTP success with a payload that violates its contract."""
+
+
+def _invalid_response(
+    operation: str,
+    *,
+    expected: str,
+    payload: Any,
+) -> PrideInvalidResponseError:
+    preview = repr(payload)
+    if len(preview) > 240:
+        preview = f"{preview[:237]}..."
+    return PrideInvalidResponseError(
+        f"{operation} received an invalid PRIDE response: expected {expected}; "
+        f"got {type(payload).__name__} {preview}"
+    )
+
+
+def _require_record(
+    payload: Any,
+    *,
+    operation: str,
+    record_kind: str,
+    identity_field: str,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict) or not str(
+        payload.get(identity_field) or ""
+    ).strip():
+        raise _invalid_response(
+            operation,
+            expected=f"a {record_kind} object with a non-empty {identity_field}",
+            payload=payload,
+        )
+    return payload
+
+
+def _require_record_list(
+    payload: Any,
+    *,
+    operation: str,
+    record_kind: str,
+    identity_field: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(payload, list):
+        raise _invalid_response(
+            operation,
+            expected=f"a list of {record_kind} objects",
+            payload=payload,
+        )
+    return [
+        _require_record(
+            record,
+            operation=f"{operation} item {index}",
+            record_kind=record_kind,
+            identity_field=identity_field,
+        )
+        for index, record in enumerate(payload)
+    ]
+
+
+def search_projects_paginated(
+    client: Any,
+    keyword: str,
+    *,
+    page_size: int,
+    max_pages: int,
+    max_results: int,
+) -> list[dict[str, Any]]:
+    """Use the paged client contract while preserving injected legacy clients."""
+    try:
+        return client.search_projects(
+            keyword,
+            page_size=page_size,
+            max_pages=max_pages,
+            max_results=max_results,
+        )
+    except TypeError as exc:
+        message = str(exc)
+        if "unexpected keyword argument" not in message or not any(
+            name in message for name in ("max_pages", "max_results")
+        ):
+            raise
+        return client.search_projects(keyword, page_size=page_size)
+
+
 class PrideClient:
     def __init__(
         self,
@@ -54,17 +140,59 @@ class PrideClient:
             raise last_error
         raise RuntimeError("PRIDE request failed without a response.")
 
-    def search_projects(self, keyword: str, page_size: int = 100) -> list[dict[str, Any]]:
-        response = self._get(
-            "/search/projects",
-            operation="search_projects",
-            params={"keyword": keyword, "pageSize": page_size},
-        )
-        return response.json()
+    def search_projects(
+        self,
+        keyword: str,
+        page_size: int = 100,
+        *,
+        max_pages: int | None = None,
+        max_results: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search PRIDE projects, paging until exhausted or a safety bound is hit.
+
+        The Archive v2 search endpoint is page-based. Passing only ``pageSize``
+        returns the first page; callers that want broad coverage must page.
+        """
+        effective_page_size = max(1, min(int(page_size or 100), 100))
+        page_limit = 1 if max_pages is None else max(1, int(max_pages))
+        projects: list[dict[str, Any]] = []
+        page = 0
+        while True:
+            if page >= page_limit:
+                break
+            response = self._get(
+                "/search/projects",
+                operation="search_projects",
+                params={
+                    "keyword": keyword,
+                    "pageSize": effective_page_size,
+                    "page": page,
+                },
+            )
+            batch = _require_record_list(
+                response.json(),
+                operation="search_projects",
+                record_kind="project",
+                identity_field="accession",
+            )
+            if not batch:
+                break
+            projects.extend(batch)
+            if max_results is not None and len(projects) >= max_results:
+                return projects[: max(0, int(max_results))]
+            if len(batch) < effective_page_size:
+                break
+            page += 1
+        return projects
 
     def get_project(self, accession: str) -> dict[str, Any]:
         response = self._get(f"/projects/{accession}", operation="get_project")
-        return response.json()
+        return _require_record(
+            response.json(),
+            operation="get_project",
+            record_kind="project",
+            identity_field="accession",
+        )
 
     def list_project_files(
         self,
@@ -90,7 +218,12 @@ class PrideClient:
                 operation="list_project_files",
                 params=page_params,
             )
-            batch = response.json()
+            batch = _require_record_list(
+                response.json(),
+                operation="list_project_files",
+                record_kind="file",
+                identity_field="fileName",
+            )
             if not batch:
                 break
             files.extend(batch)

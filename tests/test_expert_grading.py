@@ -137,6 +137,49 @@ def test_merge_machine_reviews_accumulates_model_runs() -> None:
     assert item["machine_reviews"][0]["reason"] == "b"
 
 
+def test_merge_machine_reviews_replaces_prior_run_from_same_model() -> None:
+    existing = {
+        "candidates": [
+            {
+                "candidate_id": "c1",
+                "grade": 1,
+                "machine_review_runs": [
+                    {
+                        "job_id": "old-job",
+                        "profile_id": "old-profile",
+                        "model": "gpt-5.6-sol",
+                        "grade": 1,
+                        "votes": [{"grade": 1, "reason": "old"}],
+                    }
+                ],
+            }
+        ]
+    }
+    machine = {
+        "review_model": "GPT-5.6-SOL",
+        "candidates": [
+            {
+                "candidate_id": "c1",
+                "grade": 3,
+                "machine_reviews": [{"grade": 3, "reason": "new"}],
+            }
+        ],
+    }
+
+    merged = merge_machine_reviews(
+        existing,
+        machine,
+        job_id="new-job",
+        profile_id="new-profile",
+        model="GPT-5.6-SOL",
+    )
+
+    runs = merged["candidates"][0]["machine_review_runs"]
+    assert len(runs) == 1
+    assert runs[0]["job_id"] == "new-job"
+    assert runs[0]["grade"] == 3
+
+
 def test_export_strips_blind_identity_and_machine_fields() -> None:
     pool = {
         "candidates": [

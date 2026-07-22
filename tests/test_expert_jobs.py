@@ -214,6 +214,66 @@ def test_job_manager_rejects_excessive_candidate_workers(tmp_path: Path) -> None
         manager.start_job(pool_id=record["pool_id"], profile_id="grok", workers=9)
 
 
+def test_job_manager_reuses_same_model_job_per_pool(tmp_path: Path) -> None:
+    reset_jobs_for_tests()
+    registry = ExpertPoolRegistry(tmp_path / "expert_review")
+    record = registry.import_pool(
+        {
+            "schema_version": "discovery-judgment-pool-blinded/v2",
+            "candidates": [{"candidate_id": "c1", "project_title": "Visible"}],
+        },
+        label="one-job-per-model",
+    )
+    profiles = {
+        "primary": {"api_key": "a", "base_url": "https://one.example/v1", "model": "gpt-5.6-sol"},
+        "alias": {"api_key": "b", "base_url": "https://two.example/v1", "model": "GPT-5.6-SOL"},
+    }
+    manager = ExpertJudgeJobManager(
+        registry,
+        resolve_profile=lambda profile_id: profiles[profile_id],
+        max_running=0,
+    )
+
+    first = manager.start_job(pool_id=record["pool_id"], profile_id="primary")
+    replay = manager.start_job(pool_id=record["pool_id"], profile_id="alias")
+
+    assert replay["job_id"] == first["job_id"]
+    assert replay["reused_existing"] is True
+    assert len(manager.list_jobs(pool_id=record["pool_id"])) == 1
+
+
+def test_job_manager_rejects_model_already_merged_into_pool(tmp_path: Path) -> None:
+    reset_jobs_for_tests()
+    registry = ExpertPoolRegistry(tmp_path / "expert_review")
+    record = registry.import_pool(
+        {
+            "schema_version": "discovery-judgment-pool-reviewed/v2",
+            "candidates": [
+                {
+                    "candidate_id": "c1",
+                    "project_title": "Visible",
+                    "machine_review_runs": [
+                        {"job_id": "deleted-job", "profile_id": "old", "model": "gpt-5.6-sol", "grade": 2}
+                    ],
+                }
+            ],
+        },
+        label="merged-model-result",
+    )
+    manager = ExpertJudgeJobManager(
+        registry,
+        resolve_profile=lambda _profile_id: {
+            "api_key": "a",
+            "base_url": "https://example.com/v1",
+            "model": "gpt-5.6-sol",
+        },
+        max_running=0,
+    )
+
+    with pytest.raises(ValueError, match="model_already_reviewed_pool:gpt-5.6-sol"):
+        manager.start_job(pool_id=record["pool_id"], profile_id="new")
+
+
 def test_job_manager_runs_with_mock_judge(tmp_path: Path) -> None:
     reset_jobs_for_tests()
     registry = ExpertPoolRegistry(tmp_path / "expert_review")
@@ -352,7 +412,10 @@ def test_job_manager_rejects_deleting_running_job(tmp_path: Path) -> None:
     record = registry.import_pool(
         {
             "schema_version": "discovery-judgment-pool-blinded/v2",
-            "candidates": [{"candidate_id": "c1", "project_title": "Visible"}],
+            "candidates": [
+                {"candidate_id": "c1", "project_title": "Visible"},
+                {"candidate_id": "c2", "project_title": "Queued"},
+            ],
         },
         label="running-delete",
     )
@@ -398,12 +461,13 @@ def test_job_manager_rejects_deleting_running_job(tmp_path: Path) -> None:
     deadline = time.time() + 5
     final = None
     while time.time() < deadline:
-        final = manager.get_job(job["job_id"])
+        final = manager.get_job(job["job_id"], detail=True)
         if final and final["status"] in {"cancelled", "completed", "completed_with_errors", "failed"}:
             break
         time.sleep(0.01)
     assert final is not None
     assert final["status"] == "cancelled"
+    assert final["items"]["c2"] == "pending"
 
 
 def test_job_manager_rejects_delete_path_traversal_without_touching_pool(tmp_path: Path) -> None:
@@ -773,3 +837,74 @@ def test_retry_failed_does_not_run_cancelled_pending_candidates(tmp_path: Path) 
     assert set(calls) == {"failed"}
     assert completed["items"]["failed"] == "done"
     assert completed["items"]["pending"] == "pending"
+
+
+def test_resume_recovers_stale_running_candidates(tmp_path: Path) -> None:
+    reset_jobs_for_tests()
+    registry = ExpertPoolRegistry(tmp_path / "expert_review")
+    record = registry.import_pool(
+        {
+            "schema_version": "discovery-judgment-pool-blinded/v2",
+            "candidates": [
+                {"candidate_id": "done", "project_title": "Done"},
+                {"candidate_id": "running", "project_title": "Interrupted"},
+                {"candidate_id": "pending", "project_title": "Pending"},
+                {"candidate_id": "failed", "project_title": "Failed"},
+            ],
+        },
+        label="resume-stale-running",
+    )
+    profile = {
+        "api_key": "secret",
+        "base_url": "https://example.com/v1",
+        "model": "grok-4.5",
+        "timeout": "120",
+    }
+    calls: list[str] = []
+
+    def judge_factory(**_kwargs):
+        def judge(_system_prompt: str, user_prompt: str) -> dict[str, Any]:
+            calls.append(str(json.loads(user_prompt)["candidate_id"]))
+            return {"grade": 2, "reason": "ok", "supporting_evidence": ["e"], "constraint_conflicts": []}
+
+        return judge
+
+    manager = ExpertJudgeJobManager(
+        registry,
+        resolve_profile=lambda _profile_id: profile,
+        judge_factory=judge_factory,
+        max_running=1,
+    )
+    manager._kick = lambda: None  # type: ignore[method-assign]
+    job = manager.start_job(pool_id=record["pool_id"], profile_id="grok", workers=2)
+    job_path = tmp_path / "expert_review" / record["pool_id"] / "jobs" / f"{job['job_id']}.json"
+    stored = json.loads(job_path.read_text(encoding="utf-8"))
+    stored.update(
+        status="cancelled",
+        items={"done": "done", "running": "running", "pending": "pending", "failed": "failed"},
+        failed_ids=["failed"],
+        progress={"total": 4, "done": 1, "failed": 1, "skipped_resume": 0},
+    )
+    job_path.write_text(json.dumps(stored), encoding="utf-8")
+    reset_jobs_for_tests()
+    manager = ExpertJudgeJobManager(
+        registry,
+        resolve_profile=lambda _profile_id: profile,
+        judge_factory=judge_factory,
+        max_running=1,
+    )
+
+    resumed = manager.resume_job(job["job_id"], workers=4)
+    assert resumed is not None
+    assert resumed["workers"] == 4
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        completed = manager.get_job(job["job_id"], detail=True)
+        if completed and completed["status"] in {"completed", "completed_with_errors"}:
+            break
+        time.sleep(0.05)
+
+    assert completed is not None
+    assert completed["status"] == "completed"
+    assert set(calls) == {"running", "pending", "failed"}

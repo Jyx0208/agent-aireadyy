@@ -14,6 +14,8 @@ from agent.utils import write_json
 
 MANIFEST_COLUMNS = [
     "run_id",
+    "harvest_run_id",
+    "ms_run_id",
     "repository",
     "project_accession",
     "native_accession",
@@ -51,10 +53,22 @@ MANIFEST_COLUMNS = [
     "immunopeptide_enrichment_methods",
     "immunopeptide_metadata_confidence",
     "labeling_strategy",
-    "project_score",
-    "file_score",
-    "confidence",
-    "trust_score",
+    "final_grade",
+    "judgment_status",
+    "hard_gate",
+    "judgment_confidence",
+    "judgment_decision",
+    "judgment_next_action",
+    "judgment_evidence_stage",
+    "judgment_explanation",
+    "judgment_evidence_refs",
+    "judgment_constraint_assessments",
+    "judgment_limitations",
+    "judgment_rubric_version",
+    "retrieval_project_score",
+    "retrieval_file_score",
+    "retrieval_confidence",
+    "retrieval_trust_score",
     "evidence_completeness",
     "memory_prior",
     "memory_feedback",
@@ -82,6 +96,8 @@ MANIFEST_COLUMNS = [
     "ai_ready_target_schema",
     "instrument_names",
     "instrument_families",
+    "instrument_generation_score",
+    "instrument_generation_label",
     "fragmentation_methods",
     "lc_gradient",
     "lc_gradient_minutes",
@@ -89,7 +105,8 @@ MANIFEST_COLUMNS = [
     "review_decision",
     "review_reason",
     "review_note",
-    "evidence",
+    "evidence_count",
+    "evidence_preview",
 ]
 
 
@@ -101,9 +118,40 @@ def _join_values(values: list[str]) -> str:
     return ";".join(str(value) for value in values if str(value).strip())
 
 
-def _csv_row(file: DiscoveredFile, run_id: str | None) -> dict[str, Any]:
+def _ms_run_id(file: DiscoveredFile) -> str:
+    name = str(file.file_name or "").strip()
+    if not name:
+        return str(file.file_accession_or_path or "")
+    # Collapse representation variants (raw/mgf/mzml) into one MS run stem.
+    stem = Path(name).stem
+    lower = stem.casefold()
+    for suffix in (".raw", ".mzml", ".mgf", ".d"):
+        if lower.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    return f"{file.project_accession}:{stem}"
+
+
+def _judgment_for_file(file: DiscoveredFile, judgments: dict[str, dict[str, Any]] | None) -> dict[str, Any]:
+    if not judgments:
+        return {}
+    return judgments.get(str(file.project_accession or "").upper()) or judgments.get(
+        str(file.project_accession or "")
+    ) or {}
+
+
+def _csv_row(
+    file: DiscoveredFile,
+    run_id: str | None,
+    *,
+    judgments: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    judgment = _judgment_for_file(file, judgments)
+    evidence_payload = _evidence_payload(file.evidence)
     return {
         "run_id": run_id or "",
+        "harvest_run_id": run_id or "",
+        "ms_run_id": _ms_run_id(file),
         "repository": file.repository,
         "project_accession": file.project_accession,
         "native_accession": file.native_accession or "",
@@ -141,10 +189,26 @@ def _csv_row(file: DiscoveredFile, run_id: str | None) -> dict[str, Any]:
         "immunopeptide_enrichment_methods": _join_values(file.immunopeptide_enrichment_methods),
         "immunopeptide_metadata_confidence": file.immunopeptide_metadata_confidence,
         "labeling_strategy": file.labeling_strategy or "",
-        "project_score": file.project_score,
-        "file_score": file.file_score,
-        "confidence": file.confidence,
-        "trust_score": file.trust_score,
+        "final_grade": judgment.get("grade", ""),
+        "judgment_status": judgment.get("status", ""),
+        "hard_gate": judgment.get("hard_gate", ""),
+        "judgment_confidence": judgment.get("confidence", ""),
+        "judgment_decision": judgment.get("decision", ""),
+        "judgment_next_action": judgment.get("next_action", ""),
+        "judgment_evidence_stage": judgment.get("evidence_stage", ""),
+        "judgment_explanation": judgment.get("explanation", ""),
+        "judgment_evidence_refs": _join_values(judgment.get("evidence_refs") or []),
+        "judgment_constraint_assessments": json.dumps(
+            judgment.get("constraint_assessments") or [],
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        "judgment_limitations": _join_values(judgment.get("limitations") or []),
+        "judgment_rubric_version": judgment.get("rubric_version", ""),
+        "retrieval_project_score": file.project_score,
+        "retrieval_file_score": file.file_score,
+        "retrieval_confidence": file.confidence,
+        "retrieval_trust_score": file.trust_score,
         "evidence_completeness": file.evidence_completeness,
         "memory_prior": file.memory_prior,
         "memory_feedback": json.dumps(file.memory_feedback, ensure_ascii=False, sort_keys=True),
@@ -172,6 +236,12 @@ def _csv_row(file: DiscoveredFile, run_id: str | None) -> dict[str, Any]:
         "ai_ready_target_schema": file.ai_ready_target_schema or "",
         "instrument_names": _join_values(file.instrument_names),
         "instrument_families": _join_values(file.instrument_families),
+        "instrument_generation_score": (
+            file.instrument_generation_score
+            if file.instrument_generation_score is not None
+            else ""
+        ),
+        "instrument_generation_label": file.instrument_generation_label or "",
         "fragmentation_methods": _join_values(file.fragmentation_methods),
         "lc_gradient": file.lc_gradient or "",
         "lc_gradient_minutes": file.lc_gradient_minutes if file.lc_gradient_minutes is not None else "",
@@ -179,16 +249,23 @@ def _csv_row(file: DiscoveredFile, run_id: str | None) -> dict[str, Any]:
         "review_decision": file.review_decision or "",
         "review_reason": file.review_reason or "",
         "review_note": file.review_note or "",
-        "evidence": json.dumps(_evidence_payload(file.evidence), ensure_ascii=False),
+        "evidence_count": len(evidence_payload),
+        "evidence_preview": json.dumps(evidence_payload[:3], ensure_ascii=False),
     }
 
 
-def _write_manifest_csv(path: Path, files: list[DiscoveredFile], run_id: str | None) -> None:
+def _write_manifest_csv(
+    path: Path,
+    files: list[DiscoveredFile],
+    run_id: str | None,
+    *,
+    judgments: dict[str, dict[str, Any]] | None = None,
+) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=MANIFEST_COLUMNS)
         writer.writeheader()
         for file in files:
-            writer.writerow(_csv_row(file, run_id))
+            writer.writerow(_csv_row(file, run_id, judgments=judgments))
 
 
 def _write_batch_inputs(path: Path, files: list[DiscoveredFile]) -> None:
@@ -225,7 +302,37 @@ def build_quality_report(manifest: DatasetManifest) -> dict[str, Any]:
     for file in manifest.files:
         reason_counts.update(file.validity_reasons)
     valid_files = _files_with_statuses(manifest.files, {"valid"})
-    usable_files = _files_with_statuses(manifest.files, {"valid", "weak_keep"})
+    usable_files = [
+        file
+        for file in _files_with_statuses(manifest.files, {"valid", "weak_keep"})
+        if not file.needs_review
+    ]
+    needs_review_files = sum(
+        file.needs_review or file.validity_status == "needs_review"
+        for file in manifest.files
+    )
+    raw_stems = {
+        _ms_run_id(file) for file in manifest.files if file.file_role == "raw_acquisition"
+    }
+    converted_stems = {
+        _ms_run_id(file) for file in manifest.files if file.file_role == "converted_peaklist"
+    }
+    task_type = manifest.summary.get("task_type")
+    recommended_outputs = {
+        "strict_manifest_csv": "dataset_manifest_valid.csv",
+        "strict_batch_inputs": "batch_inputs_valid.txt",
+        "usable_manifest_csv": "dataset_manifest_usable.csv",
+        "usable_batch_inputs": "batch_inputs_usable.txt",
+        "all_manifest_csv": "dataset_manifest.csv",
+        "all_batch_inputs": "batch_inputs.txt",
+    }
+    if task_type:
+        recommended_outputs.update(
+            {
+                "task_ready_manifest_csv": "dataset_manifest_task_ready.csv",
+                "task_ready_batch_inputs": "batch_inputs_task_ready.txt",
+            }
+        )
     return {
         "run_id": manifest.run_id,
         "request": manifest.request.model_dump(mode="json"),
@@ -233,7 +340,7 @@ def build_quality_report(manifest: DatasetManifest) -> dict[str, Any]:
         "total_files": len(manifest.files),
         "valid_files": len(valid_files),
         "usable_files": len(usable_files),
-        "needs_review_files": status_counts.get("needs_review", 0),
+        "needs_review_files": needs_review_files,
         "weak_keep_files": status_counts.get("weak_keep", 0),
         "excluded_files": manifest.summary.get("excluded_files", 0),
         "validity_status_counts": dict(status_counts),
@@ -246,29 +353,40 @@ def build_quality_report(manifest: DatasetManifest) -> dict[str, Any]:
         "ptm_enrichment_method_distribution": _count_values(manifest.files, "ptm_enrichment_methods"),
         "semantic_metadata_confidence_mean": _mean_semantic_confidence(manifest.files),
         "instrument_family_distribution": _count_values(manifest.files, "instrument_families"),
+        "instrument_generation_distribution": _count_values(
+            manifest.files, "instrument_generation_label"
+        ),
         "fragmentation_method_distribution": _count_values(manifest.files, "fragmentation_methods"),
         "unknown_counts": manifest.summary.get("unknown_counts") or manifest.summary.get("diversity", {}).get("unknown_counts", {}),
         "evidence_level_distribution": _count_values(manifest.files, "evidence_level"),
         "sdrf_match_status_distribution": _count_values(manifest.files, "sdrf_match_status"),
         "evidence_warning_counts": manifest.summary.get("evidence_warning_counts", {}),
-        "task_type": manifest.summary.get("task_type"),
+        "task_type": task_type,
+        "task_readiness_applicability": "applicable" if task_type else "not_applicable_task_undecided",
         "task_readiness": manifest.summary.get("task_readiness", {}),
         "task_ai_readiness_v2": manifest.summary.get("task_ai_readiness_v2", {}),
         "data_value_v1": manifest.summary.get("data_value_v1", {}),
         "memory_feedback_summary": _memory_feedback_summary(manifest.files),
-        "recommended_outputs": {
-            "strict_manifest_csv": "dataset_manifest_valid.csv",
-            "strict_batch_inputs": "batch_inputs_valid.txt",
-            "usable_manifest_csv": "dataset_manifest_usable.csv",
-            "usable_batch_inputs": "batch_inputs_usable.txt",
-            "task_ready_manifest_csv": "dataset_manifest_task_ready.csv",
-            "task_ready_batch_inputs": "batch_inputs_task_ready.txt",
-            "all_manifest_csv": "dataset_manifest.csv",
-            "all_batch_inputs": "batch_inputs.txt",
+        "run_representation_counts": {
+            "repository_files": len(manifest.files),
+            "raw_acquisitions": sum(
+                file.file_role == "raw_acquisition" for file in manifest.files
+            ),
+            "converted_peaklists": sum(
+                file.file_role == "converted_peaklist" for file in manifest.files
+            ),
+            "unique_run_stems": len(raw_stems | converted_stems),
+            "raw_peaklist_stem_overlap": len(raw_stems & converted_stems),
         },
+        "recommended_outputs": recommended_outputs,
         "notes": [
             "strict exports include validity_status=valid only",
-            "usable exports include validity_status=valid or weak_keep",
+            "usable exports include valid/weak_keep files that do not still require review",
+            *(
+                ["task-ready output is not applicable until a downstream task is chosen"]
+                if not task_type
+                else []
+            ),
             "original manifest and batch_inputs remain unchanged for compatibility",
         ],
     }
@@ -458,12 +576,18 @@ def write_dataset_manifest(manifest: DatasetManifest, output_dir: str | Path) ->
     _write_data_value_ranking(paths["data_value_ranking_json"], paths["data_value_ranking_csv"], paths["data_value_report_md"], manifest)
 
     valid_files = _files_with_statuses(manifest.files, {"valid"})
-    usable_files = _files_with_statuses(manifest.files, {"valid", "weak_keep"})
+    usable_files = [
+        file
+        for file in _files_with_statuses(manifest.files, {"valid", "weak_keep"})
+        if not file.needs_review
+    ]
     task_files = task_ready_files(manifest)
-    _write_manifest_csv(paths["dataset_manifest_csv"], manifest.files, manifest.run_id)
-    _write_manifest_csv(paths["dataset_manifest_valid_csv"], valid_files, manifest.run_id)
-    _write_manifest_csv(paths["dataset_manifest_usable_csv"], usable_files, manifest.run_id)
-    _write_manifest_csv(paths["dataset_manifest_task_ready_csv"], task_files, manifest.run_id)
+    judgments = (manifest.summary or {}).get("project_judgments")
+    judgments = judgments if isinstance(judgments, dict) else None
+    _write_manifest_csv(paths["dataset_manifest_csv"], manifest.files, manifest.run_id, judgments=judgments)
+    _write_manifest_csv(paths["dataset_manifest_valid_csv"], valid_files, manifest.run_id, judgments=judgments)
+    _write_manifest_csv(paths["dataset_manifest_usable_csv"], usable_files, manifest.run_id, judgments=judgments)
+    _write_manifest_csv(paths["dataset_manifest_task_ready_csv"], task_files, manifest.run_id, judgments=judgments)
     _write_batch_inputs(paths["batch_inputs"], manifest.files)
     _write_batch_inputs(paths["batch_inputs_valid"], valid_files)
     _write_batch_inputs(paths["batch_inputs_usable"], usable_files)

@@ -39,7 +39,13 @@ def expert_review_enabled() -> bool:
 
 
 def expert_review_root() -> Path:
-    return Path(os.getenv("AGENT_EXPERT_REVIEW_DIR") or "runs/expert_review")
+    configured = (os.getenv("AGENT_EXPERT_REVIEW_DIR") or "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    # Do not anchor durable review data to the process working directory. The
+    # desktop sandbox can start uvicorn from a temporary mapped directory that
+    # disappears after the session, while this source checkout remains stable.
+    return Path(__file__).resolve().parents[4] / "runs" / "expert_review"
 
 
 def _utc_now() -> str:

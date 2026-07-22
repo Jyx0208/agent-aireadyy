@@ -27,7 +27,14 @@ class RepositoryFaultEvent(JsonModel):
 
 
 class PrideLikeClient(Protocol):
-    def search_projects(self, keyword: str, page_size: int = 100) -> list[dict[str, Any]]: ...
+    def search_projects(
+        self,
+        keyword: str,
+        page_size: int = 100,
+        *,
+        max_pages: int | None = None,
+        max_results: int | None = None,
+    ) -> list[dict[str, Any]]: ...
 
     def get_project(self, accession: str) -> dict[str, Any]: ...
 
@@ -51,13 +58,30 @@ class FaultInjectingPrideClient:
         self.events: list[RepositoryFaultEvent] = []
         self._consumed: set[int] = set()
 
-    def search_projects(self, keyword: str, page_size: int = 100) -> list[dict[str, Any]]:
+    def search_projects(
+        self,
+        keyword: str,
+        page_size: int = 100,
+        *,
+        max_pages: int | None = None,
+        max_results: int | None = None,
+    ) -> list[dict[str, Any]]:
         outcome, index = self._next("search_projects", keyword)
         self._record("search_projects", keyword, outcome, index)
         if outcome == "empty":
             return []
         self._raise_if_error(outcome)
-        rows = self.delegate.search_projects(keyword, page_size=page_size)
+        try:
+            rows = self.delegate.search_projects(
+                keyword,
+                page_size=page_size,
+                max_pages=max_pages,
+                max_results=max_results,
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            rows = self.delegate.search_projects(keyword, page_size=page_size)
         if outcome == "duplicate" and rows:
             return [*rows, dict(rows[0])]
         if outcome == "incomplete":

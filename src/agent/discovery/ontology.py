@@ -376,6 +376,27 @@ LABELING_TERMS: tuple[LabelingTerm, ...] = (
         aliases=("itraq", "itraq4", "itraq4plex", "itraq8", "itraq8plex", "isobaric tags for relative and absolute quantitation"),
         query_terms=("iTRAQ", "iTRAQ4", "iTRAQ8"),
     ),
+    LabelingTerm(
+        canonical="SILAC",
+        display_name="SILAC",
+        aliases=(
+            "silac",
+            "stable isotope labeling by amino acids in cell culture",
+            "stable isotope labelling by amino acids in cell culture",
+        ),
+        query_terms=("SILAC", "stable isotope labeling by amino acids in cell culture"),
+    ),
+    LabelingTerm(
+        canonical="dimethyl",
+        display_name="Dimethyl labeling",
+        aliases=(
+            "dimethyl",
+            "dimethyl labeling",
+            "dimethyl labelling",
+            "reductive dimethylation",
+        ),
+        query_terms=("dimethyl labeling", "reductive dimethylation"),
+    ),
 )
 
 

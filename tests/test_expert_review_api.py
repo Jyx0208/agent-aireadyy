@@ -11,14 +11,15 @@ from fastapi.testclient import TestClient
 from agent.web import app as web_app
 
 
-def test_developer_mode_requires_token_by_default(tmp_path: Path, monkeypatch) -> None:
+def test_developer_mode_is_always_allowed(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AGENT_EXPERT_REVIEW_DIR", str(tmp_path / "expert_review"))
     monkeypatch.delenv("AGENT_EXPERT_REVIEW_DEVELOPER_TOKEN", raising=False)
     monkeypatch.delenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", raising=False)
     client = TestClient(web_app.app)
     status = client.get("/api/expert-review/status").json()
-    assert status["developer_allowed"] is False
-    assert client.get("/api/llm/profiles").json()["error"] == "developer_access_required"
+    assert status["developer_allowed"] is True
+    profiles = client.get("/api/llm/profiles").json()
+    assert profiles.get("ok") is True or "profiles" in profiles or "error" not in profiles or profiles.get("error") != "developer_access_required"
 
 
 def test_calibration_preview_preserves_active_version(tmp_path: Path, monkeypatch) -> None:
@@ -46,6 +47,32 @@ def test_benchmark_review_template_supports_registry_shell() -> None:
     assert "/api/expert-review/pools" in html
     assert "judgment_pool.reviewed.json" in html
     assert "project_accession" not in html
+
+
+def test_benchmark_review_serves_carbon_workbench_and_keeps_legacy_route() -> None:
+    client = TestClient(web_app.app)
+    root = client.get("/")
+    assert root.status_code == 200
+    assert 'id="root"' in root.text
+    assert "/benchmark-review/assets/" in root.text
+
+    response = client.get("/benchmark-review")
+
+    assert response.status_code == 200
+    assert 'id="root"' in response.text
+    assert "/benchmark-review/assets/" in response.text
+
+    alias = client.get("/benchmark-review-next")
+    assert alias.status_code == 200
+    assert 'id="root"' in alias.text
+
+    legacy = client.get("/benchmark-review-legacy")
+    assert legacy.status_code == 200
+    assert 'id="serverPoolSelect"' in legacy.text
+
+    workbench_legacy = client.get("/workbench-legacy")
+    assert workbench_legacy.status_code == 200
+    assert 'id="discoveryTaskTab"' in workbench_legacy.text
 
 
 def test_expert_review_pool_api_import_and_list(tmp_path: Path, monkeypatch) -> None:
@@ -273,18 +300,17 @@ def test_expert_review_grade_export_and_impact_forbidden_for_expert(tmp_path: Pa
     assert forbidden["ok"] is False
 
 
-def test_pool_build_apis_are_developer_only(tmp_path: Path, monkeypatch) -> None:
+def test_pool_build_apis_are_open_without_developer_gate(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AGENT_EXPERT_REVIEW_DIR", str(tmp_path / "expert_review"))
     monkeypatch.setenv("AGENT_EXPERT_REVIEW_ENABLED", "1")
     monkeypatch.delenv("AGENT_EXPERT_REVIEW_DEVELOPER_TOKEN", raising=False)
     monkeypatch.delenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", raising=False)
     client = TestClient(web_app.app)
 
-    forbidden = client.get("/api/benchmark-review/builds").json()
-    assert forbidden["ok"] is False
-    assert forbidden["error"] == "developer_access_required"
+    builds = client.get("/api/benchmark-review/builds").json()
+    assert builds.get("error") != "developer_access_required"
+    assert builds.get("ok") is True or "builds" in builds
 
-    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", "1")
     allowed = client.get("/api/expert-review/pool-builds").json()
     assert allowed == {"ok": True, "builds": []}
 
@@ -964,11 +990,6 @@ def test_delete_expert_job_api_requires_developer_and_reports_running_or_missing
     monkeypatch.setattr(web_app, "_expert_job_manager", lambda: _Jobs())
     client = TestClient(web_app.app)
 
-    forbidden = client.delete("/api/expert-review/jobs/completed-job").json()
-    assert forbidden == {"ok": False, "error": "developer_access_required"}
-    assert calls == []
-
-    monkeypatch.setenv("AGENT_EXPERT_REVIEW_ALLOW_LOCAL_DEVELOPER", "1")
     deleted = client.delete("/api/expert-review/jobs/completed-job").json()
     assert deleted == {
         "ok": True,

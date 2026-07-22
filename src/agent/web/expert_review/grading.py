@@ -225,6 +225,29 @@ def merge_machine_reviews(
     merged: list[dict[str, Any]] = []
     for cid in order:
         base = existing_by_id.get(cid, {})
+        if base.get("machine_review_runs"):
+            seen_run_keys: set[tuple[str, ...]] = set()
+            deduplicated_runs: list[dict[str, Any]] = []
+            for raw_run in reversed(base.get("machine_review_runs") or []):
+                if not isinstance(raw_run, dict):
+                    continue
+                run = dict(raw_run)
+                run_model = str(run.get("model") or "").strip().casefold()
+                run_key = (
+                    ("model", run_model)
+                    if run_model
+                    else (
+                        "legacy",
+                        str(run.get("job_id") or ""),
+                        str(run.get("profile_id") or ""),
+                    )
+                )
+                if run_key in seen_run_keys:
+                    continue
+                seen_run_keys.add(run_key)
+                deduplicated_runs.append(run)
+            base = dict(base)
+            base["machine_review_runs"] = list(reversed(deduplicated_runs))
         machine = next(
             (
                 dict(item)
@@ -257,11 +280,21 @@ def merge_machine_reviews(
             "rubric_version": machine_pool.get("rubric_version"),
             "created_at": _utc_now(),
         }
-        run_key = (run_record["job_id"], run_record["profile_id"], run_record["model"])
-        prior_runs = [
-            run for run in prior_runs
-            if (str(run.get("job_id") or ""), str(run.get("profile_id") or ""), str(run.get("model") or "")) != run_key
-        ]
+        resolved_model_key = resolved_model.strip().casefold()
+        if resolved_model_key:
+            prior_runs = [
+                run
+                for run in prior_runs
+                if str(run.get("model") or "").strip().casefold() != resolved_model_key
+            ]
+        else:
+            run_key = (run_record["job_id"], run_record["profile_id"], run_record["model"])
+            prior_runs = [
+                run
+                for run in prior_runs
+                if (str(run.get("job_id") or ""), str(run.get("profile_id") or ""), str(run.get("model") or ""))
+                != run_key
+            ]
         if run_record["votes"] or run_record["grade"] is not None:
             prior_runs.append(run_record)
         item.update(machine)

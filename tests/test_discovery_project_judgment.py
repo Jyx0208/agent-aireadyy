@@ -23,13 +23,51 @@ def _service(
 ) -> tuple[DiscoveryToolService, AgentRunStore, DatasetRequest]:
     request = DatasetRequest(repository="pride", max_projects=max_projects, max_files=10_000)
     store = AgentRunStore(tmp_path / f"{run_id}.sqlite")
+    inspected_accessions = list(inspected or [])
+    manifest_path: Path | None = None
+    if inspected_accessions:
+        manifest = DatasetManifest(
+            run_id=run_id,
+            request=request,
+            projects=[
+                DiscoveredProject(
+                    project_accession=accession,
+                    project_description="Persisted inspected project evidence.",
+                )
+                for accession in inspected_accessions
+            ],
+            files=[
+                DiscoveredFile(
+                    project_accession=accession,
+                    file_name=f"{accession}.raw",
+                    file_accession_or_path=f"{accession}.raw",
+                    download_url=f"https://example.test/{accession}.raw",
+                    transfer_method="https",
+                    file_type=".raw",
+                    file_role="raw_acquisition",
+                    validity_status="valid",
+                    evidence_level="file",
+                    expected_size_bytes=1024,
+                )
+                for accession in inspected_accessions
+            ],
+            summary={
+                "selected_projects": len(inspected_accessions),
+                "selected_files": len(inspected_accessions),
+            },
+        )
+        manifest_path = tmp_path / run_id / "candidate_pool.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(manifest.model_dump_json(), encoding="utf-8")
     store.save_run(
         AgentRunRecord(
             run_id=run_id,
             workflow="discovery",
             status="running",
             request=request.model_dump(mode="json"),
-            inspected_candidate_accessions=list(inspected or []),
+            inspected_candidate_accessions=inspected_accessions,
+            candidate_pool_manifest_path=str(manifest_path) if manifest_path else None,
+            current_manifest_path=str(manifest_path) if manifest_path else None,
         )
     )
     return (
@@ -65,6 +103,9 @@ def _judgment(
         missing_information=["sample-level evidence"] if decision == "investigate" else [],
         next_action=next_action,
         explanation="The current judgment follows the available project evidence.",
+        evidence_refs=(
+            ["project_description_excerpt"] if status == "evidence_backed" else []
+        ),
         target_file_count=target_file_count,
         evidence_stage=evidence_stage,
     )
@@ -95,6 +136,41 @@ def test_decision_requires_a_matching_next_action() -> None:
             explanation="Exclude must point at project exclusion.",
             evidence_stage="inspection",
         )
+
+
+def test_evidence_backed_usable_grade_cannot_be_blocked_by_soft_preferences(
+    tmp_path: Path,
+) -> None:
+    service, _store, _request = _service(
+        tmp_path,
+        run_id="soft_preference_is_not_a_gate",
+        inspected=["PXD_SOFT_ONLY"],
+    )
+    judgment = ProjectJudgmentInput(
+        project_accession="PXD_SOFT_ONLY",
+        grade=2,
+        status="evidence_backed",
+        hard_gate="pass",
+        confidence=0.8,
+        decision="investigate",
+        missing_information=["A newer instrument would be preferred."],
+        next_action="investigate_missing_evidence",
+        explanation=(
+            "The project is usable, but a soft instrument-generation preference "
+            "was not met."
+        ),
+        evidence_refs=["project_description_excerpt"],
+        limitations=["Legacy instrument"],
+        evidence_stage="inspection",
+    )
+
+    result = service.record_project_judgments([judgment])
+
+    assert result["status"] == "blocked"
+    assert result["blockers"] == [
+        "evidence_backed_usable_grade_requires_include:PXD_SOFT_ONLY"
+    ]
+    assert "soft preferences" in result["recommended_action"]
 
 
 def test_inspection_stage_judgments_require_prior_inspection(tmp_path: Path) -> None:
@@ -205,14 +281,25 @@ def test_manifest_selection_requires_pass_grade_two_and_evidence_backed_judgment
     manifest = DatasetManifest(
         run_id="selection_gate",
         request=request,
-        projects=[DiscoveredProject(project_accession=accession) for accession in accessions],
+        projects=[
+            DiscoveredProject(
+                project_accession=accession,
+                project_description="Persisted inspected project evidence.",
+            )
+            for accession in accessions
+        ],
         files=[
             DiscoveredFile(
                 project_accession=accession,
                 file_name=f"{accession}.raw",
+                file_accession_or_path=f"{accession}.raw",
+                download_url=f"https://example.test/{accession}.raw",
+                transfer_method="https",
                 file_type=".raw",
+                file_role="raw_acquisition",
                 validity_status="valid",
                 evidence_level="file",
+                expected_size_bytes=1024,
             )
             for accession in accessions
         ],
@@ -357,14 +444,24 @@ def test_selection_continues_until_target_or_repeated_no_qualified_gain(
     manifest = DatasetManifest(
         run_id="qualified_stop",
         request=request,
-        projects=[DiscoveredProject(project_accession="PXD_ONE")],
+        projects=[
+            DiscoveredProject(
+                project_accession="PXD_ONE",
+                project_description="Persisted inspected project evidence.",
+            )
+        ],
         files=[
             DiscoveredFile(
                 project_accession="PXD_ONE",
                 file_name="PXD_ONE.raw",
+                file_accession_or_path="PXD_ONE.raw",
+                download_url="https://example.test/PXD_ONE.raw",
+                transfer_method="https",
                 file_type=".raw",
+                file_role="raw_acquisition",
                 validity_status="valid",
                 evidence_level="file",
+                expected_size_bytes=1024,
             )
         ],
         summary={"selected_projects": 1, "selected_files": 1},
@@ -431,14 +528,25 @@ def test_automatic_agent_fallback_cannot_restore_unqualified_projects(
     manifest = DatasetManifest(
         run_id="auto_gate",
         request=request,
-        projects=[DiscoveredProject(project_accession=item) for item in accessions],
+        projects=[
+            DiscoveredProject(
+                project_accession=item,
+                project_description="Persisted inspected project evidence.",
+            )
+            for item in accessions
+        ],
         files=[
             DiscoveredFile(
                 project_accession=item,
                 file_name=f"{item}.raw",
+                file_accession_or_path=f"{item}.raw",
+                download_url=f"https://example.test/{item}.raw",
+                transfer_method="https",
                 file_type=".raw",
+                file_role="raw_acquisition",
                 validity_status="valid",
                 evidence_level="file",
+                expected_size_bytes=1024,
             )
             for item in accessions
         ],
@@ -454,6 +562,11 @@ def test_automatic_agent_fallback_cannot_restore_unqualified_projects(
             update={
                 "candidate_pool_manifest_path": str(manifest_path),
                 "current_manifest_path": str(manifest_path),
+                # Exercise deterministic fallback filtering after the search
+                # loop has stopped. While budget remains, the quality gate
+                # correctly asks the agent to keep looking for project 2.
+                "search_stopped": True,
+                "stop_reason": "test_selection_boundary",
             }
         )
     )

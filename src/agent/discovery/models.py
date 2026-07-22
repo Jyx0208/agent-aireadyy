@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 from pydantic import Field
 
+from agent.discovery.constraints import ScientificConstraint
 from agent.models import JsonModel
 
 
@@ -27,6 +28,18 @@ EvidenceLevel = Literal["file", "mixed", "project", "weak", "unknown"]
 TaskReadinessStatus = Literal["ready", "weak_ready", "not_ready"]
 DiscoveryRepository = Literal["pride", "massive", "iprox", "auto", "local"]
 SpeciesPolicy = Literal["open", "include_only", "exclude"]
+RunHorizon = Literal[
+    "plan_only",
+    "candidates_only",
+    "candidates_reviewed",
+    "ai_ready_table",
+    "pre_release",
+    "full_release",
+]
+MixedAcquisitionPolicy = Literal["reject_mixed", "review_mixed", "allow"]
+QuotaFlexibility = Literal["fixed", "recommended", "open_ended"]
+TimeBudgetPreference = Literal["fast", "multi_round"]
+SafetyCeilingPolicy = Literal["ask", "auto_continue_within_safety", "stop"]
 
 
 class DatasetRequest(JsonModel):
@@ -37,8 +50,17 @@ class DatasetRequest(JsonModel):
     query_terms: list[str] = Field(default_factory=list)
     species: list[str] = Field(default_factory=list)
     species_policy: SpeciesPolicy = "open"
-    acquisition_mode: str = "dda"
-    labeling_strategy: str = "label_free"
+    acquisition_mode: str = "unknown"
+    labeling_strategy: str = "unknown"
+    labeling_hard: bool = False
+    mixed_acquisition_policy: MixedAcquisitionPolicy = "review_mixed"
+    instrument_preference: Literal[
+        "none", "newer", "classic", "newer_with_legacy_floor"
+    ] = "none"
+    legacy_floor_ratio: float | None = Field(default=None, ge=0.0, le=1.0)
+    exclude_rules: list[str] = Field(default_factory=list)
+    success_criteria: list[str] = Field(default_factory=list)
+    scientific_constraints: list[ScientificConstraint] = Field(default_factory=list)
     canonical_species: list[str] = Field(default_factory=list)
     organism_taxon_id: list[str] = Field(default_factory=list)
     modification_scope: str | None = None
@@ -48,26 +70,23 @@ class DatasetRequest(JsonModel):
     immunopeptide_evidence_terms: list[str] = Field(default_factory=list)
     immunopeptide_enrichment_methods: list[str] = Field(default_factory=list)
     immunopeptide_metadata_confidence: float = 0.0
-    max_projects: int = Field(default=100, ge=1)
-    max_files: int = Field(default=2000, ge=1)
-    max_candidate_projects: int = Field(default=300, ge=1)
-    max_files_per_project: int = Field(default=50, ge=1)
+    max_projects: int = Field(default=500, ge=1, le=5000)
+    max_files: int = Field(default=20000, ge=1, le=200000)
+    max_candidate_projects: int = Field(default=2000, ge=1, le=20000)
+    max_files_per_project: int = Field(default=300, ge=1, le=5000)
     quantity_scope: Literal["unspecified", "portfolio", "per_project"] = "unspecified"
     portfolio_size_preference: str | None = None
+    quota_flexibility: QuotaFlexibility = "recommended"
+    run_horizon: RunHorizon = "candidates_only"
+    time_budget_preference: TimeBudgetPreference = "multi_round"
+    on_safety_ceiling: SafetyCeilingPolicy = "ask"
+    # Soft harvest ambition for "越多越好". Not a hard truncation limit when set with portfolio maximize.
+    harvest_all_qualified: bool = False
     per_project_min_files: int | None = Field(default=None, ge=1)
     per_project_min_samples: int | None = Field(default=None, ge=1)
-    hard_constraint_fields: list[str] = Field(
-        default_factory=lambda: [
-            "repository",
-            "goal",
-            "ptm_type",
-            "ptm_types",
-            "species",
-            "species_policy",
-            "acquisition_mode",
-            "labeling_strategy",
-        ]
-    )
+    # Only repository is hard by default. Unstated scientific fields stay open so the
+    # Discovery Agent can explore instead of being locked into parser defaults.
+    hard_constraint_fields: list[str] = Field(default_factory=lambda: ["repository"])
     constraint_provenance: dict[str, str] = Field(default_factory=dict)
 
     def is_hard_constraint(self, field_name: str) -> bool:
@@ -115,12 +134,17 @@ class DiscoveredProject(JsonModel):
     evidence: list[DiscoveryEvidence] = Field(default_factory=list)
     instrument_names: list[str] = Field(default_factory=list)
     instrument_families: list[str] = Field(default_factory=list)
+    instrument_generation_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    instrument_generation_label: str | None = None
+    project_publication_date: str | None = None
+    project_submission_date: str | None = None
     fragmentation_methods: list[str] = Field(default_factory=list)
     lc_gradient: str | None = None
     lc_gradient_minutes: float | None = None
     diversity_tags: list[str] = Field(default_factory=list)
     file_count: int = 0
     selected_file_count: int = 0
+    sdrf_summary: dict[str, Any] = Field(default_factory=dict)
     raw_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -197,6 +221,8 @@ class DiscoveredFile(JsonModel):
     evidence: list[DiscoveryEvidence] = Field(default_factory=list)
     instrument_names: list[str] = Field(default_factory=list)
     instrument_families: list[str] = Field(default_factory=list)
+    instrument_generation_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    instrument_generation_label: str | None = None
     fragmentation_methods: list[str] = Field(default_factory=list)
     lc_gradient: str | None = None
     lc_gradient_minutes: float | None = None

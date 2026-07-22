@@ -335,13 +335,14 @@
         </div>
         <div class="jobs-controls">
           <div class="field">
-            <label for="poolBuildScale">覆盖规模</label>
+            <label for="poolBuildScale">覆盖规模（可选）</label>
             <select id="poolBuildScale">
-              <option value="auto">自动理解 Prompt（推荐）</option>
+              <option value="auto" selected>自动 / Agent 自主（推荐）</option>
               <option value="curated">精选（约 10～30 个项目）</option>
               <option value="balanced">均衡（约 50～100 个项目）</option>
               <option value="exhaustive">尽量搜全（安全上限内尽量多）</option>
             </select>
+            <small class="help">默认自动：不强制数量帽，由 Agent 在服务器安全上限内决定。只有需要明确规模时再选手动档位。</small>
           </div>
           <div class="field">
             <label for="poolBuildOutputLanguage">说明语言</label>
@@ -412,13 +413,17 @@
           </div>
         </div>
         <div class="filter-row dev-only hidden" id="reviewFlagFilterRow">
-          <span class="filter-label">复核标记</span>
-          <div class="queue-bar" id="reviewFlagFilterBar" aria-label="复核标记">
-            <button type="button" data-flag="all" aria-pressed="true">全部标记</button>
-            <button type="button" data-flag="low_confidence" aria-pressed="false">低置信</button>
-            <button type="button" data-flag="vote_disagreement" aria-pressed="false">内部复核分歧</button>
-            <button type="button" data-flag="hard_constraint_conflicts" aria-pressed="false">硬约束冲突</button>
+          <span class="filter-label">多模型共识问题</span>
+          <div class="queue-bar" id="reviewFlagFilterBar" aria-label="多模型共识问题">
+            <button type="button" data-flag="all" aria-pressed="true">全部问题</button>
+            <button type="button" data-flag="awaiting_models" aria-pressed="false">仅一个模型</button>
+            <button type="button" data-flag="no_formal_consensus" aria-pressed="false">未形成正式共识</button>
+            <button type="button" data-flag="model_score_disagreement" aria-pressed="false">模型评分不一致</button>
+            <button type="button" data-flag="major_disagreement" aria-pressed="false">严重分歧</button>
+            <button type="button" data-flag="hard_gate_disagreement" aria-pressed="false">硬约束分歧</button>
+            <button type="button" data-flag="needs_adjudication" aria-pressed="false">需仲裁</button>
           </div>
+          <small class="pool-meta">问题可重叠：模型评分不一致＝不同模型最终 0–3 分不同；严重分歧＝最高与最低相差至少 2 分；正式共识只认结构化 model_expert_consensus，普通单模型 Job 结果相同也不会冒充正式共识。</small>
         </div>
       </div>
       <section class="review-shell">
@@ -587,7 +592,7 @@
         <div id="jobsList" aria-live="polite"></div>
         <div class="job-detail" id="jobDetail" aria-live="polite">请选择一个 Job 查看详情。</div>
         <div class="field" style="margin-top:8px">
-          <label for="jobLog">选中 Job 日志</label>
+          <label for="jobLog">选中 Job 日志（浏览器本地时间）</label>
           <div class="log-box" id="jobLog" role="log" aria-live="polite" aria-relevant="additions text" tabindex="0">尚未选择 Job。</div>
         </div>
         <div class="job-actions" style="margin-top:8px">
@@ -726,7 +731,7 @@
       const allowedModes = new Set(["expert", "developer", "test"]);
       const allowedCompletionFilters = new Set(["all", "graded", "ungraded"]);
       const allowedScoreFilters = new Set(["all", "0", "1", "2", "3"]);
-      const allowedFlagFilters = new Set(["all", "low_confidence", "vote_disagreement", "hard_constraint_conflicts"]);
+      const allowedFlagFilters = new Set(["all", "awaiting_models", "no_formal_consensus", "model_score_disagreement", "major_disagreement", "hard_gate_disagreement", "needs_adjudication"]);
 
       function normalize(raw) {
         if (!raw || typeof raw !== "object" || !allowedSources.has(raw.source)) return null;
@@ -1301,12 +1306,44 @@
         setReviewStatus(`上次工作区来自本地文件 ${state.local_file_name || "未命名文件"}。请重新选择该文件；浏览器不会保存文件路径或完整池内容。`, "info");
         return false;
       }
-      if (!state.pool_id) return false;
-      reviewerId.value = state.reviewer_id || "";
-      reviewerContext = reviewerId.value.trim();
-      if (!initialModeWasExplicit) reviewMode.value = state.desired_mode || "expert";
-      await refreshStatus();
-      return openServerPool(state.pool_id, state.candidate_id || null, state);
+      const restoreButton = byId("restoreWorkspaceButton");
+      const memoryStatus = byId("workspaceMemoryStatus");
+      if (!state.pool_id) {
+        memoryStatus.textContent = "恢复失败：最近工作区没有记录服务端池 ID。";
+        setReviewStatus("恢复失败：最近工作区记录不完整。", "error", true);
+        return false;
+      }
+      restoreButton.disabled = true;
+      memoryStatus.textContent = `正在恢复服务端池 ${state.pool_id}…`;
+      try {
+        reviewerId.value = state.reviewer_id || "";
+        reviewerContext = reviewerId.value.trim();
+        if (!initialModeWasExplicit) reviewMode.value = state.desired_mode || "expert";
+
+        if (pool && poolSource === "server" && poolIdentity === `server:${state.pool_id}`) {
+          applyWorkspaceControls(state);
+          applyFilter(state.candidate_id || null, false);
+          saveWorkspaceMemory();
+          memoryStatus.textContent = `已恢复到候选 ${state.candidate_id || "上次位置"}。`;
+          setReviewStatus(`已恢复服务端池 ${state.pool_id} 的位置和筛选。`, "success");
+          return true;
+        }
+
+        await refreshStatus();
+        const restored = await openServerPool(state.pool_id, state.candidate_id || null, state);
+        if (restored) {
+          memoryStatus.textContent = `已恢复服务端池 ${state.pool_id}，当前候选 ${state.candidate_id || "上次位置"}。`;
+          return true;
+        }
+        memoryStatus.textContent = `恢复失败：服务端池 ${state.pool_id} 不存在或不可读。浏览器只保存了位置，未保存完整候选池。`;
+        return false;
+      } catch (error) {
+        memoryStatus.textContent = `恢复失败：${error.message}`;
+        setReviewStatus(`恢复最近工作区失败：${error.message}`, "error", true);
+        return false;
+      } finally {
+        restoreButton.disabled = false;
+      }
     }
 
     function localIdentity(parsed, fileName) {
@@ -1325,13 +1362,37 @@
 
     function reviewFlags(candidate) {
       if (!isGraded(candidate) || !isDevMode()) return [];
-      const { votes } = machineReviewProjection(candidate);
+      const { runs, expertJudgments, consensus } = machineReviewProjection(candidate);
       const flags = [];
-      const conflicts = votes.flatMap((vote) => asTextList(vote && vote.constraint_conflicts));
-      if (conflicts.length) flags.push("hard_constraint_conflicts");
-      const grades = [...new Set(votes.map((vote) => Number(vote && vote.grade)).filter(Number.isInteger))];
-      if (grades.length >= 2 && Math.max(...grades) - Math.min(...grades) >= 2) flags.push("vote_disagreement");
-      if ((candidate.judgment_confidence || candidate.confidence) === "low") flags.push("low_confidence");
+      const triggerReasons = asTextList(consensus && consensus.trigger_reasons);
+      const runByModel = new Map();
+      runs.forEach((run) => {
+        const model = String(run && run.model || "").trim().toLowerCase();
+        const grade = Number(run && run.grade);
+        if (model && Number.isInteger(grade)) runByModel.set(model, grade);
+      });
+      const judgmentByProfile = new Map();
+      expertJudgments.forEach((judgment) => {
+        const profileId = String(judgment && judgment.profile && judgment.profile.profile_id || "").trim();
+        const grade = Number(judgment && judgment.final_grade);
+        if (profileId && Number.isInteger(grade)) judgmentByProfile.set(profileId, grade);
+      });
+      const finalGrades = judgmentByProfile.size ? [...judgmentByProfile.values()] : [...runByModel.values()];
+      const distinctGrades = [...new Set(finalGrades)];
+      const hasMultipleModels = finalGrades.length >= 2;
+      const consensusStatus = String(consensus && consensus.status || "");
+      const hasFormalConsensus = consensusStatus === "model_expert_consensus";
+      if (!hasMultipleModels && !hasFormalConsensus) flags.push("awaiting_models");
+      if (hasMultipleModels && !hasFormalConsensus) flags.push("no_formal_consensus");
+      if (distinctGrades.length >= 2) flags.push("model_score_disagreement");
+      if (finalGrades.length >= 2 && Math.max(...finalGrades) - Math.min(...finalGrades) >= 2) flags.push("major_disagreement");
+      const hardGateOutcomes = expertJudgments
+        .map((judgment) => String(judgment && judgment.hard_gate_outcome || "").toLowerCase())
+        .filter(Boolean);
+      if (new Set(hardGateOutcomes).size >= 2 || triggerReasons.includes("hard_gate_conflict")) {
+        flags.push("hard_gate_disagreement");
+      }
+      if (consensusStatus === "needs_adjudication") flags.push("needs_adjudication");
       return flags;
     }
 
@@ -1380,10 +1441,13 @@
         button.textContent = score === "all" ? `全部分数 ${gradedCount}` : `${score} 分 ${scoreCounts.get(Number(score)) || 0}`;
       });
       const flagLabels = {
-        all: "全部标记",
-        low_confidence: "低置信",
-        vote_disagreement: "内部复核分歧",
-        hard_constraint_conflicts: "硬约束冲突",
+        all: "全部问题",
+        awaiting_models: "仅一个模型",
+        no_formal_consensus: "未形成正式共识",
+        model_score_disagreement: "模型评分不一致",
+        major_disagreement: "严重分歧",
+        hard_gate_disagreement: "硬约束分歧",
+        needs_adjudication: "需仲裁",
       };
       document.querySelectorAll("#reviewFlagFilterBar button").forEach((button) => {
         const flag = button.dataset.flag;
@@ -2934,7 +2998,7 @@
           logList.setAttribute("aria-label", `${build.build_id} ${tr("构建日志", "build log")}`);
           for (const entry of logs.slice(-8)) {
             const item = document.createElement("li");
-            item.textContent = `${entry.ts || ""}${entry.level ? ` [${levelText(entry.level)}]` : ""} ${entry.message || ""}`.trim();
+            item.textContent = `${formatDate(entry.ts)}${entry.level ? ` [${levelText(entry.level)}]` : ""} ${entry.message || ""}`.trim();
             logList.appendChild(item);
           }
           summary.appendChild(logList);
@@ -3158,7 +3222,7 @@
       jobLog.textContent = logs.map((log) => {
         const level = String(log.level || "info");
         const levelLabel = jobLanguage(job).startsWith("zh") ? ({info: "信息", warning: "警告", error: "错误"}[level] || level) : level;
-        return `${log.ts || ""} [${levelLabel}] ${localizedJobLogMessage(job, log.message)}`;
+        return `${formatDate(log.ts)} [${levelLabel}] ${localizedJobLogMessage(job, log.message)}`;
       }).join("\n") || jobText(job, "无日志。", "No logs.");
       jobLog.scrollTop = jobLog.scrollHeight;
       byId("cancelJobButton").textContent = jobText(job, "取消任务", "Cancel job");
@@ -3296,11 +3360,16 @@
         });
         if (!payload.ok || !payload.job) throw new Error(payload.error || "启动失败");
         selectedJobId = payload.job.job_id;
-        setJobStatus(`已启动 ${selectedJobId}。`);
+        setJobStatus(payload.job.reused_existing
+          ? `该模型在当前评审池已有任务，已打开原任务 ${selectedJobId}。同一模型不会重复评审。`
+          : `已启动 ${selectedJobId}。`);
         await refreshJobs();
-        scheduleJobPolling();
+        if (activeJobStatuses.has(payload.job.status)) scheduleJobPolling();
       } catch (error) {
-        setJobStatus(`启动失败：${error.message}`, true);
+        const message = String(error.message || "");
+        setJobStatus(message.startsWith("model_already_reviewed_pool:")
+          ? `该模型已经评审过当前候选池，不能重复创建任务。`
+          : `启动失败：${message}`, true);
       } finally {
         byId("startJobButton").disabled = false;
       }

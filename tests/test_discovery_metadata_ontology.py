@@ -14,7 +14,7 @@ from agent.discovery.ontology import (
 from agent.discovery.query_builder import build_pride_queries
 from agent.discovery.scoring import score_project
 from agent.discovery.task_readiness import annotate_manifest_task_readiness
-from agent.discovery.validity import assess_project_validity
+from agent.discovery.validity import assess_file_validity, assess_project_validity
 from agent.discovery.value_scoring import annotate_manifest_value_scores
 
 
@@ -27,6 +27,8 @@ def test_metadata_ontology_normalizes_core_species_ptm_and_labeling() -> None:
     assert normalize_ptm_type("lysine acetylation") == "acetyl"
     assert normalize_labeling_strategy("TMT16") == "TMT"
     assert normalize_labeling_strategy("itraq8") == "iTRAQ"
+    assert normalize_labeling_strategy("SILAC") == "SILAC"
+    assert normalize_labeling_strategy("reductive dimethylation") == "dimethyl"
 
 
 def test_dataset_request_defaults_to_general_open_species() -> None:
@@ -349,3 +351,22 @@ def test_immunopeptide_project_scoring_and_validity_do_not_require_ptm_evidence(
     assert score.immunopeptide_scope == "immunopeptidomics"
     assert "strong_immunopeptide_evidence" in decision.reasons
     assert "weak_ptm_evidence" not in decision.reasons
+
+
+def test_immunopeptide_file_validity_excludes_mixed_project_proteasome_files() -> None:
+    request = DatasetRequest(goal="immunopeptidomics", species=["human"])
+    file = DiscoveredFile(
+        project_accession="PXD_MIXED",
+        file_name="tumor_PROTEASOME_fraction_01.raw",
+        file_type=".raw",
+        file_role="raw_acquisition",
+        species=["human"],
+        immunopeptide_evidence_terms=["HLA ligandome"],
+        evidence_level="project",
+    )
+
+    decision = assess_file_validity(file, request)
+
+    assert decision.status == "exclude"
+    assert decision.needs_review is True
+    assert "file_name_assay_context_conflict" in decision.reasons

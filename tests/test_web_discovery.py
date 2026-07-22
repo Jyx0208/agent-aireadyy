@@ -507,7 +507,11 @@ def test_discovery_job_recovers_completed_state_after_memory_loss(monkeypatch, t
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setattr(web_app, "discover_pride_dataset", lambda request, memory=None, **_kwargs: _manifest(request))
 
-    created = asyncio.run(web_app.start_discovery_job({"max_projects": 1, "max_files": 1}))
+    created = asyncio.run(
+        web_app.start_discovery_job(
+            {"max_projects": 1, "max_files": 1, "grill_confirmed": True}
+        )
+    )
     job_id = created["job_id"]
     final = _wait_discovery_job(job_id)
     assert final["status"] == "completed"
@@ -542,7 +546,11 @@ def test_web_worker_notifies_project_execution_coordinator(monkeypatch, tmp_path
 
     monkeypatch.setattr(web_app, "_project_execution_coordinator", lambda: FakeCoordinator())
 
-    created = asyncio.run(web_app.start_discovery_job({"max_projects": 1, "max_files": 1}))
+    created = asyncio.run(
+        web_app.start_discovery_job(
+            {"max_projects": 1, "max_files": 1, "grill_confirmed": True}
+        )
+    )
     final = _wait_discovery_job(created["job_id"])
 
     assert final["status"] == "completed"
@@ -556,7 +564,12 @@ def test_discovery_job_can_defer_worker_until_response(monkeypatch, tmp_path: Pa
     monkeypatch.setattr(web_app, "discover_pride_dataset", lambda request, memory=None, **_kwargs: _manifest(request))
 
     background_tasks = BackgroundTasks()
-    created = asyncio.run(web_app.start_discovery_job({"max_projects": 1, "max_files": 1}, background_tasks))
+    created = asyncio.run(
+        web_app.start_discovery_job(
+            {"max_projects": 1, "max_files": 1, "grill_confirmed": True},
+            background_tasks,
+        )
+    )
     job_id = created["job_id"]
     assert created["status"] == "queued"
 
@@ -1153,6 +1166,7 @@ def test_discovery_job_is_durable_idempotent_and_does_not_persist_api_key(monkey
         )
     )
     body = {
+        "grill_confirmed": True,
         "project_id": project["project_id"],
         "idempotency_key": "discovery:plan-revision-1",
         "prompt": "Find human DDA projects",
@@ -1183,7 +1197,11 @@ def test_interrupted_durable_discovery_job_can_be_resumed(monkeypatch, tmp_path:
     monkeypatch.setattr(web_app, "_start_discovery_job_thread", started.append)
     created = asyncio.run(
         web_app.start_discovery_job(
-            {"prompt": "Find human DDA projects", "idempotency_key": "resume-test"}
+            {
+                "prompt": "Find human DDA projects",
+                "idempotency_key": "resume-test",
+                "grill_confirmed": True,
+            }
         )
     )
     job_id = created["job_id"]
@@ -1216,7 +1234,11 @@ def test_discovery_job_can_be_cancelled(monkeypatch, tmp_path: Path):
         return _manifest(request)
 
     monkeypatch.setattr(web_app, "discover_pride_dataset", slow_discovery)
-    created = asyncio.run(web_app.start_discovery_job({"max_projects": 1, "max_files": 1}))
+    created = asyncio.run(
+        web_app.start_discovery_job(
+            {"max_projects": 1, "max_files": 1, "grill_confirmed": True}
+        )
+    )
     job_id = created["job_id"]
     try:
         cancel = asyncio.run(web_app.cancel_discovery_job(job_id))
@@ -1857,6 +1879,7 @@ def test_discovery_job_failed_agents_run_keeps_public_record(monkeypatch, tmp_pa
     created = asyncio.run(
         web_app.start_discovery_job(
             {
+                "grill_confirmed": True,
                 "runtime": "openai_agents",
                 "prompt": "Tight ceiling discovery",
                 "max_projects": 1,
@@ -1877,6 +1900,53 @@ def test_discovery_job_failed_agents_run_keeps_public_record(monkeypatch, tmp_pa
     assert job["record"]["output_dir"]
     assert job["record"]["status"] == "failed"
     assert "Max turns" in (job["record"]["agent"].get("error") or job["error"])
+
+
+
+def test_discovery_error_localization_preserves_detail_and_raw_persist(monkeypatch, tmp_path: Path):
+    """Failed jobs keep forensic English on disk; API localizes without progress fallback."""
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+
+    raw_error = "Discovery request is required for OpenAI Agents mode."
+    job = {
+        "job_id": "discovery_job_test_localize",
+        "idempotency_key": None,
+        "status": "failed",
+        "created_at": "2026-07-20T20:10:42+08:00",
+        "started_at": "2026-07-20T20:10:42+08:00",
+        "finished_at": "2026-07-20T20:10:42+08:00",
+        "cancel_requested": False,
+        "output_language": "zh-CN",
+        "logs": [
+            {"sequence": 1, "ts": "t", "level": "info", "message": "Discovery job queued."},
+            {"sequence": 2, "ts": "t", "level": "error", "message": f"Discovery failed: {raw_error}"},
+        ],
+        "body": {"prompt": "find immunopeptide data", "llm_config": {"api_key": "secret-key", "model": "m"}},
+        "record": None,
+        "error": raw_error,
+    }
+
+    # Localization must not wipe the real exception into the progress fallback.
+    localized_error = web_app._localize_discovery_message(raw_error, "zh-CN")
+    assert "数据发现进度已更新" not in localized_error
+    assert raw_error in localized_error or "失败" in localized_error
+
+    failed_log = web_app._localize_discovery_message(f"Discovery failed: {raw_error}", "zh-CN")
+    assert "数据发现进度已更新" not in failed_log
+    assert raw_error in failed_log
+
+    public = web_app._discovery_job_public(job, detail=True)
+    assert public["status"] == "failed"
+    assert public["error"]
+    assert "数据发现进度已更新" not in str(public["error"])
+    assert raw_error in str(public["error"]) or "失败" in str(public["error"])
+
+    web_app._persist_discovery_job(job)
+    disk = web_app._load_discovery_job(job["job_id"])
+    assert disk is not None
+    assert disk["error"] == raw_error  # raw English on disk
+    assert "secret-key" not in json.dumps(disk, ensure_ascii=False)
+    assert disk["logs"][-1]["message"].startswith("Discovery failed:")
 
 
 def test_discovery_tool_wrappers_raise_when_cancel_requested() -> None:
@@ -1900,7 +1970,11 @@ def test_discovery_job_get_defaults_to_slim_record(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setattr(web_app, "discover_pride_dataset", lambda request, memory=None, **_kwargs: _manifest(request))
     monkeypatch.setattr(web_app, "_start_discovery_job_thread", lambda job_id: web_app._run_discovery_job(job_id))
-    created = asyncio.run(web_app.start_discovery_job({"max_projects": 1, "max_files": 1}))
+    created = asyncio.run(
+        web_app.start_discovery_job(
+            {"max_projects": 1, "max_files": 1, "grill_confirmed": True}
+        )
+    )
     final = _wait_discovery_job(created["job_id"])
     assert final["status"] == "completed"
     slim = asyncio.run(web_app.get_discovery_job(created["job_id"]))

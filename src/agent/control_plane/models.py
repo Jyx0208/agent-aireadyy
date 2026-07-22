@@ -23,8 +23,17 @@ ToolRisk = Literal["read_only", "bounded_write", "expensive", "biological", "for
 PolicyOutcome = Literal["allow", "approval_required", "deny"]
 ToolCallStatus = Literal["started", "completed", "failed", "denied"]
 BudgetDecisionKind = Literal["grant", "shrink", "replan", "stop"]
-SearchGrantStatus = Literal["issued", "consumed", "rejected", "expired"]
+SearchGrantStatus = Literal["issued", "consumed", "rejected", "expired", "abandoned"]
 BudgetReviewOutcome = Literal["granted", "replan", "stopped", "denied"]
+DiscoveryAuditStatus = Literal["ready", "repair_required", "blocked"]
+DiscoveryAuditSeverity = Literal["info", "warning", "error"]
+DiscoveryRepairKind = Literal[
+    "search_more",
+    "inspect_candidates",
+    "rescore_projects",
+    "select_manifest",
+    "stop_with_limitations",
+]
 
 
 def utc_now_iso() -> str:
@@ -37,39 +46,47 @@ def minimum_high_relevance_inspections(
 ) -> int:
     if high_relevance_candidate_count <= 0:
         return 0
-    return min(
-        int(high_relevance_candidate_count),
-        max(1, int(max_projects) * 2),
-    )
+    high = int(high_relevance_candidate_count)
+    target = max(1, int(max_projects))
+    # Maximize / large harvests: require broad inspection, but never demand inspecting
+    # every high-relevance hit before any finalization is allowed.
+    if target >= 100:
+        return min(high, max(target, min(300, high)))
+    return min(high, max(1, target * 2))
 
 
 def recommended_inspection_rounds(
     target_projects: int,
     *,
     batch_size: int = 25,
-    max_rounds: int = 8,
+    max_rounds: int = 20,
 ) -> int:
     target = max(1, int(target_projects))
     batch = max(1, int(batch_size))
+    # Large maximize targets need more inspection rounds than curated pilots.
+    if target >= 100:
+        return min(max(8, int(max_rounds)), max(8, (min(target, 500) + batch - 1) // batch))
     return min(max(1, int(max_rounds)), (target + batch - 1) // batch)
 
 
 class AgentBudget(JsonModel):
-    max_turns: int = Field(default=8, ge=1, le=50)
-    max_tool_calls: int = Field(default=12, ge=1, le=100)
-    max_discovery_rounds: int = Field(default=3, ge=1, le=8)
-    max_expensive_actions: int = Field(default=0, ge=0, le=20)
+    max_turns: int = Field(default=50, ge=1, le=200)
+    max_tool_calls: int = Field(default=200, ge=1, le=500)
+    max_discovery_rounds: int = Field(default=8, ge=1, le=30)
+    max_expensive_actions: int = Field(default=0, ge=0, le=50)
     max_download_bytes: int = Field(default=0, ge=0)
 
 
 class DynamicBudgetLimits(JsonModel):
-    initial_query_units: int = Field(default=12, ge=1, le=500)
-    expanded_query_units: int = Field(default=30, ge=1, le=500)
-    max_query_units: int = Field(default=60, ge=1, le=500)
-    initial_repository_requests: int = Field(default=80, ge=1, le=5000)
-    expanded_repository_requests: int = Field(default=160, ge=1, le=5000)
-    max_repository_requests: int = Field(default=300, ge=1, le=5000)
-    max_elapsed_seconds: int = Field(default=1800, ge=30, le=86400)
+    # Generous hard ceilings: broad PRIDE paging + deep inspection should not trip
+    # these under normal "越多越好" runs. Override via env only when needed.
+    initial_query_units: int = Field(default=200, ge=1, le=10000)
+    expanded_query_units: int = Field(default=600, ge=1, le=10000)
+    max_query_units: int = Field(default=2000, ge=1, le=10000)
+    initial_repository_requests: int = Field(default=3000, ge=1, le=100000)
+    expanded_repository_requests: int = Field(default=10000, ge=1, le=100000)
+    max_repository_requests: int = Field(default=25000, ge=1, le=100000)
+    max_elapsed_seconds: int = Field(default=14400, ge=30, le=172800)
     budget_agent_max_turns: int = Field(default=3, ge=2, le=10)
 
 
@@ -183,6 +200,47 @@ class SearchDiagnosis(JsonModel):
     reason: str = ""
 
 
+class DiscoveryAuditIssue(JsonModel):
+    """One public, evidence-addressable quality finding (never hidden reasoning)."""
+
+    code: str = Field(min_length=1, max_length=120)
+    severity: DiscoveryAuditSeverity
+    summary: str = Field(min_length=1, max_length=1000)
+    project_accessions: list[str] = Field(default_factory=list, max_length=500)
+    constraint_ids: list[str] = Field(default_factory=list, max_length=200)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=100)
+
+
+class DiscoveryRepairAction(JsonModel):
+    """A bounded next operation derived from an audit finding."""
+
+    action: DiscoveryRepairKind
+    reason: str = Field(min_length=1, max_length=1000)
+    project_accessions: list[str] = Field(default_factory=list, max_length=500)
+    constraint_ids: list[str] = Field(default_factory=list, max_length=200)
+
+
+class DiscoveryQualityAudit(JsonModel):
+    """Replayable selection-readiness report for the discovery Agent and UI."""
+
+    schema_version: str = "discovery-quality-audit/v1"
+    run_id: str
+    status: DiscoveryAuditStatus
+    ready_for_selection: bool = False
+    counts: dict[str, int] = Field(default_factory=dict)
+    requested_inspection_accessions: list[str] = Field(default_factory=list)
+    succeeded_inspection_accessions: list[str] = Field(default_factory=list)
+    non_assessable_inspection_accessions: list[str] = Field(default_factory=list)
+    failed_inspection_accessions: list[str] = Field(default_factory=list)
+    selection_backed_coverage: float | None = Field(default=None, ge=0.0, le=1.0)
+    selection_backed_intent_terms: list[str] = Field(default_factory=list)
+    uncovered_intent_terms: list[str] = Field(default_factory=list)
+    unsupported_coverage_terms: list[str] = Field(default_factory=list)
+    issues: list[DiscoveryAuditIssue] = Field(default_factory=list)
+    repair_actions: list[DiscoveryRepairAction] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+
+
 class BudgetReviewResult(JsonModel):
     outcome: BudgetReviewOutcome
     decision: BudgetDecision
@@ -195,6 +253,20 @@ class ArtifactReference(JsonModel):
     artifact_type: str
     schema_version: str | None = None
     sha256: str | None = None
+
+
+class RuntimeProvenance(JsonModel):
+    """Portable facts that identify the code and dependency runtime for a run."""
+
+    schema_version: str = "runtime-provenance/v2"
+    git_sha: str | None = None
+    git_dirty: bool | None = None
+    git_diff_sha256: str | None = None
+    git_fingerprint_complete: bool | None = None
+    untracked_source_file_count: int = Field(default=0, ge=0)
+    python_version: str
+    package_versions: dict[str, str | None] = Field(default_factory=dict)
+    loaded_module_paths: dict[str, str | None] = Field(default_factory=dict)
 
 
 class PolicyDecision(JsonModel):
@@ -229,6 +301,7 @@ class AgentRunRecord(JsonModel):
     run_id: str
     project_id: str | None = None
     runtime: str = "openai_agents"
+    runtime_provenance: RuntimeProvenance | None = None
     workflow: str
     status: AgentRunStatus = "created"
     prompt: str = ""
@@ -244,6 +317,7 @@ class AgentRunRecord(JsonModel):
     latest_high_relevance_candidate_count: int = 0
     latest_semantic_coverage: float = Field(default=0.0, ge=0.0, le=1.0)
     model_requests: int = 0
+    sdk_turn_count: int = Field(default=0, ge=0)
     model_input_tokens: int = 0
     model_output_tokens: int = 0
     model_total_tokens: int = 0
@@ -266,6 +340,7 @@ class AgentRunRecord(JsonModel):
     search_stopped: bool = False
     search_stop_reason: str | None = None
     latest_metrics: RoundMetrics | None = None
+    latest_discovery_audit: DiscoveryQualityAudit | None = None
     project_judgments: dict[str, ProjectJudgmentInput] = Field(default_factory=dict)
     qualified_project_count: int = Field(default=0, ge=0)
     qualified_no_gain_count: int = Field(default=0, ge=0)
@@ -275,6 +350,12 @@ class AgentRunRecord(JsonModel):
     last_search_strategy: str | None = None
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
+
+    def remaining_model_turn_budget(self) -> int:
+        """Return the conservative shared turn budget across SDK and provider counters."""
+
+        consumed = max(int(self.sdk_turn_count), int(self.model_requests))
+        return max(0, int(self.budget.max_turns) - consumed)
 
 
 class DiscoveryRoundObservation(JsonModel):
@@ -310,11 +391,14 @@ class OpenAIAgentsDiscoveryResult(JsonModel):
     run_id: str
     output_dir: str
     state_db: str
+    runtime_provenance: RuntimeProvenance | None = None
+    sdk_turn_count: int = Field(default=0, ge=0)
     selected_manifest_path: str | None = None
     selected_round_index: int | None = None
     selection_rationale: str | None = None
     discovery_round_count: int = 0
     final_output: str = ""
+    latest_discovery_audit: DiscoveryQualityAudit | None = None
     pending_approvals: list[dict[str, Any]] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)

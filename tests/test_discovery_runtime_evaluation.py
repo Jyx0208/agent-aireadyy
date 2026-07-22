@@ -111,6 +111,16 @@ def test_known_labeling_conflict_is_excluded_from_discovery_selection() -> None:
     from agent.discovery.validity import assess_file_validity
     from agent.discovery.models import DiscoveredFile
 
+    request = _scenario().request.model_copy(
+        update={
+            "hard_constraint_fields": [
+                "repository",
+                "species",
+                "acquisition_mode",
+                "labeling_strategy",
+            ]
+        }
+    )
     decision = assess_file_validity(
         DiscoveredFile(
             project_accession="PXD000001",
@@ -119,7 +129,7 @@ def test_known_labeling_conflict_is_excluded_from_discovery_selection() -> None:
             acquisition_mode="dda",
             labeling_strategy="TMT",
         ),
-        _scenario().request,
+        request,
     )
 
     assert decision.status == "exclude"

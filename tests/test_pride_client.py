@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 
-from agent.pride.client import PrideClient
+from agent.pride.client import PrideClient, PrideInvalidResponseError
 
 
 class _FakeResponse:
@@ -19,7 +20,7 @@ class _FakeResponse:
 
 
 class _FakeHTTPClient:
-    def __init__(self, pages: dict[int, list[dict]]):
+    def __init__(self, pages: dict[int, object]):
         self.pages = pages
         self.calls: list[tuple[str, dict | None]] = []
 
@@ -51,6 +52,70 @@ def test_list_project_files_paginates_until_last_page():
         ("/projects/PXD000001/files", {"pageSize": 2, "page": 0}),
         ("/projects/PXD000001/files", {"pageSize": 2, "page": 1}),
     ]
+
+
+def test_search_projects_paginates_when_caller_requests_broad_coverage():
+    fake_client = _FakeHTTPClient(
+        {
+            0: [{"accession": f"PXD0{index:05d}"} for index in range(100)],
+            1: [{"accession": f"PXD1{index:05d}"} for index in range(50)],
+        }
+    )
+    client = PrideClient()
+    client._client = fake_client
+
+    projects = client.search_projects("human", page_size=100, max_pages=5)
+
+    assert len(projects) == 150
+    assert fake_client.calls == [
+        ("/search/projects", {"keyword": "human", "pageSize": 100, "page": 0}),
+        ("/search/projects", {"keyword": "human", "pageSize": 100, "page": 1}),
+    ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"error": "repository under maintenance"},
+        [{"error": "repository under maintenance"}],
+        ["repository under maintenance"],
+    ],
+)
+def test_search_projects_rejects_http_success_payloads_that_are_not_project_lists(
+    payload: object,
+):
+    client = PrideClient()
+    client._client = _FakeHTTPClient({0: payload})
+
+    with pytest.raises(PrideInvalidResponseError, match="invalid PRIDE response"):
+        client.search_projects("human")
+
+
+def test_search_projects_preserves_true_empty_list_as_zero_results():
+    client = PrideClient()
+    client._client = _FakeHTTPClient({0: []})
+
+    assert client.search_projects("no-scientific-match") == []
+
+
+def test_get_project_rejects_http_success_non_project_payload():
+    client = PrideClient()
+    client._client = _FakeHTTPClient(
+        {0: {"error": "repository under maintenance"}}
+    )
+
+    with pytest.raises(PrideInvalidResponseError, match="invalid PRIDE response"):
+        client.get_project("PXD000001")
+
+
+def test_list_project_files_rejects_http_success_non_list_payload():
+    client = PrideClient()
+    client._client = _FakeHTTPClient(
+        {0: {"error": "repository under maintenance"}}
+    )
+
+    with pytest.raises(PrideInvalidResponseError, match="invalid PRIDE response"):
+        client.list_project_files("PXD000001")
 
 
 def test_list_project_files_honors_pride_page_cap_of_100():
