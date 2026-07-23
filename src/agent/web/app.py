@@ -2252,6 +2252,26 @@ _DISCOVERY_STRATEGY_PATCH_FIELDS = set(_DISCOVERY_STRATEGY_FIRST_CLASS_FIELDS)
 # duplicated model-authored note without invalidating the atomic strategy
 # update, while every execution-affecting field remains required.
 _DISCOVERY_NON_ATOMIC_CONTEXT_FIELDS = {"notes"}
+# Low-risk single-field SDK tool patches skip the independent semantic verifier
+# (speed path). Hard fields and multi-field dumps still take the critic.
+_DISCOVERY_LOW_RISK_SINGLE_FIELD_VERIFIER_SKIP = frozenset(
+    {
+        "objective",
+        "task_type",
+        "species",
+        "acquisition_mode",
+        "coverage_mode",
+        "target_project_count",
+        "labeling_strategy",
+        "instrument_preference",
+        "run_horizon",
+    }
+)
+# On hard verifier reject, retain only soft theme/context fields from the
+# primary update_strategy tool call instead of wiping the whole card.
+_DISCOVERY_SOFT_REJECT_KEEP_FIELDS = frozenset(
+    {"objective", "special_themes", "notes", "task_type"}
+)
 _DISCOVERY_STRATEGY_RESERVED_RUNTIME_FIELDS = {
     "query_terms",
     "diversity_strategy",
@@ -3369,6 +3389,69 @@ def _format_discovery_reconciled_update_message(patch: Mapping[str, Any]) -> str
     return (
         f"已按你这轮明确的要求更新策略：{summary}。"
         "没有列出的现有设置保持不变；其它科学建议只作为讨论，不会悄悄写入策略。"
+    )
+
+
+def _discovery_low_risk_single_field_verifier_skip(
+    patch: Mapping[str, Any],
+    *,
+    tool_interpretation_difference: bool,
+    provider_compatibility_recovery: Mapping[str, Any] | None = None,
+) -> bool:
+    """True when a one-field typed tool patch may skip the second verifier."""
+
+    recovery = (
+        provider_compatibility_recovery
+        if isinstance(provider_compatibility_recovery, Mapping)
+        else {}
+    )
+    if not isinstance(patch, Mapping) or not patch:
+        return False
+    keys = set(patch)
+    if len(keys) != 1:
+        return False
+    field = next(iter(keys))
+    if field not in _DISCOVERY_LOW_RISK_SINGLE_FIELD_VERIFIER_SKIP:
+        return False
+    if "scientific_constraints" in keys:
+        return False
+    if tool_interpretation_difference:
+        return False
+    if (
+        _clean_text(recovery.get("mode"))
+        == "json_action_contract_after_plain_text"
+    ):
+        return False
+    return True
+
+
+def _discovery_soft_reject_kept_patch(
+    explicit_tool_patch: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Soft subset of a primary tool patch retained after verifier reject."""
+
+    if not isinstance(explicit_tool_patch, Mapping) or not explicit_tool_patch:
+        return {}
+    candidate = {
+        field: value
+        for field, value in explicit_tool_patch.items()
+        if field in _DISCOVERY_SOFT_REJECT_KEEP_FIELDS
+    }
+    if not candidate:
+        return {}
+    normalized, errors = _validate_discovery_strategy_patch(candidate)
+    if errors or not normalized:
+        return {}
+    return normalized
+
+
+def _format_discovery_soft_reject_message(patch: Mapping[str, Any]) -> str:
+    """Chinese copy when verifier rejects hard fields but soft themes remain."""
+
+    summary = _format_discovery_strategy_patch_summary(patch)
+    return (
+        f"已记录主题相关信息：{summary}。"
+        "其余字段待确认后再写入；本轮未整包清空策略。"
     )
 
 
@@ -4600,9 +4683,11 @@ def _run_discovery_dialogue_agents_sdk(
         tool_name="consult_scientific_advisor",
         tool_description=(
             "Ask the read-only proteomics specialist to prioritize task-specific scientific "
-            "decisions and distinguish user choices from repository evidence. Use for an open-ended "
-            "recommendation, a newly introduced scientific task, or a nontrivial conflict; do not "
-            "use for greetings, exact option selections, straightforward field edits, or confirmation."
+            "decisions and distinguish user choices from repository evidence. Call at most once "
+            "per turn, and only for open-ended scientific planning, a newly introduced complex "
+            "task, or a nontrivial multi-field conflict. Never call for greetings, short topic "
+            "commits, exact option selections, single-field edits, straightforward confirmations, "
+            "or any turn that already has a clear terminal action."
         ),
         parameters=_DiscoveryScientificAdvisorInput,
         include_input_schema=True,
@@ -4653,10 +4738,13 @@ def _run_discovery_dialogue_agents_sdk(
         "selected_agent_option is present, it is an explicit commitment: invoke update_strategy, "
         "not respond. If the option intentionally keeps a field open/default, submit the relevant "
         "target field with its canonical open, empty, or default value so the decision itself is "
-        "recorded. consult_scientific_advisor is a bounded read-only specialist: use it only when "
-        "scientific planning genuinely benefits, then continue as the same Manager and finish with "
-        "exactly one of respond/update_strategy/confirm_strategy. It never owns the user reply or "
-        "strategy mutation.\n\n"
+        "recorded. consult_scientific_advisor is a bounded read-only specialist: call it at most "
+        "once, and only when scientific planning genuinely benefits. Skip it for greetings, short "
+        "topic/theme commits, single-field edits, exact option selections, and confirmation. Prefer "
+        "finishing in one Manager turn with respond/update_strategy/confirm_strategy whenever the "
+        "user commitment is already clear. After any advisor call, continue as the same Manager "
+        "and finish with exactly one of respond/update_strategy/confirm_strategy. Advisor never "
+        "owns the user reply or strategy mutation.\n\n"
         "CURRENT TURN STATE AND OUTPUT CONTRACT (authoritative for this run):\n"
         f"{state_prompt}"
     )
@@ -4684,7 +4772,7 @@ def _run_discovery_dialogue_agents_sdk(
                 starting_agent=agent,
                 input=runner_input,
                 context=context,
-                max_turns=3,
+                max_turns=2,
                 run_config=sdk["RunConfig"](
                     workflow_name="proteomics_discovery_dialogue_v1",
                     group_id=session_id or None,
@@ -6617,6 +6705,11 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
             or raw_intent != "chitchat"
         )
     )
+    low_risk_single_field_skip = _discovery_low_risk_single_field_verifier_skip(
+        verification_input_patch,
+        tool_interpretation_difference=tool_interpretation_difference,
+        provider_compatibility_recovery=provider_compatibility_recovery,
+    )
     patch_verification_warranted = bool(
         agent_runtime == "openai_agents"
         and verification_input_patch
@@ -6632,6 +6725,10 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         # action, and field-scope validation above remain authoritative; any
         # out-of-scope field still takes the verifier/rejection path.
         and not selected_option_patch_is_scoped
+        # Low-risk single-field tool patches (whitelist) skip the second
+        # verifier entirely for speed; multi-field / constraints / tool
+        # interpretation gaps still require the critic.
+        and not low_risk_single_field_skip
         and (
             len(latest_clauses) > 1
             or len(verification_input_patch) > 1
@@ -6918,13 +7015,46 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
                 }
             elif verification_verdict not in {"unavailable", "budget_exhausted"}:
                 # An explicit reject, or an accept/repair verdict whose field
-                # evidence failed deterministic grounding, is authoritative.
-                # Do not let the primary model's raw patch bypass the reviewer.
-                patch = {}
-                if not commitment_recovery_warranted:
-                    mutation_errors.append(
-                        "semantic verification rejected or could not ground the strategy patch"
+                # evidence failed deterministic grounding, is authoritative for
+                # hard/execution fields. Soft theme/context keys from the
+                # primary update_strategy tool may still be retained so short
+                # topic turns (e.g. 免疫肽数据) do not blank the strategy card.
+                soft_kept = (
+                    _discovery_soft_reject_kept_patch(explicit_tool_patch)
+                    if (
+                        not commitment_recovery_warranted
+                        and explicit_tool_patch
+                        and requested_action == "update_strategy"
                     )
+                    else {}
+                )
+                if soft_kept:
+                    patch = _drop_unchanged_discovery_patch_fields(
+                        soft_kept,
+                        intent_snapshot,
+                        preserve_fields=set(explicit_resolution_patch),
+                    )
+                    semantic_verification = {
+                        **semantic_verification,
+                        "verified": False,
+                        "verdict": "reject",
+                        "patch": dict(patch),
+                        "soft_reject_kept_fields": sorted(patch),
+                        "rationale": (
+                            _clean_text(semantic_verification.get("rationale"))[:1200]
+                            or (
+                                "Independent semantic verification rejected hard "
+                                "fields; soft theme/objective fields from the "
+                                "primary tool call were retained."
+                            )
+                        ),
+                    }
+                else:
+                    patch = {}
+                    if not commitment_recovery_warranted:
+                        mutation_errors.append(
+                            "semantic verification rejected or could not ground the strategy patch"
+                        )
             elif patch_verification_warranted and explicit_tool_patch:
                 # The typed SDK function call remains the mutation authority
                 # when the bounded independent reviewer is unavailable. Never
@@ -6937,6 +7067,46 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
                 "patch": {},
                 "rationale": "The primary turn consumed the bounded dialogue budget.",
             }
+    # Catch hard-reject paths that wiped the delta earlier (incomplete grounding
+    # forced to reject, invalid verified patch, etc.): still retain soft keys
+    # from the primary tool call so the card is not blanked on short topics.
+    if (
+        agent_runtime == "openai_agents"
+        and isinstance(semantic_verification, Mapping)
+        and _clean_text(semantic_verification.get("verdict")).lower() == "reject"
+        and not patch
+        and not commitment_recovery_warranted
+        and explicit_tool_patch
+        and requested_action == "update_strategy"
+        and semantic_verification.get("soft_reject_kept_fields") is None
+    ):
+        soft_kept = _discovery_soft_reject_kept_patch(explicit_tool_patch)
+        if soft_kept:
+            patch = _drop_unchanged_discovery_patch_fields(
+                soft_kept,
+                intent_snapshot,
+                preserve_fields=set(explicit_resolution_patch),
+            )
+            semantic_verification = {
+                **semantic_verification,
+                "verified": False,
+                "verdict": "reject",
+                "patch": dict(patch),
+                "soft_reject_kept_fields": sorted(patch),
+                "rationale": (
+                    _clean_text(semantic_verification.get("rationale"))[:1200]
+                    or (
+                        "Independent semantic verification rejected hard fields; "
+                        "soft theme/objective fields from the primary tool call "
+                        "were retained."
+                    )
+                ),
+            }
+            mutation_errors = [
+                error
+                for error in mutation_errors
+                if "semantic verification" not in _clean_text(error).casefold()
+            ]
     suppressed_uncommitted_fields: list[str] = []
     # A successfully executed SDK function call plus the field-generic schema
     # contract is the normal-path mutation authority.  Do not run that semantic
@@ -6951,6 +7121,12 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
     partial_grounding_applied = bool(
         isinstance(semantic_verification, Mapping)
         and semantic_verification.get("partial_grounding") is True
+        and patch
+        and not mutation_errors
+    )
+    soft_reject_applied = bool(
+        isinstance(semantic_verification, Mapping)
+        and semantic_verification.get("soft_reject_kept_fields")
         and patch
         and not mutation_errors
     )
@@ -6977,6 +7153,8 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
             if isinstance(semantic_verification, Mapping)
             else None,
         )
+    elif soft_reject_applied:
+        assistant_message = _format_discovery_soft_reject_message(patch)
     elif patch_was_reconciled and not mutation_errors:
         assistant_message = _format_discovery_reconciled_update_message(patch)
     if requested_action not in _DISCOVERY_TURN_ACTIONS:
