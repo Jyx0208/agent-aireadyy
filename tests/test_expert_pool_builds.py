@@ -139,14 +139,13 @@ def test_pool_build_registers_once_and_idempotent_replay_hides_secrets(tmp_path:
     assert task["visible_prompt"] == "Find human DDA proteomics projects"
     assert task["visible_constraints"] == {"repository": "pride", "species": "Homo sapiens"}
     assert private_key["build_id"] == first["build_id"]
-    assert private_key["candidates"] == [
-        {
-            "candidate_id": candidate["candidate_id"],
-            "scenario_id": candidate["scenario_id"],
-            "variant_id": candidate["variant_id"],
-            "project_accession": "PXD123456",
-        }
-    ]
+    private_candidate = private_key["candidates"][0]
+    assert private_candidate["candidate_id"] == candidate["candidate_id"]
+    assert private_candidate["scenario_id"] == candidate["scenario_id"]
+    assert private_candidate["variant_id"] == candidate["variant_id"]
+    assert private_candidate["project_accession"] == "PXD123456"
+    assert private_candidate["calibration_task_id"]
+    assert "calibration_features" in private_candidate
     expert_payload = json.dumps(pool, ensure_ascii=False)
     for hidden_value in ("PXD123456", "candidate-generator-model", "private-runtime", "secret-key", "discovery-secret"):
         assert hidden_value not in expert_payload

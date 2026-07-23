@@ -57,6 +57,7 @@ from agent.control_plane.models import (
     RuntimeProvenance,
     recommended_inspection_rounds,
 )
+from agent.discovery.agenda import agenda_for_manager
 from agent.discovery.runner import run_agents_discovery
 from agent.discovery.agentic import AgenticDiscoveryPlanner, OpenAICompatibleDiscoveryLLM, default_agentic_discovery_planner, default_discovery_llm_client
 from agent.discovery.agentic_runner import run_agentic_discovery
@@ -89,6 +90,10 @@ from agent.discovery.ontology import (
     species_from_text,
 )
 from agent.discovery.pride_discovery import discover_pride_dataset
+from agent.discovery.publication import (
+    BusinessCompletionDecision,
+    business_completion_allows_success,
+)
 from agent.discovery.search_environment import PrideDiscoverySearchEnvironment
 from agent.discovery.repository_discovery import discover_repository_dataset
 from agent.discovery.scoring import build_discovered_project, classify_file_role, score_file, score_project
@@ -1274,6 +1279,57 @@ def _agent_discovery_configuration(
                     limits.max_repository_requests, 3_000
                 ),
                 "max_elapsed_seconds": min(limits.max_elapsed_seconds, 900),
+            }
+        )
+    project_plan = body.get("project_plan")
+    hard_ceilings = (
+        project_plan.get("hard_ceilings")
+        if isinstance(project_plan, dict)
+        and isinstance(project_plan.get("hard_ceilings"), dict)
+        else {}
+    )
+    if hard_ceilings:
+        # A persisted project plan may narrow server safety budgets, but it can
+        # never expand them. Keep this generic and fail-safe at the execution
+        # boundary so a resumed plan cannot bypass its approved ceilings.
+        ceiling_turns = _bounded_int(
+            hard_ceilings.get("max_model_turns"),
+            default=budget.max_turns,
+            minimum=1,
+            maximum=budget.max_turns,
+        )
+        ceiling_tool_calls = _bounded_int(
+            hard_ceilings.get("max_tool_calls"),
+            default=budget.max_tool_calls,
+            minimum=1,
+            maximum=budget.max_tool_calls,
+        )
+        ceiling_rounds = _bounded_int(
+            hard_ceilings.get("max_discovery_rounds"),
+            default=budget.max_discovery_rounds,
+            minimum=1,
+            maximum=budget.max_discovery_rounds,
+        )
+        ceiling_runtime_minutes = _bounded_int(
+            hard_ceilings.get("max_runtime_minutes"),
+            default=max(1, limits.max_elapsed_seconds // 60),
+            minimum=1,
+            maximum=max(1, limits.max_elapsed_seconds // 60),
+        )
+        budget = budget.model_copy(
+            update={
+                "max_turns": min(budget.max_turns, ceiling_turns),
+                "max_tool_calls": min(budget.max_tool_calls, ceiling_tool_calls),
+                "max_discovery_rounds": min(
+                    budget.max_discovery_rounds, ceiling_rounds
+                ),
+            }
+        )
+        limits = limits.model_copy(
+            update={
+                "max_elapsed_seconds": min(
+                    limits.max_elapsed_seconds, ceiling_runtime_minutes * 60
+                )
             }
         )
     return mode, budget, limits
@@ -3609,115 +3665,11 @@ def _discovery_critical_decision_agenda(
     Repository facts are deliberately excluded because the Agent should fetch
     those during Discovery rather than ask the user to guess them.
     """
-
-    task_type = _clean_text(intent_snapshot.get("task_type")).lower()
-    run_horizon = _clean_text(intent_snapshot.get("run_horizon")).lower()
-    quota_flexibility = _clean_text(
-        intent_snapshot.get("quota_flexibility")
-    ).lower()
-    training_tasks = {
-        "rt_prediction",
-        "fragment_intensity_prediction",
-        "psm_scoring",
-        "denovo",
-        "ptm_denovo",
-        "chimeric_interpretation",
-        "other",
-    }
-    agenda: list[dict[str, Any]] = []
-
-    def add(
-        decision_id: str,
-        priority: int,
-        target_fields: list[str],
-        reason: str,
-        *,
-        critical: bool = True,
-    ) -> None:
-        agenda.append(
-            {
-                "id": decision_id,
-                "priority": priority,
-                "critical": critical,
-                "target_fields": target_fields,
-                "reason": reason,
-                "source": "ask_user_preference",
-            }
-        )
-
-    objective = _clean_text(intent_snapshot.get("objective"))
-    if not objective:
-        add(
-            "scientific_objective",
-            100,
-            ["objective"],
-            "The scientific objective determines relevance and cannot be recovered from repository metadata alone.",
-        )
-    if not task_type:
-        add(
-            "downstream_task",
-            98,
-            ["task_type"],
-            "Different downstream tasks require different spectra, labels, and project evidence.",
-        )
-    if not run_horizon:
-        add(
-            "delivery_horizon",
-            94,
-            ["run_horizon"],
-            "The stopping point controls whether the Agent only plans, finds candidates, or performs evidence review.",
-        )
-    if (
-        run_horizon != "plan_only"
-        and intent_snapshot.get("target_project_count") is None
-        and quota_flexibility != "open_ended"
-    ):
-        add(
-            "search_scale",
-            92,
-            ["coverage_mode", "target_project_count", "quota_flexibility"],
-            "Search scale materially changes runtime, candidate-pool size, diversity, and review depth; it must be explicit or explicitly open-ended.",
-        )
-
-    if task_type in training_tasks:
-        acquisition = _clean_text(intent_snapshot.get("acquisition_mode")).lower()
-        if (
-            (not acquisition or acquisition == "unknown")
-            and "acquisition_mode" not in resolved_fields
-        ):
-            add(
-                "acquisition_compatibility",
-                82,
-                ["acquisition_mode", "mixed_acquisition_policy"],
-                "Training suitability depends on how spectra were acquired and how mixed DDA/DIA projects are handled.",
-            )
-        species = intent_snapshot.get("species")
-        species_policy = _clean_text(intent_snapshot.get("species_policy")).lower()
-        if (
-            not species
-            and species_policy in {"", "open"}
-            and not {"species", "species_policy"}.intersection(resolved_fields)
-        ):
-            add(
-                "generalization_scope",
-                78,
-                ["species", "species_policy", "species_coverage"],
-                "Species scope determines biological generalization and whether taxa should be mixed or stratified.",
-            )
-        labeling = _clean_text(intent_snapshot.get("labeling_strategy")).lower()
-        if (
-            (not labeling or labeling in {"unknown", "any"})
-            and "labeling_strategy" not in resolved_fields
-        ):
-            add(
-                "labeling_compatibility",
-                58,
-                ["labeling_strategy", "labeling_hard"],
-                "Labeling can alter usable ions or batch structure, but it is usually lower impact than task, horizon, scale, and acquisition.",
-                critical=False,
-            )
-
-    return sorted(agenda, key=lambda item: (-int(item["priority"]), item["id"]))
+    return agenda_for_manager(
+        intent_snapshot,
+        gap_report=gap_report,
+        resolved_fields=resolved_fields,
+    )
 
 
 def _normalise_discovery_dialogue_history(raw: Any) -> list[dict[str, str]]:
@@ -4035,7 +3987,8 @@ def _legacy_discovery_turn_intent(action: str, raw_intent: str) -> str:
     }[action]
 
 
-_DISCOVERY_GRILL_MAX_REQUEST_SECONDS = 60.0
+_DISCOVERY_GRILL_DEFAULT_REQUEST_SECONDS = 60.0
+_DISCOVERY_GRILL_MAX_REQUEST_SECONDS = 300.0
 _DISCOVERY_SEMANTIC_VERIFIER_ATTEMPT_SECONDS = 15.0
 _DISCOVERY_SEMANTIC_VERIFIER_MAX_ATTEMPTS = 2
 _DISCOVERY_CONFIRMATION_VOLATILE_FIELDS = {
@@ -4175,13 +4128,22 @@ def _discovery_confirmation_context(
 
 
 def _bind_discovery_turn_request_budget(client: Any, body: Mapping[str, Any]) -> float:
+    try:
+        client_timeout = float(
+            getattr(client, "timeout", _DISCOVERY_GRILL_DEFAULT_REQUEST_SECONDS)
+        )
+    except (TypeError, ValueError):
+        client_timeout = _DISCOVERY_GRILL_DEFAULT_REQUEST_SECONDS
+    if not math.isfinite(client_timeout) or client_timeout <= 0:
+        client_timeout = _DISCOVERY_GRILL_DEFAULT_REQUEST_SECONDS
+
     raw_budget = body.get("request_timeout_seconds")
     try:
-        requested = float(raw_budget) if raw_budget is not None else _DISCOVERY_GRILL_MAX_REQUEST_SECONDS
+        requested = float(raw_budget) if raw_budget is not None else client_timeout
     except (TypeError, ValueError):
-        requested = _DISCOVERY_GRILL_MAX_REQUEST_SECONDS
+        requested = client_timeout
     if not math.isfinite(requested) or requested <= 0:
-        requested = _DISCOVERY_GRILL_MAX_REQUEST_SECONDS
+        requested = client_timeout
     budget = min(_DISCOVERY_GRILL_MAX_REQUEST_SECONDS, max(1.0, requested))
 
     # The production OpenAI-compatible client exposes a per-request timeout.
@@ -4497,6 +4459,29 @@ def _run_discovery_dialogue_json_compatibility(
     return dict(raw) if isinstance(raw, Mapping) else {}
 
 
+
+def _discovery_tool_required_model_settings(
+    sdk: Mapping[str, Any],
+    *,
+    model_name: str,
+    temperature: float = 0,
+) -> Any:
+    """Build ModelSettings for forced tool use.
+
+    DeepSeek thinking-mode models (e.g. deepseek-v4-pro default) reject
+    tool_choice=required unless thinking is explicitly disabled.
+    """
+    kwargs: dict[str, Any] = {
+        "temperature": temperature,
+        "parallel_tool_calls": False,
+        "tool_choice": "required",
+    }
+    name = str(model_name or "").casefold()
+    if "deepseek" in name:
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    return sdk["ModelSettings"](**kwargs)
+
+
 def _run_discovery_dialogue_agents_sdk(
     client: OpenAICompatibleDiscoveryLLM,
     *,
@@ -4638,10 +4623,9 @@ def _run_discovery_dialogue_agents_sdk(
         instructions=instructions,
         model=model,
         tools=tools,
-        model_settings=sdk["ModelSettings"](
-            temperature=0,
-            parallel_tool_calls=False,
-            tool_choice="required",
+        model_settings=_discovery_tool_required_model_settings(
+            sdk,
+            model_name=client.model,
         ),
         tool_use_behavior={
             "stop_at_tool_names": ["respond", "update_strategy", "confirm_strategy"]
@@ -5206,10 +5190,9 @@ def _run_discovery_patch_verifier_agents_sdk(
         instructions=instructions,
         model=model,
         tools=[verifier_tool],
-        model_settings=sdk["ModelSettings"](
-            temperature=0,
-            parallel_tool_calls=False,
-            tool_choice="required",
+        model_settings=_discovery_tool_required_model_settings(
+            sdk,
+            model_name=client.model,
         ),
         tool_use_behavior="stop_on_first_tool",
     )
@@ -7393,6 +7376,18 @@ def _ensure_discovery_review_artifacts(output_dir: Path) -> dict[str, Path]:
     return produced
 
 
+def _validated_business_completion_payload(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        decision = BusinessCompletionDecision.model_validate(dict(value))
+    except Exception:
+        return None
+    if decision.succeeded and not business_completion_allows_success(decision):
+        return None
+    return decision.model_dump(mode="json")
+
+
 def _public_discovery_record(
     *,
     discovery_id: str,
@@ -7460,6 +7455,27 @@ def _public_discovery_record(
             ).model_dump(mode="json")
         except Exception:
             runtime_provenance = None
+    business_completion = (
+        _validated_business_completion_payload(
+            provenance_summary.get("business_completion")
+        )
+        if summary_matches_run
+        else None
+    )
+    if status in {"completed", "completed_with_review"}:
+        try:
+            completion_decision = BusinessCompletionDecision.model_validate(
+                business_completion
+            )
+        except Exception:
+            completion_decision = None
+        if not business_completion_allows_success(completion_decision):
+            status = (
+                "running"
+                if completion_decision is not None
+                and completion_decision.status == "running_progress"
+                else "blocked"
+            )
     judgments = _merge_discovery_project_judgments(
         control_summary.get("project_judgments"),
         (
@@ -7584,6 +7600,7 @@ def _public_discovery_record(
         "runtime": runtime,
         "agent": agent,
         "latest_discovery_audit": latest_discovery_audit,
+        "business_completion": business_completion,
         "runtime_provenance": runtime_provenance,
         "request": manifest.request.model_dump(mode="json"),
         "summary": {
@@ -7962,6 +7979,9 @@ def _discovery_history_record_from_run_dir(run_dir: Path) -> dict[str, Any] | No
         "display_name": display,
         "input_value": display,
         "status": status,
+        "business_completion": _validated_business_completion_payload(
+            (summary or {}).get("business_completion")
+        ),
         "repository": _clean_text((request or {}).get("repository") if isinstance(request, Mapping) else "")
         or "pride",
         "run_mode": "discovery",
@@ -8925,6 +8945,7 @@ def _run_web_discovery(
                 if result.latest_discovery_audit is not None
                 else control_summary.get("latest_discovery_audit")
             ),
+            "business_completion": control_summary.get("business_completion"),
             "quality_budget_tier": _clean_text(budget_audit.get("quality_budget_tier")),
             "tool_calls": int(control_summary.get("tool_call_count") or 0),
             "stop_reason": _clean_text(control_summary.get("stop_reason") or result.status),
@@ -8982,6 +9003,7 @@ def _run_web_discovery(
         manifest_path = Path(
             result.selected_manifest_path
             or result.files.get("dataset_manifest_json")
+            or control_summary.get("candidate_pool_manifest_path")
             or output_dir / "dataset_manifest.json"
         )
         if not manifest_path.exists():
@@ -14378,10 +14400,11 @@ def _event_message(event: AgentEvent) -> str:
             f"{len(audit.get('repair_actions') or [])} bounded repair action(s)."
         )
     if event.event_type == "discovery_quality_repair_completed":
-        counts = payload.get("counts") or {}
+        audit = payload.get("audit") or {}
+        counts = audit.get("counts") or payload.get("counts") or {}
         return (
-            "Autonomous quality repair completed; "
-            f"{int(counts.get('delivery_eligible_projects') or 0)} project(s) now pass delivery gates."
+            "Autonomous quality repair attempt finished; authority audit is pending or incomplete. "
+            f"{int(counts.get('delivery_eligible_projects') or 0)} project(s) currently meet intermediate review gates."
         )
     if event.event_type == "manifest_selected":
         return (

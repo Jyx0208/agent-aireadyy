@@ -1,0 +1,58 @@
+{
+  "schema_version": "discovery-scenario/v1",
+  "scenario_id": "real_derived_progress_without_build_ready",
+  "source_kind": "sanitized_real_run_summary",
+  "network_required": false,
+  "contains_secrets": false,
+  "request": {
+    "task_family": "generic_project_discovery",
+    "internal_stage_hint": "candidates_reviewed",
+    "constraints": [
+      {
+        "dimension": "acquisition_mode",
+        "value": "dda",
+        "strength": "soft",
+        "evidence_scope": "assay",
+        "source": "accepted_preference"
+      },
+      {
+        "dimension": "labeling_strategy",
+        "value": "label_free",
+        "strength": "hard",
+        "evidence_scope": "assay",
+        "source": "user"
+      }
+    ]
+  },
+  "observed_state": {
+    "candidate_projects": 32,
+    "candidate_files": 2409,
+    "requested_inspections": 35,
+    "assessable_inspections": 32,
+    "judgment_qualified_projects": 20,
+    "needs_review_files": 2408,
+    "build_ready_count": 0,
+    "build_ready_projects": 0,
+    "build_ready_files": 0,
+    "blocker_counts": {
+      "missing_file_evidence": 2408,
+      "missing_labeling_evidence": 2181,
+      "project_only_evidence": 1941
+    },
+    "latest_audit_status": "repair_required"
+  },
+  "expected": {
+    "progress_visible": true,
+    "business_status": "blocked_with_progress",
+    "business_succeeded": false,
+    "package_kind": "progress",
+    "success_ui_allowed": false,
+    "required_progress_metrics": [
+      "candidate_projects",
+      "assessable_inspections",
+      "judgment_qualified_projects",
+      "build_ready_projects",
+      "blocker_counts"
+    ]
+  }
+}

@@ -83,11 +83,102 @@ export const startBatch = (payload: WorkflowRecord) =>
 export const getBatch = (batchId: string, signal?: AbortSignal) =>
   workflowJson<WorkflowRecord>(`/api/batches/${encodeURIComponent(batchId)}`, { signal });
 
+export type DiscoveryPublicationProgress = {
+  candidate_projects?: number;
+  candidate_files?: number;
+  reviewed_projects?: number;
+  judgment_qualified_projects?: number;
+  build_ready_projects?: number;
+  build_ready_files?: number;
+  blocker_counts?: Record<string, number>;
+};
+
+export type BusinessCompletionDecision = WorkflowRecord & {
+  schema_version?: string;
+  authority_source?: "publication_contract_registry";
+  succeeded?: boolean;
+  status?: "blocked" | "blocked_with_progress" | "running_progress" | "build_ready_succeeded";
+  package_kind?: "progress" | "build_ready";
+  progress_visible?: boolean;
+  progress?: DiscoveryPublicationProgress;
+  build_ready_package?: WorkflowRecord | null;
+  issuance_token?: string | null;
+  limitations?: string[];
+  success_ui_allowed?: boolean;
+  /** Replay compatibility for early Wave 2 fixtures. */
+  build_ready_projects?: number;
+  build_ready_files?: number;
+};
+
+export type DiscoveryJobRecord = WorkflowRecord & {
+  business_completion?: BusinessCompletionDecision;
+};
+
 export type DiscoveryJob = WorkflowRecord & {
   job_id?: string;
   logs?: WorkflowRecord[];
-  record?: WorkflowRecord;
+  record?: DiscoveryJobRecord;
 };
+
+const isRecordValue = (value: unknown): value is Record<string, unknown> =>
+  value != null && typeof value === "object" && !Array.isArray(value);
+
+function businessCompletionCount(
+  completion: Record<string, unknown>,
+  key: "build_ready_projects" | "build_ready_files",
+): number {
+  const progress = isRecordValue(completion.progress) ? completion.progress : {};
+  const parsed = Number(completion[key] ?? progress[key] ?? 0);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+/** Mirror the Authority Plane's fail-closed UI success gate. */
+export function businessCompletionAllowsSuccess(record: Record<string, unknown>): boolean {
+  const completion = isRecordValue(record.business_completion)
+    ? record.business_completion
+    : null;
+  if (!completion) return false;
+  return (
+    completion.schema_version === "business-completion/v2" &&
+    completion.authority_source === "publication_contract_registry" &&
+    completion.succeeded === true &&
+    completion.status === "build_ready_succeeded" &&
+    completion.package_kind === "build_ready" &&
+    completion.success_ui_allowed === true &&
+    isRecordValue(completion.build_ready_package) &&
+    String(completion.issuance_token || "").trim().length > 0 &&
+    businessCompletionCount(completion, "build_ready_projects") > 0 &&
+    businessCompletionCount(completion, "build_ready_files") > 0
+  );
+}
+
+export function honestDiscoveryStatus(
+  serverStatus: string,
+  record: Record<string, unknown>,
+  _attemptFinishedWithoutAudit = false,
+): string {
+  if (serverStatus !== "completed") return serverStatus;
+  if (!isRecordValue(record.business_completion)) {
+    return "blocked";
+  }
+  if (businessCompletionAllowsSuccess(record)) return "completed";
+  return record.business_completion.status === "running_progress" ? "running" : "blocked";
+}
+
+export function normalizeDiscoveryJobForUi(job: DiscoveryJob): DiscoveryJob {
+  const record = (job.record || {}) as Record<string, unknown>;
+  const attemptFinishedWithoutAudit = (job.logs || []).some((log) =>
+    ["discovery_quality_repair_completed", "repair_attempt_finished"].includes(
+      String(log.type || ""),
+    ),
+  );
+  const status = honestDiscoveryStatus(
+    String(job.status || record.status || "queued").toLowerCase(),
+    record,
+    attemptFinishedWithoutAudit,
+  );
+  return status === job.status ? job : { ...job, status };
+}
 
 export type DiscoveryGoalParse = WorkflowRecord & {
   parser?: string;
@@ -168,10 +259,11 @@ export const startDiscoveryJob = (payload: WorkflowRecord, signal?: AbortSignal)
           idempotency_key: crypto.randomUUID(),
           ...payload,
         }),
-      });
+      }).then(normalizeDiscoveryJobForUi);
 
 export const getDiscoveryJob = (jobId: string, detail = false, signal?: AbortSignal) =>
-  workflowJson<DiscoveryJob>(`/api/discovery/jobs/${encodeURIComponent(jobId)}${detail ? "?detail=1" : ""}`, { signal });
+  workflowJson<DiscoveryJob>(`/api/discovery/jobs/${encodeURIComponent(jobId)}${detail ? "?detail=1" : ""}`, { signal })
+    .then(normalizeDiscoveryJobForUi);
 
 export const cancelDiscoveryJob = (jobId: string) =>
   workflowJson<DiscoveryJob>(`/api/discovery/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });

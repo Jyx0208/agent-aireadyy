@@ -387,7 +387,7 @@ def test_frontend_template_allows_open_species_general_discovery():
     assert "优先填写物种，保留其他" in html
     assert "Please provide positive project/file limits." in html
     assert "请确保项目和文件数量限制为正数。" in html
-    assert "if(payload.max_projects<1||payload.max_files<1)" in html
+    assert "if(payload.constraints_enabled && (payload.max_projects<1||payload.max_files<1))" in html
     assert "!payload.species.length" not in html
 
 

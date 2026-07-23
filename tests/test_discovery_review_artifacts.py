@@ -123,7 +123,8 @@ def test_review_artifacts_separate_full_candidate_scorecard_from_final_selection
         output_dir=tmp_path,
         manifest=selected,
     )
-    assert record["status"] == "completed"
+    assert record["status"] == "blocked"
+    assert record["business_completion"] is None
     assert record["projects"][0]["actual_final_selection"] is True
     assert (
         record["projects"][0]["review_provenance"]

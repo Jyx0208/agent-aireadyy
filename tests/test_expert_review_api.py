@@ -323,11 +323,19 @@ def test_discovery_job_start_is_idempotent_for_build_handoff(tmp_path: Path, mon
 
     first = client.post(
         "/api/discovery/jobs",
-        json={"prompt": "general", "idempotency_key": "pool-build-1:discovery"},
+        json={
+            "prompt": "general",
+            "idempotency_key": "pool-build-1:discovery",
+            "grill_confirmed": True,
+        },
     ).json()
     replay = client.post(
         "/api/discovery/jobs",
-        json={"prompt": "general", "idempotency_key": "pool-build-1:discovery"},
+        json={
+            "prompt": "general",
+            "idempotency_key": "pool-build-1:discovery",
+            "grill_confirmed": True,
+        },
     ).json()
 
     assert replay["job_id"] == first["job_id"]
@@ -680,21 +688,21 @@ def test_pool_build_does_not_silently_use_general_default_llm(monkeypatch) -> No
         lambda: (_ for _ in ()).throw(AssertionError("general default must not be used")),
     )
 
-    with pytest.raises(ValueError) as exc_info:
-        web_app._prepare_expert_pool_discovery_request(
-            {
-                "prompt": "寻找人类 DDA 蛋白质组",
-                "output_language": "zh-CN",
-                "llm_config": {
-                    "api_key": "forged-request-key",
-                    "base_url": "https://api.deepseek.com",
-                    "model": "deepseek-chat",
-                    "timeout": "120",
-                },
-            }
-        )
+    prepared = web_app._prepare_expert_pool_discovery_request(
+        {
+            "prompt": "寻找人类 DDA 蛋白质组",
+            "output_language": "zh-CN",
+            "llm_config": {
+                "api_key": "forged-request-key",
+                "base_url": "https://api.deepseek.com",
+                "model": "deepseek-chat",
+                "timeout": "120",
+            },
+        }
+    )
 
-    assert "评审池构建模型配置" in str(exc_info.value)
+    assert prepared["parser"] == "broad_human_proteomics_fallback"
+    assert "llm_config" not in prepared["request"]
 
 
 def test_pool_build_strips_request_supplied_model_identity_and_credentials(monkeypatch) -> None:
@@ -721,7 +729,7 @@ def test_pool_build_strips_request_supplied_model_identity_and_credentials(monke
     )
 
     request = prepared["request"]
-    assert prepared["parser"] == "deterministic_english_fallback"
+    assert prepared["parser"] == "broad_human_proteomics_fallback"
     assert "llm_config" not in request
     assert "_generation_contributors" not in request
     assert "pool_builder_profile_id" not in request
@@ -827,9 +835,9 @@ def test_pool_build_prompt_preparation_uses_english_terms_scale_preset_and_expli
     assert prepared["parser"] == "llm"
     assert request["query_terms"] == ["immunopeptidomics", "HLA ligandome"]
     assert request["scale_mode"] == "exhaustive"
-    assert request["max_projects"] == 200
-    assert request["max_candidate_projects"] == 600
-    assert request["max_files"] == 5000
+    assert request["max_projects"] == 2000
+    assert request["max_candidate_projects"] == 5000
+    assert request["max_files"] == 100000
     assert request["agentic"] is False
     assert request["output_language"] == "zh-CN"
     assert request["_generation_contributors"][0]["model_family"] == "parser-family"
@@ -869,8 +877,8 @@ def test_pool_build_explicit_scale_and_agentic_override_parser(monkeypatch) -> N
 
     request = prepared["request"]
     assert request["scale_mode"] == "balanced"
-    assert request["max_projects"] == 75
-    assert request["max_candidate_projects"] == 300
+    assert request["max_projects"] == 200
+    assert request["max_candidate_projects"] == 800
     assert request["agentic"] is True
     assert request["runtime"] == "openai_agents"
     assert request["source"] == "remote"
@@ -895,7 +903,7 @@ def test_pool_build_localizes_common_discovery_logs_but_keeps_search_terms_engli
     assert public["logs"][0]["message"] == "正在检索 PRIDE 项目：HLA ligandome"
     assert public["logs"][1]["message"] == "项目检索目前返回 25 条原始记录。"
     assert public["logs"][2]["message"] == "观察：已记录当前数据发现状态。"
-    assert public["logs"][3]["message"] == "数据发现进度已更新。"
+    assert public["logs"][3]["message"] == "Unmapped internal discovery detail"
     assert "HLA ligandome" in public["logs"][0]["message"]
 
 

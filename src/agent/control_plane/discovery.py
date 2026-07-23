@@ -39,6 +39,7 @@ from agent.discovery.project_judgment import (
     is_qualified_project_judgment,
     summarize_project_judgments,
 )
+from agent.discovery.publication import business_completion_allows_success
 from agent.discovery.repository_discovery import discover_repository_dataset
 from agent.discovery.query_builder import classify_pride_query_strategy
 from agent.discovery.search_environment import (
@@ -1701,6 +1702,21 @@ class DiscoveryToolService:
                 return payload
             run = self._require_run()
 
+        if run.business_completion is not None and not business_completion_allows_success(
+            run.business_completion
+        ):
+            payload = {
+                "status": "blocked",
+                "round_index": round_index,
+                "manifest_path": str(manifest_path),
+                "selected_files": selected_files,
+                "blockers": ["build_ready_publication_contract_not_satisfied"],
+                "business_completion": run.business_completion.model_dump(mode="json"),
+            }
+            self.store.complete_tool_call(tool_call.idempotency_key, payload)
+            self.store.append_event(self.run_id, "manifest_selection_rejected", payload)
+            return payload
+
         paths = write_dataset_manifest(manifest, self.output_dir / "final_selection")
         manifest_path = paths["dataset_manifest_json"]
 
@@ -1735,6 +1751,32 @@ class DiscoveryToolService:
         run = self._require_run()
         if run.selected_round_index is not None:
             return run
+        if run.business_completion is not None and not business_completion_allows_success(
+            run.business_completion
+        ):
+            blocker = "build_ready_publication_contract_not_satisfied"
+            updated = self.store.save_run(
+                run.model_copy(
+                    update={
+                        "blockers": _dedupe([*run.blockers, blocker]),
+                        "stop_reason": "selection_quality_gate_not_completed",
+                    }
+                )
+            )
+            self.store.append_event(
+                self.run_id,
+                "manifest_selection_rejected",
+                {
+                    "status": "blocked",
+                    "round_index": 0,
+                    "blockers": [blocker],
+                    "auto_selected": True,
+                    "business_completion": run.business_completion.model_dump(
+                        mode="json"
+                    ),
+                },
+            )
+            return updated
 
         harvest_all = bool(getattr(self.request, "harvest_all_qualified", False)) or (
             str(getattr(self.request, "quantity_scope", "") or "") == "portfolio"

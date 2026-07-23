@@ -10,6 +10,7 @@ from agent.cli import app
 from agent.discovery.manifest import write_dataset_manifest
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile
 from agent.discovery.task_build_plan import build_task_build_plan, write_task_build_plan
+from agent.discovery.task_profiles import get_task_profile
 
 
 def _file(
@@ -101,6 +102,20 @@ def test_task_build_plan_marks_chimeric_active_but_not_candidate_without_require
     assert "isolation_window" in by_name["good.raw"].missing_task_requirements
     assert by_name["good.raw"].task_readiness_status == "not_ready"
     assert plan.target_schema == "chimeric_train.parquet"
+
+
+def test_chimeric_task_profile_declares_critical_agenda_as_data():
+    profile = get_task_profile("chimeric_interpretation")
+
+    item = next(
+        item
+        for item in profile.critical_agenda
+        if item.id == "chimeric_label_feasibility"
+    )
+    assert item.blocks_build_ready is True
+    assert item.decision_variables == ["label_provenance", "relabel_tolerance"]
+    assert item.required_evidence
+    assert item.trigger_conditions
 
 
 def test_task_build_plan_respects_max_files_and_order():

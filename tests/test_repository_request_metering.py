@@ -14,7 +14,7 @@ def test_repository_meter_records_each_http_attempt(monkeypatch) -> None:
     observed: list[tuple[str, str]] = []
     response = httpx.Response(
         200,
-        json={"_embedded": {"projects": []}},
+        json=[],
         request=httpx.Request("GET", "https://x.test"),
     )
     client = PrideClient()

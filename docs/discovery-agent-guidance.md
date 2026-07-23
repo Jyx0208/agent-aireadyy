@@ -93,6 +93,11 @@ normally emit no patch for that field.
   optional preferences. Every executable search needs an explicit project
   scale or an explicitly open-ended quota; do not skip scale in favor of
   optional labeling or instrument preferences.
+- The agenda is declared by task profiles. Each item exposes its trigger,
+  whether it blocks build-ready completion, its decision variables, and the
+  repository evidence to retrieve. Evidence requirements are retrieval work,
+  not questions asking the user to guess repository facts. The Dialogue
+  Manager remains the only strategy writer.
 - A next question has one decision variable. Do not bundle two dimensions such
   as PTM scope and enrichment method into a single question.
 - State one recommendation and one short, task-specific reason. Usually offer

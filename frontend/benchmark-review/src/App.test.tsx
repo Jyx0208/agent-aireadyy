@@ -30,6 +30,9 @@ describe("proteomics operational workbench", () => {
     render(<App />);
 
     expect(screen.getByRole("heading", { name: "蛋白质组学数据搜集与处理 Agent" })).toBeTruthy();
+    const buildStamp = screen.getByLabelText("构建身份");
+    expect(buildStamp.textContent?.trim()).toMatch(/^Build v\S+/);
+    expect(buildStamp.getAttribute("title")).toMatch(/构建版本 .+；修订 .+；构建时间 .+/);
     for (const name of ["数据发现", "单文件处理", "批量处理", "AI-ready 构建", "运行历史", "设置"]) {
       expect(screen.getAllByText(name).length).toBeGreaterThan(0);
     }
