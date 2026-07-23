@@ -756,7 +756,7 @@ def test_discover_dataset_cli_writes_manifest_files(monkeypatch, tmp_path: Path)
     assert result.exit_code == 0, result.output
     assert (output_dir / "dataset_manifest.json").exists()
     assert (output_dir / "dataset_manifest.csv").exists()
-    assert (output_dir / "batch_inputs.txt").read_text(encoding="utf-8").strip() == "HeLa_01.raw"
+    assert (output_dir / "batch_inputs.txt").read_text(encoding="utf-8").strip() == "https://ftp.pride.ebi.ac.uk/HeLa_01.raw"
 
 
 def test_manifest_writer_outputs_expected_files(tmp_path: Path):
@@ -898,8 +898,8 @@ def test_manifest_writer_outputs_valid_and_usable_subsets(tmp_path: Path):
 
     assert [row["file_name"] for row in valid_rows] == ["valid.raw"]
     assert [row["file_name"] for row in usable_rows] == ["valid.raw", "weak.mzML"]
-    assert paths["batch_inputs_valid"].read_text(encoding="utf-8").splitlines() == ["valid.raw"]
-    assert paths["batch_inputs_usable"].read_text(encoding="utf-8").splitlines() == ["valid.raw", "weak.mzML"]
+    assert paths["batch_inputs_valid"].read_text(encoding="utf-8").splitlines() == ["PXD000001/valid.raw"]
+    assert paths["batch_inputs_usable"].read_text(encoding="utf-8").splitlines() == ["PXD000001/valid.raw", "PXD000001/weak.mzML"]
     assert quality["valid_files"] == 1
     assert quality["usable_files"] == 2
     assert quality["needs_review_files"] == 2

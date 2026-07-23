@@ -473,7 +473,7 @@ describe("humanizeJobProgress", () => {
     });
 
     expect(JSON.stringify(incomplete.progressEvents)).toMatch(/可验证进展|尚待 build-ready/);
-    expect(incomplete.summary).toMatch(/质量闸门未通过/);
+    expect(incomplete.summary).toMatch(/搜索已结束|可用文件|批量参数规划/);
     expect(incomplete.summary).not.toMatch(/搜完了/);
   });
 
@@ -499,7 +499,7 @@ describe("humanizeJobProgress", () => {
       },
     });
 
-    expect(result.summary).toMatch(/质量闸门未通过/);
+    expect(result.summary).toMatch(/搜索已结束|可用文件|批量参数规划/);
     expect(JSON.stringify(result.progressEvents)).not.toMatch(/本轮完成/);
     expect(JSON.stringify(result.progressEvents)).toMatch(/未识别的修复事件|忽略其状态声明/);
     expect(result.progressEvents.some((event) => event.kind === "tool" && event.status === "ok"))

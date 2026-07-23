@@ -268,14 +268,34 @@ def _write_manifest_csv(
             writer.writerow(_csv_row(file, run_id, judgments=judgments))
 
 
+def _batch_input_line(file: DiscoveredFile) -> str:
+    """Prefer a line the batch planner can resolve (URL or PXD-scoped path)."""
+    download = str(getattr(file, "download_url", "") or "").strip()
+    if download.startswith("http://") or download.startswith("https://"):
+        return download
+    project = str(
+        getattr(file, "project_accession", "")
+        or getattr(file, "px_accession", "")
+        or ""
+    ).strip()
+    name = str(getattr(file, "file_name", "") or "").strip()
+    if project and name:
+        return f"{project}/{name}"
+    if name:
+        return name
+    path = str(getattr(file, "file_accession_or_path", "") or "").strip()
+    return path
+
+
 def _write_batch_inputs(path: Path, files: list[DiscoveredFile]) -> None:
-    seen_names: set[str] = set()
+    seen: set[str] = set()
     batch_lines: list[str] = []
     for file in files:
-        if file.file_name in seen_names:
+        line = _batch_input_line(file)
+        if not line or line in seen:
             continue
-        seen_names.add(file.file_name)
-        batch_lines.append(file.file_name)
+        seen.add(line)
+        batch_lines.append(line)
     path.write_text("\n".join(batch_lines) + ("\n" if batch_lines else ""), encoding="utf-8")
 
 

@@ -262,6 +262,70 @@ def test_audit_persistence_materializes_but_cannot_graduate_without_signer(
     assert persisted.business_completion.success_ui_allowed is False
 
 
+def test_selected_manifest_prepares_real_publication_inputs_without_fixture_injection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A normal selected run must not depend on tests injecting publication state."""
+
+    monkeypatch.delenv("DISCOVERY_AUTHORITY_DEV_SIGN", raising=False)
+    manifest = _manifest().model_copy(
+        update={
+            "request": DatasetRequest(repository="pride"),
+            "files": [
+                _manifest().files[0].model_copy(
+                    update={"evidence_level": "file"}
+                )
+            ],
+        }
+    )
+    manifest_path = tmp_path / "selected-manifest.json"
+    manifest_path.write_text(manifest.model_dump_json(), encoding="utf-8")
+    audit = DiscoveryQualityAudit(
+        run_id="materialize-run",
+        status="ready",
+        ready_for_selection=True,
+        counts={
+            "candidate_projects": 1,
+            "candidate_files": 1,
+            "assessable_inspections": 1,
+            "qualified_projects": 1,
+        },
+    )
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    store.save_run(
+        AgentRunRecord(
+            run_id="materialize-run",
+            workflow="discovery",
+            request=manifest.request.model_dump(mode="json"),
+            current_manifest_path=str(manifest_path),
+            selected_round_index=0,
+        )
+    )
+
+    _persist_discovery_audit_snapshot(
+        SimpleNamespace(
+            store=store,
+            run_id="materialize-run",
+            output_dir=tmp_path,
+        ),
+        audit,
+    )
+
+    persisted = store.load_run("materialize-run")
+    assert persisted is not None
+    assert persisted.publication_evidence_store is not None
+    assert persisted.publication_evidence_store.observations
+    assert persisted.publication_membership_refs
+    assert persisted.publication_builder_entrypoint
+    assert persisted.publication_builder_preflight_status == "ready"
+    assert persisted.publication_builder_preflight_ref
+    assert persisted.publication_materialization_blockers == []
+    assert persisted.build_ready_package_material is not None
+    assert persisted.business_completion is not None
+    assert persisted.business_completion.succeeded is False
+
+
 def test_blocked_materialization_preserves_membership_inventory_for_repair(
     tmp_path: Path,
 ) -> None:

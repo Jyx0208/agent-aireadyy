@@ -3126,7 +3126,12 @@ def test_read_only_verifier_json_fallback_classifies_clauses_without_write_autho
     assert "candidate_findings" in llm.calls[0]["system_prompt"]
 
 
-def test_semantic_verifier_partial_grounding_is_not_a_verified_subset():
+def test_semantic_verifier_partial_grounding_applies_verified_subset():
+    """Evidence for a subset of proposed fields must authorize that subset.
+
+    Policy (strategy-paste fix): multi-field updates must not wipe the whole
+    patch when the independent verifier grounds only some fields.
+    """
     client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
     model = _DialogueScriptedModel(
         [
@@ -3142,7 +3147,7 @@ def test_semantic_verifier_partial_grounding_is_not_a_verified_subset():
                         "evidence": [
                             {"field": "species", "source": "mouse"},
                         ],
-                        "rationale": "Both fields are complete.",
+                        "rationale": "Only species is evidenced in the latest message.",
                     },
                 },
             )
@@ -3158,9 +3163,11 @@ def test_semantic_verifier_partial_grounding_is_not_a_verified_subset():
         model=model,
     )
 
-    assert result["verified"] is False
-    assert result["patch"] == {}
+    assert result["verified"] is True
+    assert result["verdict"] == "repair"
+    assert result["patch"] == {"species": ["mouse"]}
     assert result["missing_fields"] == ["acquisition_mode"]
+    assert result["partial_grounding"] is True
 
 
 def test_semantic_verifier_ignores_unmentioned_null_schema_placeholders():
@@ -4087,7 +4094,12 @@ def test_primary_sdk_null_schema_placeholders_are_not_treated_as_clear_commands(
     }
 
 
-def test_partial_completeness_verifier_cannot_write_a_grounded_subset(monkeypatch):
+def test_partial_completeness_verifier_applies_grounded_subset(monkeypatch):
+    """Grill turn must apply the grounded subset, not reject-all + empty patch.
+
+    When the manager proposes multi-field update_strategy and the verifier
+    omits 1-2 fields, remaining valid fields still write to the card.
+    """
     client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
     monkeypatch.setattr(
         web_app,
@@ -4122,6 +4134,8 @@ def test_partial_completeness_verifier_cannot_write_a_grounded_subset(monkeypatc
             "verified": True,
             "verdict": "repair",
             "patch": {"species": ["mouse"]},
+            "missing_fields": ["acquisition_mode"],
+            "partial_grounding": True,
             "rationale": "Only one field was grounded.",
         },
     )
@@ -4141,12 +4155,123 @@ def test_partial_completeness_verifier_cannot_write_a_grounded_subset(monkeypatc
         )
     )
 
-    assert result["tool_calls"] == []
-    assert result["extra_fields"] == {}
-    assert result["semantic_verification"]["verified"] is False
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {"species": ["mouse"]}
+    assert result["tool_calls"] == [
+        {
+            "name": "update_strategy",
+            "arguments": {"patch": {"species": ["mouse"]}},
+        }
+    ]
+    assert result["semantic_verification"]["verified"] is True
+    assert result["semantic_verification"]["partial_grounding"] is True
     assert result["semantic_verification"]["missing_fields"] == [
         "acquisition_mode"
     ]
+    assert result["semantic_verification"]["patch"] == {"species": ["mouse"]}
+
+
+
+
+def test_multi_field_strategy_paste_partial_verifier_still_applies_remaining_patch(
+    monkeypatch,
+):
+    """User-style multi-field paste: omit 1-2 fields, still apply the rest.
+
+    Mirrors the strategy-paste bug where a full card dump was wiped because
+    acquisition_mode / quota_flexibility / species failed independent grounding.
+    """
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    multi_field_patch = {
+        "task_type": "denovo",
+        "species": ["human"],
+        "species_policy": "prefer",
+        "acquisition_mode": "dda",
+        "target_project_count": 20,
+        "quota_flexibility": "recommended",
+    }
+    grounded_subset = {
+        "task_type": "denovo",
+        "species": ["human"],
+        "species_policy": "prefer",
+        "target_project_count": 20,
+        "quota_flexibility": "recommended",
+    }
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "已根据粘贴内容更新策略。",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": multi_field_patch},
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        lambda *_args, **_kwargs: {
+            "verified": True,
+            "verdict": "repair",
+            "patch": grounded_subset,
+            "missing_fields": ["acquisition_mode"],
+            "partial_grounding": True,
+            "rationale": (
+                "Grounded task/species/quota-style fields; acquisition_mode "
+                "was not independently evidenced."
+            ),
+        },
+    )
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": (
+                    "免疫肽/HLA 配体 · 人源 · 下游偏de novo · "
+                    "DDA下游任务de novo物种优先 human规模精选 · "
+                    "约 20 个项目采集方式DDA"
+                ),
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == grounded_subset
+    assert "acquisition_mode" not in result["extra_fields"]
+    assert result["tool_calls"] == [
+        {
+            "name": "update_strategy",
+            "arguments": {"patch": grounded_subset},
+        }
+    ]
+    sv = result["semantic_verification"]
+    assert sv["verified"] is True
+    assert sv["partial_grounding"] is True
+    assert sv["missing_fields"] == ["acquisition_mode"]
+    assert sv["patch"] == grounded_subset
+    # Must not surface the old reject-all contract wipe.
+    assert not any(
+        "incomplete strategy patch" in error
+        for error in result.get("contract_errors") or []
+    )
 
 
 def test_verifier_can_remove_primary_tool_fields_not_classified_as_commitments(

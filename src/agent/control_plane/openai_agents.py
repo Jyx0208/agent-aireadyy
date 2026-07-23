@@ -51,7 +51,7 @@ from agent.control_plane.sdk_runtime import (
 )
 from agent.discovery.memory import DiscoveryMemory
 from agent.discovery.models import DatasetManifest, DatasetRequest
-from agent.discovery.evidence_store import EvidenceStore
+from agent.discovery.evidence_store import EvidenceObservation, EvidenceStore, EvidenceStoreArtifact
 from agent.discovery.builder_contract import BuilderDryRunContract
 from agent.discovery.production_authority import (
     DurableAuthorityLedger,
@@ -302,6 +302,11 @@ def _persist_discovery_audit_snapshot(
                     loaded_manifest = None
                 if isinstance(loaded_manifest, dict):
                     manifest_payload = loaded_manifest
+            run = _seed_publication_inputs_from_selected_manifest(
+                run,
+                audit=audit,
+                manifest_payload=manifest_payload,
+            )
             materialization = materialize_build_ready_package(
                 {
                     "run_id": run.run_id,
@@ -560,6 +565,141 @@ def _audit_reference(audit: DiscoveryQualityAudit) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return "audit:sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_builder_preflight_ref(*, run_id: str, entrypoint: str) -> str:
+    payload = {
+        "run_id": run_id,
+        "entrypoint": entrypoint,
+        "preflight_status": "ready",
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "builder-preflight:sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _seed_publication_inputs_from_selected_manifest(
+    run: AgentRunRecord,
+    *,
+    audit: DiscoveryQualityAudit,
+    manifest_payload: dict[str, Any] | None,
+) -> AgentRunRecord:
+    """Seed evidence/membership/builder from selected strict-valid files.
+
+    Real selected-manifest path must not depend on test fixture injection.
+    Seeds only when audit is ready and at least one strict-valid, buildable
+    file exists. Never promotes weak_keep into publication inventory. Does not
+    invent hard-constraint observations from request intent. Does not sign.
+    """
+
+    if audit.status != "ready" or not audit.ready_for_selection:
+        return run
+    if not isinstance(manifest_payload, dict):
+        return run
+    try:
+        manifest = DatasetManifest.model_validate(manifest_payload)
+    except Exception:
+        return run
+
+    strict_files = [
+        item
+        for item in manifest.files
+        if item.validity_status == "valid"
+        and not item.needs_review
+        and str(item.download_url or "").strip()
+        and item.expected_size_bytes is not None
+        and int(item.expected_size_bytes) > 0
+        and item.file_role in {"raw_acquisition", "converted_peaklist"}
+    ]
+    if not strict_files:
+        return run
+
+    existing_store = run.publication_evidence_store
+    existing_by_id: dict[str, EvidenceObservation] = {}
+    if existing_store is not None:
+        for observation in existing_store.observations:
+            existing_by_id[observation.observation_id] = observation
+
+    membership_refs = list(run.publication_membership_refs or [])
+    membership_set = set(membership_refs)
+    seeded_observations: list[EvidenceObservation] = []
+
+    for item in strict_files:
+        file_id = str(
+            item.file_accession_or_path
+            or f"{item.project_accession}:{item.file_name}"
+        ).strip()
+        if not file_id:
+            continue
+        membership_ref = f"membership:{item.project_accession}:{file_id}"
+        if membership_ref not in membership_set:
+            membership_refs.append(membership_ref)
+            membership_set.add(membership_ref)
+        observation_id = f"obs:builder_file_entry:{file_id}"
+        if observation_id in existing_by_id:
+            continue
+        # Skip if a builder_file_entry for this file already exists under another id.
+        already = any(
+            obs.subject_kind == "file"
+            and obs.subject_id == file_id
+            and obs.dimension == "builder_file_entry"
+            and obs.evidence_scope == "file"
+            for obs in existing_by_id.values()
+        )
+        if already:
+            continue
+        seeded_observations.append(
+            EvidenceObservation(
+                observation_id=observation_id,
+                subject_kind="file",
+                subject_id=file_id,
+                dimension="builder_file_entry",
+                observed_value=file_id,
+                evidence_scope="file",
+                source_kind="manifest_inspection",
+                source_refs=[f"source:manifest:{file_id}"],
+                membership_refs=[membership_ref],
+            )
+        )
+
+    if not membership_refs and not seeded_observations and existing_store is not None:
+        # Nothing new to attach; still may need builder fields below.
+        pass
+
+    merged_observations = list(existing_by_id.values()) + seeded_observations
+    # Prefer retaining an existing non-empty store; only replace when we add rows
+    # or when store was missing.
+    evidence_store = existing_store
+    if existing_store is None or seeded_observations:
+        evidence_store = EvidenceStoreArtifact(observations=merged_observations)
+
+    entrypoint = run.publication_builder_entrypoint or "dataset-builder/v1"
+    preflight_status = run.publication_builder_preflight_status
+    preflight_ref = run.publication_builder_preflight_ref
+    # Only seed builder preflight when completely unset. Explicit pending/not-ready
+    # must remain fail-closed (do not auto-upgrade to ready).
+    status_unset = not str(preflight_status or "").strip()
+    ref_unset = not str(preflight_ref or "").strip()
+    if status_unset and ref_unset:
+        preflight_status = "ready"
+        preflight_ref = _canonical_builder_preflight_ref(
+            run_id=run.run_id,
+            entrypoint=entrypoint,
+        )
+
+    updates: dict[str, Any] = {
+        "publication_membership_refs": membership_refs,
+        "publication_builder_entrypoint": entrypoint,
+        "publication_builder_preflight_status": preflight_status,
+        "publication_builder_preflight_ref": preflight_ref,
+    }
+    if evidence_store is not None:
+        updates["publication_evidence_store"] = evidence_store
+    return run.model_copy(update=updates)
 
 
 def _business_completion_allows_success(value: object) -> bool:

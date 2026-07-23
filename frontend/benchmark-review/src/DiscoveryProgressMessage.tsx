@@ -21,7 +21,10 @@ export type DiscoveryRunMetrics = {
   projects: number;
   files: number;
   reviews: number;
+  /** L1 usable files (valid + weak_keep); primary delivery count for the workbench. */
   selectedProjects?: number;
+  usableFiles: number;
+  strictValidFiles: number;
   inspectedProjects: number;
   judgmentQualifiedProjects: number;
   buildReadyProjects: number;
@@ -86,7 +89,7 @@ const STATUS_LABEL: Record<DiscoveryRunStatus, string> = {
   running: "搜索中",
   completed: "已完成",
   failed: "失败",
-  blocked: "质量未通过",
+  blocked: "已交付候选清单",
   cancelled: "已取消",
 };
 
@@ -154,7 +157,7 @@ function buildMilestones(
         : status === "failed"
           ? "运行已停止，等待查看失败原因"
           : status === "blocked"
-            ? "检索已结束，但交付质量闸门未通过"
+            ? "检索已结束：已整理可用文件清单，可继续批量参数规划"
           : status === "cancelled"
             ? "本轮搜索已停止"
             : "已接收并锁定本轮确认策略";
@@ -203,6 +206,7 @@ export function buildDiscoveryRunView(job: DiscoveryJob): DiscoveryRunView {
   const status = normalizeStatus(
     honestDiscoveryStatus(serverStatus, record, attemptFinishedWithoutAudit),
   );
+  const auditCounts = isRecord(audit.counts) ? audit.counts : {};
   const metrics: DiscoveryRunMetrics = {
     projects: firstCount(
       completionProgress.candidate_projects,
@@ -215,6 +219,17 @@ export function buildDiscoveryRunView(job: DiscoveryJob): DiscoveryRunView {
       record.file_count,
     ),
     reviews: firstCount(recordSummary.needs_review_files, record.needs_review_files),
+    usableFiles: firstCount(
+      auditCounts.usable_files,
+      recordSummary.usable_files,
+      record.usable_files,
+      completionProgress.usable_files,
+    ),
+    strictValidFiles: firstCount(
+      auditCounts.strict_valid_files,
+      recordSummary.strict_valid_files,
+      record.strict_valid_files,
+    ),
     inspectedProjects: firstCount(
       completionProgress.reviewed_projects,
       recordSummary.reviewed_projects,
@@ -241,7 +256,8 @@ export function buildDiscoveryRunView(job: DiscoveryJob): DiscoveryRunView {
       completionProgress.blocker_counts ?? recordSummary.blocker_counts,
     ),
   };
-  metrics.selectedProjects = metrics.buildReadyProjects;
+  // L1 success metric: usable file list (not build-ready package count).
+  metrics.selectedProjects = metrics.usableFiles;
   const human = humanizeJobProgress({
     ...job,
     status,
@@ -327,6 +343,8 @@ export function isDiscoveryProgressPayload(value: unknown): value is DiscoveryPr
     value.metrics.buildReadyFiles,
   ].every(isNonNegativeNumber)) return false;
   if (value.metrics.selectedProjects != null && !isNonNegativeNumber(value.metrics.selectedProjects)) return false;
+  if (value.metrics.usableFiles != null && !isNonNegativeNumber(value.metrics.usableFiles)) return false;
+  if (value.metrics.strictValidFiles != null && !isNonNegativeNumber(value.metrics.strictValidFiles)) return false;
   if (
     !isRecord(value.metrics.blockerCounts) ||
     !Object.entries(value.metrics.blockerCounts).every(
@@ -391,7 +409,7 @@ export function DiscoveryProgressMessage({ payload }: { payload: DiscoveryProgre
           value={payload.progressPercent ?? undefined}
           max={100}
           size="small"
-          status={payload.status === "failed" || payload.status === "blocked" ? "error" : payload.status === "completed" ? "finished" : "active"}
+          status={payload.status === "failed" ? "error" : payload.status === "completed" || payload.status === "blocked" ? "finished" : "active"}
         />
       ) : null}
       {payload.milestones.length ? (
@@ -408,7 +426,7 @@ export function DiscoveryProgressMessage({ payload }: { payload: DiscoveryProgre
         <div><dt>检索项目</dt><dd>{payload.metrics.projects}</dd></div>
         <div><dt>已审项目</dt><dd>{payload.metrics.inspectedProjects}</dd></div>
         <div><dt>判断合格</dt><dd>{payload.metrics.judgmentQualifiedProjects}</dd></div>
-        <div><dt>build-ready 项目</dt><dd>{payload.metrics.buildReadyProjects}</dd></div>
+        <div><dt>可用文件 L1</dt><dd>{payload.metrics.usableFiles ?? payload.metrics.selectedProjects ?? 0}</dd></div>
       </dl>
       {Object.keys(payload.metrics.blockerCounts).length ? (
         <div className="discovery-progress__blockers">
@@ -424,8 +442,9 @@ export function DiscoveryProgressMessage({ payload }: { payload: DiscoveryProgre
         <summary>文件与兼容指标</summary>
         <dl>
           <div><dt>候选文件</dt><dd>{payload.metrics.files}</dd></div>
-          <div><dt>build-ready 文件</dt><dd>{payload.metrics.buildReadyFiles}</dd></div>
-          <div><dt>通过交付</dt><dd>{payload.metrics.selectedProjects ?? 0}</dd></div>
+          <div><dt>严格 valid</dt><dd>{payload.metrics.strictValidFiles ?? 0}</dd></div>
+          <div><dt>可用文件 L1</dt><dd>{payload.metrics.usableFiles ?? payload.metrics.selectedProjects ?? 0}</dd></div>
+          <div><dt>build-ready（参考）</dt><dd>{payload.metrics.buildReadyProjects}/{payload.metrics.buildReadyFiles}</dd></div>
           <div><dt>待复核</dt><dd>{payload.metrics.reviews}</dd></div>
           {payload.provenance?.authorityMode ? (
             <div><dt>Authority 模式</dt><dd>{payload.provenance.authorityMode}</dd></div>

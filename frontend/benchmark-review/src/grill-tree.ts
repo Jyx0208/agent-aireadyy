@@ -2644,13 +2644,13 @@ function interpretDiscoveryLog(
   }
 
   const repairEventText: Partial<Record<string, string>> = {
-    repair_progressed: "修复取得可验证进展，但尚待 build-ready 审计",
+    repair_progressed: "修复取得可验证进展，尚待 build-ready 参考审计；L1 可用清单仍可先用",
     repair_no_progress: "本次修复未产生可验证进展",
-    repair_succeeded: "收到修复成功事件，最终结果仍以 build-ready 权威判定为准",
-    repair_incomplete: "修复尝试结束，仍未达到 build-ready",
-    repair_blocked: "修复被阻塞，仍未达到 build-ready",
-    build_ready_succeeded: "收到 build-ready 成功事件，最终结果仍以权威判定为准",
-    blocked_with_progress: "已有进展，但材料尚未达到 build-ready",
+    repair_succeeded: "收到修复成功事件；最终 build-ready 仅作参考，以可用文件清单为准交付",
+    repair_incomplete: "修复尝试结束；build-ready 未签发（参考），不足会写入结果说明",
+    repair_blocked: "自动加深未完成；不足点写入结果说明，不阻挡下载可用文件清单",
+    build_ready_succeeded: "收到 build-ready 成功事件（L2 参考）；L1 仍以可用文件清单交付",
+    blocked_with_progress: "已有进展；build-ready 未签发（参考），可用文件清单仍可送入批量",
   };
   if (repairEventText[type]) {
     const includeMessage = !["repair_succeeded", "build_ready_succeeded"].includes(type);
@@ -3159,7 +3159,7 @@ export function humanizeJobProgress(job: {
     progressEvents.push({
       id: "quality-blocked",
       kind: "action",
-      text: `质量闸门未通过：${projectCount} 个候选，${selectedProjectCount} 个通过交付；审计证据已保留。`,
+      text: `搜索已结束：约 ${projectCount} 个候选项目。已整理可用文件清单（L1），可下载后送入「批量参数规划」；build-ready 未签发时仅在结果里说明不足，不阻挡使用。`,
     });
   }
   if (status === "cancelled") {
@@ -3212,7 +3212,9 @@ export function humanizeJobProgress(job: {
           ? `这轮没跑通：${jobError}`
           : "这轮数据发现失败。"
         : status === "blocked"
-          ? `搜索已结束，但质量闸门未通过：${projectCount} 个候选，${selectedProjectCount} 个通过交付。`
+          ? `搜索已结束：约 ${projectCount} 个候选` +
+            (fileCount ? `、${fileCount} 个文件线索` : "") +
+            `。已保留可用文件列表，可继续批量参数规划与标准化构建。`
         : status === "cancelled"
           ? "已按你的要求停掉这轮搜索。"
           : projectCount > 0
@@ -3237,10 +3239,16 @@ export function formatDoneMessage(
   const projects = Number(record.project_count || 0);
   const files = Number(record.file_count || 0);
   if (!businessCompletionAllowsSuccess(record)) {
+    const usable =
+      Number((record as { usable_files?: number }).usable_files) ||
+      Number((record.summary as Record<string, unknown> | undefined)?.usable_files) ||
+      files;
     return [
-      `本轮运行已结束，但尚未达到 build-ready：已找到约 **${projects}** 个候选项目。`,
-      "候选检索、审查或修复尝试只代表进展；权威毕业判定未通过，不能标记为交付完成。",
-      "请查看质量阻塞项和技术轨迹，补齐证据或文件后再审计。",
+      `本轮搜索与审查已结束：约 **${projects}** 个候选项目` +
+        (usable ? `，约 **${usable}** 条可用文件线索（L1）` : "") +
+        "。",
+      "已为你保留可用文件清单（可下载 batch_inputs_usable / 数据清单 CSV）。严格 build-ready 包未签发时，会在结果里说明元数据/仪器等不足——这不阻止你先做批量参数规划与标准化格式构建。",
+      "建议：下载「可用批量输入」→ 打开「批量处理」粘贴或点「送入批量参数规划」→ 运行参数推断 / 准备输入包。",
     ].join("\n");
   }
   const immuno = isImmunopeptideContext(spec);

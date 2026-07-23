@@ -3174,6 +3174,42 @@ class DiscoveryToolService:
                 )
             )
 
+        # Wave A policy: qualified progress with zero strict-valid is not graduation.
+        if (
+            len(qualified) > 0
+            and strict_valid_file_count == 0
+            and can_continue
+        ):
+            limitations.append(
+                "zero_strict_valid_files_continue_search:"
+                f"qualified={len(qualified)},weak_keep_files={weak_keep_file_count}"
+            )
+            issues.append(
+                DiscoveryAuditIssue(
+                    code="zero_strict_valid_files_with_qualified_projects",
+                    severity="error",
+                    summary=(
+                        "Projects may be judgment-qualified, but no strict-valid files exist yet. "
+                        "Continue search under budget; do not treat qualified headcount as build-ready."
+                    ),
+                    evidence_refs=[
+                        "strict_valid_files",
+                        "qualified_projects",
+                        "weak_keep_files",
+                    ],
+                )
+            )
+            actions.append(
+                DiscoveryRepairAction(
+                    action="search_more",
+                    reason=(
+                        "No strict-valid delivery files yet (build-ready path blocked). "
+                        "Search a materially different query hypothesis; avoid looping the same strategy "
+                        "(no-progress cap ~2 rounds per strategy, ~3 strategies)."
+                    ),
+                )
+            )
+
         if failed_accessions:
             issues.append(
                 DiscoveryAuditIssue(

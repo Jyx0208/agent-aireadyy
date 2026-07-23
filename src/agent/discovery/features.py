@@ -293,19 +293,11 @@ def extract_file_features(
     if matched_sdrf_rows:
         fields.extend(_sdrf_text_fields(matched_sdrf_rows))
 
+    # Instruments are file-owned (SDRF / file fields). Project-level models are
+    # never broadcast onto individual files — that would invent per-file evidence.
     sdrf_names, sdrf_name_evidence = _instrument_names_from_fields(fields)
-    if sdrf_names:
-        names = _dedupe(sdrf_names)
-        families = _instrument_families(names)
-    elif len(project_features.instrument_names) == 1:
-        # A single project-level instrument is a reasonable file default.  A
-        # mixed-instrument project is not: broadcasting every model to every
-        # file creates false per-file evidence.
-        names = list(project_features.instrument_names)
-        families = list(project_features.instrument_families)
-    else:
-        names = []
-        families = []
+    names = _dedupe(sdrf_names)
+    families = _instrument_families(names) if names else []
     generation_score, generation_label = instrument_generation(names)
     fragmentation, fragmentation_evidence = _fragmentation_from_fields(fields)
     if not fragmentation:
