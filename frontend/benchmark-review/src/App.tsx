@@ -17,6 +17,7 @@ import { IbmWatsonDiscovery } from "@carbon/icons-react";
 
 import { AiReadyPanel } from "./AiReadyPanel";
 import { BatchPanel } from "./BatchPanel";
+import { buildInfoLabel, buildInfoTitle } from "./build-info";
 import { CarbonAgentChat } from "./CarbonAgentChat";
 import { DiscoveryContextRail } from "./DiscoveryContextRail";
 import { HistoryPanel } from "./HistoryPanel";
@@ -55,7 +56,16 @@ export default function App() {
                 <h1>蛋白质组学数据搜集与处理 Agent</h1>
                 <p>自然语言对齐科学需求，确认策略后再检索、审查并交付可追溯结果。</p>
               </div>
-              <Tag type="purple" renderIcon={IbmWatsonDiscovery}>OpenAI Agents SDK</Tag>
+              <div className="workspace-heading__meta">
+                <Tag type="purple" renderIcon={IbmWatsonDiscovery}>OpenAI Agents SDK</Tag>
+                <span
+                  className="build-stamp"
+                  aria-label="构建身份"
+                  title={buildInfoTitle()}
+                >
+                  Build {buildInfoLabel()}
+                </span>
+              </div>
             </div>
           </Column>
 

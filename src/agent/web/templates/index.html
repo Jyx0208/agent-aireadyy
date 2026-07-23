@@ -2817,10 +2817,10 @@ async function openDiscoveryFromHistory(discoveryId, jobId){
         renderDiscovery(data);
         return;
       }
-      alert((data && data.error) || '无法打开 Discovery 结果');
+      showFormAlert((data && data.error) || '无法打开 Discovery 结果');
     }
   }catch(e){
-    alert('打开 Discovery 历史失败: '+e);
+    showFormAlert('打开 Discovery 历史失败: '+e);
   }
 }
 

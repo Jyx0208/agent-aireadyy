@@ -413,7 +413,7 @@ describe("humanizeJobProgress", () => {
     expect(result.humanSteps.join(" ")).toMatch(/PXD001234|入选|免疫|检索|审查/);
   });
 
-  it("shows quality audit and autonomous repair as human milestones", () => {
+  it("shows legacy repair completion as attempt finished pending audit", () => {
     const result = humanizeJobProgress({
       status: "running",
       logs: [
@@ -446,9 +446,64 @@ describe("humanizeJobProgress", () => {
     });
 
     const visible = JSON.stringify(result.progressEvents);
-    expect(visible).toMatch(/质量审计|自主修复|项目评分/);
-    expect(result.humanSteps.join(" ")).toMatch(/自主修复|质量/);
+    expect(visible).toMatch(/质量审计|修复尝试结束|项目评分/);
+    expect(result.humanSteps.join(" ")).toMatch(/结果待审计|质量/);
+    expect(visible).not.toMatch(/自主修复完成/);
+    expect(visible).not.toMatch(/repair completed|pass delivery gates/i);
     expect(visible).not.toMatch(/sdk tool|sdk llm/i);
+  });
+
+  it("maps authoritative repair results without using events as the success gate", () => {
+    const incomplete = humanizeJobProgress({
+      status: "completed",
+      logs: [
+        { sequence: 1, type: "repair_attempt_finished", message: "attempt returned" },
+        { sequence: 2, type: "repair_progressed", message: "one blocker removed" },
+      ],
+      record: {
+        project_count: 8,
+        business_completion: {
+          succeeded: false,
+          status: "blocked_with_progress",
+          package_kind: "progress",
+          success_ui_allowed: false,
+          progress: { build_ready_projects: 0, build_ready_files: 0 },
+        },
+      },
+    });
+
+    expect(JSON.stringify(incomplete.progressEvents)).toMatch(/可验证进展|尚待 build-ready/);
+    expect(incomplete.summary).toMatch(/质量闸门未通过/);
+    expect(incomplete.summary).not.toMatch(/搜完了/);
+  });
+
+  it("fails soft for an unknown future event and never promotes it to completion", () => {
+    const result = humanizeJobProgress({
+      status: "completed",
+      logs: [
+        {
+          sequence: 1,
+          type: "repair_future_success_signal",
+          message: "A future worker reported an unfamiliar successful result payload.",
+        },
+      ],
+      record: {
+        project_count: 3,
+        business_completion: {
+          succeeded: false,
+          status: "blocked_with_progress",
+          package_kind: "progress",
+          success_ui_allowed: false,
+          progress: { build_ready_projects: 0, build_ready_files: 0 },
+        },
+      },
+    });
+
+    expect(result.summary).toMatch(/质量闸门未通过/);
+    expect(JSON.stringify(result.progressEvents)).not.toMatch(/本轮完成/);
+    expect(JSON.stringify(result.progressEvents)).toMatch(/未识别的修复事件|忽略其状态声明/);
+    expect(result.progressEvents.some((event) => event.kind === "tool" && event.status === "ok"))
+      .toBe(false);
   });
 
   it("aggregates repeated project inspections into a live step", () => {

@@ -1,0 +1,267 @@
+{
+  "schema_version": "discovery-scenario/v1",
+  "scenario_id": "synthetic_rt_psm_build_ready_transition",
+  "source_kind": "synthetic_non_domain_specific_regression",
+  "network_required": false,
+  "contains_secrets": false,
+  "request": {
+    "task_family": "retention_time_prediction",
+    "label_generation_route": "high_confidence_psm_table",
+    "constraints": [
+      {
+        "dimension": "acquisition_mode",
+        "value": "dda",
+        "strength": "soft",
+        "evidence_scope": "assay",
+        "source": "accepted_preference"
+      },
+      {
+        "id": "constraint.labeling_strategy",
+        "label": "labeling strategy",
+        "dimension": "labeling_strategy",
+        "value": "label_free",
+        "strength": "hard",
+        "evidence_scope": "assay",
+        "source": "user"
+      }
+    ]
+  },
+  "states": {
+    "progress_only": {
+      "candidate_projects": 4,
+      "reviewed_projects": 3,
+      "judgment_qualified_projects": 2,
+      "build_ready_count": 0,
+      "build_ready_projects": 0,
+      "evidence": {
+        "project": [
+          "organism",
+          "study_design"
+        ],
+        "assay": [
+          "labeling_strategy",
+          "lc_gradient"
+        ],
+        "file": [
+          "file_name"
+        ]
+      },
+      "missing_build_ready_fields": [
+        "download_url",
+        "expected_size_bytes",
+        "file_role",
+        "file_to_assay_membership",
+        "psm_label_source"
+      ],
+      "latest_audit_status": "repair_required"
+    },
+    "build_ready_control": {
+      "candidate_projects": 4,
+      "reviewed_projects": 3,
+      "judgment_qualified_projects": 2,
+      "build_ready_count": 2,
+      "build_ready_projects": 2,
+      "build_ready_files": 6,
+      "evidence": {
+        "project": [
+          "organism",
+          "study_design"
+        ],
+        "assay": [
+          "labeling_strategy",
+          "lc_gradient"
+        ],
+        "file": [
+          "file_name",
+          "download_url",
+          "expected_size_bytes",
+          "file_role",
+          "file_to_assay_membership",
+          "psm_label_source"
+        ]
+      },
+      "missing_build_ready_fields": [],
+      "latest_audit_status": "ready",
+      "latest_audit_ref": "audit:synthetic-ready-v1",
+      "publication_authority": {
+        "schema_version": "publication-authority-state/v1",
+        "issued_run_ids": ["run:synthetic-control"],
+        "verified_audit_refs": ["audit:synthetic-ready-v1"],
+        "verified_manifest_refs": ["manifest:synthetic-ready-v1"],
+        "verified_evidence_store_refs": ["evidence-store:synthetic-ready-v1"],
+        "compatible_builder_entrypoints": ["dataset-builder/v1"],
+        "verified_membership_refs": [
+          "membership:A:A1",
+          "membership:A:A2",
+          "membership:A:A3",
+          "membership:B:B1",
+          "membership:B:B2",
+          "membership:B:B3"
+        ],
+        "observations": [
+          {
+            "observation_id": "obs:file:A1",
+            "dimension": "builder_file_entry",
+            "scope": "file",
+            "observed_value": "file:A1",
+            "source_refs": ["source:file:A1"]
+          },
+          {
+            "observation_id": "obs:file:A2",
+            "dimension": "builder_file_entry",
+            "scope": "file",
+            "observed_value": "file:A2",
+            "source_refs": ["source:file:A2"]
+          },
+          {
+            "observation_id": "obs:file:A3",
+            "dimension": "builder_file_entry",
+            "scope": "file",
+            "observed_value": "file:A3",
+            "source_refs": ["source:file:A3"]
+          },
+          {
+            "observation_id": "obs:file:B1",
+            "dimension": "builder_file_entry",
+            "scope": "file",
+            "observed_value": "file:B1",
+            "source_refs": ["source:file:B1"]
+          },
+          {
+            "observation_id": "obs:file:B2",
+            "dimension": "builder_file_entry",
+            "scope": "file",
+            "observed_value": "file:B2",
+            "source_refs": ["source:file:B2"]
+          },
+          {
+            "observation_id": "obs:file:B3",
+            "dimension": "builder_file_entry",
+            "scope": "file",
+            "observed_value": "file:B3",
+            "source_refs": ["source:file:B3"]
+          },
+          {
+            "observation_id": "obs:constraint:labeling",
+            "dimension": "labeling_strategy",
+            "scope": "assay",
+            "observed_value": "label_free",
+            "source_refs": ["evidence:assay:labeling"]
+          }
+        ],
+        "authorized_package_digest": "sha256:e2c8c11423cd8499a0eaedbe66cd53f3f3f05e41ba9483b7ebcbc379a19746b4",
+        "issuance_token": "Bdh1OLDz7d-ksbM-tyEBmYoPjE6HayubcFxURKtNlRIKmq2nzCiFpF2RGjHCxL1hmTy2wRNMFAT4NCz4Ql1fAaQFIapienh7SIeHWyOmG7eltVjSDrqGF0z_vI-9BprNBFM_1Rfz2ddMORjHyYFo6gTqo4EGVBienUEJFE1LXNYTDei0o1iBZddN2vS0RbBRopvrmL46toSwpSuQkpZ46bgq_ZvaGjPJroIDS_arecOhpQiOUK76R3h3NXEjDkVLq8vSkEQMILGJF811Tz_LibCu7VL-kkThAq29cPOB9GUgKbbn0m66aEGLDt_axx7xWbR73yqRnPlFyHFut5YAaw=="
+      },
+      "validated_build_ready_package": {
+        "schema_version": "discovery-build-ready-package/v1",
+        "package_id": "package:synthetic-ready-v1",
+        "authority": "publication_contract_registry",
+        "authority_run_id": "run:synthetic-control",
+        "audit_ref": "audit:synthetic-ready-v1",
+        "manifest_ref": "manifest:synthetic-ready-v1",
+        "evidence_store_ref": "evidence-store:synthetic-ready-v1",
+        "builder_entrypoint": "dataset-builder/v1",
+        "validated": true,
+        "builder_compatible": true,
+        "project_ids": ["GENERIC_PROJECT_A", "GENERIC_PROJECT_B"],
+        "files": [
+          {
+            "file_id": "file:A1",
+            "project_id": "GENERIC_PROJECT_A",
+            "download_url": "https://example.invalid/A1.raw",
+            "expected_size_bytes": 10,
+            "file_role": "raw_acquisition",
+            "validity_status": "valid",
+            "needs_review": false,
+            "evidence_observation_refs": ["obs:file:A1"],
+            "membership_ref": "membership:A:A1"
+          },
+          {
+            "file_id": "file:A2",
+            "project_id": "GENERIC_PROJECT_A",
+            "download_url": "https://example.invalid/A2.raw",
+            "expected_size_bytes": 10,
+            "file_role": "raw_acquisition",
+            "validity_status": "valid",
+            "needs_review": false,
+            "evidence_observation_refs": ["obs:file:A2"],
+            "membership_ref": "membership:A:A2"
+          },
+          {
+            "file_id": "file:A3",
+            "project_id": "GENERIC_PROJECT_A",
+            "download_url": "https://example.invalid/A3.raw",
+            "expected_size_bytes": 10,
+            "file_role": "raw_acquisition",
+            "validity_status": "valid",
+            "needs_review": false,
+            "evidence_observation_refs": ["obs:file:A3"],
+            "membership_ref": "membership:A:A3"
+          },
+          {
+            "file_id": "file:B1",
+            "project_id": "GENERIC_PROJECT_B",
+            "download_url": "https://example.invalid/B1.raw",
+            "expected_size_bytes": 10,
+            "file_role": "raw_acquisition",
+            "validity_status": "valid",
+            "needs_review": false,
+            "evidence_observation_refs": ["obs:file:B1"],
+            "membership_ref": "membership:B:B1"
+          },
+          {
+            "file_id": "file:B2",
+            "project_id": "GENERIC_PROJECT_B",
+            "download_url": "https://example.invalid/B2.raw",
+            "expected_size_bytes": 10,
+            "file_role": "raw_acquisition",
+            "validity_status": "valid",
+            "needs_review": false,
+            "evidence_observation_refs": ["obs:file:B2"],
+            "membership_ref": "membership:B:B2"
+          },
+          {
+            "file_id": "file:B3",
+            "project_id": "GENERIC_PROJECT_B",
+            "download_url": "https://example.invalid/B3.raw",
+            "expected_size_bytes": 10,
+            "file_role": "raw_acquisition",
+            "validity_status": "valid",
+            "needs_review": false,
+            "evidence_observation_refs": ["obs:file:B3"],
+            "membership_ref": "membership:B:B3"
+          }
+        ],
+        "constraint_evidence": [
+          {
+            "observation_id": "obs:constraint:labeling",
+            "constraint_id": "constraint.labeling_strategy",
+            "dimension": "labeling_strategy",
+            "scope": "assay",
+            "operator": "matches",
+            "observed_value": "label_free",
+            "source_refs": ["evidence:assay:labeling"]
+          }
+        ],
+        "unresolved": [],
+        "excluded": []
+      }
+    }
+  },
+  "expected": {
+    "progress_only": {
+      "progress_visible": true,
+      "business_status": "blocked_with_progress",
+      "business_succeeded": false,
+      "package_kind": "progress",
+      "success_ui_allowed": false
+    },
+    "build_ready_control": {
+      "progress_visible": true,
+      "business_status": "build_ready_succeeded",
+      "business_succeeded": true,
+      "package_kind": "build_ready",
+      "success_ui_allowed": true
+    }
+  }
+}

@@ -9,8 +9,15 @@ from pydantic import Field, field_validator, model_validator
 from agent.models import JsonModel
 
 
-ConstraintStrength = Literal["hard", "soft"]
-ConstraintScope = Literal["project", "file", "sample", "portfolio"]
+ConstraintStrength = Literal["hard", "soft", "open"]
+ConstraintScope = Literal[
+    "project",
+    "assay",
+    "file",
+    "spectrum",
+    "sample",
+    "portfolio",
+]
 ConstraintStatus = Literal["pass", "partial", "fail", "unknown", "not_applicable"]
 
 _UNKNOWN_VALUE_SENTINELS = frozenset(
@@ -149,6 +156,58 @@ def normalize_scientific_constraints(value: Any) -> list[ScientificConstraint]:
 def constraint_slug(label: str, *, fallback: str = "constraint") -> str:
     normalized = re.sub(r"[^A-Za-z0-9_.:-]+", "-", str(label or "").strip()).strip("-.")
     return (normalized or fallback)[:96]
+
+
+def normalize_constraint_bindings(value: Any) -> list[ScientificConstraint]:
+    """Normalize first-class strategy bindings into the existing constraint model.
+
+    This is a compatibility adapter, not a second constraint hierarchy.  Legacy
+    ``ScientificConstraint`` payloads keep their explicit ids/labels, while the
+    compact binding shape used by strategy/publication contracts receives stable
+    defaults and maps ``evidence_scope`` onto ``scope``.
+    """
+
+    if not isinstance(value, list):
+        return []
+    normalized: list[ScientificConstraint] = []
+    by_id: dict[str, int] = {}
+    for index, raw in enumerate(value[:100], start=1):
+        if isinstance(raw, ScientificConstraint):
+            constraint = raw
+        elif isinstance(raw, dict):
+            item = dict(raw)
+            dimension = " ".join(str(item.get("dimension") or "").split()).strip()
+            if not dimension:
+                continue
+            item.setdefault(
+                "id",
+                constraint_slug(
+                    f"binding.{dimension}.{index}",
+                    fallback=f"binding-{index}",
+                ),
+            )
+            item.setdefault("label", dimension.replace("_", " "))
+            if "scope" not in item and item.get("evidence_scope") is not None:
+                item["scope"] = item.pop("evidence_scope")
+            source = str(item.get("source") or "user").strip().casefold()
+            item["source"] = {
+                "accepted_preference": "accepted_recommendation",
+                "system_default": "inferred",
+                "default": "inferred",
+            }.get(source, source)
+            try:
+                constraint = ScientificConstraint.model_validate(item)
+            except Exception:
+                continue
+        else:
+            continue
+        key = constraint.id.casefold()
+        if key in by_id:
+            normalized[by_id[key]] = constraint
+        else:
+            by_id[key] = len(normalized)
+            normalized.append(constraint)
+    return normalized
 
 
 def evaluate_constraint_value(

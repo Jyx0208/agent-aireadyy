@@ -23,6 +23,11 @@ async def _llm_ok(_config):
     return True, "ok"
 
 
+def _clear_server_llm_env(monkeypatch) -> None:
+    for name in ("AGENT_LLM_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_pride_cache(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_PRIDE_CACHE_DIR", str(tmp_path / "pride-cache"))
@@ -3550,8 +3555,10 @@ def test_zip_output_rebuilds_cached_archive_missing_parameter_files(tmp_path):
 
 
 def test_saved_llm_config_is_masked_and_used_without_browser_key(monkeypatch, tmp_path):
+    _clear_server_llm_env(monkeypatch)
     monkeypatch.setenv("AGENT_LLM_CONFIG_PATH", str(tmp_path / "secrets" / "llm_config.json"))
     monkeypatch.setattr("agent.web.app._run_llm_check", _llm_ok)
+    request = SimpleNamespace()
 
     saved = asyncio.run(
         web_app.save_llm_config(
@@ -3562,22 +3569,23 @@ def test_saved_llm_config_is_masked_and_used_without_browser_key(monkeypatch, tm
                     "model": "deepseek-v4-pro",
                     "timeout": "1200",
                 }
-            }
+            },
+            request,
         )
     )
-    public = asyncio.run(web_app.get_llm_config())
+    public = asyncio.run(web_app.get_llm_config(request))
     effective, error = web_app._build_llm_config({})
 
     assert saved["ok"] is True
     assert saved["api_key_set"] is True
     assert "api_key" not in saved
-    assert public == {
-        "api_key_set": True,
-        "base_url": "https://api.deepseek.com",
-        "model": "deepseek-v4-pro",
-        "timeout": "1200",
-        "source": "saved",
-    }
+    assert public["api_key_set"] is True
+    assert public["base_url"] == "https://api.deepseek.com"
+    assert public["model"] == "deepseek-v4-pro"
+    assert public["timeout"] == "1200"
+    assert public["source"] == "saved"
+    assert public["default_profile_id"] == "default"
+    assert public["profiles"][0]["api_key_set"] is True
     assert effective == {
         "api_key": "saved-secret",
         "base_url": "https://api.deepseek.com",
@@ -3590,27 +3598,33 @@ def test_saved_llm_config_is_masked_and_used_without_browser_key(monkeypatch, tm
 
 
 def test_saved_llm_config_can_be_deleted(monkeypatch, tmp_path):
+    _clear_server_llm_env(monkeypatch)
     monkeypatch.setenv("AGENT_LLM_CONFIG_PATH", str(tmp_path / "llm_config.json"))
     monkeypatch.setattr("agent.web.app._run_llm_check", _llm_ok)
+    request = SimpleNamespace()
     asyncio.run(
         web_app.save_llm_config(
-            {"llm_config": {"api_key": "saved-secret", "model": "deepseek-v4-pro"}}
+            {"llm_config": {"api_key": "saved-secret", "model": "deepseek-v4-pro"}},
+            request,
         )
     )
 
-    deleted = asyncio.run(web_app.delete_llm_config())
-    public = asyncio.run(web_app.get_llm_config())
+    deleted = asyncio.run(web_app.delete_llm_config(request))
+    public = asyncio.run(web_app.get_llm_config(request))
 
     assert deleted == {"ok": True, "deleted": True}
     assert public["api_key_set"] is False
 
 
 def test_list_llm_models_uses_saved_config_without_returning_key(monkeypatch, tmp_path):
+    _clear_server_llm_env(monkeypatch)
     monkeypatch.setenv("AGENT_LLM_CONFIG_PATH", str(tmp_path / "llm_config.json"))
     monkeypatch.setattr("agent.web.app._run_llm_check", _llm_ok)
+    request = SimpleNamespace()
     asyncio.run(
         web_app.save_llm_config(
-            {"llm_config": {"api_key": "saved-secret", "model": "deepseek-v4-pro"}}
+            {"llm_config": {"api_key": "saved-secret", "model": "deepseek-v4-pro"}},
+            request,
         )
     )
     captured = {}
@@ -3620,7 +3634,12 @@ def test_list_llm_models_uses_saved_config_without_returning_key(monkeypatch, tm
         return ["deepseek-v4-flash", "deepseek-v4-pro"]
 
     monkeypatch.setattr("agent.web.app._fetch_llm_models", fake_fetch)
-    result = asyncio.run(web_app.list_llm_models({"llm_config": {}}))
+    result = asyncio.run(
+        web_app.list_llm_models(
+            {"profile_id": "default", "llm_config": {}},
+            request,
+        )
+    )
 
     assert result == {
         "ok": True,

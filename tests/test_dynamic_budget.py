@@ -43,12 +43,12 @@ def test_dynamic_budget_contracts_reject_invalid_decision_shapes() -> None:
     )
     assert len(proposal.queries) == 2
     limits = DynamicBudgetLimits()
-    assert limits.initial_query_units == 12
-    assert limits.expanded_query_units == 30
-    assert limits.max_query_units == 60
-    assert limits.initial_repository_requests == 80
-    assert limits.expanded_repository_requests == 160
-    assert limits.max_repository_requests == 300
+    assert limits.initial_query_units == 200
+    assert limits.expanded_query_units == 600
+    assert limits.max_query_units == 2000
+    assert limits.initial_repository_requests == 3000
+    assert limits.expanded_repository_requests == 10000
+    assert limits.max_repository_requests == 25000
     transport = BudgetDecisionInput(
         proposal_id="proposal_1",
         decision="stop",
@@ -294,7 +294,11 @@ def _dynamic_store_and_run(
             status="running",
             dynamic_budget_enabled=True,
             dynamic_limits=DynamicBudgetLimits(
+                initial_query_units=12,
+                expanded_query_units=30,
                 max_query_units=max_query_units,
+                initial_repository_requests=80,
+                expanded_repository_requests=160,
                 max_repository_requests=200,
             ),
             budget=AgentBudget(max_turns=50, max_tool_calls=100),

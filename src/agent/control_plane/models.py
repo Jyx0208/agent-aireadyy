@@ -5,6 +5,14 @@ from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
+from agent.discovery.publication import (
+    AuthorityEvidenceObservation,
+    BuildReadyPackage,
+    BusinessCompletionDecision,
+    PublicationAuthorityState,
+)
+from agent.discovery.evidence_store import EvidenceStoreArtifact
+from agent.discovery.builder_contract import BuilderDryRunResult
 from agent.discovery.project_judgment import ProjectJudgmentInput
 from agent.models import JsonModel
 
@@ -341,6 +349,23 @@ class AgentRunRecord(JsonModel):
     search_stop_reason: str | None = None
     latest_metrics: RoundMetrics | None = None
     latest_discovery_audit: DiscoveryQualityAudit | None = None
+    business_completion: BusinessCompletionDecision | None = None
+    builder_dry_run_result: BuilderDryRunResult | None = None
+    build_ready_package_material: BuildReadyPackage | None = None
+    publication_authority: PublicationAuthorityState | None = None
+    publication_evidence_observations: list[AuthorityEvidenceObservation] = Field(
+        default_factory=list
+    )
+    publication_membership_refs: list[str] = Field(default_factory=list)
+    publication_evidence_store: EvidenceStoreArtifact | None = None
+    publication_builder_entrypoint: str | None = None
+    publication_builder_preflight_ref: str | None = None
+    publication_builder_preflight_status: str | None = None
+    publication_materialization_blockers: list[str] = Field(default_factory=list)
+    repair_execution_keys: list[str] = Field(default_factory=list)
+    repair_no_progress_signature: str | None = None
+    repair_no_progress_count: int = Field(default=0, ge=0)
+    auth_refresh_attempts: int = Field(default=0, ge=0)
     project_judgments: dict[str, ProjectJudgmentInput] = Field(default_factory=dict)
     qualified_project_count: int = Field(default=0, ge=0)
     qualified_no_gain_count: int = Field(default=0, ge=0)

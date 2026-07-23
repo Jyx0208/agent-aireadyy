@@ -387,7 +387,7 @@ def test_runtime_provenance_typed_field_round_trips_run_and_result(tmp_path: Pat
     assert result.sdk_turn_count == 3
 
 
-def test_repair_runner_uses_remaining_sdk_turns_without_provider_usage(
+def test_authority_repair_does_not_spend_a_second_runner_turn(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -482,30 +482,29 @@ def test_repair_runner_uses_remaining_sdk_turns_without_provider_usage(
         Path(result.files["agents_discovery_summary_json"]).read_text(encoding="utf-8")
     )
 
-    assert FakeRunner.max_turns == [5, 2]
-    assert FakeRunner.live_turn_counts == [3, 4]
+    assert FakeRunner.max_turns == [5]
+    assert FakeRunner.live_turn_counts == [3]
     assert run is not None
     assert run.model_requests == 0
-    assert run.sdk_turn_count == 4
-    assert run.remaining_model_turn_budget() == 1
-    assert run.stop_reason == "model_turn_budget_insufficient"
+    assert run.sdk_turn_count == 3
+    assert run.remaining_model_turn_budget() == 2
+    assert run.stop_reason == "missing_issue_context"
     assert run.latest_discovery_audit is not None
-    assert run.latest_discovery_audit.status == "blocked"
+    assert run.latest_discovery_audit.status == "repair_required"
     assert [
         action.action for action in run.latest_discovery_audit.repair_actions
     ] == ["stop_with_limitations"]
-    assert result.sdk_turn_count == 4
-    assert repair_event.payload["remaining_turns"] == 2
+    assert result.sdk_turn_count == 3
+    assert repair_event.payload["authority_mode"] == "repair_proposal_v2"
     assert repair_event.payload["sdk_turn_count"] == 3
-    assert stopped_event.payload["reason"] == "model_turn_budget_insufficient"
-    assert stopped_event.payload["remaining_turns"] == 1
-    assert summary["stop_reason"] == "model_turn_budget_insufficient"
-    assert summary["latest_discovery_audit"]["status"] == "blocked"
-    assert summary["model_usage"]["sdk_turns"] == 4
-    assert summary["model_usage"]["remaining_model_turn_budget"] == 1
+    assert stopped_event.payload["reason"] == "missing_issue_context"
+    assert summary["stop_reason"] == "missing_issue_context"
+    assert summary["latest_discovery_audit"]["status"] == "repair_required"
+    assert summary["model_usage"]["sdk_turns"] == 3
+    assert summary["model_usage"]["remaining_model_turn_budget"] == 2
 
 
-def test_runner_stops_with_matching_audit_when_one_turn_cannot_fund_repair(
+def test_authority_repair_runs_without_requiring_two_remaining_model_turns(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -605,26 +604,24 @@ def test_runner_stops_with_matching_audit_when_one_turn_cannot_fund_repair(
 
     assert FakeRunner.max_turns == [5]
     assert auto_select_calls == 0
-    assert not any(
+    assert any(
         event.event_type == "discovery_quality_repair_started" for event in events
     )
-    assert stopped.payload["reason"] == "model_turn_budget_insufficient"
-    assert stopped.payload["remaining_turns"] == 1
-    assert stopped.payload["minimum_repair_turns"] == 2
+    assert stopped.payload["reason"] == "missing_issue_context"
     assert run is not None
     assert run.status == result.status == "blocked"
-    assert run.stop_reason == "model_turn_budget_insufficient"
-    assert run.blockers == ["model_turn_budget_insufficient"]
+    assert run.stop_reason == "missing_issue_context"
+    assert run.blockers == ["missing_issue_context"]
     assert result.blockers == run.blockers
     assert run.remaining_model_turn_budget() == 1
     assert run.latest_discovery_audit is not None
-    assert run.latest_discovery_audit.status == "blocked"
+    assert run.latest_discovery_audit.status == "repair_required"
     assert [
         action.action for action in run.latest_discovery_audit.repair_actions
-    ] == ["stop_with_limitations"]
-    assert "model_turn_budget_insufficient" in run.latest_discovery_audit.limitations
+    ] == ["rescore_projects"]
+    assert "inspection_coverage_incomplete" in run.latest_discovery_audit.limitations
     assert result.latest_discovery_audit == run.latest_discovery_audit
-    assert summary["stop_reason"] == "model_turn_budget_insufficient"
+    assert summary["stop_reason"] == "missing_issue_context"
     assert summary["latest_discovery_audit"] == run.latest_discovery_audit.model_dump(
         mode="json"
     )

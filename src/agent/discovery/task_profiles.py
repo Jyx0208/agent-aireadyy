@@ -8,6 +8,35 @@ from agent.models import JsonModel
 
 
 TaskImplementationStatus = Literal["active", "planned"]
+AgendaTriggerOperator = Literal[
+    "missing",
+    "missing_or_values",
+    "not_values",
+    "decision_variables_unresolved",
+]
+
+
+class AgendaTrigger(JsonModel):
+    """A declarative condition interpreted by the task-agnostic agenda engine."""
+
+    operator: AgendaTriggerOperator
+    field: str | None = None
+    values: list[str] = Field(default_factory=list)
+    description: str
+
+
+class CriticalAgendaItem(JsonModel):
+    """One decision dependency and the evidence needed to resolve it honestly."""
+
+    id: str
+    priority: int
+    blocks_build_ready: bool
+    decision_variables: list[str] = Field(default_factory=list)
+    target_fields: list[str] = Field(default_factory=list)
+    required_evidence: list[str] = Field(default_factory=list)
+    reason: str
+    source: Literal["ask_user_preference"] = "ask_user_preference"
+    trigger_conditions: list[AgendaTrigger] = Field(default_factory=list)
 
 
 class TaskProfile(JsonModel):
@@ -25,6 +54,230 @@ class TaskProfile(JsonModel):
     next_pipeline_steps: list[str] = Field(default_factory=list)
     ai_ready_target_schema: str
     quality_gate: list[str] = Field(default_factory=list)
+    critical_agenda: list[CriticalAgendaItem] = Field(
+        default_factory=lambda: _training_task_agenda()
+    )
+
+
+def _common_agenda() -> list[CriticalAgendaItem]:
+    return [
+        CriticalAgendaItem(
+            id="scientific_objective",
+            priority=100,
+            blocks_build_ready=True,
+            decision_variables=["objective"],
+            target_fields=["objective"],
+            required_evidence=["repository_project_descriptions"],
+            reason=(
+                "The scientific objective determines relevance and cannot be "
+                "recovered from repository metadata alone."
+            ),
+            trigger_conditions=[
+                AgendaTrigger(
+                    operator="missing",
+                    field="objective",
+                    description="The strategy has no scientific objective.",
+                )
+            ],
+        ),
+        CriticalAgendaItem(
+            id="downstream_task",
+            priority=98,
+            blocks_build_ready=True,
+            decision_variables=["task_type"],
+            target_fields=["task_type"],
+            required_evidence=["repository_file_roles"],
+            reason=(
+                "Different downstream tasks require different spectra, labels, "
+                "and project evidence."
+            ),
+            trigger_conditions=[
+                AgendaTrigger(
+                    operator="missing",
+                    field="task_type",
+                    description="No downstream task or browse-only choice is recorded.",
+                )
+            ],
+        ),
+        CriticalAgendaItem(
+            id="delivery_horizon",
+            priority=94,
+            blocks_build_ready=True,
+            decision_variables=["run_horizon"],
+            target_fields=["run_horizon"],
+            required_evidence=["publication_package_requirements"],
+            reason=(
+                "The stopping point controls whether the Agent only plans, finds "
+                "candidates, reviews evidence, or builds a dataset."
+            ),
+            trigger_conditions=[
+                AgendaTrigger(
+                    operator="missing",
+                    field="run_horizon",
+                    description="The requested stopping point is not resolved.",
+                )
+            ],
+        ),
+        CriticalAgendaItem(
+            id="search_scale",
+            priority=92,
+            blocks_build_ready=True,
+            decision_variables=[
+                "coverage_mode",
+                "target_project_count",
+                "quota_flexibility",
+            ],
+            target_fields=[
+                "coverage_mode",
+                "target_project_count",
+                "quota_flexibility",
+            ],
+            required_evidence=["repository_search_result_count"],
+            reason=(
+                "Search scale materially changes runtime, candidate-pool size, "
+                "diversity, and review depth."
+            ),
+            trigger_conditions=[
+                AgendaTrigger(
+                    operator="not_values",
+                    field="run_horizon",
+                    values=["plan_only"],
+                    description="An executable search, rather than plan-only advice, is requested.",
+                ),
+                AgendaTrigger(
+                    operator="missing",
+                    field="target_project_count",
+                    description="No project target has been chosen.",
+                ),
+                AgendaTrigger(
+                    operator="not_values",
+                    field="quota_flexibility",
+                    values=["open_ended"],
+                    description="The user has not explicitly chosen an open-ended quota.",
+                ),
+            ],
+        ),
+    ]
+
+
+def _training_agenda() -> list[CriticalAgendaItem]:
+    return [
+        CriticalAgendaItem(
+            id="acquisition_compatibility",
+            priority=82,
+            blocks_build_ready=True,
+            decision_variables=["acquisition_mode", "mixed_acquisition_policy"],
+            target_fields=["acquisition_mode", "mixed_acquisition_policy"],
+            required_evidence=["repository_acquisition_mode", "repository_file_roles"],
+            reason=(
+                "Training suitability depends on how spectra were acquired and "
+                "how mixed DDA/DIA projects are handled."
+            ),
+            trigger_conditions=[
+                AgendaTrigger(
+                    operator="missing",
+                    field="acquisition_mode",
+                    description="No acquisition policy is recorded; unknown is an explicit open choice.",
+                )
+            ],
+        ),
+        CriticalAgendaItem(
+            id="generalization_scope",
+            priority=78,
+            blocks_build_ready=True,
+            decision_variables=["species", "species_policy", "species_coverage"],
+            target_fields=["species", "species_policy", "species_coverage"],
+            required_evidence=["repository_organism_annotations"],
+            reason=(
+                "Species scope determines biological generalization and whether "
+                "taxa should be mixed or stratified."
+            ),
+            trigger_conditions=[
+                AgendaTrigger(
+                    operator="missing",
+                    field="species",
+                    description="No species list is present.",
+                ),
+                AgendaTrigger(
+                    operator="missing",
+                    field="species_policy",
+                    description="No species policy is recorded; open is a resolved policy.",
+                ),
+            ],
+        ),
+        CriticalAgendaItem(
+            id="labeling_compatibility",
+            priority=58,
+            blocks_build_ready=False,
+            decision_variables=["labeling_strategy", "labeling_hard"],
+            target_fields=["labeling_strategy", "labeling_hard"],
+            required_evidence=["repository_labeling_strategy"],
+            reason=(
+                "Labeling can alter usable ions or batch structure, but is usually "
+                "lower impact than task feasibility."
+            ),
+            trigger_conditions=[
+                AgendaTrigger(
+                    operator="missing_or_values",
+                    field="labeling_strategy",
+                    values=["unknown"],
+                    description="Labeling is absent or unknown and has not been explicitly left open.",
+                )
+            ],
+        ),
+    ]
+
+
+def _chimeric_agenda() -> list[CriticalAgendaItem]:
+    return [
+        CriticalAgendaItem(
+            id="chimeric_label_feasibility",
+            priority=88,
+            blocks_build_ready=True,
+            decision_variables=["label_provenance", "relabel_tolerance"],
+            target_fields=["scientific_constraints"],
+            required_evidence=[
+                "multi_peptide_assignment_provenance",
+                "search_result_qvalue_or_fdr",
+                "isolation_window_metadata",
+                "raw_or_peaklist_files_for_relabeling",
+            ],
+            reason=(
+                "Wide isolation windows suggest chimericity but do not provide "
+                "defensible multi-peptide labels; decide whether provenance-ready "
+                "labels are required or downstream relabeling is acceptable."
+            ),
+            trigger_conditions=[
+                AgendaTrigger(
+                    operator="decision_variables_unresolved",
+                    description=(
+                        "Label provenance and tolerance for downstream relabeling "
+                        "are not both resolved."
+                    ),
+                )
+            ],
+        )
+    ]
+
+
+def _training_task_agenda() -> list[CriticalAgendaItem]:
+    return [*_common_agenda(), *_training_agenda()]
+
+
+def _chimeric_task_agenda() -> list[CriticalAgendaItem]:
+    return [*_training_task_agenda(), *_chimeric_agenda()]
+
+
+def common_critical_agenda() -> list[CriticalAgendaItem]:
+    """Return an isolated copy of the non-training discovery agenda pack."""
+
+    return [item.model_copy(deep=True) for item in _common_agenda()]
+
+
+def training_critical_agenda() -> list[CriticalAgendaItem]:
+    """Return an isolated generic training agenda for non-profiled task types."""
+
+    return [item.model_copy(deep=True) for item in _training_task_agenda()]
 
 
 TASK_TYPE_ALIASES = {
@@ -209,6 +462,7 @@ TASK_PROFILES: dict[str, TaskProfile] = {
         ],
         ai_ready_target_schema="chimeric_train.parquet",
         quality_gate=["multi_peptide_label_confidence", "isolation_window_available", "component_assignment_quality"],
+        critical_agenda=_chimeric_task_agenda(),
     ),
 }
 

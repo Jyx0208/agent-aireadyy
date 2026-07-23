@@ -19,6 +19,10 @@ import {
   type StrategyCard,
   type TaskType,
 } from "./intent-spec";
+import {
+  businessCompletionAllowsSuccess,
+  honestDiscoveryStatus,
+} from "./workflow-api";
 
 const text = (value: unknown) => String(value ?? "").trim();
 const lower = (value: unknown) => text(value).toLowerCase();
@@ -2619,23 +2623,53 @@ function interpretDiscoveryLog(
     };
   }
 
-  if (type === "discovery_quality_repair_started") {
+  if (type === "discovery_quality_repair_started" || type === "repair_attempt_started") {
     return {
       id: `repair-start-${seq}`,
       kind: "action",
-      text: `Agent 正在自主修复质量缺口：${compactLogDetail(message)}`,
+      text: `修复尝试已开始：${compactLogDetail(message)}`,
       mergeKey: "quality-repair",
       signal: 10,
     };
   }
 
-  if (type === "discovery_quality_repair_completed") {
+  if (type === "discovery_quality_repair_completed" || type === "repair_attempt_finished") {
     return {
       id: `repair-done-${seq}`,
       kind: "action",
-      text: `自主修复完成：${compactLogDetail(message)}`,
+      text: "修复尝试结束，结果待审计",
       mergeKey: "quality-repair",
       signal: 10,
+    };
+  }
+
+  const repairEventText: Partial<Record<string, string>> = {
+    repair_progressed: "修复取得可验证进展，但尚待 build-ready 审计",
+    repair_no_progress: "本次修复未产生可验证进展",
+    repair_succeeded: "收到修复成功事件，最终结果仍以 build-ready 权威判定为准",
+    repair_incomplete: "修复尝试结束，仍未达到 build-ready",
+    repair_blocked: "修复被阻塞，仍未达到 build-ready",
+    build_ready_succeeded: "收到 build-ready 成功事件，最终结果仍以权威判定为准",
+    blocked_with_progress: "已有进展，但材料尚未达到 build-ready",
+  };
+  if (repairEventText[type]) {
+    const includeMessage = !["repair_succeeded", "build_ready_succeeded"].includes(type);
+    return {
+      id: `repair-result-${seq}`,
+      kind: type === "repair_no_progress" ? "think" : "action",
+      text: `${repairEventText[type]}${includeMessage && message ? `：${compactLogDetail(message)}` : ""}`,
+      mergeKey: type === "build_ready_succeeded" ? "build-ready" : "quality-repair-result",
+      signal: 10,
+    };
+  }
+
+  if (/^(repair_|build_ready_)/.test(type)) {
+    return {
+      id: `unknown-repair-${seq}`,
+      kind: "think",
+      text: `收到未识别的修复事件 ${type}，已忽略其状态声明`,
+      mergeKey: "quality-repair-unknown",
+      signal: 8,
     };
   }
 
@@ -2948,9 +2982,16 @@ export function humanizeJobProgress(job: {
   rawLogCount: number;
   headline: string;
 } {
-  const status = text(job.status || "queued");
-  const record = (job.record || {}) as Record<string, unknown>;
   const logs = Array.isArray(job.logs) ? job.logs : [];
+  const record = (job.record || {}) as Record<string, unknown>;
+  const attemptFinishedWithoutAudit = logs.some((log) =>
+    ["discovery_quality_repair_completed", "repair_attempt_finished"].includes(text(log.type)),
+  );
+  const status = honestDiscoveryStatus(
+    text(job.status || "queued"),
+    record,
+    attemptFinishedWithoutAudit,
+  );
   const jobError = text(job.error);
   const projectCount = Number(record.project_count || 0);
   const fileCount = Number(record.file_count || 0);
@@ -3195,6 +3236,13 @@ export function formatDoneMessage(
   const record = (job.record || {}) as Record<string, unknown>;
   const projects = Number(record.project_count || 0);
   const files = Number(record.file_count || 0);
+  if (!businessCompletionAllowsSuccess(record)) {
+    return [
+      `本轮运行已结束，但尚未达到 build-ready：已找到约 **${projects}** 个候选项目。`,
+      "候选检索、审查或修复尝试只代表进展；权威毕业判定未通过，不能标记为交付完成。",
+      "请查看质量阻塞项和技术轨迹，补齐证据或文件后再审计。",
+    ].join("\n");
+  }
   const immuno = isImmunopeptideContext(spec);
   const lines = [
     immuno

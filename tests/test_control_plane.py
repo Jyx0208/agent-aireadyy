@@ -1592,7 +1592,7 @@ def test_openai_agents_runner_executes_real_function_tool_loop(tmp_path: Path) -
         model=model,
     )
 
-    assert result.status == "completed"
+    assert result.status == "blocked"
     assert result.discovery_round_count == 1
     assert model.calls == 3
     assert result.selected_round_index == 0
@@ -1602,10 +1602,18 @@ def test_openai_agents_runner_executes_real_function_tool_loop(tmp_path: Path) -
     summary = json.loads(Path(result.files["agents_discovery_summary_json"]).read_text(encoding="utf-8"))
     assert summary["project_id"] == "project_human_dda"
     assert Path(result.files["agent_sessions_sqlite"]) == tmp_path / "project_sessions.sqlite"
-    assert AgentRunStore(tmp_path / "agent_control.sqlite").load_run(result.run_id).project_id == "project_human_dda"  # type: ignore[union-attr]
+    stored_run = AgentRunStore(tmp_path / "agent_control.sqlite").load_run(result.run_id)
+    assert stored_run is not None
+    assert stored_run.project_id == "project_human_dda"
+    assert stored_run.business_completion is not None
+    assert stored_run.business_completion.succeeded is False
+    assert stored_run.business_completion.success_ui_allowed is False
     assert "Accept the current manifest" in result.final_output
     events = json.loads(Path(result.files["agents_discovery_events_json"]).read_text(encoding="utf-8"))
-    assert "manifest_selected" in [event["event_type"] for event in events]
+    event_types = [event["event_type"] for event in events]
+    assert "manifest_selected" in event_types
+    assert "build_ready_succeeded" not in event_types
+    assert "repair_succeeded" not in event_types
 
 
 def test_openai_chat_completions_model_buffers_streamed_tool_calls() -> None:
@@ -1759,10 +1767,13 @@ def test_openai_agents_runner_executes_multi_agent_budget_loop(monkeypatch, tmp_
         stream_events=False,
     )
     store = AgentRunStore(state_db)
-    assert result.status == "completed"
+    assert result.status == "blocked"
     assert result.selected_round_index == 0
     run = store.load_run(result.run_id)
     assert run is not None
+    assert run.business_completion is not None
+    assert run.business_completion.succeeded is False
+    assert run.business_completion.success_ui_allowed is False
     assert run.dynamic_usage.budget_reviews == 1
     assert run.dynamic_usage.search_batches == 1
     assert run.dynamic_usage.query_units == 1
@@ -1771,6 +1782,8 @@ def test_openai_agents_runner_executes_multi_agent_budget_loop(monkeypatch, tmp_
     assert "budget_decision_recorded" in event_types
     assert "search_grant_consumed" in event_types
     assert "manifest_selected" in event_types
+    assert "build_ready_succeeded" not in event_types
+    assert "repair_succeeded" not in event_types
     budget_path = Path(result.files["agents_discovery_budget_json"])
     payload = json.loads(budget_path.read_text(encoding="utf-8"))
     assert payload["mode"] == "multi_agent_dynamic"
@@ -1906,9 +1919,12 @@ def test_openai_agents_runner_uses_quality_first_search_environment(tmp_path: Pa
     )
 
     run = AgentRunStore(state_db).load_run(result.run_id)
-    assert result.status == "completed"
+    assert result.status == "blocked"
     assert result.selected_round_index == 0
     assert run is not None
+    assert run.business_completion is not None
+    assert run.business_completion.succeeded is False
+    assert run.business_completion.success_ui_allowed is False
     assert run.candidate_search_count == 1
     assert run.candidate_inspection_count == 1
     assert run.latest_candidate_search_id == "search_0001"
@@ -1921,7 +1937,7 @@ def test_openai_agents_runner_uses_quality_first_search_environment(tmp_path: Pa
     )
 
 
-def test_quality_first_runner_autonomously_repairs_a_premature_final_answer(
+def test_quality_first_runner_blocks_a_premature_final_without_authority_completion(
     tmp_path: Path,
 ) -> None:
     from agents.items import ModelResponse
@@ -2052,13 +2068,21 @@ def test_quality_first_runner_autonomously_repairs_a_premature_final_answer(
         stream_events=False,
     )
 
-    events = AgentRunStore(state_db).list_events(result.run_id)
-    assert result.status == "completed"
-    assert result.selected_round_index == 0
-    assert model.calls == len(model.actions)
+    store = AgentRunStore(state_db)
+    events = store.list_events(result.run_id)
+    assert result.status == "blocked"
+    assert result.selected_round_index is None
+    assert model.calls == 3
     assert any(event.event_type == "discovery_quality_repair_started" for event in events)
     assert any(event.event_type == "discovery_quality_repair_completed" for event in events)
-    assert "Repaired, audited" in result.final_output
+    assert not any(event.event_type == "repair_succeeded" for event in events)
+    assert not any(event.event_type == "build_ready_succeeded" for event in events)
+    stored_run = store.load_run(result.run_id)
+    assert stored_run is not None
+    assert stored_run.business_completion is not None
+    assert stored_run.business_completion.succeeded is False
+    assert stored_run.business_completion.success_ui_allowed is False
+    assert "done before scoring" in result.final_output
 
 
 def test_openai_agents_setup_failure_is_persisted(monkeypatch, tmp_path: Path) -> None:

@@ -1,0 +1,226 @@
+{
+  "schema_version": "repair-scenarios/v1",
+  "network_required": false,
+  "contains_secrets": false,
+  "registered_capabilities": [
+    "search_expand",
+    "inspect",
+    "materialize_evidence",
+    "recompute_validity",
+    "refresh_auth_context",
+    "select_manifest",
+    "stop_with_limitations",
+    "ask_user_blocking_question"
+  ],
+  "registered_metrics": [
+    "unique_candidate_count",
+    "unresolved_claim_count",
+    "verified_observation_count",
+    "build_ready_project_count",
+    "active_context_freshness"
+  ],
+  "proposal_cases": [
+    {
+      "case_id": "open_intent_maps_to_registered_primitives",
+      "proposal": {
+        "intent": "Collect focused evidence for unresolved claims, then recompute readiness.",
+        "rationale": "The latest audit identifies evidence gaps that can be checked without changing user constraints.",
+        "requested_capabilities": [
+          "inspect",
+          "materialize_evidence",
+          "recompute_validity"
+        ],
+        "parameters": {
+          "target_group": "unresolved_claims",
+          "max_items": 5
+        },
+        "success_metric_spec": {
+          "metric_id": "hard_unknown_count",
+          "expected_delta_direction": "decrease"
+        },
+        "risk_class": "bounded_write"
+      },
+      "authority_context": {
+        "issue_code_set": [
+          "qualified_projects_have_unresolved_constraints"
+        ],
+        "available_evidence_scopes": [
+          "project"
+        ],
+        "remaining_tool_calls": 10,
+        "hard_conflicts": 0,
+        "hard_unknowns": 0
+      },
+      "expected": {
+        "decision": "approve",
+        "approved_capabilities": [
+          "inspect",
+          "materialize_evidence",
+          "recompute_validity"
+        ]
+      }
+    },
+    {
+      "case_id": "unknown_capability_is_rejected",
+      "proposal": {
+        "intent": "Use an unavailable external transformation to manufacture missing labels.",
+        "rationale": "The proposal asks for a capability that is not registered.",
+        "requested_capabilities": [
+          "unregistered_external_transformation"
+        ],
+        "parameters": {},
+        "success_metric_spec": {
+          "metric_id": "verified_observation_count",
+          "expected_delta_direction": "increase"
+        },
+        "risk_class": "bounded_write"
+      },
+      "authority_context": {
+        "remaining_tool_calls": 10,
+        "hard_conflicts": 0,
+        "hard_unknowns": 0
+      },
+      "expected": {
+        "decision": "reject",
+        "reason_code": "unknown_capability",
+        "must_not_emit_success": true
+      }
+    },
+    {
+      "case_id": "uncomputable_metric_is_rejected",
+      "proposal": {
+        "intent": "Repeat inspection until the result feels better.",
+        "rationale": "The proposed success measure is model self-assessment rather than an authority metric.",
+        "requested_capabilities": [
+          "inspect"
+        ],
+        "parameters": {
+          "target_group": "reviewed_projects"
+        },
+        "success_metric_spec": {
+          "metric_id": "model_says_quality_improved",
+          "expected_delta_direction": "increase"
+        },
+        "risk_class": "read_only"
+      },
+      "authority_context": {
+        "remaining_tool_calls": 10,
+        "hard_conflicts": 0,
+        "hard_unknowns": 0
+      },
+      "expected": {
+        "decision": "reject",
+        "reason_code": "uncomputable_metric",
+        "must_not_emit_success": true
+      }
+    },
+    {
+      "case_id": "stale_context_requests_refresh",
+      "proposal": {
+        "intent": "Refresh the stale search context and retry the bounded inspection.",
+        "rationale": "The previous inspection referenced an expired context identifier.",
+        "requested_capabilities": [
+          "refresh_auth_context",
+          "inspect"
+        ],
+        "parameters": {
+          "stale_context_id": "search_ctx_old",
+          "stale_grant_id": "grant_old",
+          "retry_operation": "inspect"
+        },
+        "success_metric_spec": {
+          "metric_id": "active_context_freshness",
+          "expected_delta_direction": "increase"
+        },
+        "risk_class": "bounded_write"
+      },
+      "authority_context": {
+        "issue_code_set": [
+          "stale_context"
+        ],
+        "available_evidence_scopes": [
+          "project"
+        ],
+        "remaining_tool_calls": 4,
+        "active_context_id": "search_ctx_new",
+        "active_grant_id": "grant_new",
+        "hard_conflicts": 0,
+        "hard_unknowns": 0
+      },
+      "expected": {
+        "decision": "approve",
+        "approved_capabilities": [
+          "refresh_auth_context",
+          "inspect"
+        ],
+        "max_refresh_attempts": 1
+      }
+    }
+  ],
+  "no_progress_case": {
+    "case_id": "two_identical_no_progress_attempts_stop",
+    "limit": 2,
+    "attempts": [
+      {
+        "approved_capability_set": [
+          "inspect"
+        ],
+        "parameter_hash": "sha256:neutral-parameters",
+        "issue_code_set": [
+          "missing_file_evidence"
+        ],
+        "metric_id": "unresolved_claim_count",
+        "pre": 7,
+        "post": 7,
+        "delta": 0
+      },
+      {
+        "approved_capability_set": [
+          "inspect"
+        ],
+        "parameter_hash": "sha256:neutral-parameters",
+        "issue_code_set": [
+          "missing_file_evidence"
+        ],
+        "metric_id": "unresolved_claim_count",
+        "pre": 7,
+        "post": 7,
+        "delta": 0
+      }
+    ],
+    "expected": {
+      "stop": true,
+      "reason_code": "no_progress_limit_reached",
+      "required_events": [
+        "repair_no_progress",
+        "repair_incomplete"
+      ],
+      "forbidden_events": [
+        "repair_succeeded",
+        "build_ready_succeeded"
+      ]
+    }
+  },
+  "attempt_finished_not_ready_case": {
+    "case_id": "attempt_finished_without_build_ready_is_not_success",
+    "attempt_event": "repair_attempt_finished",
+    "audit_status": "repair_required",
+    "business_completion": {
+      "succeeded": false,
+      "status": "blocked_with_progress",
+      "build_ready_projects": 0
+    },
+    "expected": {
+      "allowed_events": [
+        "repair_attempt_finished",
+        "repair_progressed",
+        "repair_incomplete"
+      ],
+      "forbidden_events": [
+        "repair_succeeded",
+        "build_ready_succeeded"
+      ],
+      "success_ui_allowed": false
+    }
+  }
+}

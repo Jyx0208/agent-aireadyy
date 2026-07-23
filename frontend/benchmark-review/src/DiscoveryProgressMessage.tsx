@@ -9,7 +9,11 @@ import {
   type TimelineEvent,
 } from "./CodexTimeline";
 import { humanizeJobProgress } from "./grill-tree";
-import type { DiscoveryJob, WorkflowRecord } from "./workflow-api";
+import {
+  honestDiscoveryStatus,
+  type DiscoveryJob,
+  type WorkflowRecord,
+} from "./workflow-api";
 
 export type DiscoveryRunStatus = "queued" | "running" | "completed" | "failed" | "blocked" | "cancelled";
 
@@ -18,11 +22,23 @@ export type DiscoveryRunMetrics = {
   files: number;
   reviews: number;
   selectedProjects?: number;
+  inspectedProjects: number;
+  judgmentQualifiedProjects: number;
+  buildReadyProjects: number;
+  buildReadyFiles: number;
+  blockerCounts: Record<string, number>;
 };
 
 export type DiscoveryMilestone = {
   id: string;
   text: string;
+};
+
+export type DiscoveryRunProvenance = {
+  authorityMode: string;
+  authorityKeyId: string;
+  builderPreflightStatus: string;
+  builderPreflightRef: string;
 };
 
 export type DiscoveryRunView = {
@@ -33,6 +49,7 @@ export type DiscoveryRunView = {
   headline: string;
   milestones: DiscoveryMilestone[];
   metrics: DiscoveryRunMetrics;
+  provenance: DiscoveryRunProvenance;
   progressPercent: number | null;
   technicalEvents: TimelineEvent[];
   rawLogCount: number;
@@ -49,6 +66,7 @@ export type DiscoveryProgressPayload = {
   headline: string;
   milestones: DiscoveryMilestone[];
   metrics: DiscoveryRunMetrics;
+  provenance?: DiscoveryRunProvenance;
   progressPercent: number | null;
   technicalEvents: TimelineEvent[];
   rawLogCount: number;
@@ -88,11 +106,28 @@ function readCount(value: unknown): number {
   return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : 0;
 }
 
+function firstCount(...values: unknown[]): number {
+  return readCount(values.find((value) => value != null && value !== ""));
+}
+
+function readBlockerCounts(value: unknown): Record<string, number> {
+  if (!isRecord(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value)
+      .map(([code, count]) => [code, readCount(count)] as const)
+      .filter(([code, count]) => code.trim().length > 0 && count > 0),
+  );
+}
+
 function readProgressPercent(value: unknown): number | null {
   if (value == null || value === "") return null;
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return null;
   return Math.max(0, Math.min(100, parsed));
+}
+
+function readOptionalText(value: unknown): string {
+  return typeof value === "string" ? value.trim().slice(0, 500) : "";
 }
 
 function progressEventToTimeline(event: ReturnType<typeof humanizeJobProgress>["progressEvents"][number]): TimelineEvent {
@@ -140,6 +175,13 @@ function buildMilestones(
 export function buildDiscoveryRunView(job: DiscoveryJob): DiscoveryRunView {
   const record = (job.record || {}) as WorkflowRecord;
   const recordSummary = isRecord(record.summary) ? record.summary : {};
+  const completion = isRecord(record.business_completion) ? record.business_completion : {};
+  const completionProgress = isRecord(completion.progress) ? completion.progress : {};
+  const publicationAuthority = isRecord(record.publication_authority)
+    ? record.publication_authority
+    : isRecord(recordSummary.publication_authority)
+      ? recordSummary.publication_authority
+      : {};
   const audit = isRecord(record.latest_discovery_audit)
     ? record.latest_discovery_audit
     : isRecord(recordSummary.latest_discovery_audit)
@@ -152,9 +194,65 @@ export function buildDiscoveryRunView(job: DiscoveryJob): DiscoveryRunView {
         .filter(Boolean)
         .slice(0, 4)
     : [];
-  const status = normalizeStatus(job.status || record.status);
-  const human = humanizeJobProgress(job);
-  const statusDetail = String(record.status_message || record.phase_label || "").trim();
+  const serverStatus = normalizeStatus(job.status || record.status);
+  const attemptFinishedWithoutAudit = (job.logs || []).some((log) =>
+    ["discovery_quality_repair_completed", "repair_attempt_finished"].includes(
+      String(log.type || ""),
+    ),
+  );
+  const status = normalizeStatus(
+    honestDiscoveryStatus(serverStatus, record, attemptFinishedWithoutAudit),
+  );
+  const metrics: DiscoveryRunMetrics = {
+    projects: firstCount(
+      completionProgress.candidate_projects,
+      recordSummary.candidate_projects,
+      record.project_count,
+    ),
+    files: firstCount(
+      completionProgress.candidate_files,
+      recordSummary.candidate_files,
+      record.file_count,
+    ),
+    reviews: firstCount(recordSummary.needs_review_files, record.needs_review_files),
+    inspectedProjects: firstCount(
+      completionProgress.reviewed_projects,
+      recordSummary.reviewed_projects,
+      recordSummary.inspected_projects,
+      recordSummary.assessable_inspections,
+      record.review_count,
+    ),
+    judgmentQualifiedProjects: firstCount(
+      completionProgress.judgment_qualified_projects,
+      recordSummary.judgment_qualified_projects,
+      recordSummary.judgment_qualified,
+    ),
+    buildReadyProjects: firstCount(
+      completionProgress.build_ready_projects,
+      completion.build_ready_projects,
+      recordSummary.build_ready_projects,
+    ),
+    buildReadyFiles: firstCount(
+      completionProgress.build_ready_files,
+      completion.build_ready_files,
+      recordSummary.build_ready_files,
+    ),
+    blockerCounts: readBlockerCounts(
+      completionProgress.blocker_counts ?? recordSummary.blocker_counts,
+    ),
+  };
+  metrics.selectedProjects = metrics.buildReadyProjects;
+  const human = humanizeJobProgress({
+    ...job,
+    status,
+    record: { ...record, project_count: metrics.projects, file_count: metrics.files },
+  });
+  const statusDetail = String(
+    record.status_message ||
+      record.phase_label ||
+      (Array.isArray(completion.limitations) ? completion.limitations[0] : "") ||
+      "",
+  ).trim();
   const technicalEvents = human.progressEvents.map(progressEventToTimeline);
 
   return {
@@ -164,12 +262,17 @@ export function buildDiscoveryRunView(job: DiscoveryJob): DiscoveryRunView {
     summary: human.summary,
     headline: human.headline,
     milestones: buildMilestones(human.humanSteps, human.headline, status),
-    metrics: {
-      projects: readCount(record.project_count),
-      files: readCount(record.file_count),
-      reviews: readCount(record.review_count ?? recordSummary.needs_review_files),
-      selectedProjects: readCount(
-        recordSummary.selected_projects ?? recordSummary.delivery_eligible_projects,
+    metrics,
+    provenance: {
+      authorityMode: readOptionalText(
+        publicationAuthority.authority_mode ?? record.authority_mode,
+      ),
+      authorityKeyId: readOptionalText(publicationAuthority.key_id ?? record.authority_key_id),
+      builderPreflightStatus: readOptionalText(
+        record.publication_builder_preflight_status ?? recordSummary.publication_builder_preflight_status,
+      ),
+      builderPreflightRef: readOptionalText(
+        record.publication_builder_preflight_ref ?? recordSummary.publication_builder_preflight_ref,
       ),
     },
     progressPercent: readProgressPercent(record.progress_percent),
@@ -182,6 +285,9 @@ export function buildDiscoveryRunView(job: DiscoveryJob): DiscoveryRunView {
 }
 
 export function toDiscoveryProgressPayload(view: DiscoveryRunView): DiscoveryProgressPayload {
+  const provenance = Object.values(view.provenance).some(Boolean)
+    ? view.provenance
+    : undefined;
   return {
     kind: "discovery_progress",
     status: view.status,
@@ -190,6 +296,7 @@ export function toDiscoveryProgressPayload(view: DiscoveryRunView): DiscoveryPro
     headline: view.headline,
     milestones: view.milestones,
     metrics: view.metrics,
+    provenance,
     progressPercent: view.progressPercent,
     technicalEvents: view.technicalEvents,
     rawLogCount: view.rawLogCount,
@@ -210,8 +317,34 @@ export function isDiscoveryProgressPayload(value: unknown): value is DiscoveryPr
     return false;
   }
   if (!isRecord(value.metrics)) return false;
-  if (![value.metrics.projects, value.metrics.files, value.metrics.reviews].every(isNonNegativeNumber)) return false;
+  if (![
+    value.metrics.projects,
+    value.metrics.files,
+    value.metrics.reviews,
+    value.metrics.inspectedProjects,
+    value.metrics.judgmentQualifiedProjects,
+    value.metrics.buildReadyProjects,
+    value.metrics.buildReadyFiles,
+  ].every(isNonNegativeNumber)) return false;
   if (value.metrics.selectedProjects != null && !isNonNegativeNumber(value.metrics.selectedProjects)) return false;
+  if (
+    !isRecord(value.metrics.blockerCounts) ||
+    !Object.entries(value.metrics.blockerCounts).every(
+      ([code, count]) => code.trim().length > 0 && isNonNegativeNumber(count),
+    )
+  ) return false;
+  if (
+    value.provenance != null &&
+    (!isRecord(value.provenance) ||
+      ![
+        value.provenance.authorityMode,
+        value.provenance.authorityKeyId,
+        value.provenance.builderPreflightStatus,
+        value.provenance.builderPreflightRef,
+      ].every((item) => typeof item === "string"))
+  ) {
+    return false;
+  }
   if (
     value.progressPercent != null &&
     (typeof value.progressPercent !== "number" ||
@@ -272,11 +405,45 @@ export function DiscoveryProgressMessage({ payload }: { payload: DiscoveryProgre
         </ol>
       ) : null}
       <dl className="discovery-progress__metrics">
-        <div><dt>候选项目</dt><dd>{payload.metrics.projects}</dd></div>
-        <div><dt>候选文件</dt><dd>{payload.metrics.files}</dd></div>
-        <div><dt>通过交付</dt><dd>{payload.metrics.selectedProjects ?? 0}</dd></div>
-        <div><dt>待复核</dt><dd>{payload.metrics.reviews}</dd></div>
+        <div><dt>检索项目</dt><dd>{payload.metrics.projects}</dd></div>
+        <div><dt>已审项目</dt><dd>{payload.metrics.inspectedProjects}</dd></div>
+        <div><dt>判断合格</dt><dd>{payload.metrics.judgmentQualifiedProjects}</dd></div>
+        <div><dt>build-ready 项目</dt><dd>{payload.metrics.buildReadyProjects}</dd></div>
       </dl>
+      {Object.keys(payload.metrics.blockerCounts).length ? (
+        <div className="discovery-progress__blockers">
+          <p>阻塞原因</p>
+          <ul>
+            {Object.entries(payload.metrics.blockerCounts).map(([code, count]) => (
+              <li key={code}>{code.replaceAll("_", " ")}：{count}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      <details className="discovery-progress__file-details">
+        <summary>文件与兼容指标</summary>
+        <dl>
+          <div><dt>候选文件</dt><dd>{payload.metrics.files}</dd></div>
+          <div><dt>build-ready 文件</dt><dd>{payload.metrics.buildReadyFiles}</dd></div>
+          <div><dt>通过交付</dt><dd>{payload.metrics.selectedProjects ?? 0}</dd></div>
+          <div><dt>待复核</dt><dd>{payload.metrics.reviews}</dd></div>
+          {payload.provenance?.authorityMode ? (
+            <div><dt>Authority 模式</dt><dd>{payload.provenance.authorityMode}</dd></div>
+          ) : null}
+          {payload.provenance?.authorityKeyId ? (
+            <div><dt>Authority key ID</dt><dd>{payload.provenance.authorityKeyId}</dd></div>
+          ) : null}
+          {payload.provenance?.builderPreflightStatus ? (
+            <div>
+              <dt>Builder preflight</dt>
+              <dd>{payload.provenance.builderPreflightStatus}（兼容预检，不等于 dry-run 接受）</dd>
+            </div>
+          ) : null}
+          {payload.provenance?.builderPreflightRef ? (
+            <div><dt>Preflight 引用</dt><dd>{payload.provenance.builderPreflightRef}</dd></div>
+          ) : null}
+        </dl>
+      </details>
       <CodexTimeline
         events={payload.technicalEvents}
         summary={`技术轨迹 · ${payload.rawLogCount} 条运行事件`}

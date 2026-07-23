@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
-from typing import Annotated, Any, Callable, Literal
+from typing import Annotated, Any, Callable, Literal, Mapping, Sequence
 
 from pydantic import Field
 
@@ -23,15 +23,14 @@ except ImportError:  # pragma: no cover - exercised when the optional extra is a
 
 from agent.control_plane.budget_agent import run_budget_agent_review
 from agent.control_plane.budget_governor import BudgetGovernor, quality_budget_tier
+from agent.control_plane.capabilities import AuthorityMetric, CapabilityRegistry
 from agent.control_plane.discovery import DiscoveryToolService
 from agent.control_plane.models import (
     AgentBudget,
     AgentEvent,
     AgentRunRecord,
     ArtifactReference,
-    DiscoveryAuditIssue,
     DiscoveryQualityAudit,
-    DiscoveryRepairAction,
     DynamicBudgetLimits,
     OpenAIAgentsDiscoveryResult,
     RuntimeProvenance,
@@ -39,6 +38,11 @@ from agent.control_plane.models import (
     minimum_high_relevance_inspections,
 )
 from agent.control_plane.store import AgentRunStore
+from agent.control_plane.repair import (
+    RepairAuthority,
+    RepairProposal,
+    upgrade_v1_repair_action,
+)
 from agent.control_plane.sdk_runtime import (
     PublicRunHooks,
     configure_local_trace,
@@ -47,6 +51,27 @@ from agent.control_plane.sdk_runtime import (
 )
 from agent.discovery.memory import DiscoveryMemory
 from agent.discovery.models import DatasetManifest, DatasetRequest
+from agent.discovery.evidence_store import EvidenceStore
+from agent.discovery.builder_contract import BuilderDryRunContract
+from agent.discovery.production_authority import (
+    DurableAuthorityLedger,
+    ProductionPublicationSigner,
+    authority_mode,
+    issue_publication_completion_context,
+    load_production_authority_runtime,
+)
+from agent.discovery.publication import (
+    AuthorityEvidenceObservation,
+    BuildReadyPackage,
+    BusinessCompletionDecision,
+    PublicationContractRegistry,
+    business_completion_allows_success,
+    canonical_package_digest,
+    dev_publication_signing_enabled,
+    issue_dev_publication_authority,
+    issue_production_publication_authority,
+    materialize_build_ready_package,
+)
 from agent.discovery.project_judgment import ProjectJudgmentInput, summarize_project_judgments
 from agent.discovery.query_builder import build_pride_queries
 from agent.discovery.search_environment import (
@@ -237,63 +262,1196 @@ def _audit_and_persist(
     service: DiscoveryToolService,
     *,
     meter_tool: bool = True,
+    production_signer: ProductionPublicationSigner | None = None,
+    allow_normal_publication_context: bool = True,
 ) -> DiscoveryQualityAudit:
     audit = service.audit_discovery_state(meter_tool=meter_tool)
-    return _persist_discovery_audit_snapshot(service, audit)
+    return _persist_discovery_audit_snapshot(
+        service,
+        audit,
+        production_signer=production_signer,
+        allow_normal_publication_context=allow_normal_publication_context,
+    )
 
 
 def _persist_discovery_audit_snapshot(
     service: DiscoveryToolService,
     audit: DiscoveryQualityAudit,
+    *,
+    completion_context: dict[str, str] | None = None,
+    production_signer: ProductionPublicationSigner | None = None,
+    builder_adapter: Callable[[BuildReadyPackage], Mapping[str, Any]] | None = None,
+    allow_normal_publication_context: bool = True,
 ) -> DiscoveryQualityAudit:
     run = service.store.load_run(service.run_id)
     if run is not None:
-        service.store.save_run(run.model_copy(update={"latest_discovery_audit": audit}))
+        audit_ref = _audit_reference(audit)
+        counts = audit.counts or {}
+        blocker_counts: dict[str, int] = {}
+        for issue in audit.issues:
+            blocker_counts[issue.code] = blocker_counts.get(issue.code, 0) + 1
+        if run.build_ready_package_material is None:
+            manifest_payload: dict[str, Any] | None = None
+            manifest_path = Path(run.current_manifest_path or "")
+            if manifest_path.is_file():
+                try:
+                    loaded_manifest = json.loads(
+                        manifest_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    loaded_manifest = None
+                if isinstance(loaded_manifest, dict):
+                    manifest_payload = loaded_manifest
+            materialization = materialize_build_ready_package(
+                {
+                    "run_id": run.run_id,
+                    "audit": {
+                        "run_id": audit.run_id,
+                        "status": audit.status,
+                        "ready_for_selection": audit.ready_for_selection,
+                        "ref": audit_ref,
+                    },
+                    "manifest": manifest_payload,
+                    "constraints": list(
+                        (run.request or {}).get("scientific_constraints") or []
+                    ),
+                    "evidence_store": (
+                        run.publication_evidence_store.model_dump(mode="json")
+                        if run.publication_evidence_store is not None
+                        else None
+                    ),
+                    "available_membership_refs": run.publication_membership_refs,
+                    "builder": {
+                        "entrypoint": run.publication_builder_entrypoint,
+                        "preflight_status": run.publication_builder_preflight_status,
+                        "preflight_ref": run.publication_builder_preflight_ref,
+                    },
+                }
+            )
+            run = run.model_copy(
+                update={
+                    "build_ready_package_material": materialization.package,
+                    "publication_evidence_observations": (
+                        materialization.evidence_observations
+                        or run.publication_evidence_observations
+                    ),
+                    "publication_membership_refs": (
+                        materialization.membership_refs
+                        if materialization.ready_for_authority_signing
+                        else run.publication_membership_refs
+                    ),
+                    "publication_materialization_blockers": materialization.blockers,
+                }
+            )
+        for blocker in run.publication_materialization_blockers:
+            blocker_counts[blocker] = blocker_counts.get(blocker, 0) + 1
+        configured_authority_mode = authority_mode()
+        publication_authority = run.publication_authority
+        if configured_authority_mode == "invalid":
+            publication_authority = None
+        if (
+            configured_authority_mode == "production"
+            and publication_authority is not None
+            and publication_authority.authority_mode != "production"
+        ):
+            publication_authority = None
+        production_runtime = None
+        production_blocker: str | None = None
+        if configured_authority_mode == "invalid":
+            production_blocker = "authority_mode_invalid"
+        if (
+            publication_authority is None
+            and run.build_ready_package_material is not None
+            and run.publication_evidence_observations
+            and run.publication_membership_refs
+        ):
+            if configured_authority_mode == "production":
+                try:
+                    production_runtime = load_production_authority_runtime(
+                        signer=production_signer
+                    )
+                except (RuntimeError, TypeError, ValueError):
+                    production_blocker = "production_authority_configuration_missing"
+                else:
+                    try:
+                        publication_authority = issue_production_publication_authority(
+                            run.build_ready_package_material,
+                            observations=run.publication_evidence_observations,
+                            verified_membership_refs=run.publication_membership_refs,
+                            signer=production_runtime.signer,
+                            verifier=production_runtime.verifier,
+                            ledger=production_runtime.ledger,
+                        )
+                    except (RuntimeError, TypeError, ValueError):
+                        production_blocker = "production_authority_issuance_failed"
+            elif (
+                configured_authority_mode in {"off", "dev"}
+                and dev_publication_signing_enabled()
+            ):
+                try:
+                    publication_authority = issue_dev_publication_authority(
+                        run.build_ready_package_material,
+                        observations=run.publication_evidence_observations,
+                        verified_membership_refs=run.publication_membership_refs,
+                    )
+                except (ImportError, PermissionError, RuntimeError, TypeError, ValueError):
+                    publication_authority = None
+        effective_completion_context = completion_context or {}
+        if (
+            configured_authority_mode == "production"
+            and not effective_completion_context
+            and allow_normal_publication_context
+            and audit.status == "ready"
+            and audit.ready_for_selection
+            and publication_authority is not None
+            and publication_authority.authority_mode == "production"
+        ):
+            completion_ledger = (
+                production_runtime.ledger
+                if production_runtime is not None
+                else DurableAuthorityLedger.from_environment(required=False)
+            )
+            if completion_ledger is None:
+                production_blocker = "production_publication_context_unavailable"
+            else:
+                try:
+                    effective_completion_context = issue_publication_completion_context(
+                        ledger=completion_ledger,
+                        run_id=run.run_id,
+                        audit_ref=audit_ref,
+                        package_digest=canonical_package_digest(
+                            run.build_ready_package_material
+                        ),
+                    )
+                except (RuntimeError, TypeError, ValueError):
+                    production_blocker = "production_publication_context_unavailable"
+        production_blocker_codes = {
+            "authority_mode_invalid",
+            "production_authority_configuration_missing",
+            "production_authority_issuance_failed",
+            "production_publication_context_unavailable",
+        }
+        retained_run_blockers = [
+            value for value in run.blockers if value not in production_blocker_codes
+        ]
+        if production_blocker is not None:
+            blocker_counts[production_blocker] = blocker_counts.get(
+                production_blocker, 0
+            ) + 1
+            retained_run_blockers.append(production_blocker)
+        run = run.model_copy(
+            update={"blockers": list(dict.fromkeys(retained_run_blockers))}
+        )
+        state = {
+            "latest_audit_status": (
+                "ready"
+                if audit.status == "ready" and audit.ready_for_selection
+                else audit.status
+            ),
+            "latest_audit_ref": audit_ref,
+            "candidate_projects": int(counts.get("candidate_projects") or 0),
+            "candidate_files": int(counts.get("candidate_files") or 0),
+            "reviewed_projects": int(
+                counts.get("assessable_inspections")
+                or counts.get("inspected_projects")
+                or 0
+            ),
+            "judgment_qualified_projects": int(
+                counts.get("qualified_projects") or 0
+            ),
+            "blocker_counts": blocker_counts,
+            "missing_build_ready_fields": list(
+                run.publication_materialization_blockers
+            ),
+        }
+        if run.build_ready_package_material is not None:
+            state["validated_build_ready_package"] = (
+                run.build_ready_package_material.model_dump(mode="json")
+            )
+        if publication_authority is not None:
+            state["publication_authority"] = publication_authority.model_dump(
+                mode="json"
+            )
+        publication_snapshot = {
+                "request": {
+                    "constraints": list(
+                        (run.request or {}).get("scientific_constraints") or []
+                    )
+                },
+                "state": state,
+                "completion_context": effective_completion_context,
+            }
+        registry = PublicationContractRegistry(
+            production_verifier=(
+                production_runtime.verifier if production_runtime is not None else None
+            ),
+            ledger=(production_runtime.ledger if production_runtime is not None else None),
+        )
+        decision = registry.evaluate(publication_snapshot)
+        # A builder receipt is valid only for the decision/package revalidated
+        # in this persistence pass. Never carry a prior accepted receipt across
+        # a blocked audit, changed package, missing adapter, or config failure.
+        builder_dry_run_result = None
+        if (
+            builder_adapter is not None
+            and decision.succeeded
+            and decision.build_ready_package is not None
+        ):
+            builder_adapter_failed_this_call = False
+            try:
+                raw_builder_result = builder_adapter(decision.build_ready_package)
+            except Exception:
+                raw_builder_result = {}
+                builder_adapter_failed_this_call = True
+                run = run.model_copy(
+                    update={
+                        "blockers": list(
+                            dict.fromkeys([*run.blockers, "builder_adapter_failed"])
+                        )
+                    }
+                )
+            else:
+                run = run.model_copy(
+                    update={
+                        "blockers": [
+                            value
+                            for value in run.blockers
+                            if value != "builder_adapter_failed"
+                        ]
+                    }
+                )
+            builder_dry_run_result = BuilderDryRunContract(
+                registry=registry
+            ).evaluate(
+                publication_snapshot,
+                builder_result=raw_builder_result,
+            )
+            if builder_adapter_failed_this_call:
+                builder_dry_run_result = builder_dry_run_result.model_copy(
+                    update={
+                        "blockers": list(
+                            dict.fromkeys(
+                                [
+                                    "builder_adapter_failed",
+                                    *builder_dry_run_result.blockers,
+                                ]
+                            )
+                        )
+                    }
+                )
+        service.store.save_run(
+            run.model_copy(
+                update={
+                    "latest_discovery_audit": audit,
+                    "business_completion": decision,
+                    "builder_dry_run_result": builder_dry_run_result,
+                    "publication_authority": publication_authority,
+                }
+            )
+        )
     return audit
 
 
-# One turn can request repair tools; a second is needed to observe their output
-# and close the audit/selection loop without exceeding the SDK turn ceiling.
-_MINIMUM_QUALITY_REPAIR_TURNS = 2
-_MODEL_TURN_BUDGET_INSUFFICIENT = "model_turn_budget_insufficient"
+def _audit_reference(audit: DiscoveryQualityAudit) -> str:
+    encoded = json.dumps(
+        audit.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "audit:sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-def _repair_budget_insufficient_audit(
+def _business_completion_allows_success(value: object) -> bool:
+    """Return true only for a Registry-issued build-ready completion."""
+
+    return business_completion_allows_success(value)
+
+
+def _legacy_repair_finished_payload(
     audit: DiscoveryQualityAudit,
-) -> DiscoveryQualityAudit:
-    issues = list(audit.issues)
-    if not any(issue.code == _MODEL_TURN_BUDGET_INSUFFICIENT for issue in issues):
-        issues.append(
-            DiscoveryAuditIssue(
-                code=_MODEL_TURN_BUDGET_INSUFFICIENT,
-                severity="error",
-                summary=(
-                    "Autonomous quality repair requires at least two model turns, "
-                    "but the shared model-turn budget cannot fund that bounded cycle."
-                ),
-                evidence_refs=["budget", "agent_events"],
+    business_completion: BusinessCompletionDecision | None,
+) -> dict[str, Any]:
+    """Keep the v1 event replayable without granting it success semantics."""
+
+    return {
+        "attempt_status": "finished",
+        "audit": audit.model_dump(mode="json"),
+        "business_completion": (
+            business_completion.model_dump(mode="json")
+            if business_completion is not None
+            else None
+        ),
+    }
+
+
+def _runner_v2_repair_proposals(value: object) -> list[RepairProposal]:
+    """Parse only explicit v2 repair envelopes from a Runner final output."""
+
+    raw: object = value
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+    if isinstance(raw, RepairProposal):
+        items: list[object] = [raw]
+    elif isinstance(raw, Mapping):
+        if raw.get("schema_version") == "discovery-repair-proposal/v2":
+            items = [raw]
+        else:
+            candidate_items = raw.get("repair_proposals")
+            items = list(candidate_items) if isinstance(candidate_items, list) else []
+    else:
+        return []
+
+    proposals: list[RepairProposal] = []
+    for item in items:
+        try:
+            proposal = RepairProposal.model_validate(item)
+        except (TypeError, ValueError):
+            continue
+        if proposal.schema_version == "discovery-repair-proposal/v2":
+            proposals.append(proposal)
+    return proposals
+
+
+def run_authority_repair_cycle(
+    service: DiscoveryToolService,
+    audit: DiscoveryQualityAudit,
+    *,
+    authority: RepairAuthority | None = None,
+    max_actions: int = 2,
+    proposals: Sequence[RepairProposal | Mapping[str, Any]] | None = None,
+    production_signer: ProductionPublicationSigner | None = None,
+    builder_adapter: Callable[[BuildReadyPackage], Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Execute v1 audit actions or Runner v2 proposals through one Authority."""
+
+    _persist_discovery_audit_snapshot(
+        service,
+        audit,
+        production_signer=production_signer,
+    )
+    registry = CapabilityRegistry.default()
+    result: dict[str, Any] = {
+        "attempted": 0,
+        "stopped": False,
+        "stop_reason": None,
+        "attempts": [],
+    }
+    if authority is not None:
+        active_authority = authority
+    else:
+        repair_ledger = None
+        repair_authority_id = None
+        configured_repair_mode = authority_mode()
+        if configured_repair_mode == "invalid":
+            payload = {
+                "reason_code": "authority_mode_invalid",
+                "attempt_status": "not_started",
+            }
+            service.store.append_event(
+                service.run_id,
+                "repair_incomplete",
+                payload,
             )
-        )
-    return audit.model_copy(
-        update={
-            "status": "blocked",
-            "ready_for_selection": False,
-            "issues": issues,
-            "repair_actions": [
-                DiscoveryRepairAction(
-                    action="stop_with_limitations",
-                    reason=(
-                        f"{_MODEL_TURN_BUDGET_INSUFFICIENT}: at least "
-                        f"{_MINIMUM_QUALITY_REPAIR_TURNS} model turns are required "
-                        "for a bounded autonomous repair cycle."
-                    ),
+            result.update(stopped=True, stop_reason="authority_mode_invalid")
+            return result
+        if configured_repair_mode == "production":
+            repair_ledger = DurableAuthorityLedger.from_environment(required=False)
+            if repair_ledger is None:
+                payload = {
+                    "reason_code": "production_authority_ledger_unavailable",
+                    "attempt_status": "not_started",
+                }
+                service.store.append_event(
+                    service.run_id,
+                    "repair_incomplete",
+                    payload,
                 )
-            ],
-            "limitations": _dedupe(
-                [*audit.limitations, _MODEL_TURN_BUDGET_INSUFFICIENT]
+                result.update(
+                    stopped=True,
+                    stop_reason="production_authority_ledger_unavailable",
+                )
+                return result
+            repair_authority_id = str(
+                os.getenv("DISCOVERY_REPAIR_AUTHORITY_ID")
+                or f"repair-authority:{service.run_id}"
+            ).strip()
+        active_authority = RepairAuthority(
+            registry=registry,
+            no_progress_limit=2,
+            metric_reader=_repair_metric_reader(service),
+            ledger=repair_ledger,
+            authority_id=repair_authority_id,
+        )
+    candidates: list[RepairProposal | Mapping[str, Any] | Any]
+    proposal_source: str
+    if proposals:
+        candidates = list(proposals)[: max(0, int(max_actions))]
+        proposal_source = "runner_v2"
+    else:
+        candidates = list(audit.repair_actions)[: max(0, int(max_actions))]
+        proposal_source = "audit_v1"
+    if not candidates:
+        result.update(stopped=True, stop_reason="repair_actions_missing")
+        return result
+
+    for index, candidate in enumerate(candidates, start=1):
+        try:
+            if proposal_source == "runner_v2":
+                proposal = RepairProposal.model_validate(candidate)
+                if proposal.schema_version != "discovery-repair-proposal/v2":
+                    raise ValueError("unsupported repair proposal schema_version")
+                if proposal.proposal_id is None:
+                    proposal = proposal.model_copy(
+                        update={"proposal_id": f"{service.run_id}:runner-repair:{index}"}
+                    )
+            else:
+                proposal = upgrade_v1_repair_action(
+                    candidate,
+                    proposal_id=f"{service.run_id}:repair:{index}",
+                )
+        except (TypeError, ValueError) as exc:
+            service.store.append_event(
+                service.run_id,
+                "repair_proposal_rejected",
+                {
+                    "reason_code": (
+                        "runner_v2_invalid"
+                        if proposal_source == "runner_v2"
+                        else "v1_upgrade_rejected"
+                    ),
+                    "reason": str(exc),
+                },
+            )
+            result.update(
+                stopped=True,
+                stop_reason=(
+                    "runner_v2_invalid"
+                    if proposal_source == "runner_v2"
+                    else "v1_upgrade_rejected"
+                ),
+            )
+            break
+
+        run = service.store.load_run(service.run_id)
+        if run is None:
+            result.update(stopped=True, stop_reason="repair_run_missing")
+            break
+        issue_codes = _repair_issue_codes_for_proposal(registry, proposal, audit)
+        proposal_signature = _repair_proposal_signature(proposal, issue_codes)
+        context = {
+            "issue_code_set": issue_codes,
+            "available_evidence_scopes": _repair_evidence_scopes(run, audit),
+            "remaining_tool_calls": max(
+                0, int(run.budget.max_tool_calls) - int(run.tool_call_count)
+            ),
+            "remaining_expensive_actions": max(
+                0,
+                int(run.budget.max_expensive_actions)
+                - int(run.expensive_action_count),
+            ),
+            "executed_idempotency_keys": list(run.repair_execution_keys),
+            "auth_refresh_attempts": int(run.auth_refresh_attempts),
+            "refresh_attempts": int(run.auth_refresh_attempts),
+            "business_completion": run.business_completion,
+        }
+        decision = active_authority.review_proposal(proposal, context)
+        service.store.append_event(
+            service.run_id,
+            (
+                "repair_proposal_approved"
+                if decision.decision == "approve"
+                else "repair_proposal_degraded"
+                if decision.decision == "degrade"
+                else "repair_proposal_rejected"
+            ),
+            {
+                "proposal": proposal.model_dump(mode="json"),
+                "proposal_source": proposal_source,
+                "decision": decision.model_dump(mode="json"),
+                "issue_code_set": issue_codes,
+            },
+        )
+        if decision.decision != "approve":
+            stop_reason = decision.reason_code
+            if (
+                decision.reason_code == "duplicate_idempotent_execution"
+                and run.repair_no_progress_signature == proposal_signature
+                and run.repair_no_progress_count > 0
+            ):
+                no_progress_count = run.repair_no_progress_count + 1
+                service.store.save_run(
+                    run.model_copy(
+                        update={"repair_no_progress_count": no_progress_count}
+                    )
+                )
+                payload = {
+                    "proposal_id": proposal.proposal_id,
+                    "signature": proposal_signature,
+                    "no_progress_count": no_progress_count,
+                    "reason_code": "no_progress_limit_reached",
+                }
+                service.store.append_event(
+                    service.run_id, "repair_no_progress", payload
+                )
+                service.store.append_event(
+                    service.run_id, "repair_incomplete", payload
+                )
+                stop_reason = "no_progress_limit_reached"
+            result.update(stopped=True, stop_reason=stop_reason)
+            break
+
+        active_authority.mark_execution_started(decision)
+        execution_keys = list(
+            dict.fromkeys([*run.repair_execution_keys, str(decision.idempotency_key)])
+        )
+        run = service.store.save_run(
+            run.model_copy(update={"repair_execution_keys": execution_keys})
+        )
+        attempt_id = f"{service.run_id}:repair-attempt:{index}:{uuid.uuid4().hex[:12]}"
+        scope_fingerprint = f"run:{service.run_id}"
+        pre_observation = active_authority.capture_metric_observation(
+            metric_id=str(decision.metric_id),
+            scope_fingerprint=scope_fingerprint,
+            observation_id=f"{attempt_id}:pre",
+        )
+        service.store.append_event(
+            service.run_id,
+            "repair_attempt_started",
+            {
+                "attempt_id": attempt_id,
+                "proposal_id": proposal.proposal_id,
+                "approved_capabilities": decision.approved_capabilities,
+                "metric_id": decision.metric_id,
+                "idempotency_key": decision.idempotency_key,
+            },
+        )
+        dispatch = _dispatch_authority_repair(
+            service,
+            proposal=proposal,
+            approved_capabilities=decision.approved_capabilities,
+        )
+        post_audit = _audit_and_persist(
+            service,
+            meter_tool=False,
+            production_signer=production_signer,
+            allow_normal_publication_context=False,
+        )
+        post_observation = active_authority.capture_metric_observation(
+            metric_id=str(decision.metric_id),
+            scope_fingerprint=scope_fingerprint,
+            observation_id=f"{attempt_id}:post",
+        )
+        attempt_result = active_authority.record_attempt(
+            {
+                "approved_capability_set": decision.approved_capabilities,
+                "parameter_hash": decision.parameter_hash,
+                "parameters": proposal.parameters,
+                "issue_code_set": issue_codes,
+                "metric_id": decision.metric_id,
+                "expected_delta_direction": decision.expected_delta_direction,
+                "pre_observation": pre_observation,
+                "post_observation": post_observation,
+            }
+        )
+        measured_run = service.store.load_run(service.run_id)
+        if measured_run is not None:
+            service.store.save_run(
+                measured_run.model_copy(
+                    update={
+                        "repair_no_progress_signature": (
+                            None if attempt_result.progressed else attempt_result.signature
+                        ),
+                        "repair_no_progress_count": (
+                            0
+                            if attempt_result.progressed
+                            else max(
+                                int(measured_run.repair_no_progress_count),
+                                int(attempt_result.no_progress_count),
+                            )
+                        ),
+                    }
+                )
+            )
+        completion_context = active_authority.completion_context(attempt_id)
+        _persist_discovery_audit_snapshot(
+            service,
+            post_audit,
+            completion_context=completion_context,
+            production_signer=production_signer,
+            builder_adapter=builder_adapter,
+        )
+        completed_run = service.store.load_run(service.run_id)
+        terminal_events = active_authority.events_for_finished_attempt(
+            attempt_event="repair_attempt_finished",
+            audit_status=post_audit.status,
+            business_completion=(
+                completed_run.business_completion if completed_run is not None else None
+            ),
+            attempt_id=attempt_id,
+        )
+        events = list(dict.fromkeys([*attempt_result.events, *terminal_events]))
+        event_payload = {
+            "attempt_id": attempt_id,
+            "proposal_id": proposal.proposal_id,
+            "metric_id": decision.metric_id,
+            "pre": attempt_result.pre,
+            "post": attempt_result.post,
+            "delta": attempt_result.delta,
+            "progressed": attempt_result.progressed,
+            "no_progress_count": attempt_result.no_progress_count,
+            "reason_code": attempt_result.reason_code,
+            "dispatch": dispatch,
+            "business_completion": (
+                completed_run.business_completion.model_dump(mode="json")
+                if completed_run is not None
+                and completed_run.business_completion is not None
+                else None
             ),
         }
+        for event_type in events:
+            service.store.append_event(service.run_id, event_type, event_payload)
+        result["attempted"] += 1
+        result["attempts"].append(
+            {
+                "attempt_id": attempt_id,
+                "proposal_schema": proposal.schema_version,
+                "decision": decision.decision,
+                "metric_id": decision.metric_id,
+                "delta": attempt_result.delta,
+                "progressed": attempt_result.progressed,
+                "events": events,
+                "dispatch": dispatch,
+            }
+        )
+        if "repair_succeeded" in events:
+            result.update(stopped=True, stop_reason="build_ready_succeeded")
+            break
+        if attempt_result.stop:
+            result.update(stopped=True, stop_reason=attempt_result.reason_code)
+            break
+        if dispatch.get("stop"):
+            result.update(
+                stopped=True,
+                stop_reason=str(dispatch.get("reason") or "authority_repair_stopped"),
+            )
+            break
+        audit = post_audit
+    return result
+
+
+def _repair_metric_reader(
+    service: DiscoveryToolService,
+) -> Callable[[AuthorityMetric, str], int | float | bool]:
+    def read(metric: AuthorityMetric, _scope_fingerprint: str) -> int | float | bool:
+        run = service.store.load_run(service.run_id)
+        if run is None:
+            raise KeyError(f"Unknown agent run: {service.run_id}")
+        audit = run.latest_discovery_audit
+        counts = audit.counts if audit is not None else {}
+        completion = run.business_completion
+        progress = completion.progress if completion is not None else None
+        blockers = progress.blocker_counts if progress is not None else {}
+        values: dict[str, int | float | bool] = {
+            "unique_candidate_count": int(counts.get("candidate_projects") or 0),
+            "reviewed_project_count": int(
+                counts.get("assessable_inspections")
+                or counts.get("inspected_projects")
+                or 0
+            ),
+            "judgment_qualified_project_count": int(
+                counts.get("qualified_projects") or 0
+            ),
+            "verified_observation_count": len(
+                run.publication_evidence_observations
+            ),
+            "unresolved_claim_count": len(audit.issues) if audit is not None else 0,
+            "missing_build_ready_field_count": sum(
+                1
+                for value in (completion.limitations if completion is not None else [])
+                if value.startswith("missing_build_ready_field:")
+                or value == "build_ready_package_missing"
+            ),
+            "hard_conflict_count": int(blockers.get("hard_conflicts") or 0),
+            "hard_unknown_count": int(blockers.get("hard_unknowns") or 0),
+            "build_ready_project_count": (
+                int(progress.build_ready_projects) if progress is not None else 0
+            ),
+            "build_ready_file_count": (
+                int(progress.build_ready_files) if progress is not None else 0
+            ),
+            "active_context_freshness": bool(
+                run.latest_candidate_search_id
+                and not any(
+                    issue.code == "stale_context"
+                    for issue in (audit.issues if audit is not None else [])
+                )
+            ),
+            "audit_ready": bool(
+                audit is not None
+                and audit.status == "ready"
+                and audit.ready_for_selection
+            ),
+        }
+        return values[metric.metric_id]
+
+    return read
+
+
+def _repair_issue_codes_for_proposal(
+    registry: CapabilityRegistry,
+    proposal: RepairProposal,
+    audit: DiscoveryQualityAudit,
+) -> list[str]:
+    requested = set(proposal.requested_capabilities)
+    metric_id = proposal.success_metric_spec.metric_id
+    compatible: list[str] = []
+    for issue in audit.issues:
+        policy = registry.issue_policy(issue.code)
+        if (
+            policy is not None
+            and requested.issubset(policy.capability_names)
+            and metric_id in policy.preferred_metric_ids
+        ):
+            compatible.append(issue.code)
+    return list(dict.fromkeys(compatible))
+
+
+def _repair_evidence_scopes(
+    run: AgentRunRecord,
+    audit: DiscoveryQualityAudit,
+) -> list[str]:
+    scopes = ["project", "portfolio"]
+    counts = audit.counts or {}
+    if (
+        int(counts.get("candidate_files") or 0) > 0
+        or int(counts.get("usable_files") or 0) > 0
+        or run.build_ready_package_material is not None
+    ):
+        scopes.append("file")
+    return scopes
+
+
+def _repair_proposal_signature(
+    proposal: RepairProposal,
+    issue_codes: list[str],
+) -> str:
+    parameter_payload = json.dumps(
+        proposal.parameters,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    parameter_hash = "sha256:" + hashlib.sha256(parameter_payload).hexdigest()
+    payload = {
+        "approved_capability_set": sorted(set(proposal.requested_capabilities)),
+        "parameter_hash": parameter_hash,
+        "issue_code_set": sorted(set(issue_codes)),
+        "metric_id": proposal.success_metric_spec.metric_id,
+    }
+    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
     )
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _dispatch_authority_repair(
+    service: DiscoveryToolService,
+    *,
+    proposal: RepairProposal,
+    approved_capabilities: list[str],
+) -> dict[str, Any]:
+    outputs: list[dict[str, Any]] = []
+    parameters = proposal.parameters
+    stop = False
+    stop_reason: str | None = None
+    for capability in approved_capabilities:
+        if capability == "search_expand":
+            queries = [
+                str(value).strip()
+                for value in parameters.get("queries", [])
+                if str(value).strip()
+            ]
+            query = str(parameters.get("query") or "").strip()
+            if query:
+                queries.append(query)
+            if not queries:
+                outputs.append(
+                    {"capability": capability, "status": "blocked", "reason": "repair_search_queries_required"}
+                )
+                continue
+            observation = service.search_repository_datasets(list(dict.fromkeys(queries)))
+            outputs.append(
+                {"capability": capability, "status": observation.status}
+            )
+        elif capability == "inspect":
+            accessions = [
+                str(value).strip().upper()
+                for value in parameters.get("project_accessions", [])
+                if str(value).strip()
+            ]
+            run = service.store.load_run(service.run_id)
+            search_id = run.latest_candidate_search_id if run is not None else None
+            if not accessions or not search_id:
+                outputs.append(
+                    {"capability": capability, "status": "blocked", "reason": "repair_inspection_context_missing"}
+                )
+                continue
+            observation = service.inspect_repository_candidates(
+                CandidateInspectionAction(
+                    search_id=search_id,
+                    accessions=accessions,
+                    rationale=proposal.rationale,
+                )
+            )
+            outputs.append(
+                {"capability": capability, "status": observation.status}
+            )
+        elif capability == "recompute_validity":
+            recomputed = service.audit_discovery_state(meter_tool=False)
+            outputs.append(
+                {"capability": capability, "status": recomputed.status}
+            )
+        elif capability == "select_manifest":
+            selected = service.auto_select_best_manifest()
+            outputs.append(
+                {
+                    "capability": capability,
+                    "status": (
+                        "completed"
+                        if selected.selected_round_index is not None
+                        else "blocked"
+                    ),
+                }
+            )
+        elif capability == "materialize_evidence":
+            outputs.append(
+                _dispatch_materialize_evidence_adapter(service, parameters=parameters)
+            )
+        elif capability == "refresh_auth_context":
+            outputs.append(
+                _dispatch_refresh_auth_context_adapter(service, parameters=parameters)
+            )
+        elif capability == "stop_with_limitations":
+            stop = True
+            stop_reason = "authority_stop_with_limitations"
+            outputs.append({"capability": capability, "status": "stopped"})
+        elif capability == "ask_user_blocking_question":
+            stop = True
+            stop_reason = "authority_ask_user_blocking_question"
+            outputs.append({"capability": capability, "status": "blocked"})
+        else:
+            outputs.append(
+                {
+                    "capability": capability,
+                    "status": "blocked",
+                    "reason": "registered_adapter_not_wired",
+                }
+            )
+    return {"outputs": outputs, "stop": stop, "reason": stop_reason}
+
+
+def _dispatch_materialize_evidence_adapter(
+    service: DiscoveryToolService,
+    *,
+    parameters: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Promote already-trusted EvidenceStore observations into Authority inventory.
+
+    Fail-closed: never invents observations, never reads secrets, never signs.
+    Only copies observations already present in publication_evidence_store when
+    their ids are explicitly requested and their source_refs are known to the
+    store inventory.
+    """
+
+    capability = "materialize_evidence"
+    run = service.store.load_run(service.run_id)
+    if run is None:
+        return {
+            "capability": capability,
+            "status": "blocked",
+            "reason": "repair_run_missing",
+        }
+    store_artifact = run.publication_evidence_store
+    if store_artifact is None or not store_artifact.observations:
+        return {
+            "capability": capability,
+            "status": "blocked",
+            "reason": "materialize_evidence_store_missing",
+        }
+
+    requested_ids = [
+        str(value).strip()
+        for value in parameters.get("observation_ids", [])
+        if str(value).strip()
+    ]
+    if not requested_ids:
+        return {
+            "capability": capability,
+            "status": "blocked",
+            "reason": "materialize_observation_ids_required",
+        }
+    max_items = parameters.get("max_items")
+    if max_items is not None:
+        try:
+            limit = int(max_items)
+        except (TypeError, ValueError):
+            return {
+                "capability": capability,
+                "status": "blocked",
+                "reason": "materialize_max_items_invalid",
+            }
+        if limit < 1:
+            return {
+                "capability": capability,
+                "status": "blocked",
+                "reason": "materialize_max_items_invalid",
+            }
+        requested_ids = requested_ids[:limit]
+
+    allowed_membership = set(run.publication_membership_refs)
+    parameter_membership = [
+        str(value).strip()
+        for value in parameters.get("membership_refs", [])
+        if str(value).strip()
+    ]
+    if parameter_membership:
+        unknown_membership = sorted(set(parameter_membership) - allowed_membership)
+        if unknown_membership:
+            return {
+                "capability": capability,
+                "status": "blocked",
+                "reason": "materialize_membership_ref_unknown",
+                "unknown_membership_refs": unknown_membership,
+            }
+
+    parameter_source_refs = [
+        str(value).strip()
+        for value in parameters.get("source_refs", [])
+        if str(value).strip()
+    ]
+    store_available_refs = {
+        ref
+        for observation in store_artifact.observations
+        for ref in observation.source_refs
+    }
+    if parameter_source_refs:
+        unknown_sources = sorted(set(parameter_source_refs) - store_available_refs)
+        if unknown_sources:
+            return {
+                "capability": capability,
+                "status": "blocked",
+                "reason": "materialize_source_ref_unknown",
+                "unknown_source_refs": unknown_sources,
+            }
+
+    by_id = {
+        observation.observation_id: observation
+        for observation in store_artifact.observations
+    }
+    missing_ids = [obs_id for obs_id in requested_ids if obs_id not in by_id]
+    if missing_ids:
+        return {
+            "capability": capability,
+            "status": "blocked",
+            "reason": "materialize_observation_not_in_store",
+            "missing_observation_ids": missing_ids,
+        }
+
+    trusted_store = EvidenceStore(
+        available_refs=store_available_refs,
+        available_membership_refs=allowed_membership,
+    )
+    promoted: list[AuthorityEvidenceObservation] = []
+    for obs_id in requested_ids:
+        raw = by_id[obs_id]
+        try:
+            validated = trusted_store.materialize(raw)
+        except ValueError as exc:
+            return {
+                "capability": capability,
+                "status": "blocked",
+                "reason": "materialize_observation_rejected",
+                "detail": str(exc),
+                "observation_id": obs_id,
+            }
+        if parameter_source_refs and not set(validated.source_refs).issubset(
+            set(parameter_source_refs)
+        ):
+            return {
+                "capability": capability,
+                "status": "blocked",
+                "reason": "materialize_source_ref_not_in_request",
+                "observation_id": obs_id,
+            }
+        if parameter_membership and not set(validated.membership_refs).issubset(
+            set(parameter_membership)
+        ):
+            return {
+                "capability": capability,
+                "status": "blocked",
+                "reason": "materialize_membership_ref_not_in_request",
+                "observation_id": obs_id,
+            }
+        promoted.append(
+            AuthorityEvidenceObservation(
+                observation_id=validated.observation_id,
+                dimension=validated.dimension,
+                scope=validated.evidence_scope,
+                observed_value=validated.observed_value,
+                source_refs=list(validated.source_refs),
+            )
+        )
+
+    existing_by_id = {
+        item.observation_id: item for item in run.publication_evidence_observations
+    }
+    added = 0
+    for item in promoted:
+        previous = existing_by_id.get(item.observation_id)
+        if previous is not None and previous != item:
+            return {
+                "capability": capability,
+                "status": "blocked",
+                "reason": "materialize_observation_conflict",
+                "observation_id": item.observation_id,
+            }
+        if previous is None:
+            existing_by_id[item.observation_id] = item
+            added += 1
+
+    updated_observations = sorted(
+        existing_by_id.values(), key=lambda item: item.observation_id
+    )
+    service.store.save_run(
+        run.model_copy(
+            update={
+                "publication_evidence_observations": updated_observations,
+            }
+        )
+    )
+    return {
+        "capability": capability,
+        "status": "completed" if added > 0 else "noop",
+        "added_observation_count": added,
+        "observation_ids": [item.observation_id for item in promoted],
+    }
+
+
+def _dispatch_refresh_auth_context_adapter(
+    service: DiscoveryToolService,
+    *,
+    parameters: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Clear a stale context flag when a fresher search/grant handle already exists.
+
+    Fail-closed and secret-free: does not mint credentials, call external auth,
+    or invent a new search id. Only accepts a refresh when the run already holds
+    a live latest_candidate_search_id (and optional active_grant_id) that differs
+    from the declared stale identifiers, and the refresh budget has remaining
+    attempts. Never emits success UI or build-ready.
+    """
+
+    capability = "refresh_auth_context"
+    run = service.store.load_run(service.run_id)
+    if run is None:
+        return {
+            "capability": capability,
+            "status": "blocked",
+            "reason": "repair_run_missing",
+        }
+
+    stale_context_id = str(parameters.get("stale_context_id") or "").strip()
+    stale_grant_id = str(parameters.get("stale_grant_id") or "").strip()
+    if not stale_context_id and not stale_grant_id:
+        return {
+            "capability": capability,
+            "status": "blocked",
+            "reason": "refresh_stale_identifier_required",
+        }
+
+    if int(run.auth_refresh_attempts) >= 1:
+        return {
+            "capability": capability,
+            "status": "blocked",
+            "reason": "refresh_limit_reached",
+            "auth_refresh_attempts": int(run.auth_refresh_attempts),
+        }
+
+    active_context_id = str(run.latest_candidate_search_id or "").strip()
+    active_grant_id = str(run.active_grant_id or "").strip()
+    if not active_context_id:
+        return {
+            "capability": capability,
+            "status": "blocked",
+            "reason": "refresh_active_context_missing",
+        }
+
+    if stale_context_id and stale_context_id == active_context_id:
+        return {
+            "capability": capability,
+            "status": "blocked",
+            "reason": "refresh_context_still_stale",
+            "stale_context_id": stale_context_id,
+            "active_context_id": active_context_id,
+        }
+    if stale_grant_id and active_grant_id and stale_grant_id == active_grant_id:
+        return {
+            "capability": capability,
+            "status": "blocked",
+            "reason": "refresh_grant_still_stale",
+            "stale_grant_id": stale_grant_id,
+            "active_grant_id": active_grant_id,
+        }
+    if stale_grant_id and not active_grant_id:
+        return {
+            "capability": capability,
+            "status": "blocked",
+            "reason": "refresh_active_grant_missing",
+            "stale_grant_id": stale_grant_id,
+        }
+    if stale_context_id and not (
+        active_context_id and active_context_id != stale_context_id
+    ):
+        return {
+            "capability": capability,
+            "status": "blocked",
+            "reason": "refresh_no_fresher_context",
+        }
+
+    audit = run.latest_discovery_audit
+    updated_audit = audit
+    cleared_stale = False
+    if audit is not None:
+        remaining_issues = [
+            issue for issue in audit.issues if issue.code != "stale_context"
+        ]
+        cleared_stale = len(remaining_issues) < len(audit.issues)
+        if cleared_stale:
+            updated_audit = audit.model_copy(update={"issues": remaining_issues})
+
+    service.store.save_run(
+        run.model_copy(
+            update={
+                "auth_refresh_attempts": int(run.auth_refresh_attempts) + 1,
+                "latest_discovery_audit": updated_audit,
+            }
+        )
+    )
+    return {
+        "capability": capability,
+        "status": "completed",
+        "cleared_stale_context_issue": cleared_stale,
+        "active_context_id": active_context_id,
+        "active_grant_id": active_grant_id or None,
+        "auth_refresh_attempts": int(run.auth_refresh_attempts) + 1,
+        # Never echo secrets; identifiers only.
+        "retry_operation": str(parameters.get("retry_operation") or "").strip() or None,
+    }
 
 
 def _persist_closing_discovery_audit(
@@ -668,107 +1826,60 @@ def run_openai_agents_discovery(
     assert service is not None  # A completed Runner call has an initialized service.
     repair_stop_reason: str | None = None
 
-    def _stop_unfunded_quality_repair(
-        audit: DiscoveryQualityAudit,
-        *,
-        remaining_turns: int,
-    ) -> DiscoveryQualityAudit:
-        nonlocal repair_stop_reason
-        repair_stop_reason = _MODEL_TURN_BUDGET_INSUFFICIENT
-        stopped_audit = _persist_discovery_audit_snapshot(
-            service,
-            _repair_budget_insufficient_audit(audit),
-        )
-        store.append_event(
-            run_id,
-            "discovery_quality_repair_stopped",
-            {
-                "reason": repair_stop_reason,
-                "remaining_turns": remaining_turns,
-                "minimum_repair_turns": _MINIMUM_QUALITY_REPAIR_TURNS,
-                "audit": stopped_audit.model_dump(mode="json"),
-            },
-        )
-        return stopped_audit
-
     initial_interruptions = list(getattr(result, "interruptions", []) or [])
     if quality_first and not initial_interruptions and run.selected_round_index is None:
         audit = _audit_and_persist(service, meter_tool=False)
-        remaining_turns = run.remaining_model_turn_budget()
-        if (
-            audit.status == "repair_required"
-            and remaining_turns >= _MINIMUM_QUALITY_REPAIR_TURNS
-        ):
+        if audit.status == "repair_required":
             store.append_event(
                 run_id,
                 "discovery_quality_repair_started",
                 {
                     "audit": audit.model_dump(mode="json"),
-                    "remaining_turns": remaining_turns,
                     "sdk_turn_count": run.sdk_turn_count,
                     "provider_request_count": run.model_requests,
+                    "authority_mode": "repair_proposal_v2",
                 },
             )
-            repair_kwargs = {
-                **runner_kwargs,
-                "input": (
-                    "The server quality audit rejected premature completion. Continue autonomously "
-                    "with tools; do not merely explain the problems. Follow the bounded repair_actions, "
-                    "then call audit_discovery_state again and select only when it returns select_manifest.\n\n"
-                    f"Quality audit JSON: {audit.model_dump_json()}"
-                ),
-                "max_turns": remaining_turns,
-            }
             try:
-                repair_turns_before = observed_sdk_turns
-                if use_stream:
-                    repair_result = asyncio.run(
-                        _run_streamed_to_completion(
-                            sdk=sdk,
-                            store=store,
-                            should_cancel=should_cancel,
-                            **repair_kwargs,
-                        )
-                    )
-                else:
-                    repair_result = sdk["Runner"].run_sync(**repair_kwargs)
-                run = _record_result_usage(
-                    repair_result,
-                    turns_before=repair_turns_before,
+                repair_cycle = run_authority_repair_cycle(
+                    service,
+                    audit,
+                    proposals=_runner_v2_repair_proposals(
+                        getattr(result, "final_output", None)
+                    ),
                 )
-                result = repair_result
-                completed_audit = _audit_and_persist(service, meter_tool=False)
+                completed_run = store.load_run(run_id)
+                completed_audit = (
+                    completed_run.latest_discovery_audit
+                    if completed_run is not None
+                    and completed_run.latest_discovery_audit is not None
+                    else audit
+                )
+                if repair_cycle.get("stopped") and repair_cycle.get("stop_reason") != "build_ready_succeeded":
+                    repair_stop_reason = str(
+                        repair_cycle.get("stop_reason") or "authority_repair_stopped"
+                    )
+                    store.append_event(
+                        run_id,
+                        "discovery_quality_repair_stopped",
+                        {
+                            "reason": repair_stop_reason,
+                            "authority_cycle": repair_cycle,
+                        },
+                    )
                 store.append_event(
                     run_id,
                     "discovery_quality_repair_completed",
-                    completed_audit.model_dump(mode="json"),
+                    {
+                        **_legacy_repair_finished_payload(
+                            completed_audit,
+                            completed_run.business_completion if completed_run else None,
+                        ),
+                        "authority_cycle": repair_cycle,
+                    },
                 )
-            except InterruptedError as exc:
-                run = _persist_observed_sdk_turns()
-                run = store.save_run(
-                    run.model_copy(
-                        update={
-                            "status": "cancelled",
-                            "stop_reason": "user_cancelled",
-                            "blockers": _dedupe([*run.blockers, str(exc)]),
-                        }
-                    )
-                )
-                store.append_event(run_id, "run_cancelled", {"error": str(exc)})
-                _persist_closing_discovery_audit(service)
-                run = store.load_run(run_id) or run
-                _write_run_outputs(
-                    store,
-                    run,
-                    output_dir,
-                    session_db=session_db,
-                    trace_path=trace_path,
-                )
-                raise
             except Exception as exc:
-                # Preserve the first run and its evidence; a failed repair turn is
-                # auditable and blocks publication rather than erasing progress.
-                run = _persist_observed_sdk_turns()
+                repair_stop_reason = "authority_repair_failed"
                 store.append_event(
                     run_id,
                     "discovery_quality_repair_failed",
@@ -777,26 +1888,29 @@ def run_openai_agents_discovery(
     final_output = str(result.final_output or "").strip()
     interruptions = list(getattr(result, "interruptions", []) or [])
     run = store.load_run(run_id) or run
-    latest_audit = run.latest_discovery_audit
-    remaining_turns = run.remaining_model_turn_budget()
-    if (
-        not interruptions
-        and run.selected_round_index is None
-        and latest_audit is not None
-        and latest_audit.status == "repair_required"
-        and remaining_turns < _MINIMUM_QUALITY_REPAIR_TURNS
-    ):
-        _stop_unfunded_quality_repair(
-            latest_audit,
-            remaining_turns=remaining_turns,
-        )
-        run = store.load_run(run_id) or run
     if (
         not interruptions
         and run.selected_round_index is None
         and repair_stop_reason is None
     ):
         run = service.auto_select_best_manifest()
+    if not interruptions and run.selected_round_index is not None:
+        # Selection is an intermediate artifact. Re-audit it and persist the
+        # publication decision before any run-level success state is emitted.
+        closing_audit = _persist_closing_discovery_audit(service)
+        if closing_audit is None:
+            run = store.save_run(
+                run.model_copy(
+                    update={
+                        "business_completion": None,
+                        "blockers": _dedupe(
+                            [*run.blockers, "closing_publication_audit_missing"]
+                        ),
+                    }
+                )
+            )
+        else:
+            run = store.load_run(run_id) or run
     if interruptions:
         pending = [_interruption_payload(item) for item in interruptions]
         state_json = _serialize_sdk_state(result.to_state())
@@ -831,10 +1945,19 @@ def run_openai_agents_discovery(
         store.append_event(run_id, "run_blocked", {"reason": run.stop_reason})
     else:
         selected_files = _selected_file_count(run.current_manifest_path)
-        status = _manifest_completion_status(run.current_manifest_path) if selected_files > 0 else "blocked"
+        publication_succeeded = _business_completion_allows_success(
+            run.business_completion
+        )
+        status = (
+            _manifest_completion_status(run.current_manifest_path)
+            if selected_files > 0 and publication_succeeded
+            else "blocked"
+        )
         recovery_incomplete = selected_files <= 0 and run.search_recovery_required
         stop_reason = (
             _selected_manifest_stop_reason(run)
+            if selected_files > 0 and publication_succeeded
+            else "build_ready_authority_not_satisfied"
             if selected_files > 0
             else "search_recovery_incomplete"
             if recovery_incomplete
@@ -842,9 +1965,12 @@ def run_openai_agents_discovery(
         )
         blockers = (
             []
-            if selected_files > 0
+            if selected_files > 0 and publication_succeeded
             else _dedupe(
-                [*run.blockers, "search_recovery_required" if recovery_incomplete else stop_reason]
+                [
+                    *run.blockers,
+                    "search_recovery_required" if recovery_incomplete else stop_reason,
+                ]
             )
         )
         run = store.save_run(
@@ -859,8 +1985,18 @@ def run_openai_agents_discovery(
         )
         store.append_event(
             run_id,
-            "run_completed" if selected_files > 0 else "run_blocked",
-            {"reason": stop_reason, "selected_files": selected_files},
+            "run_completed"
+            if selected_files > 0 and publication_succeeded
+            else "run_blocked",
+            {
+                "reason": stop_reason,
+                "selected_files": selected_files,
+                "business_completion": (
+                    run.business_completion.model_dump(mode="json")
+                    if run.business_completion
+                    else None
+                ),
+            },
         )
 
     selected_files = (
@@ -1688,6 +2824,16 @@ def _write_run_outputs(
         "latest_discovery_audit": (
             run.latest_discovery_audit.model_dump(mode="json")
             if run.latest_discovery_audit
+            else None
+        ),
+        "business_completion": (
+            run.business_completion.model_dump(mode="json")
+            if run.business_completion
+            else None
+        ),
+        "builder_dry_run_result": (
+            run.builder_dry_run_result.model_dump(mode="json")
+            if run.builder_dry_run_result
             else None
         ),
         "project_judgment_summary": project_judgment_summary,

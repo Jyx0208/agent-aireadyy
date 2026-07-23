@@ -195,6 +195,106 @@ def test_training_agenda_prioritizes_search_scale_before_optional_labeling():
     assert next(item for item in agenda if item["id"] == "search_scale")["critical"] is True
 
 
+def test_web_critical_agenda_is_a_thin_profile_engine_delegate(monkeypatch):
+    snapshot = {"task_type": "browse_only", "objective": "Browse public data"}
+    gaps = {"required_missing": [], "optional_missing": []}
+    resolved = {"run_horizon"}
+    expected = [
+        {
+            "id": "delegated",
+            "priority": 1,
+            "critical": False,
+            "target_fields": [],
+            "source": "ask_user_preference",
+        }
+    ]
+    captured = {}
+
+    def fake_agenda_for_manager(intent_snapshot, gap_report, resolved_fields):
+        captured.update(
+            snapshot=intent_snapshot,
+            gaps=gap_report,
+            resolved=resolved_fields,
+        )
+        return expected
+
+    monkeypatch.setattr(web_app, "agenda_for_manager", fake_agenda_for_manager)
+
+    actual = web_app._discovery_critical_decision_agenda(snapshot, gaps, resolved)
+
+    assert actual is expected
+    assert captured == {"snapshot": snapshot, "gaps": gaps, "resolved": resolved}
+
+
+def test_web_browse_only_agenda_does_not_load_training_questions():
+    agenda = web_app._discovery_critical_decision_agenda(
+        {
+            "objective": "Browse a bounded public proteomics landscape",
+            "task_type": "browse_only",
+            "run_horizon": "candidates_only",
+            "target_project_count": 12,
+            "quota_flexibility": "recommended",
+            "acquisition_mode": "",
+            "species": [],
+            "species_policy": "",
+            "labeling_strategy": "",
+        },
+        {"required_missing": [], "optional_missing": []},
+        set(),
+    )
+
+    assert agenda == []
+
+
+def test_web_explicit_open_training_choices_are_not_reasked():
+    agenda = web_app._discovery_critical_decision_agenda(
+        {
+            "objective": "Build a de novo training table",
+            "task_type": "denovo",
+            "run_horizon": "ai_ready_table",
+            "target_project_count": None,
+            "quota_flexibility": "open_ended",
+            "acquisition_mode": "unknown",
+            "species": [],
+            "species_policy": "open",
+            "labeling_strategy": "any",
+        },
+        {"required_missing": [], "optional_missing": []},
+        set(),
+    )
+
+    assert agenda == []
+
+
+def test_web_chimeric_agenda_prioritizes_label_feasibility_over_optional_labeling():
+    agenda = web_app._discovery_critical_decision_agenda(
+        {
+            "objective": "Build a chimeric-spectrum benchmark",
+            "task_type": "chimeric_interpretation",
+            "run_horizon": "ai_ready_table",
+            "target_project_count": 20,
+            "quota_flexibility": "recommended",
+            "acquisition_mode": "dda",
+            "species": [],
+            "species_policy": "open",
+            "labeling_strategy": "unknown",
+            "scientific_constraints": [],
+        },
+        {"required_missing": [], "optional_missing": ["labeling"]},
+        {"acquisition_mode", "species_policy"},
+    )
+
+    ids = [item["id"] for item in agenda]
+    assert ids.index("chimeric_label_feasibility") < ids.index(
+        "labeling_compatibility"
+    )
+    feasibility = next(
+        item for item in agenda if item["id"] == "chimeric_label_feasibility"
+    )
+    assert feasibility["critical"] is True
+    assert feasibility["target_fields"] == ["scientific_constraints"]
+
+
 def test_confirmation_rejects_training_strategy_with_unresolved_search_scale():
     snapshot = {
         "objective": "构建免疫肽 de novo 训练集",
@@ -4277,6 +4377,20 @@ def test_grill_turn_uses_one_bounded_model_attempt(monkeypatch):
     assert "策略保持不变" in result["assistant_message"]
     assert len(llm.calls) == 1
     assert llm.timeout == 25
+
+
+def test_grill_turn_request_budget_uses_profile_timeout_with_server_cap():
+    class Client:
+        timeout = 180
+
+    client = Client()
+    assert web_app._bind_discovery_turn_request_budget(client, {}) == 180
+    assert client.timeout == 180
+
+    capped = Client()
+    capped.timeout = 600
+    assert web_app._bind_discovery_turn_request_budget(capped, {}) == 300
+    assert capped.timeout == 300
 
 
 @pytest.mark.parametrize("grill_confirmed", [None, False, 1, "true"])

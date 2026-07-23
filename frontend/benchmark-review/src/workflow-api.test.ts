@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  businessCompletionAllowsSuccess,
   getDiscoveryJob,
+  honestDiscoveryStatus,
+  normalizeDiscoveryJobForUi,
   parseDiscoveryGoal,
   startBatch,
   startDiscoveryJob,
@@ -62,6 +65,66 @@ describe("operational workflow API", () => {
     await expect(workflowJson("/api/discovery/jobs/job-blocked")).resolves.toMatchObject({
       status: "blocked",
     });
+  });
+
+  it("normalizes server completion to blocked when Authority reports progress only", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({
+          job_id: "job-progress",
+          status: "completed",
+          record: {
+            business_completion: {
+              schema_version: "business-completion/v2",
+              authority_source: "publication_contract_registry",
+              succeeded: false,
+              status: "blocked_with_progress",
+              package_kind: "progress",
+              success_ui_allowed: false,
+              progress: { build_ready_projects: 0, build_ready_files: 0 },
+            },
+          },
+        })),
+      ),
+    );
+
+    await expect(getDiscoveryJob("job-progress")).resolves.toMatchObject({
+      status: "blocked",
+    });
+  });
+
+  it("fails closed when the server says completed without an Authority decision", () => {
+    expect(honestDiscoveryStatus("completed", {}, false)).toBe("blocked");
+    expect(normalizeDiscoveryJobForUi({
+      status: "completed",
+      record: {},
+    }).status).toBe("blocked");
+  });
+
+  it("requires the v2 Authority package envelope before preserving completion", () => {
+    const completion = {
+      succeeded: true,
+      status: "build_ready_succeeded",
+      package_kind: "build_ready",
+      success_ui_allowed: true,
+      progress: { build_ready_projects: 1, build_ready_files: 2 },
+    } as const;
+    expect(businessCompletionAllowsSuccess({ business_completion: completion })).toBe(false);
+    expect(normalizeDiscoveryJobForUi({
+      status: "completed",
+      record: { business_completion: completion },
+    }).status).toBe("blocked");
+
+    expect(businessCompletionAllowsSuccess({
+      business_completion: {
+        ...completion,
+        schema_version: "business-completion/v2",
+        authority_source: "publication_contract_registry",
+        build_ready_package: { package_id: "package-1" },
+        issuance_token: "issued-token",
+      },
+    })).toBe(true);
   });
 
   it("starts Discovery only with a grill-confirmed payload and without review-pool actions", async () => {
