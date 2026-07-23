@@ -3646,12 +3646,16 @@ def test_short_topic_plain_text_recovery_is_audited_and_repaired(monkeypatch):
 def test_semantic_verifier_retries_once_to_repair_a_partial_primary_omission(
     monkeypatch,
 ):
+    """Unavailable first attempt must retry once; critic cannot invent fields."""
+
     client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=30)
     monkeypatch.setattr(
         web_app,
         "_discovery_llm_client",
         lambda *_args, **_kwargs: client,
     )
+    # Multi-field patch keeps the second verifier on the critical path; a lone
+    # low-risk field (e.g. species) now intentionally skips the critic.
     monkeypatch.setattr(
         web_app,
         "_complete_discovery_dialogue_json",
@@ -3661,7 +3665,12 @@ def test_semantic_verifier_retries_once_to_repair_a_partial_primary_omission(
             "tool_calls": [
                 {
                     "name": "update_strategy",
-                    "arguments": {"patch": {"species": ["Danio rerio"]}},
+                    "arguments": {
+                        "patch": {
+                            "species": ["Danio rerio"],
+                            "task_type": "denovo",
+                        }
+                    },
                 }
             ],
             "_agent_runtime": "openai_agents",
@@ -3684,6 +3693,7 @@ def test_semantic_verifier_retries_once_to_repair_a_partial_primary_omission(
             "verdict": "repair",
             "patch": {
                 "species": ["Danio rerio"],
+                "task_type": "denovo",
                 "special_themes": ["immunopeptidomics"],
             },
             "rationale": "Recovered the omitted study theme.",
@@ -3712,11 +3722,19 @@ def test_semantic_verifier_retries_once_to_repair_a_partial_primary_omission(
     assert verifier_calls[0]["use_update_strategy_tool"] is False
     assert verifier_calls[1]["allow_commitment_recovery"] is False
     assert verifier_calls[1]["use_update_strategy_tool"] is False
-    assert result["extra_fields"] == {"species": ["Danio rerio"]}
+    assert result["extra_fields"] == {
+        "species": ["Danio rerio"],
+        "task_type": "denovo",
+    }
     assert result["tool_calls"] == [
         {
             "name": "update_strategy",
-            "arguments": {"patch": {"species": ["Danio rerio"]}},
+            "arguments": {
+                "patch": {
+                    "species": ["Danio rerio"],
+                    "task_type": "denovo",
+                }
+            },
         }
     ]
     assert "special_themes" not in result["extra_fields"]
@@ -3724,6 +3742,7 @@ def test_semantic_verifier_retries_once_to_repair_a_partial_primary_omission(
     assert result["semantic_verification"]["previous_attempts"][0]["verdict"] == (
         "unavailable"
     )
+
 
 
 def test_independent_agent_confirms_long_consultation_should_not_write_card(
@@ -3855,6 +3874,283 @@ def test_semantic_verifier_reject_blocks_strategy_write_and_persists_final_memor
     assert len(history) == 2
     assert '"strategy_patch":{}' in history[-1]["content"]
     assert '"species":["mouse"]' not in history[-1]["content"]
+
+
+def test_low_risk_single_field_skip_helper_whitelists_objective_and_species():
+    assert web_app._discovery_low_risk_single_field_verifier_skip(
+        {"objective": "免疫肽数据"},
+        tool_interpretation_difference=False,
+    )
+    assert web_app._discovery_low_risk_single_field_verifier_skip(
+        {"species": ["mouse"]},
+        tool_interpretation_difference=False,
+    )
+    # Multi-field and interpretation gaps stay on the verifier path.
+    assert not web_app._discovery_low_risk_single_field_verifier_skip(
+        {"objective": "x", "species": ["mouse"]},
+        tool_interpretation_difference=False,
+    )
+    assert not web_app._discovery_low_risk_single_field_verifier_skip(
+        {"species": ["mouse"]},
+        tool_interpretation_difference=True,
+    )
+    assert not web_app._discovery_low_risk_single_field_verifier_skip(
+        {"scientific_constraints": [{"value": True}]},
+        tool_interpretation_difference=False,
+    )
+    assert not web_app._discovery_low_risk_single_field_verifier_skip(
+        {"special_themes": ["immunopeptidomics"]},
+        tool_interpretation_difference=False,
+    )
+
+
+def test_soft_reject_kept_patch_retains_only_soft_keys():
+    kept = web_app._discovery_soft_reject_kept_patch(
+        {
+            "objective": "免疫肽数据",
+            "special_themes": ["immunopeptidomics"],
+            "species": ["mouse"],
+            "acquisition_mode": "dia",
+        }
+    )
+    assert kept == {
+        "objective": "免疫肽数据",
+        "special_themes": ["immunopeptidomics"],
+    }
+    assert web_app._discovery_soft_reject_kept_patch(
+        {"species": ["mouse"], "acquisition_mode": "dia"}
+    ) == {}
+
+
+def test_low_risk_single_field_objective_skips_semantic_verifier(monkeypatch):
+    """Short topic single-field SDK patch must not pay for a second verifier."""
+
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "已记录主题。",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {"objective": "免疫肽数据"}
+                    },
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    verifier_calls: list[dict[str, Any]] = []
+
+    def verify(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        verifier_calls.append(kwargs)
+        return {
+            "verified": False,
+            "verdict": "reject",
+            "patch": {},
+            "rationale": "should not run on low-risk single-field path",
+        }
+
+    monkeypatch.setattr(web_app, "_run_discovery_patch_verifier_agents_sdk", verify)
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "免疫肽数据",
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert verifier_calls == []
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {"objective": "免疫肽数据"}
+    assert result["tool_calls"] == [
+        {
+            "name": "update_strategy",
+            "arguments": {"patch": {"objective": "免疫肽数据"}},
+        }
+    ]
+    assert result.get("semantic_verification") is None
+    assert not any(
+        "semantic verification" in error
+        for error in result.get("contract_errors") or []
+    )
+
+
+def test_soft_reject_keeps_objective_from_explicit_tool_patch(monkeypatch):
+    """Verifier reject must retain soft keys instead of wiping the whole card."""
+
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "I will update the strategy.",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "objective": "免疫肽数据",
+                            "special_themes": ["immunopeptidomics"],
+                            "species": ["mouse"],
+                            "acquisition_mode": "dia",
+                        }
+                    },
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        lambda *_args, **_kwargs: {
+            "verified": False,
+            "verdict": "reject",
+            "patch": {},
+            "rationale": "Hard fields are not grounded in the latest message.",
+        },
+    )
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": (
+                    "Use mouse DIA for immunopeptidomics, objective is "
+                    "免疫肽数据."
+                ),
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {
+        "objective": "免疫肽数据",
+        "special_themes": ["immunopeptidomics"],
+    }
+    assert "species" not in result["extra_fields"]
+    assert "acquisition_mode" not in result["extra_fields"]
+    assert result["tool_calls"] == [
+        {
+            "name": "update_strategy",
+            "arguments": {
+                "patch": {
+                    "objective": "免疫肽数据",
+                    "special_themes": ["immunopeptidomics"],
+                }
+            },
+        }
+    ]
+    sv = result["semantic_verification"]
+    assert sv["verdict"] == "reject"
+    assert sv["verified"] is False
+    assert sv["soft_reject_kept_fields"] == ["objective", "special_themes"]
+    assert sv["patch"] == {
+        "objective": "免疫肽数据",
+        "special_themes": ["immunopeptidomics"],
+    }
+    assert "已记录主题" in result["assistant_message"]
+    assert not any(
+        "semantic verification" in error
+        for error in result.get("contract_errors") or []
+    )
+
+
+def test_soft_reject_without_soft_keys_still_blocks_hard_fields(monkeypatch):
+    """Hard-only rejected patches keep fail-closed wipe (no soft subset)."""
+
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "I will update the strategy.",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "species": ["mouse"],
+                            "acquisition_mode": "dia",
+                        }
+                    },
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        lambda *_args, **_kwargs: {
+            "verified": False,
+            "verdict": "reject",
+            "patch": {},
+            "rationale": "Not grounded.",
+        },
+    )
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "Can you compare mouse DIA with other options?",
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert result["tool_calls"] == []
+    assert result["extra_fields"] == {}
+    assert result["action"] in {"advise", "clarify"}
+    assert result["semantic_verification"]["verdict"] == "reject"
+    assert result["semantic_verification"].get("soft_reject_kept_fields") is None
+    assert any(
+        "semantic verification" in error for error in result["contract_errors"]
+    )
 
 
 def test_semantic_verifier_runs_for_final_reconciled_multi_field_patch(monkeypatch):
