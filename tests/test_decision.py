@@ -512,7 +512,7 @@ def test_plan_dda_execution_defaults_to_uniprot_species_fasta_over_project_fasta
     assert "UP000005640" in plan.fasta_download_url
 
 
-def test_plan_dda_execution_requires_review_when_multiple_project_fastas_exist(tmp_path: Path):
+def test_plan_dda_execution_auto_selects_when_multiple_project_fastas_exist(tmp_path: Path):
     attributes = _dda_attributes()
     context = ProjectContext(
         project_accession="PXD000011",
@@ -544,8 +544,13 @@ def test_plan_dda_execution_requires_review_when_multiple_project_fastas_exist(t
         prefer_project_fasta=True,
     )
 
-    assert plan.needs_review is True
-    assert any("多个项目 FASTA" in issue for issue in plan.blocking_issues)
+    # Unattended batch/full runs must not hard-stop on multi-FASTA projects.
+    assert plan.needs_review is False or not any(
+        "需要人工选择" in issue for issue in plan.blocking_issues
+    )
+    assert plan.fasta_selection_mode == "reproduced"
+    assert plan.fasta_path.name == "human_reference.fasta"
+    assert plan.fasta_download_url is not None
 
 
 def test_plan_dda_execution_prefers_uniprot_species_fasta_over_non_uniprot_llm_url_and_project_fastas(tmp_path: Path):
