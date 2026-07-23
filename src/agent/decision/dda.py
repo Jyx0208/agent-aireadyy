@@ -211,6 +211,53 @@ def _project_fasta_records(project_context: ProjectContext | None) -> list[dict]
     return records
 
 
+def _score_project_fasta_record(file_record: dict) -> tuple[int, str]:
+    """Higher score = better unattended default among project FASTAs."""
+    name = str(file_record.get("fileName", "") or "").lower()
+    score = 0
+    # Prefer curated / reference-looking libraries
+    for token, weight in (
+        ("reviewed", 50),
+        ("uniprot", 40),
+        ("canonical", 35),
+        ("reference", 30),
+        ("proteome", 25),
+        ("up00000", 20),
+        ("swiss", 15),
+        ("target", 10),
+    ):
+        if token in name:
+            score += weight
+    # Deprioritize decoys / contaminants / reverse DBs as sole library
+    for token, weight in (
+        ("decoy", -80),
+        ("reverse", -60),
+        ("contaminant", -20),
+        ("crap", -40),
+        ("concat", -10),
+    ):
+        if token in name:
+            score += weight
+    # Prefer plain fasta over odd extensions when tied
+    if name.endswith((".fasta", ".fasta.gz")):
+        score += 5
+    size = file_record.get("fileSize") or file_record.get("size") or 0
+    try:
+        score += min(int(size) // (1024 * 1024), 20)  # slight preference for larger libs
+    except (TypeError, ValueError):
+        pass
+    return score, name
+
+
+def _select_project_fasta_record(fasta_records: list[dict]) -> dict:
+    ranked = sorted(
+        fasta_records,
+        key=lambda rec: _score_project_fasta_record(rec),
+        reverse=True,
+    )
+    return ranked[0]
+
+
 def _project_fasta_choice(
     project_context: ProjectContext | None,
     output_dir: Path,
@@ -218,17 +265,27 @@ def _project_fasta_choice(
     fasta_records = _project_fasta_records(project_context)
     if not fasta_records:
         return None, None, []
+    notes: list[str] = []
     if len(fasta_records) > 1:
-        return None, None, ["发现多个项目 FASTA 文件，需要人工选择。请使用 --reviewed-fasta-path 或 --reviewed-fasta-url 指定。"]
+        # Unattended batch/full runs cannot stop for a chooser UI. Auto-pick the
+        # best-scoring project FASTA and continue (operator can still override
+        # with reviewed FASTA path/URL when needed).
+        fasta_record = _select_project_fasta_record(fasta_records)
+        chosen = str(fasta_record.get("fileName", ""))
+        notes.append(
+            f"项目含 {len(fasta_records)} 个 FASTA，已自动选择：{chosen}。"
+            "如需指定其它库，请使用 --reviewed-fasta-path 或 --reviewed-fasta-url。"
+        )
+    else:
+        fasta_record = fasta_records[0]
 
-    fasta_record = fasta_records[0]
     file_name = _safe_file_name(str(fasta_record.get("fileName", "")))
     if file_name.lower().endswith(".gz"):
         file_name = Path(file_name).stem
     download_url = PrideClient.first_download_url(fasta_record)
     if not download_url:
         return None, None, [f"项目 FASTA 文件 {file_name} 没有可用的下载地址。"]
-    return output_dir / "fasta" / file_name, download_url, []
+    return output_dir / "fasta" / file_name, download_url, notes
 
 
 def _reviewed_fasta_choice(
@@ -658,18 +715,28 @@ def plan_dda_execution(
         project_fasta_url = reviewed_url
         fasta_issues = []
     elif prefer_project_fasta:
-        project_fasta_path, project_fasta_url, fasta_issues = _project_fasta_choice(project_context, output_dir)
+        project_fasta_path, project_fasta_url, fasta_notes = _project_fasta_choice(project_context, output_dir)
+        # Auto-selection notes are informational; never hard-block unattended runs.
+        fasta_issues = [
+            note
+            for note in fasta_notes
+            if "没有可用的下载地址" in note or note.startswith("项目 FASTA 文件")
+        ]
         if project_fasta_path is not None:
             fasta_path = project_fasta_path
             fasta_mode = "reproduced"
-        elif not fasta_issues and llm_fasta_path is not None:
+        elif llm_fasta_path is not None:
+            # Prefer LLM/UniProt recommendation over failing the whole batch when
+            # project libraries are ambiguous or incomplete.
             fasta_path = llm_fasta_path
             fasta_mode = "inferred"
             project_fasta_url = llm_fasta_url
+            fasta_issues = []
         else:
             fasta_file_name, fasta_mode, inferred_fasta_url = _species_fasta_choice(str(decision_attributes.species.value))
             fasta_path = output_dir / "fasta" / fasta_file_name
             project_fasta_url = inferred_fasta_url
+            fasta_issues = []
     elif llm_fasta_path is not None:
         fasta_path = llm_fasta_path
         fasta_mode = "inferred"
