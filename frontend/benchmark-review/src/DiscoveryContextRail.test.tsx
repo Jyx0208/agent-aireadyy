@@ -118,16 +118,18 @@ describe("DiscoveryContextRail", () => {
 
     expect(screen.getAllByText("较新仪器优先").length).toBeGreaterThan(0);
     expect(screen.getByText("发现结果已就绪")).toBeTruthy();
-    expect(screen.getAllByRole("button", { name: "查看结果" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: /查看结果/ })).toHaveLength(1);
     expect(screen.queryByText(/原始运行日志/)).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "查看结果" }));
+    fireEvent.click(screen.getByRole("button", { name: /查看结果/ }));
     expect(screen.getByRole("heading", { name: "发现结果" })).toBeTruthy();
-    expect(screen.getByRole("heading", { name: "质量说明" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /质量说明|当前不足/ })).toBeTruthy();
     expect(screen.getByText("部分文件为 weak-keep；可交付但不是严格 valid。")).toBeTruthy();
     expect(screen.getByRole("link", { name: /Agent 审查报告/ }).getAttribute("href")).toContain("agents_discovery_report_md");
-    expect(screen.getByRole("link", { name: /数据清单 CSV/ }).getAttribute("href")).toContain("dataset_manifest_csv");
-    expect(screen.getByRole("link", { name: /项目评分与理由/ }).getAttribute("href")).toContain("project_judgments_table_csv");
+    expect(screen.getByRole("link", { name: /可用批量输入 L1/ }).getAttribute("href")).toContain("batch_inputs_usable");
+    expect(screen.getByRole("link", { name: /可用.*数据清单 CSV|可用文件清单 CSV/ }).getAttribute("href")).toContain("dataset_manifest_usable_csv");
+    expect(screen.getByRole("link", { name: /完整运行包/ }).getAttribute("href")).toContain("discovery_run_bundle_zip");
+    expect(screen.getByRole("button", { name: /送入批量参数规划/ })).toBeTruthy();
   });
 
   it("does not render unresolved dimensions as confirmed defaults", () => {
@@ -147,7 +149,7 @@ describe("DiscoveryContextRail", () => {
     expect(screen.queryByText(/均衡 · 约 80/)).toBeNull();
   });
 
-  it("keeps a quality-blocked run auditable without presenting candidates as delivered", () => {
+  it("presents L1 usable list for a non-build-ready run and allows batch handoff", () => {
     render(
       <DiscoveryContextRail
         spec={createEmptyIntent("免疫肽候选")}
@@ -160,9 +162,11 @@ describe("DiscoveryContextRail", () => {
             file_count: 1477,
             summary: {
               selected_projects: 0,
+              usable_files: 378,
               needs_review_files: 1441,
             },
             latest_discovery_audit: {
+              counts: { usable_files: 378, strict_valid_files: 0 },
               issues: [
                 { code: "qualified_project_has_no_delivery_assets", summary: "候选文件仍缺少可交付证据。" },
               ],
@@ -172,16 +176,16 @@ describe("DiscoveryContextRail", () => {
         onConfirm={vi.fn()}
         onApplyDefaults={vi.fn()}
         onNavigate={vi.fn()}
+        onSeedBatchInputs={vi.fn()}
       />,
     );
 
-    expect(screen.getByText("质量未通过")).toBeTruthy();
-    expect(screen.getByText("候选已保留，但没有结果通过交付质量闸门")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "查看审计" }));
-    expect(screen.getByRole("heading", { name: "质量审计与候选证据" })).toBeTruthy();
+    expect(screen.getByText("已交付候选清单")).toBeTruthy();
+    expect(screen.getByText("可用文件清单已就绪")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "查看结果与送入批量" }));
+    expect(screen.getByRole("heading", { name: "可用文件清单与说明" })).toBeTruthy();
     expect(screen.getByText("候选文件仍缺少可交付证据。")).toBeTruthy();
-    expect(screen.getAllByText("0").length).toBeGreaterThan(0);
-    expect(screen.queryByRole("button", { name: "单文件处理" })).toBeNull();
+    expect(screen.getByRole("button", { name: "送入批量参数规划" })).toBeTruthy();
   });
 
   it("shows a resolved mixed-acquisition policy in the compact preview while mode is open", () => {

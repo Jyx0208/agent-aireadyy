@@ -38,14 +38,36 @@ def _has_file_level_acquisition_evidence(evidence: list[DiscoveryEvidence]) -> b
 
 
 def _has_file_level_immunopeptide_evidence(evidence: list[DiscoveryEvidence]) -> bool:
+    """True for assay/file-record/SDRF immunopeptide evidence, not bare file-name hints."""
     return any(
         item.source == "immunopeptidomics"
         and (
-            item.field in {"file_name", "file_record"}
+            item.field == "file_record"
             or item.field.startswith("sdrf:")
         )
         for item in evidence
     )
+
+
+def _has_filename_immunopeptide_hint(evidence: list[DiscoveryEvidence]) -> bool:
+    """File-name-only immuno terms are soft corroboration, never alone sufficient for valid."""
+    return any(
+        item.source == "immunopeptidomics" and item.field == "file_name"
+        for item in evidence
+    )
+
+
+def _has_domain_evidence(reasons: list[str]) -> bool:
+    """True for project/SDRF/file-record domain evidence (not bare file-name hints)."""
+    domain_reasons = {
+        "strong_immunopeptide_evidence",
+        "project_level_immunopeptide_evidence",
+        "strong_ptm_evidence",
+        "project_level_ptm_evidence",
+        "general_discovery_target",
+        "sdrf_matched",
+    }
+    return any(reason in domain_reasons for reason in reasons)
 
 
 _NON_IMMUNO_ASSAY_FILE_RE = re.compile(
@@ -225,27 +247,52 @@ def assess_project_validity(project: DiscoveredProject, request: DatasetRequest)
     if not project.fragmentation_methods:
         reasons.append("missing_fragmentation")
 
-    weak_reasons = {
-        "weak_ptm_evidence",
-        "weak_immunopeptide_evidence",
-        "missing_species_evidence",
+    # Domain signal from project description is acceptable (weak_keep), not hard_review.
+    has_domain = any(
+        r
+        in {
+            "strong_immunopeptide_evidence",
+            "strong_ptm_evidence",
+            "general_discovery_target",
+        }
+        for r in reasons
+    ) or bool(project.immunopeptide_evidence_terms)
+    missing_method = "missing_instrument" in reasons and "missing_fragmentation" in reasons
+    if (
+        not has_domain
+        and "weak_immunopeptide_evidence" not in reasons
+        and "weak_ptm_evidence" not in reasons
+        and missing_method
+        and not general_goal
+    ):
+        reasons = list(dict.fromkeys([*reasons, "insufficient_project_metadata_exclude"]))
+        return ValidityDecision("exclude", reasons, True)
+
+    hard_review = {
         "missing_acquisition_evidence",
         "missing_labeling_strategy_evidence",
+        "species_hard_constraint_conflict",
+    }
+    if request.species_policy == "include_only":
+        hard_review.add("missing_species_evidence")
+    soft_method = {
         "missing_instrument",
         "missing_fragmentation",
         "mixed_acquisition_project",
+        "weak_immunopeptide_evidence",
+        "weak_ptm_evidence",
     }
-    weak_count = sum(1 for reason in reasons if reason in weak_reasons)
-    if (
-        "weak_ptm_evidence" in reasons
-        or "weak_immunopeptide_evidence" in reasons
-        or (request.species_policy == "include_only" and "missing_species_evidence" in reasons)
-        or "species_hard_constraint_conflict" in reasons
-        or "missing_acquisition_evidence" in reasons
-        or "missing_labeling_strategy_evidence" in reasons
-    ):
+    if any(reason in hard_review for reason in reasons):
         status: ValidityStatus = "needs_review"
-    elif weak_count:
+    elif "mixed_acquisition_project" in reasons:
+        # review_mixed: project stays soft-keep until file-level acquisition resolves uncertainty.
+        status = "weak_keep"
+    elif has_domain or "strong_immunopeptide_evidence" in reasons or "strong_ptm_evidence" in reasons:
+        if "missing_instrument" in reasons or "missing_fragmentation" in reasons:
+            status = "weak_keep"
+        else:
+            status = "valid"
+    elif any(reason in soft_method for reason in reasons):
         status = "weak_keep"
     else:
         status = "valid"
@@ -298,7 +345,11 @@ def assess_file_validity(file: DiscoveredFile, request: DatasetRequest) -> Valid
     if immunopeptidomics_goal and _has_file_level_immunopeptide_evidence(file.evidence):
         reasons.append("strong_immunopeptide_evidence")
     elif immunopeptidomics_goal and file.immunopeptide_evidence_terms:
+        # Project description / keywords are domain evidence: weak_keep path, never hard_review alone.
         reasons.append("project_level_immunopeptide_evidence")
+    elif immunopeptidomics_goal and _has_filename_immunopeptide_hint(file.evidence):
+        # File-name immuno tokens only corroborate; cannot alone authorize valid.
+        reasons.append("filename_immunopeptide_hint")
     elif immunopeptidomics_goal:
         reasons.append("weak_immunopeptide_evidence")
     if not general_goal and not immunopeptidomics_goal and _ptm_matches_request(file.ptm_type, request) and _has_source(file.evidence, "ptm"):
@@ -321,10 +372,12 @@ def assess_file_validity(file: DiscoveredFile, request: DatasetRequest) -> Valid
     if request.species_policy == "include_only" and _file_name_species_conflict(file.file_name, request):
         reasons.append("file_name_species_conflict")
     if file.file_role == "converted_peaklist":
+        # Soft only: converted peaklist never alone hard-reviews a file.
         reasons.append("converted_peaklist")
     if file.evidence_level == "project":
         reasons.append("project_level_evidence_only")
     if "sdrf_no_file_match" in file.evidence_warnings:
+        # Soft: unmatched SDRF rows leave weak_keep when domain evidence exists.
         reasons.append("sdrf_no_file_match")
     if _requested_acquisition_requires_evidence(request) and not _acquisition_matches(
         file.acquisition_mode,
@@ -342,37 +395,92 @@ def assess_file_validity(file: DiscoveredFile, request: DatasetRequest) -> Valid
     if not file.fragmentation_methods:
         reasons.append("missing_fragmentation")
 
+    if file.sdrf_match_status == "matched" and "conflicting_sdrf_assay_evidence" not in reasons:
+        if "sdrf_matched" not in reasons:
+            reasons.append("sdrf_matched")
+
+    has_domain = _has_domain_evidence(reasons)
+    missing_method = "missing_instrument" in reasons or "missing_fragmentation" in reasons
+    has_delivery = bool(file.download_url) and file.expected_size_bytes is not None
+
+    # No domain and no instrument/fragmentation → exclude (do not queue for review).
+    if not has_domain and missing_method and not general_goal:
+        if "insufficient_metadata_exclude" not in reasons:
+            reasons.append("insufficient_metadata_exclude")
+        return ValidityDecision("exclude", reasons, True)
+
+    # Hard review only for conflicts, true uncertainty, or missing delivery handle.
+    # Project-level domain evidence and sdrf_no_file_match are intentionally soft.
     hard_review = {
-        "weak_ptm_evidence",
-        "weak_immunopeptide_evidence",
         "missing_acquisition_evidence",
         "file_name_species_conflict",
         "missing_labeling_strategy_evidence",
         "species_hard_constraint_conflict",
         "needs_file_level_acquisition_confirmation",
-        "project_level_immunopeptide_evidence",
         "conflicting_sdrf_assay_evidence",
-    }
-    if immunopeptidomics_goal:
-        hard_review.add("sdrf_no_file_match")
-    if request.species_policy == "include_only":
-        hard_review.add("missing_species_evidence")
-    weak = {
-        "project_level_ptm_evidence",
         "missing_download_url",
         "missing_file_size",
-        "missing_species_evidence",
+    }
+    if request.species_policy == "include_only":
+        hard_review.add("missing_species_evidence")
+
+    # Soft reasons that block strict-valid (DDA hard method expectation) but keep weak_keep.
+    blocks_valid = {
         "missing_instrument",
         "missing_fragmentation",
         "converted_peaklist",
         "project_level_evidence_only",
+        "project_level_immunopeptide_evidence",
+        "project_level_ptm_evidence",
+        "filename_immunopeptide_hint",
         "sdrf_no_file_match",
         "mixed_acquisition_project",
+        "weak_immunopeptide_evidence",
+        "weak_ptm_evidence",
     }
+    if request.species_policy == "include_only":
+        blocks_valid.add("missing_species_evidence")
+
     if any(reason in hard_review for reason in reasons):
         status: ValidityStatus = "needs_review"
-    elif any(reason in weak for reason in reasons):
-        status = "weak_keep"
-    else:
+    elif (
+        "sdrf_matched" in reasons
+        and has_delivery
+        and has_domain
+        and not any(reason in blocks_valid for reason in reasons)
+    ):
+        # SDRF matched + downloadable + domain/assay evidence + methods present → strict-valid.
         status = "valid"
+    elif has_domain and has_delivery:
+        # Strong file-level domain / general target without soft blocks can be valid;
+        # project-level domain reasons stay in blocks_valid → weak_keep.
+        soft_or_method = any(reason in blocks_valid for reason in reasons) or missing_method
+        if soft_or_method:
+            status = "weak_keep"
+        elif (
+            "strong_immunopeptide_evidence" in reasons
+            or "strong_ptm_evidence" in reasons
+            or "general_discovery_target" in reasons
+            or "sdrf_matched" in reasons
+        ):
+            status = "valid"
+        else:
+            status = "weak_keep"
+    elif "filename_immunopeptide_hint" in reasons and has_delivery and not missing_method:
+        # File-name corroboration with method metadata: soft keep, never valid alone.
+        status = "weak_keep"
+    elif has_delivery and general_goal:
+        status = "weak_keep" if any(reason in blocks_valid for reason in reasons) else "valid"
+    else:
+        if "insufficient_metadata_exclude" not in reasons:
+            reasons.append("insufficient_metadata_exclude")
+        return ValidityDecision("exclude", reasons, True)
+
+    # Filename immuno alone must never become valid.
+    if (
+        status == "valid"
+        and "filename_immunopeptide_hint" in reasons
+        and "strong_immunopeptide_evidence" not in reasons
+    ):
+        status = "weak_keep"
     return ValidityDecision(status, reasons, status == "needs_review")

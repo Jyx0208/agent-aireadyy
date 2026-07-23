@@ -58,7 +58,7 @@ describe("discovery run display projection", () => {
     expect(isDiscoveryProgressPayload({ ...valid, technicalEvents: [{ type: "tool", name: "x", status: "done" }] })).toBe(false);
   });
 
-  it("shows candidate, delivery, and review counts when the quality gate blocks publication", () => {
+  it("shows candidate and L1 usable counts when publication is not build-ready", () => {
     const view = buildDiscoveryRunView({
       status: "blocked",
       record: {
@@ -67,20 +67,24 @@ describe("discovery run display projection", () => {
         summary: {
           candidate_projects: 24,
           selected_projects: 0,
+          usable_files: 378,
           needs_review_files: 1441,
+        },
+        latest_discovery_audit: {
+          counts: { usable_files: 378, strict_valid_files: 0 },
         },
       },
     });
 
     expect(view.status).toBe("blocked");
-    expect(view.metrics.selectedProjects).toBe(0);
+    expect(view.metrics.selectedProjects).toBe(378);
+    expect(view.metrics.usableFiles).toBe(378);
     expect(view.metrics.reviews).toBe(1441);
     expect(view.summary).toContain("24");
-    expect(view.summary).toContain("0");
 
     render(<DiscoveryProgressMessage payload={toDiscoveryProgressPayload(view)} />);
-    expect(screen.getByText("质量未通过")).toBeTruthy();
-    expect(screen.getByText("通过交付")).toBeTruthy();
+    expect(screen.getByText("已交付候选清单")).toBeTruthy();
+    expect(screen.getAllByText("可用文件 L1").length).toBeGreaterThan(0);
     expect(screen.getByText("1441")).toBeTruthy();
   });
 
@@ -140,10 +144,10 @@ describe("discovery run display projection", () => {
 
     render(<DiscoveryProgressMessage payload={toDiscoveryProgressPayload(view)} />);
     expect(screen.queryByText("已完成")).toBeNull();
-    expect(screen.getByText("质量未通过")).toBeTruthy();
+    expect(screen.getByText("已交付候选清单")).toBeTruthy();
     expect(screen.getByText("已审项目")).toBeTruthy();
     expect(screen.getByText("判断合格")).toBeTruthy();
-    expect(screen.getByText("build-ready 项目")).toBeTruthy();
+    expect(screen.getAllByText("可用文件 L1").length).toBeGreaterThan(0);
     expect(screen.getByText(/missing file evidence：2408/)).toBeTruthy();
   });
 
@@ -234,8 +238,8 @@ describe("discovery run display projection", () => {
     });
 
     expect(view.status).toBe("blocked");
-    expect(view.statusLabel).toBe("质量未通过");
-    expect(JSON.stringify(view.technicalEvents)).toMatch(/仍以 build-ready 权威判定为准/);
+    expect(view.statusLabel).toBe("已交付候选清单");
+    expect(JSON.stringify(view.technicalEvents)).toMatch(/build-ready 仅作参考|可用文件清单为准交付/);
     expect(JSON.stringify(view.technicalEvents)).not.toMatch(/权威审计已确认/);
   });
 });

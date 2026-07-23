@@ -4,9 +4,17 @@ import { Download, Play, Renew } from "@carbon/icons-react";
 
 import { getBatch, preflight, startBatch, terminalWorkflowStatus, type WorkflowRecord } from "./workflow-api";
 
-type Props = { batchId: string; onBatchId: (batchId: string) => void; onChanged?: () => void };
+type Props = {
+  batchId: string;
+  onBatchId: (batchId: string) => void;
+  onChanged?: () => void;
+  /** Prefill from discovery L1 usable file list (one input per line). */
+  initialInputs?: string;
+  /** Bumps on each discovery → batch handoff so re-seed of the same text still applies. */
+  initialInputsToken?: number;
+};
 
-export function BatchPanel({ batchId, onBatchId, onChanged }: Props) {
+export function BatchPanel({ batchId, onBatchId, onChanged, initialInputs, initialInputsToken }: Props) {
   const [inputs, setInputs] = useState("");
   const [submitter, setSubmitter] = useState("local-user");
   const [repository, setRepository] = useState("pride");
@@ -15,6 +23,15 @@ export function BatchPanel({ batchId, onBatchId, onChanged }: Props) {
   const [record, setRecord] = useState<WorkflowRecord | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [seedNotice, setSeedNotice] = useState("");
+
+  useEffect(() => {
+    const text = String(initialInputs || "").trim();
+    if (!text) return;
+    setInputs(text);
+    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
+    setSeedNotice(`已从发现结果预填 ${lines.length} 条可用输入（L1），可直接启动参数推断或继续编辑。`);
+  }, [initialInputs, initialInputsToken]);
 
   useEffect(() => {
     if (!batchId) { setRecord(null); return; }
@@ -46,9 +63,18 @@ export function BatchPanel({ batchId, onBatchId, onChanged }: Props) {
   const items = Array.isArray(record?.items) ? record.items as WorkflowRecord[] : [];
   return <div className="workspace-stack workflow-panel">
     {error && <InlineNotification kind="error" title="批量任务失败" subtitle={error} onCloseButtonClick={() => setError("")} />}
+    {seedNotice && (
+      <InlineNotification
+        kind="success"
+        lowContrast
+        title="已送入批量参数规划"
+        subtitle={seedNotice}
+        onCloseButtonClick={() => setSeedNotice("")}
+      />
+    )}
     <Tile>
-      <div className="panel-heading"><div><p className="eyebrow">B3 · BATCH EXCEL</p><h2>批量参数规划与运行</h2><p className="empty-copy">每行一个项目、文件或 URL；沿用原工作流的 Preflight、并行任务和 Excel/Audit 导出。</p></div></div>
-      <TextArea id="batch-inputs" rows={7} labelText="批量输入" helperText="空行和以 # 开头的行会被忽略。" value={inputs} onChange={(event) => setInputs(event.target.value)} />
+      <div className="panel-heading"><div><p className="eyebrow">B3 · BATCH EXCEL</p><h2>批量参数规划与运行</h2><p className="empty-copy">每行一个项目、文件或 URL；沿用原工作流的 Preflight、并行任务和 Excel/Audit 导出。发现页「送入批量参数规划」会预填可用文件列表。</p></div></div>
+      <TextArea id="batch-inputs" rows={7} labelText="批量输入" helperText="空行和以 # 开头的行会被忽略。来自发现 L1 的列表会自动填入。" value={inputs} onChange={(event) => setInputs(event.target.value)} />
       <div className="form-grid form-grid--four">
         <TextInput id="batch-submitter" labelText="提交人" value={submitter} onChange={(event) => setSubmitter(event.target.value)} />
         <Select id="batch-repository" labelText="Repository" value={repository} onChange={(event) => setRepository(event.target.value)}><SelectItem value="pride" text="PRIDE"/><SelectItem value="iprox" text="iProX"/></Select>

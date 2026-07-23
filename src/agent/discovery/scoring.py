@@ -916,6 +916,27 @@ def score_file(
     needs_review = not download_url or expected_size_bytes is None
     confidence = max(0.0, min(1.0, (project.project_score + score) / 150.0))
     feature_summary = features or DiscoveryFeatureSummary()
+    # Conditional project→file method inheritance (Wave A / Q2):
+    # Fragmentation may be inherited when the file is empty and the project is
+    # not mixed_acquisition. Instrument names/families stay file-owned (SDRF or
+    # file fields only) — project-level instruments must not be broadcast onto
+    # every file as if they were per-file evidence.
+    project_method_inherited = False
+    mixed_acquisition_on_file = any(
+        item.source == "mixed_acquisition" for item in feature_summary.evidence
+    ) or any(item.source == "mixed_acquisition" for item in project_evidence)
+    inherited_instrument_names = list(feature_summary.instrument_names)
+    inherited_instrument_families = list(feature_summary.instrument_families)
+    inherited_fragmentation = list(feature_summary.fragmentation_methods)
+    inherited_generation_score = feature_summary.instrument_generation_score
+    inherited_generation_label = feature_summary.instrument_generation_label
+    if (
+        not mixed_acquisition_on_file
+        and not inherited_fragmentation
+        and list(project.fragmentation_methods or [])
+    ):
+        inherited_fragmentation = list(project.fragmentation_methods)
+        project_method_inherited = True
     completeness = _file_completeness(
         download_url=download_url,
         expected_size_bytes=expected_size_bytes,
@@ -923,6 +944,16 @@ def score_file(
         features=feature_summary,
     )
     trust = _trust_score(confidence, completeness, memory_prior, needs_review)
+    inheritance_evidence: list[DiscoveryEvidence] = []
+    if project_method_inherited:
+        inheritance_evidence.append(
+            DiscoveryEvidence(
+                field="project_method",
+                source="project_method_inherited",
+                text="fragmentation_from_project",
+                weight=2,
+            )
+        )
     file_context_evidence = (
         general_file_evidence
         + immuno_file_evidence
@@ -930,12 +961,25 @@ def score_file(
         + file_acquisition_evidence
         + labeling_evidence
         + feature_summary.evidence
+        + inheritance_evidence
     )
     evidence_level, file_level_count, project_level_count, evidence_warnings = _file_context_from_evidence(
         project_evidence=project_evidence,
         file_evidence=file_context_evidence,
         sdrf_match_status=sdrf_match_status,
     )
+
+    diversity = diversity_tags(
+        species=project.species,
+        instrument_families=inherited_instrument_families,
+        fragmentation_methods=inherited_fragmentation,
+        lc_gradient_minutes=feature_summary.lc_gradient_minutes,
+        modification_scope=project.modification_scope,
+        immunopeptide_scope=file_immuno.scope if immuno_file_evidence else project.immunopeptide_scope,
+        labeling_strategy=_file_level_labeling(file_name, detected_labeling or project.labeling_strategy),
+    )
+    if project_method_inherited and "project_method_inherited" not in diversity:
+        diversity = [*diversity, "project_method_inherited"]
 
     file_model = DiscoveredFile(
         repository=request.repository,
@@ -990,22 +1034,14 @@ def score_file(
         memory_feedback=memory_feedback or {},
         needs_review=needs_review,
         evidence=_dedupe_evidence(project_evidence + file_context_evidence),
-        instrument_names=feature_summary.instrument_names,
-        instrument_families=feature_summary.instrument_families,
-        instrument_generation_score=feature_summary.instrument_generation_score,
-        instrument_generation_label=feature_summary.instrument_generation_label,
-        fragmentation_methods=feature_summary.fragmentation_methods,
+        instrument_names=inherited_instrument_names,
+        instrument_families=inherited_instrument_families,
+        instrument_generation_score=inherited_generation_score,
+        instrument_generation_label=inherited_generation_label,
+        fragmentation_methods=inherited_fragmentation,
         lc_gradient=feature_summary.lc_gradient,
         lc_gradient_minutes=feature_summary.lc_gradient_minutes,
-        diversity_tags=diversity_tags(
-            species=project.species,
-            instrument_families=feature_summary.instrument_families,
-            fragmentation_methods=feature_summary.fragmentation_methods,
-            lc_gradient_minutes=feature_summary.lc_gradient_minutes,
-            modification_scope=project.modification_scope,
-            immunopeptide_scope=file_immuno.scope if immuno_file_evidence else project.immunopeptide_scope,
-            labeling_strategy=_file_level_labeling(file_name, detected_labeling or project.labeling_strategy),
-        ),
+        diversity_tags=diversity,
         raw_record=file_record,
     )
     validity = assess_file_validity(file_model, request)

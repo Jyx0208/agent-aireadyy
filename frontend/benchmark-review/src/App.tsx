@@ -34,6 +34,8 @@ export default function App() {
   const [job, setJob] = useState<DiscoveryJob | null>(null);
   const [taskId, setTaskId] = useState("");
   const [batchId, setBatchId] = useState("");
+  const [batchSeedInputs, setBatchSeedInputs] = useState("");
+  const [batchSeedToken, setBatchSeedToken] = useState(0);
   const [historyKey, setHistoryKey] = useState(0);
   const [intent, setIntent] = useState<IntentSpec>(() => createEmptyIntent());
   const [phase, setPhase] = useState<GrillPhase>("idle");
@@ -41,6 +43,13 @@ export default function App() {
 
   const changed = () => setHistoryKey((value) => value + 1);
   const onNavigate = useCallback((tabIndex: number) => setSelectedTab(tabIndex), []);
+  const onSeedBatchInputs = useCallback((text: string) => {
+    const next = String(text || "").trim();
+    if (!next) return;
+    setBatchSeedInputs(next);
+    setBatchSeedToken((token) => token + 1);
+    setSelectedTab(2);
+  }, []);
 
   return (
     <>
@@ -107,6 +116,7 @@ export default function App() {
                       onConfirm={() => setExternalCommand("confirm")}
                       onApplyDefaults={() => setExternalCommand("defaults")}
                       onNavigate={onNavigate}
+                      onSeedBatchInputs={onSeedBatchInputs}
                     />
                   </div>
                 </TabPanel>
@@ -114,7 +124,13 @@ export default function App() {
                   <SingleTaskPanel taskId={taskId} onTaskId={setTaskId} onChanged={changed} />
                 </TabPanel>
                 <TabPanel>
-                  <BatchPanel batchId={batchId} onBatchId={setBatchId} onChanged={changed} />
+                  <BatchPanel
+                    batchId={batchId}
+                    onBatchId={setBatchId}
+                    onChanged={changed}
+                    initialInputs={batchSeedInputs}
+                    initialInputsToken={batchSeedToken}
+                  />
                 </TabPanel>
                 <TabPanel>
                   <AiReadyPanel onChanged={changed} />

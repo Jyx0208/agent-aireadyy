@@ -86,7 +86,8 @@ const terminal = (job: DiscoveryJob | null) =>
   ["completed", "failed", "blocked", "cancelled"].includes(String(job?.status || "").toLowerCase());
 
 /** Slightly above the server's bounded turn deadline; never wait for multi-minute retries. */
-export const AGENT_TURN_TIMEOUT_MS = 75_000;
+/** Align with server grill budget (~profile timeout 180s); 75s caused false stalls on DeepSeek. */
+export const AGENT_TURN_TIMEOUT_MS = 180_000;
 
 type AgentTurnRequestContext = {
   sessionId: string;
@@ -327,16 +328,33 @@ export function CarbonAgentChat({
             "数据发现失败，请查看任务日志了解原因。";
           await pushAssistant(`数据发现失败：${detail}`);
         } else if (job.status === "blocked") {
-          setPhase("failed");
+          setPhase("done");
           const record = (job.record || {}) as WorkflowRecord;
           const summary = (record.summary || {}) as WorkflowRecord;
+          const audit = (record.latest_discovery_audit || summary.latest_discovery_audit || {}) as WorkflowRecord;
+          const auditCounts = (audit.counts || {}) as WorkflowRecord;
           const candidates = Number(summary.candidate_projects ?? record.project_count ?? 0);
-          const selected = Number(summary.selected_projects ?? summary.delivery_eligible_projects ?? 0);
-          const reason = text((record.agent as WorkflowRecord | undefined)?.stop_reason || job.error);
+          const usable = Number(
+            auditCounts.usable_files ?? summary.usable_files ?? record.usable_files ?? record.file_count ?? 0,
+          );
+          const strictValid = Number(auditCounts.strict_valid_files ?? summary.strict_valid_files ?? 0);
+          const gaps = Array.isArray(audit.issues)
+            ? (audit.issues as WorkflowRecord[])
+                .map((issue) => String(issue.summary || issue.code || "").trim())
+                .filter(Boolean)
+                .slice(0, 3)
+            : [];
           await pushAssistant(
-            `搜索和审查已经结束，但质量闸门没有放行结果：${candidates} 个候选，${selected} 个通过交付。` +
-              (reason ? ` 原因：${reason}。` : "") +
-              " 我保留了候选证据和完整审计记录；你可以查看审计，或调整策略后让我继续修复。",
+            [
+              `搜索与审查已结束：约 **${candidates}** 个候选项目，**${usable}** 条可用文件（L1）。`,
+              strictValid > 0
+                ? `其中严格 valid 文件约 ${strictValid} 个；其余多为 weak_keep（证据偏项目级/缺仪器碎裂等），仍可先做批量参数规划。`
+                : `本轮尚无严格 valid 文件（多为 weak_keep）。不足点会列在结果里，但不阻止你使用可用文件列表。`,
+              gaps.length ? `当前主要不足：${gaps.join("；")}。` : "",
+              "请在右侧打开结果：下载「可用批量输入」，或点「送入批量参数规划」继续构建标准化格式。",
+            ]
+              .filter(Boolean)
+              .join("\n"),
           );
         } else {
           setPhase("done");
@@ -574,8 +592,11 @@ export function CarbonAgentChat({
 
         let activeRequest: AgentTurnRequestContext | null = null;
         let expectedSnapshotKey = "";
+        // Capture identity checker under a stable local name so minifiers cannot
+        // later reuse the same short identifier for setInterval and break S().
+        const identityStillCurrent = isRequestIdentityCurrent;
         const requestIsCurrent = () => activeRequest != null
-          && isRequestIdentityCurrent(activeRequest)
+          && identityStillCurrent(activeRequest)
           && expectedSnapshotKey === intentSnapshotKey(intentRef.current);
 
         try {
@@ -619,16 +640,40 @@ export function CarbonAgentChat({
           };
           expectedSnapshotKey = capturedSnapshot.snapshotKey;
           setPhase("grilling");
-          await reply("正在结合当前策略思考…", MessageState.STREAMING);
-          if (!requestIsCurrent()) return;
+          await reply(
+            "正在调用模型对齐策略（通常 30～90 秒，请稍候）…",
+            MessageState.STREAMING,
+          );
           const onlineStarted = performance.now();
-          const agentTurn = await callGrillTurn(prompt, {
-            phase: turnPhase,
-            turnKind: "agent_turn",
-            request: activeRequest,
-            signal: requestOptions.signal,
-          });
-          if (!requestIsCurrent()) return;
+          // Heartbeat so the bubble never looks "frozen" while waiting on DeepSeek.
+          const progressTimer = window.setInterval(() => {
+            const sec = Math.round((performance.now() - onlineStarted) / 1000);
+            void reply(
+              `仍在等待模型（已 ${sec}s）。服务端在跑 grill-turn，确认前不会访问 PRIDE。`,
+              MessageState.STREAMING,
+            );
+          }, 1_000);
+          let agentTurn: GrillTurnResult | null = null;
+          try {
+            agentTurn = await callGrillTurn(prompt, {
+              phase: turnPhase,
+              turnKind: "agent_turn",
+              request: activeRequest,
+              signal: requestOptions.signal,
+            });
+          } finally {
+            window.clearInterval(progressTimer);
+          }
+          // Never leave STREAMING forever: even if identity/snapshot went stale, close the bubble.
+          if (!requestIsCurrent()) {
+            await reply(
+              agentTurn
+                ? `本轮结果已返回，但对话上下文已变化（例如重复发送/重置），未写入策略。请再发一次需求。`
+                : `本轮被中断或会话已过期。请再发一次；若反复发生请 Ctrl+F5 强制刷新。`,
+              MessageState.COMPLETE,
+            );
+            return;
+          }
           if (agentTurn) {
             await toolCall(
               "agent-turn",
@@ -636,14 +681,12 @@ export function CarbonAgentChat({
               `${agentTurn.action} · ${agentTurn.tool_calls.length} tool call(s)`,
               Math.round(performance.now() - onlineStarted),
             );
-            if (!requestIsCurrent()) return;
             const verificationEvent = semanticVerificationTimelineEvent(
               agentTurn.semantic_verification,
             );
             if (verificationEvent) {
               events.push(verificationEvent);
               await reply(lastBody || "处理中…", MessageState.STREAMING);
-              if (!requestIsCurrent()) return;
             }
             pendingDecisionRef.current = agentTurn.next_decision;
             decisionMemoryRef.current = agentTurn.decision_memory;
@@ -658,7 +701,6 @@ export function CarbonAgentChat({
                 true,
                 `更新字段：${Object.keys(agentTurn.strategy_patch).join("、")}`,
               );
-              if (!requestIsCurrent()) return;
               action("Agent 已更新策略");
             }
             if (reduction.confirmationRequested) {
@@ -671,7 +713,6 @@ export function CarbonAgentChat({
                     ? "确认指纹缺失或不匹配；未启动搜索"
                     : "当前并非可接受确认的状态；未启动搜索",
               );
-              if (!requestIsCurrent()) return;
             }
 
             const nextDecisionText = formatAgentNextDecision(agentTurn.next_decision);
@@ -693,11 +734,12 @@ export function CarbonAgentChat({
             if (reduction.confirmationAccepted) {
               setPhase("awaiting_confirm");
               await reply(responseBody, MessageState.COMPLETE);
-              if (!requestIsCurrent() || !reduction.confirmationFingerprint || !activeRequest) return;
-              await runDiscovery({
-                request: activeRequest,
-                agentStrategyFingerprint: reduction.confirmationFingerprint,
-              }, request.id, requestOptions.signal);
+              if (reduction.confirmationFingerprint && activeRequest) {
+                await runDiscovery({
+                  request: activeRequest,
+                  agentStrategyFingerprint: reduction.confirmationFingerprint,
+                }, request.id, requestOptions.signal);
+              }
               return;
             }
 
@@ -716,7 +758,6 @@ export function CarbonAgentChat({
               : "Agent \u672a\u8fd4\u56de\u53ef\u9a8c\u8bc1\u7684\u5bf9\u8bdd\u52a8\u4f5c",
             Math.round(performance.now() - onlineStarted),
           );
-          if (!requestIsCurrent()) return;
 
           const failureReply = unavailable.assistantMessage;
           dialogueHistoryRef.current = appendAgentDialogue(
@@ -727,10 +768,12 @@ export function CarbonAgentChat({
           await reply(failureReply, MessageState.COMPLETE);
           return;
         } catch (reason) {
-          if (activeRequest && !isRequestIdentityCurrent(activeRequest)) return;
           const msg = reason instanceof Error ? reason.message : String(reason);
           try {
-            await reply(`处理时出了点问题：${msg}。本轮没有修改策略，也没有启动搜索；请稍后重试。`);
+            await reply(
+              `处理时出了点问题：${msg}。本轮没有修改策略，也没有启动搜索；请稍后重试。`,
+              MessageState.COMPLETE,
+            );
           } catch {
             // swallow — never bubble to Carbon catastrophic panel
           }

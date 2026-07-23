@@ -3289,8 +3289,8 @@ def _drop_uncommitted_discovery_null_placeholders(
     }
 
 
-def _format_discovery_reconciled_update_message(patch: Mapping[str, Any]) -> str:
-    """Tell the user the card truth when model prose and validated delta diverge."""
+def _format_discovery_strategy_patch_summary(patch: Mapping[str, Any]) -> str:
+    """Render applied strategy fields for user-facing Chinese copy."""
 
     rendered: list[str] = []
     priority = [
@@ -3344,9 +3344,51 @@ def _format_discovery_reconciled_update_message(patch: Mapping[str, Any]) -> str
     summary = "；".join(visible) or "无"
     if remainder > 0:
         summary += f"；另有 {remainder} 项结构化设置"
+    return summary
+
+
+def _format_discovery_field_names_zh(fields: Any) -> str:
+    """Join strategy field ids into Chinese labels for residual-missing copy."""
+
+    names: list[str] = []
+    if isinstance(fields, (list, tuple, set)):
+        for field in fields:
+            key = _clean_text(field)
+            if not key:
+                continue
+            label = _DISCOVERY_STRATEGY_FIELD_LABELS_ZH.get(key, key)
+            if label not in names:
+                names.append(label)
+    return "、".join(names)
+
+
+def _format_discovery_reconciled_update_message(patch: Mapping[str, Any]) -> str:
+    """Tell the user the card truth when model prose and validated delta diverge."""
+
+    summary = _format_discovery_strategy_patch_summary(patch)
     return (
         f"已按你这轮明确的要求更新策略：{summary}。"
         "没有列出的现有设置保持不变；其它科学建议只作为讨论，不会悄悄写入策略。"
+    )
+
+
+def _format_discovery_partial_grounding_message(
+    patch: Mapping[str, Any],
+    missing_fields: Any = None,
+) -> str:
+    """Explain partial semantic apply: what landed vs what remains open."""
+
+    applied = _format_discovery_strategy_patch_summary(patch)
+    residual = _format_discovery_field_names_zh(missing_fields)
+    if residual:
+        return (
+            f"已根据可核验部分更新策略：{applied}。"
+            f"以下字段未能可靠对齐，未写入本轮策略：{residual}。"
+            "你可以补充这些信息，或继续基于已应用部分推进。"
+        )
+    return (
+        f"已根据可核验部分更新策略：{applied}。"
+        "未能完全核验的字段未写入；没有列出的现有设置保持不变。"
     )
 
 
@@ -5365,7 +5407,23 @@ def _run_discovery_patch_verifier_agents_sdk(
     if raw_verdict == "repair":
         atomic_fields.difference_update(_DISCOVERY_NON_ATOMIC_CONTEXT_FIELDS)
     missing_fields = sorted(atomic_fields.difference(grounded_patch))
-    if raw_verdict == "reject" or missing_fields:
+    if raw_verdict == "reject" and not grounded_patch:
+        # Hard reject with no evidence-grounded fields: wipe the delta.
+        return {
+            **dict(raw_verification),
+            "verdict": "reject",
+            "patch": {},
+            "verified": False,
+            "missing_fields": missing_fields,
+            "rationale": (
+                _clean_text(raw_verification.get("rationale"))[:1200]
+                or "Independent semantic verification rejected the strategy delta."
+            ),
+            "model_verdict": raw_verdict,
+            "tool_authority": tool_authority,
+        }
+    if missing_fields and not grounded_patch:
+        # Accept/repair verdict but nothing evidence-grounded: full incomplete reject.
         return {
             **dict(raw_verification),
             "verdict": "reject",
@@ -5375,11 +5433,35 @@ def _run_discovery_patch_verifier_agents_sdk(
             "rationale": (
                 "Independent semantic verification did not ground the complete "
                 "proposed strategy delta."
-                if missing_fields
-                else _clean_text(raw_verification.get("rationale"))[:1200]
             ),
             "model_verdict": raw_verdict,
             "tool_authority": tool_authority,
+        }
+    if missing_fields and grounded_patch:
+        # Partial grounding: apply the evidence-backed subset; surface residual
+        # missing fields so the grill turn / UX can report what remains open.
+        audit = _normalise_discovery_patch_verification_audit(
+            raw_verification,
+            user_message=user_message,
+            proposed_patch=proposed_patch,
+            grounded_patch=grounded_patch,
+        )
+        return {
+            **dict(raw_verification),
+            **audit,
+            "verdict": "repair",
+            "patch": grounded_patch,
+            "verified": True,
+            "missing_fields": missing_fields,
+            "partial_grounding": True,
+            "model_verdict": raw_verdict,
+            "tool_authority": tool_authority,
+            "rationale": (
+                "Independent semantic verification grounded a subset of the "
+                "primary strategy delta; ungrounded fields were omitted instead "
+                "of rejecting the whole update. Missing: "
+                + ", ".join(missing_fields)
+            ),
         }
     audit = _normalise_discovery_patch_verification_audit(
         raw_verification,
@@ -6724,6 +6806,57 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
                 semantic_verification.get("verified") is True
                 and verification_verdict in {"accept", "repair"}
                 and missing_verified_fields
+                and isinstance(verified_patch, Mapping)
+                and verified_patch
+            ):
+                # Multi-field free-text strategy dumps often ground most, but not
+                # every, field under a strict independent critic. Prefer the
+                # grounded subset over wiping the whole card (L1 UX: partial
+                # strategy apply beats "no change" + opaque reject).
+                normalized_partial, partial_errors = (
+                    _validate_discovery_strategy_patch(dict(verified_patch))
+                )
+                if partial_errors or not normalized_partial:
+                    semantic_verification = {
+                        **semantic_verification,
+                        "verified": False,
+                        "verdict": "reject",
+                        "patch": {},
+                        "missing_fields": missing_verified_fields,
+                        "rationale": (
+                            "Independent semantic verification did not ground the "
+                            "complete primary strategy delta."
+                        ),
+                    }
+                    patch = {}
+                    mutation_errors.append(
+                        "semantic verification returned an incomplete strategy patch: "
+                        + ", ".join(missing_verified_fields)
+                    )
+                else:
+                    semantic_verification = {
+                        **semantic_verification,
+                        "verified": True,
+                        "verdict": "repair",
+                        "patch": normalized_partial,
+                        "missing_fields": missing_verified_fields,
+                        "partial_grounding": True,
+                        "rationale": (
+                            "Independent semantic verification grounded a subset of "
+                            "the primary strategy delta; ungrounded fields were "
+                            "omitted instead of rejecting the whole update. Missing: "
+                            + ", ".join(missing_verified_fields)
+                        ),
+                    }
+                    patch = _drop_unchanged_discovery_patch_fields(
+                        normalized_partial,
+                        intent_snapshot,
+                        preserve_fields=set(explicit_resolution_patch),
+                    )
+            elif (
+                semantic_verification.get("verified") is True
+                and verification_verdict in {"accept", "repair"}
+                and missing_verified_fields
             ):
                 semantic_verification = {
                     **semantic_verification,
@@ -6815,6 +6948,12 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
     # a provider omits that optional audit, keep the validated SDK tool delta
     # rather than replacing model reasoning with keyword rules.
     patch_was_reconciled = bool(patch) and patch != explicit_tool_patch
+    partial_grounding_applied = bool(
+        isinstance(semantic_verification, Mapping)
+        and semantic_verification.get("partial_grounding") is True
+        and patch
+        and not mutation_errors
+    )
     contract_errors = list(mutation_errors)
     blocking_contract_error = bool(mutation_errors)
     action = _normalise_discovery_turn_action(
@@ -6829,9 +6968,17 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
 
     if option_resolution_audit is not None and patch and not mutation_errors:
         assistant_message = _format_discovery_reconciled_update_message(patch)
+    elif partial_grounding_applied:
+        # Prefer explicit applied/residual copy over model prose or generic
+        # reconciled text when the verifier only grounded a subset.
+        assistant_message = _format_discovery_partial_grounding_message(
+            patch,
+            semantic_verification.get("missing_fields")
+            if isinstance(semantic_verification, Mapping)
+            else None,
+        )
     elif patch_was_reconciled and not mutation_errors:
         assistant_message = _format_discovery_reconciled_update_message(patch)
-
     if requested_action not in _DISCOVERY_TURN_ACTIONS:
         contract_errors.append("missing or unsupported D1 action")
         blocking_contract_error = True
@@ -14748,8 +14895,14 @@ async def download_discovery_file(discovery_id: str, file: str = "dataset_manife
     if entry is None:
         return {"error": "Discovery file not available."}
     filename, media_type = entry
-    path = output_dir / filename
-    if not path.exists():
+    # Prefer run root; fall back to candidate_pool (manifest exports live there).
+    candidates = [
+        output_dir / filename,
+        output_dir / "candidate_pool" / filename,
+        output_dir / "final_selection" / filename,
+    ]
+    path = next((item for item in candidates if item.exists()), None)
+    if path is None:
         return {"error": "Discovery file not available."}
     return FileResponse(path=str(path), filename=f"{discovery_id}_{filename}", media_type=media_type)
 
