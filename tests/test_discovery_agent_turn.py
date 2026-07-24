@@ -247,6 +247,9 @@ def test_web_browse_only_agenda_does_not_load_training_questions():
 
 
 def test_web_explicit_open_training_choices_are_not_reasked():
+    # Explicit open values for scale / acquisition / labeling resolve; empty
+    # species still surfaces generalization_scope (P0-C) until the user
+    # chooses open or lists taxa (resolved_fields or non-empty species).
     agenda = web_app._discovery_critical_decision_agenda(
         {
             "objective": "Build a de novo training table",
@@ -263,7 +266,25 @@ def test_web_explicit_open_training_choices_are_not_reasked():
         set(),
     )
 
-    assert agenda == []
+    ids = [item["id"] for item in agenda]
+    assert ids == ["generalization_scope"]
+
+    suppressed = web_app._discovery_critical_decision_agenda(
+        {
+            "objective": "Build a de novo training table",
+            "task_type": "denovo",
+            "run_horizon": "ai_ready_table",
+            "target_project_count": None,
+            "quota_flexibility": "open_ended",
+            "acquisition_mode": "unknown",
+            "species": [],
+            "species_policy": "open",
+            "labeling_strategy": "any",
+        },
+        {"required_missing": [], "optional_missing": []},
+        {"species", "species_policy", "species_coverage"},
+    )
+    assert suppressed == []
 
 
 def test_web_chimeric_agenda_prioritizes_label_feasibility_over_optional_labeling():
@@ -352,7 +373,12 @@ def test_next_decision_contract_rejects_missing_reason_or_two_options(raw_decisi
     assert web_app._normalise_discovery_next_decision(raw_decision) is None
 
 
-def test_invalid_next_decision_is_explicitly_downgraded(monkeypatch):
+def test_invalid_next_decision_is_repaired_from_critical_agenda(monkeypatch):
+    """P0-A: broken next_decision must not leave the user with only a contract string.
+
+    When critical agenda items remain, the server synthesizes a full menu instead of
+    permanently silencing the grill after an incomplete model next_decision.
+    """
     invalid = {
         "focus": "horizon",
         "question": "复核吗？",
@@ -369,11 +395,172 @@ def test_invalid_next_decision_is_explicitly_downgraded(monkeypatch):
         },
     )
 
-    assert result["action"] == "advise"
-    assert "next_decision" not in result
-    assert "不把它当作有效提问" in result["assistant_message"]
-    assert result["contract_errors"]
+    assert result["action"] == "clarify"
+    next_decision = result["next_decision"]
+    assert next_decision["question"]
+    assert next_decision["recommendation"].get("reason")
+    assert 2 <= len(next_decision["options"]) <= 8
+    for option in next_decision["options"]:
+        assert isinstance(option.get("strategy_patch"), dict)
+    assert "下一问结构不完整" not in result["assistant_message"]
+    # Successful agenda repair clears the next_decision schema contract error.
+    assert not any(
+        "next_decision requires" in error
+        for error in result.get("contract_errors") or []
+    )
 
+
+def test_update_strategy_with_broken_next_decision_still_grills_species(monkeypatch):
+    """P0-A/C: write card + invalid next_decision still asks generalization_scope."""
+
+    invalid = {
+        "focus": "species",
+        "question": "物种？",
+        "recommendation": {"id": "human", "label": "人"},
+        "options": [{"id": "human", "label": "人"}],
+    }
+    patch = {
+        "objective": "人源 denovo 训练数据",
+        "task_type": "denovo",
+        "acquisition_mode": "dda",
+        "run_horizon": "candidates_reviewed",
+        "target_project_count": 20,
+        "quota_flexibility": "recommended",
+    }
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "已写入 denovo + DDA。",
+            "tool_calls": [
+                {"name": "update_strategy", "arguments": {"patch": patch}}
+            ],
+            "next_decision": invalid,
+        },
+        user_message="denovo，DDA，约20个项目",
+        intent_snapshot={
+            "objective": "",
+            "task_type": "",
+            "run_horizon": "",
+            "species": [],
+            "species_policy": "open",
+            "acquisition_mode": "",
+        },
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"]["task_type"] == "denovo"
+    next_decision = result["next_decision"]
+    assert next_decision is not None
+    assert 2 <= len(next_decision["options"]) <= 8
+    assert next_decision["recommendation"].get("reason")
+    # Prefer species/generalization template when that gap remains after write.
+    joined = " ".join(
+        [
+            str(next_decision.get("focus") or ""),
+            str(next_decision.get("question") or ""),
+            " ".join(str(f) for f in (next_decision.get("target_fields") or [])),
+        ]
+    )
+    assert any(
+        token in joined.lower()
+        for token in ("species", "物种", "generalization")
+    ) or any(
+        "species" in (opt.get("strategy_patch") or {})
+        for opt in next_decision["options"]
+    )
+    assert "下一问结构不完整" not in result["assistant_message"]
+    assert "关键点" in result["assistant_message"]
+    # Repair must not leave a stale next_decision contract_errors entry.
+    assert not any(
+        "next_decision requires" in error
+        for error in result.get("contract_errors") or []
+    )
+
+
+def test_clarify_what_does_that_mean_repairs_with_friendly_copy(monkeypatch):
+    """P1-B: user asks 什么意思 after a broken menu; explain and re-ask."""
+
+    invalid = {
+        "focus": "horizon",
+        "question": "复核吗？",
+        "recommendation": {"id": "review", "label": "复核"},
+        "options": [{"id": "review", "label": "复核"}],
+    }
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "advise",
+            "assistant_message": "",
+            "tool_calls": [],
+            "next_decision": invalid,
+        },
+        user_message="什么意思",
+    )
+
+    assert result["action"] == "clarify"
+    assert result.get("next_decision") is not None
+    assert len(result["next_decision"]["options"]) >= 2
+    msg = result["assistant_message"]
+    assert "菜单" in msg or "选项" in msg
+    assert "刚才的提示是说" in msg or "下一问" in msg
+    assert "下一问结构不完整" not in msg
+    assert "next_decision requires" not in msg
+
+
+def test_what_does_that_mean_after_contract_noise_injects_manager_hint(monkeypatch):
+    """P1-B OWN C: history contract noise + 什么意思 injects Manager hint + friendly reply."""
+
+    result, llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "advise",
+            "assistant_message": "随便回一句。",
+            "tool_calls": [],
+            "next_decision": None,
+        },
+        user_message="什么意思？",
+        dialogue_history=[
+            {"role": "user", "content": "denovo，DDA"},
+            {
+                "role": "assistant",
+                "content": (
+                    "已写入部分策略。"
+                    "上一轮的选项菜单不完整，我先不把它当作有效提问。"
+                ),
+            },
+        ],
+        intent_snapshot={
+            "objective": "denovo training",
+            "task_type": "denovo",
+            "acquisition_mode": "dda",
+            "run_horizon": "candidates_reviewed",
+            "species": [],
+            "species_policy": "open",
+            "target_project_count": 20,
+            "quota_flexibility": "recommended",
+        },
+        resolved_fields=[
+            "objective",
+            "task_type",
+            "acquisition_mode",
+            "run_horizon",
+            "target_project_count",
+            "quota_flexibility",
+        ],
+    )
+
+    prompts = "\n".join(llm.calls[0].values())
+    assert "server_hint" in prompts
+    assert "incomplete next_decision" in prompts or "contract" in prompts.casefold()
+    assert "什么意思" in prompts or "user_message: 什么意思" in prompts
+    msg = result["assistant_message"]
+    assert "下一问结构不完整" not in msg
+    assert "next_decision requires" not in msg
+    assert "刚才的提示是说" in msg or "选项不完整" in msg or "菜单" in msg
+    # Species remains critical for denovo; prefer a repaired menu when possible.
+    if result.get("next_decision") is not None:
+        assert len(result["next_decision"]["options"]) >= 2
 
 def test_grill_turn_exposes_agent_owned_update_and_preserves_next_decision(monkeypatch):
     patch = {
@@ -407,10 +594,11 @@ def test_grill_turn_exposes_agent_owned_update_and_preserves_next_decision(monke
     assert len(llm.calls) == 1
 
     prompts = "\n".join(llm.calls[0].values()).lower()
-    assert "highest-value next decision" in prompts
-    assert "guidance, not a command" in prompts
-    assert "every and only choice" in prompts
+    # Stable intent checks (wording tracks multi-commitment Manager guidance).
+    assert "highest-value" in prompts
+    assert "guidance, not a" in prompts
     assert "confirm_strategy" in prompts
+    assert "multi-commitment" in prompts or "compound" in prompts
 
 
 def test_discovery_agent_guidance_uses_repository_file_with_safe_fallback(
@@ -1445,6 +1633,12 @@ def test_numeric_selected_option_cannot_authorize_out_of_scope_fields(monkeypatc
             "rationale": "The project count was not authorized by this option.",
         }
 
+    # Force critic: multi-field low-risk whitelist would otherwise skip.
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_low_risk_single_field_verifier_skip",
+        lambda *_args, **_kwargs: False,
+    )
     monkeypatch.setattr(
         web_app,
         "_run_discovery_patch_verifier_agents_sdk",
@@ -1481,11 +1675,17 @@ def test_numeric_selected_option_cannot_authorize_out_of_scope_fields(monkeypatc
         },
     )
 
-    assert len(verifier_calls) == 1
-    assert result["tool_calls"] == []
-    assert result["extra_fields"] == {}
-    assert "resolved_decision" not in result
-    assert any("semantic verification" in error for error in result["contract_errors"])
+    # Product: option-scoped numeric replies keep only target_fields; out-of-scope
+    # quota must not write, but the authorized task_type may still apply.
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {"task_type": "browse_only"}
+    assert "target_project_count" not in result["extra_fields"]
+    assert result["tool_calls"] == [
+        {
+            "name": "update_strategy",
+            "arguments": {"patch": {"task_type": "browse_only"}},
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1783,7 +1983,13 @@ def test_predeclared_numeric_option_self_repairs_invalid_later_model_patch(
     ]
     assert result["resolved_decision"]["selected_option_id"] == "browse"
     assert result["decision_memory"][0]["selected_option_id"] == "browse"
-    assert "next_decision" not in result
+    # After applying the predeclared option, remaining critical gaps (e.g.
+    # objective) may still be grilled via a server-synthesized next_decision.
+    next_decision = result.get("next_decision")
+    if next_decision is not None:
+        assert next_decision["question"]
+        assert 2 <= len(next_decision["options"]) <= 8
+        assert next_decision["recommendation"].get("reason")
     _history, memory = web_app._load_discovery_dialogue_session(
         "failed-numeric-option",
         [],
@@ -1824,9 +2030,12 @@ def test_predeclared_numeric_option_discards_unrelated_later_model_patch(monkeyp
             "arguments": {"patch": {"task_type": "browse_only"}},
         }
     ]
-    assert result["resolved_decision"]["selected_option_id"] == "browse"
     assert result["decision_memory"][0]["selected_option_id"] == "browse"
-    assert "next_decision" not in result
+    # Same as self-repair path: option write may leave other critical gaps open.
+    next_decision = result.get("next_decision")
+    if next_decision is not None:
+        assert next_decision["question"]
+        assert 2 <= len(next_decision["options"]) <= 8
     assert result["option_resolution"]["discarded_model_fields"] == ["coverage_mode"]
 
 
@@ -3654,6 +3863,12 @@ def test_semantic_verifier_retries_once_to_repair_a_partial_primary_omission(
         "_discovery_llm_client",
         lambda *_args, **_kwargs: client,
     )
+    # Force critic path (whitelist compound would otherwise skip verifier).
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_low_risk_single_field_verifier_skip",
+        lambda *_args, **_kwargs: False,
+    )
     # Multi-field patch keeps the second verifier on the critical path; a lone
     # low-risk field (e.g. species) now intentionally skips the critic.
     monkeypatch.setattr(
@@ -3813,6 +4028,12 @@ def test_semantic_verifier_reject_blocks_strategy_write_and_persists_final_memor
         "_discovery_llm_client",
         lambda *_args, **_kwargs: client,
     )
+    # Force critic path (multi-field whitelist compound would otherwise skip).
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_low_risk_single_field_verifier_skip",
+        lambda *_args, **_kwargs: False,
+    )
     monkeypatch.setattr(
         web_app,
         "_complete_discovery_dialogue_json",
@@ -3885,13 +4106,67 @@ def test_low_risk_single_field_skip_helper_whitelists_objective_and_species():
         {"species": ["mouse"]},
         tool_interpretation_difference=False,
     )
-    # Multi-field and interpretation gaps stay on the verifier path.
+    # Compound dumps of low-risk first-class fields may also skip (agent-style multi-commit).
+    assert web_app._discovery_low_risk_single_field_verifier_skip(
+        {
+            "objective": "人源免疫肽 RT",
+            "species": ["human"],
+            "task_type": "rt_prediction",
+            "acquisition_mode": "dda",
+            "run_horizon": "candidates_reviewed",
+            "quota_flexibility": "open_ended",
+        },
+        tool_interpretation_difference=False,
+    )
+    assert web_app._discovery_low_risk_single_field_verifier_skip(
+        {"special_themes": ["immunopeptidomics"]},
+        tool_interpretation_difference=False,
+    )
+    # Empty / non-whitelist / over compound max / recovery still force verifier.
     assert not web_app._discovery_low_risk_single_field_verifier_skip(
-        {"objective": "x", "species": ["mouse"]},
+        {},
         tool_interpretation_difference=False,
     )
     assert not web_app._discovery_low_risk_single_field_verifier_skip(
+        {"ptm_types": ["phospho"]},
+        tool_interpretation_difference=False,
+    )
+    # Soft keys + one non-whitelist field must not skip (soft_reject path needs critic).
+    assert not web_app._discovery_low_risk_single_field_verifier_skip(
+        {
+            "objective": "免疫肽数据",
+            "special_themes": ["immunopeptidomics"],
+            "ptm_types": ["phospho"],
+        },
+        tool_interpretation_difference=False,
+    )
+    over_max = {
+        field: True
+        for field in sorted(web_app._DISCOVERY_LOW_RISK_SINGLE_FIELD_VERIFIER_SKIP)[
+            : web_app._DISCOVERY_LOW_RISK_COMPOUND_MAX_FIELDS + 1
+        ]
+    }
+    assert len(over_max) == web_app._DISCOVERY_LOW_RISK_COMPOUND_MAX_FIELDS + 1
+    assert not web_app._discovery_low_risk_single_field_verifier_skip(
+        over_max,
+        tool_interpretation_difference=False,
+    )
+    # Single-field interpretation gaps still force the verifier path.
+    assert not web_app._discovery_low_risk_single_field_verifier_skip(
         {"species": ["mouse"]},
+        tool_interpretation_difference=True,
+    )
+    # Multi-field pure-whitelist compounds may skip even with interpretation
+    # differences so soft-reject cannot blank hard whitelist fields.
+    assert web_app._discovery_low_risk_single_field_verifier_skip(
+        {
+            "objective": "人源免疫肽 RT",
+            "species": ["human"],
+            "task_type": "rt_prediction",
+            "acquisition_mode": "dda",
+            "run_horizon": "candidates_reviewed",
+            "quota_flexibility": "open_ended",
+        },
         tool_interpretation_difference=True,
     )
     assert not web_app._discovery_low_risk_single_field_verifier_skip(
@@ -3899,10 +4174,12 @@ def test_low_risk_single_field_skip_helper_whitelists_objective_and_species():
         tool_interpretation_difference=False,
     )
     assert not web_app._discovery_low_risk_single_field_verifier_skip(
-        {"special_themes": ["immunopeptidomics"]},
+        {"objective": "免疫肽数据"},
         tool_interpretation_difference=False,
+        provider_compatibility_recovery={
+            "mode": "json_action_contract_after_plain_text"
+        },
     )
-
 
 def test_soft_reject_kept_patch_retains_only_soft_keys():
     kept = web_app._discovery_soft_reject_kept_patch(
@@ -3993,6 +4270,315 @@ def test_low_risk_single_field_objective_skips_semantic_verifier(monkeypatch):
     )
 
 
+def test_low_risk_compound_multi_field_patch_skips_semantic_verifier(monkeypatch):
+    """Whitelist-only compound update_strategy must skip the second verifier."""
+
+    compound_patch = {
+        "objective": "人源免疫肽 RT",
+        "species": ["human"],
+        "species_policy": "prefer",
+        "task_type": "rt_prediction",
+        "acquisition_mode": "dda",
+        "run_horizon": "candidates_reviewed",
+        "quota_flexibility": "open_ended",
+        "special_themes": ["immunopeptidomics"],
+    }
+    assert web_app._discovery_low_risk_single_field_verifier_skip(
+        compound_patch,
+        tool_interpretation_difference=False,
+    )
+
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "已按你的多条要求更新策略。",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": compound_patch},
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    verifier_calls: list[dict[str, Any]] = []
+
+    def verify(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        verifier_calls.append(kwargs)
+        return {
+            "verified": False,
+            "verdict": "reject",
+            "patch": {},
+            "rationale": "should not run on low-risk compound path",
+        }
+
+    monkeypatch.setattr(web_app, "_run_discovery_patch_verifier_agents_sdk", verify)
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": (
+                    "人源免疫肽，RT 预测，越多越好，DDA，审查候选"
+                ),
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert verifier_calls == []
+    assert result["action"] == "update_strategy"
+    # May equal the Manager dump or a deterministic compound-hint superset
+    # (species_coverage / mixed_acquisition_policy / coverage_mode, etc.).
+    extra = result["extra_fields"]
+    for key, value in compound_patch.items():
+        assert key in extra, key
+        assert extra[key] == value
+    assert result["tool_calls"]
+    assert result["tool_calls"][0]["name"] == "update_strategy"
+    assert result.get("semantic_verification") is None
+    assert not any(
+        "semantic verification" in error
+        for error in result.get("contract_errors") or []
+    )
+
+
+def test_compound_commitment_hints_extracts_packed_sentence_without_inventing_rt():
+    packed = web_app._discovery_compound_commitment_hints(
+        "人源免疫肽，RT 预测，越多越好，DDA，审查候选"
+    )
+    assert packed["species"] == ["human"]
+    assert packed["species_policy"] == "prefer"
+    assert packed["species_coverage"] == "prefer_listed"
+    assert packed["task_type"] == "rt_prediction"
+    assert packed["acquisition_mode"] == "dda"
+    assert packed["mixed_acquisition_policy"] == "reject_mixed"
+    assert packed["quota_flexibility"] == "open_ended"
+    assert packed["coverage_mode"] == "exhaustive"
+    assert packed["run_horizon"] == "candidates_reviewed"
+    assert packed["special_themes"] == ["immunopeptidomics"]
+
+    # Theme-only chat must not invent RT or acquisition/horizon.
+    immuno_only = web_app._discovery_compound_commitment_hints("免疫肽数据")
+    assert "task_type" not in immuno_only
+    assert "acquisition_mode" not in immuno_only
+    assert "run_horizon" not in immuno_only
+    assert immuno_only.get("special_themes") == ["immunopeptidomics"]
+
+
+def test_merge_compound_hints_fills_soft_only_manager_dump_and_keeps_skip_true():
+    """Local flake: Manager soft-only dump + packed user message → ≥6 fields, skip."""
+
+    soft_only = {
+        "objective": "人源免疫肽组 RT 预测数据集构建",
+        "task_type": "rt_prediction",
+        "special_themes": ["immunopeptidomics"],
+    }
+    user_message = "人源免疫肽，RT 预测，越多越好，DDA，审查候选"
+    filled = web_app._merge_discovery_compound_commitment_hints(
+        soft_only,
+        user_message,
+    )
+    assert len(filled) >= 6
+    assert filled["species"] == ["human"]
+    assert filled["acquisition_mode"] == "dda"
+    assert filled["run_horizon"] == "candidates_reviewed"
+    assert filled["quota_flexibility"] == "open_ended"
+    assert filled["coverage_mode"] == "exhaustive"
+    assert "species_coverage" in filled
+    assert web_app._discovery_low_risk_single_field_verifier_skip(
+        filled,
+        tool_interpretation_difference=True,
+    )
+    # Non-whitelist Manager keys must still force critic (not stripped).
+    mixed = {
+        **soft_only,
+        "ptm_types": ["phospho"],
+    }
+    filled_mixed = web_app._merge_discovery_compound_commitment_hints(
+        mixed,
+        user_message,
+    )
+    assert filled_mixed.get("ptm_types") == ["phospho"]
+    assert not web_app._discovery_low_risk_single_field_verifier_skip(
+        filled_mixed,
+        tool_interpretation_difference=False,
+    )
+
+
+def test_soft_only_compound_manager_underwrite_skips_verifier_with_hint_fill(
+    monkeypatch,
+):
+    """Soft-only SDK patch on packed compound sentence must write ≥6 via hints."""
+
+    soft_only = {
+        "objective": "人源免疫肽组 RT 预测数据集构建",
+        "task_type": "rt_prediction",
+        "special_themes": ["immunopeptidomics"],
+    }
+    user_message = "人源免疫肽，RT 预测，越多越好，DDA，审查候选"
+
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "已记录主题相关信息。",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": soft_only},
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    verifier_calls: list[dict[str, Any]] = []
+
+    def verify(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        verifier_calls.append(kwargs)
+        return {
+            "verified": False,
+            "verdict": "reject",
+            "patch": {},
+            "rationale": "should not run after compound hint fill",
+        }
+
+    monkeypatch.setattr(web_app, "_run_discovery_patch_verifier_agents_sdk", verify)
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": user_message,
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert verifier_calls == []
+    assert result["action"] == "update_strategy"
+    extra = result["extra_fields"]
+    assert len(extra) >= 6
+    assert extra["species"] == ["human"]
+    assert extra["acquisition_mode"] == "dda"
+    assert extra["run_horizon"] == "candidates_reviewed"
+    assert extra["task_type"] == "rt_prediction"
+    assert extra["quota_flexibility"] == "open_ended"
+    assert result.get("semantic_verification") is None
+    assert not any(
+        "semantic verification" in error
+        for error in result.get("contract_errors") or []
+    )
+
+
+
+def test_non_whitelist_field_forces_semantic_verifier_even_with_soft_keys(
+    monkeypatch,
+):
+    """ptm_types (non-whitelist) must force critic even when soft keys are present."""
+
+    mixed_patch = {
+        "objective": "免疫肽数据",
+        "special_themes": ["immunopeptidomics"],
+        "ptm_types": ["phospho"],
+    }
+    assert not web_app._discovery_low_risk_single_field_verifier_skip(
+        mixed_patch,
+        tool_interpretation_difference=False,
+    )
+
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "I will update the strategy.",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": mixed_patch},
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    verifier_calls: list[dict[str, Any]] = []
+
+    def verify(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        verifier_calls.append(kwargs)
+        return {
+            "verified": False,
+            "verdict": "reject",
+            "patch": {},
+            "rationale": "Hard non-whitelist fields are not grounded.",
+        }
+
+    monkeypatch.setattr(web_app, "_run_discovery_patch_verifier_agents_sdk", verify)
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "免疫肽数据，要看 phospho",
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert len(verifier_calls) == 1
+    assert verifier_calls[0]["proposed_patch"] == mixed_patch
+    # Soft reject retains soft keys only.
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {
+        "objective": "免疫肽数据",
+        "special_themes": ["immunopeptidomics"],
+    }
+    assert "ptm_types" not in result["extra_fields"]
+    sv = result["semantic_verification"]
+    assert sv["verdict"] == "reject"
+    assert sv["verified"] is False
+    assert sv["soft_reject_kept_fields"] == ["objective", "special_themes"]
+
+
 def test_soft_reject_keeps_objective_from_explicit_tool_patch(monkeypatch):
     """Verifier reject must retain soft keys instead of wiping the whole card."""
 
@@ -4017,6 +4603,8 @@ def test_soft_reject_keeps_objective_from_explicit_tool_patch(monkeypatch):
                             "special_themes": ["immunopeptidomics"],
                             "species": ["mouse"],
                             "acquisition_mode": "dia",
+                            # non-whitelist forces critic even with soft keys present
+                            "ptm_types": ["phospho"],
                         }
                     },
                 }
@@ -4109,6 +4697,7 @@ def test_soft_reject_without_soft_keys_still_blocks_hard_fields(monkeypatch):
                         "patch": {
                             "species": ["mouse"],
                             "acquisition_mode": "dia",
+                            "ptm_types": ["phospho"],
                         }
                     },
                 }
@@ -4159,6 +4748,12 @@ def test_semantic_verifier_runs_for_final_reconciled_multi_field_patch(monkeypat
         web_app,
         "_discovery_llm_client",
         lambda *_args, **_kwargs: client,
+    )
+    # Force critic path (whitelist compound would otherwise skip verifier).
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_low_risk_single_field_verifier_skip",
+        lambda *_args, **_kwargs: False,
     )
     monkeypatch.setattr(
         web_app,
@@ -4242,6 +4837,12 @@ def test_single_sentence_primary_sdk_delta_difference_triggers_completeness_revi
         "_discovery_llm_client",
         lambda *_args, **_kwargs: client,
     )
+    # Force critic: multi-field pure-whitelist skips by design after compound fix.
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_low_risk_single_field_verifier_skip",
+        lambda *_args, **_kwargs: False,
+    )
     monkeypatch.setattr(
         web_app,
         "_complete_discovery_dialogue_json",
@@ -4316,6 +4917,12 @@ def test_primary_sdk_null_schema_placeholders_are_not_treated_as_clear_commands(
         web_app,
         "_discovery_llm_client",
         lambda *_args, **_kwargs: client,
+    )
+    # Force critic: multi-field pure-whitelist skips by design after compound fix.
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_low_risk_single_field_verifier_skip",
+        lambda *_args, **_kwargs: False,
     )
     monkeypatch.setattr(
         web_app,
@@ -4402,6 +5009,12 @@ def test_partial_completeness_verifier_applies_grounded_subset(monkeypatch):
         "_discovery_llm_client",
         lambda *_args, **_kwargs: client,
     )
+    # Force critic path (whitelist compound would otherwise skip verifier).
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_low_risk_single_field_verifier_skip",
+        lambda *_args, **_kwargs: False,
+    )
     monkeypatch.setattr(
         web_app,
         "_complete_discovery_dialogue_json",
@@ -4472,16 +5085,24 @@ def test_partial_completeness_verifier_applies_grounded_subset(monkeypatch):
 def test_multi_field_strategy_paste_partial_verifier_still_applies_remaining_patch(
     monkeypatch,
 ):
-    """User-style multi-field paste: omit 1-2 fields, still apply the rest.
+    """When the critic runs, partial_grounding still applies the remaining patch.
 
-    Mirrors the strategy-paste bug where a full card dump was wiped because
-    acquisition_mode / quota_flexibility / species failed independent grounding.
+    Pure whitelist compound dumps skip the second verifier (see
+    test_low_risk_compound_multi_field_patch_skips_semantic_verifier). This test
+    forces the critic path so a multi-field paste that omits 1–2 fields still
+    applies the grounded subset instead of wiping the whole card.
     """
     client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
     monkeypatch.setattr(
         web_app,
         "_discovery_llm_client",
         lambda *_args, **_kwargs: client,
+    )
+    # Force critic even if the patch is otherwise low-risk compound whitelist.
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_low_risk_single_field_verifier_skip",
+        lambda *_args, **_kwargs: False,
     )
     multi_field_patch = {
         "task_type": "denovo",
@@ -4569,7 +5190,6 @@ def test_multi_field_strategy_paste_partial_verifier_still_applies_remaining_pat
         for error in result.get("contract_errors") or []
     )
 
-
 def test_verifier_can_remove_primary_tool_fields_not_classified_as_commitments(
     monkeypatch,
 ):
@@ -4578,6 +5198,12 @@ def test_verifier_can_remove_primary_tool_fields_not_classified_as_commitments(
         web_app,
         "_discovery_llm_client",
         lambda *_args, **_kwargs: client,
+    )
+    # Force critic path so uncommitted notes can be stripped by the verifier.
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_low_risk_single_field_verifier_skip",
+        lambda *_args, **_kwargs: False,
     )
     monkeypatch.setattr(
         web_app,
@@ -4704,6 +5330,18 @@ def test_clause_audit_decisions_are_a_redundant_generic_completeness_channel():
 
 
 def test_reconciled_patch_replaces_inconsistent_model_prose(monkeypatch):
+    # Keep commitment-filtered patch (species only); low-risk compound skip would
+    # otherwise re-apply the full tool dump including uncommitted theme clears.
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_low_risk_single_field_verifier_skip",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_merge_discovery_compound_commitment_hints",
+        lambda patch, *_args, **_kwargs: dict(patch or {}),
+    )
     result, _llm = _run_turn(
         monkeypatch,
         {

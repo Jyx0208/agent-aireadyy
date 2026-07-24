@@ -2252,21 +2252,30 @@ _DISCOVERY_STRATEGY_PATCH_FIELDS = set(_DISCOVERY_STRATEGY_FIRST_CLASS_FIELDS)
 # duplicated model-authored note without invalidating the atomic strategy
 # update, while every execution-affecting field remains required.
 _DISCOVERY_NON_ATOMIC_CONTEXT_FIELDS = {"notes"}
-# Low-risk single-field SDK tool patches skip the independent semantic verifier
-# (speed path). Hard fields and multi-field dumps still take the critic.
+# Low-risk first-class fields may skip the independent semantic verifier when
+# the Manager emits a typed update_strategy patch limited to this set (single
+# field or a small compound update). scientific_constraints still forces critic.
 _DISCOVERY_LOW_RISK_SINGLE_FIELD_VERIFIER_SKIP = frozenset(
     {
         "objective",
         "task_type",
         "species",
+        "species_policy",
+        "species_coverage",
         "acquisition_mode",
+        "mixed_acquisition_policy",
         "coverage_mode",
         "target_project_count",
+        "quota_flexibility",
         "labeling_strategy",
         "instrument_preference",
         "run_horizon",
+        "special_themes",
+        "notes",
     }
 )
+# Max fields in a compound low-risk skip (compound natural-language dumps).
+_DISCOVERY_LOW_RISK_COMPOUND_MAX_FIELDS = 12
 # On hard verifier reject, retain only soft theme/context fields from the
 # primary update_strategy tool call instead of wiping the whole card.
 _DISCOVERY_SOFT_REJECT_KEEP_FIELDS = frozenset(
@@ -3392,13 +3401,189 @@ def _format_discovery_reconciled_update_message(patch: Mapping[str, Any]) -> str
     )
 
 
+def _discovery_compound_commitment_hints(user_message: str) -> dict[str, Any]:
+    """Deterministic, generic extractions for packed multi-commitment turns.
+
+    Only fills fields clearly supported by the latest message. Does not invent
+    modeling tasks (e.g. RT) unless the text states them. Used to complete an
+    under-specified Manager tool patch so local soft-reject cannot blank
+    species / acquisition / scale / horizon that the user already said.
+    """
+
+    text = _clean_text(user_message)
+    if not text:
+        return {}
+    lower = text.casefold()
+    hints: dict[str, Any] = {}
+
+    # Species (generic bilingual cues)
+    if re.search(
+        r"人源|人类|智人|\bhuman\b|homo\s*sapiens",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        hints["species"] = ["human"]
+        if re.search(r"仅|只要|限定|strict|only", text, flags=re.IGNORECASE):
+            hints["species_policy"] = "include_only"
+        else:
+            hints["species_policy"] = "prefer"
+            hints["species_coverage"] = "prefer_listed"
+    elif re.search(r"小鼠|老鼠|\bmouse\b|mus\s*musculus", text, flags=re.IGNORECASE):
+        hints["species"] = ["mouse"]
+        hints["species_policy"] = "prefer"
+
+    # Downstream task — only when explicit
+    if re.search(
+        r"\brt\b|保留时间|retention\s*time|rt\s*预测|rt预测",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        hints["task_type"] = "rt_prediction"
+    elif re.search(r"denovo|de\s*novo|从头测序", text, flags=re.IGNORECASE):
+        hints["task_type"] = "denovo"
+    elif re.search(r"psm\s*评分|psm\s*score", text, flags=re.IGNORECASE):
+        hints["task_type"] = "psm_scoring"
+    elif re.search(r"碎片强度|fragment\s*intensity", text, flags=re.IGNORECASE):
+        hints["task_type"] = "fragment_intensity"
+
+    # Scale / quota
+    if re.search(
+        r"越多越好|尽可能多|尽量多|搜全|exhaustive|as\s*many|open[-\s]?ended|不限(数量|规模)?",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        hints["quota_flexibility"] = "open_ended"
+        hints["coverage_mode"] = "exhaustive"
+        hints["target_project_count"] = None
+    elif re.search(r"约\s*20|20\s*个|精选|curated", text, flags=re.IGNORECASE):
+        hints["coverage_mode"] = "curated"
+        hints["quota_flexibility"] = "recommended"
+        if re.search(r"\b20\b|20\s*个", text):
+            hints["target_project_count"] = 20
+
+    # Acquisition
+    if re.search(r"\bdda\b|data[-\s]?dependent|仅\s*dda|只要\s*dda", text, flags=re.IGNORECASE):
+        hints["acquisition_mode"] = "dda"
+        hints["mixed_acquisition_policy"] = "reject_mixed"
+    elif re.search(r"\bdia\b|data[-\s]?independent", text, flags=re.IGNORECASE):
+        hints["acquisition_mode"] = "dia"
+
+    # Run horizon
+    if re.search(
+        r"审查候选|候选\+?审查|candidates?_reviewed|找到并审查",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        hints["run_horizon"] = "candidates_reviewed"
+    elif re.search(r"仅候选|只要候选|candidates?_only", text, flags=re.IGNORECASE):
+        hints["run_horizon"] = "candidates_only"
+    elif re.search(r"只做计划|仅规划|plan_only", text, flags=re.IGNORECASE):
+        hints["run_horizon"] = "plan_only"
+
+    # Domain theme (generic immunopeptide / HLA cues — not a full ontology)
+    if re.search(
+        r"免疫肽|免疫肽组|hla|mhc|ligandome|immunopeptid",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        hints["special_themes"] = ["immunopeptidomics"]
+        if "objective" not in hints and len(text) <= 80:
+            hints["objective"] = text.strip()[:200]
+
+    return hints
+
+
+def _merge_discovery_compound_commitment_hints(
+    patch: Mapping[str, Any] | None,
+    user_message: str,
+    *,
+    intent_snapshot: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Union Manager patch with deterministic compound hints (hints fill gaps only)."""
+
+    base = dict(patch) if isinstance(patch, Mapping) else {}
+    hints = _discovery_compound_commitment_hints(user_message)
+    if not hints:
+        return base
+    # Only help packed multi-commitment turns when the Manager under-wrote
+    # structural fields (soft-only dumps: objective/themes/task alone).
+    # Never expand an already multi-structural Manager patch — that pollutes
+    # critic/partial-grounding paths and can incorrectly flip skip.
+    structural_hint_keys = {
+        "species",
+        "task_type",
+        "acquisition_mode",
+        "run_horizon",
+        "quota_flexibility",
+        "coverage_mode",
+        "target_project_count",
+    }
+    structural_hits = len(structural_hint_keys.intersection(hints))
+    base_structural = len(structural_hint_keys.intersection(base))
+    if base_structural >= 2:
+        # Manager already committed multiple structural fields.
+        return base
+    if len(base) < 2 and structural_hits < 2:
+        return base
+    if len(base) < 2 and structural_hits < 3 and len(hints) < 4:
+        # Need a clearly packed sentence (e.g. species+task+acquisition).
+        return base
+    # Soft-only / thin Manager dump: require a clearly packed user sentence.
+    if base_structural < 2 and structural_hits < 3 and len(hints) < 4:
+        return base
+    merged = dict(base)
+    snapshot = intent_snapshot if isinstance(intent_snapshot, Mapping) else {}
+    for field, value in hints.items():
+        if field in merged:
+            continue
+        # Keep skip-path pure: never inject keys outside the low-risk whitelist.
+        if field not in _DISCOVERY_LOW_RISK_SINGLE_FIELD_VERIFIER_SKIP:
+            continue
+        # Do not overwrite an intentional empty clear already on the card via patch
+        if field in snapshot and field not in base and value is None:
+            continue
+        merged[field] = value
+    if merged == base:
+        return base
+    normalized, errors = _validate_discovery_strategy_patch(merged)
+    if errors or not normalized:
+        return base
+    # Preserve non-whitelist keys from the original Manager patch so they still
+    # force the semantic critic (e.g. ptm_types / scientific_constraints).
+    manager_hard = {
+        field: value
+        for field, value in base.items()
+        if field not in _DISCOVERY_LOW_RISK_SINGLE_FIELD_VERIFIER_SKIP
+    }
+    if manager_hard:
+        out = dict(normalized)
+        out.update(manager_hard)
+        revalidated, re_errors = _validate_discovery_strategy_patch(out)
+        return revalidated if not re_errors and revalidated else base
+    # Pure low-risk compound: keep only whitelist keys for a clean skip path.
+    return {
+        field: value
+        for field, value in normalized.items()
+        if field in _DISCOVERY_LOW_RISK_SINGLE_FIELD_VERIFIER_SKIP
+    }
+
+
 def _discovery_low_risk_single_field_verifier_skip(
     patch: Mapping[str, Any],
     *,
     tool_interpretation_difference: bool,
     provider_compatibility_recovery: Mapping[str, Any] | None = None,
 ) -> bool:
-    """True when a one-field typed tool patch may skip the second verifier."""
+    """True when a typed tool patch may skip the second verifier.
+
+    Supports one field or a small compound dump of first-class low-risk fields
+    (natural-language multi-commitment turns). scientific_constraints and
+    provider plain-text recovery still require the critic. A single-field
+    tool/interpretation gap still forces the critic; multi-field pure-whitelist
+    compounds may skip even when the reconciled patch differs from the tool
+    dump so soft-reject cannot blank hard whitelist fields (species, DDA,
+    horizon, quota).
+    """
 
     recovery = (
         provider_compatibility_recovery
@@ -3408,14 +3593,14 @@ def _discovery_low_risk_single_field_verifier_skip(
     if not isinstance(patch, Mapping) or not patch:
         return False
     keys = set(patch)
-    if len(keys) != 1:
-        return False
-    field = next(iter(keys))
-    if field not in _DISCOVERY_LOW_RISK_SINGLE_FIELD_VERIFIER_SKIP:
-        return False
     if "scientific_constraints" in keys:
         return False
-    if tool_interpretation_difference:
+    if not keys.issubset(_DISCOVERY_LOW_RISK_SINGLE_FIELD_VERIFIER_SKIP):
+        return False
+    if len(keys) > _DISCOVERY_LOW_RISK_COMPOUND_MAX_FIELDS:
+        return False
+    if tool_interpretation_difference and len(keys) < 2:
+        # Single-field interpretation gaps still need the critic.
         return False
     if (
         _clean_text(recovery.get("mode"))
@@ -3505,6 +3690,350 @@ def _normalise_discovery_decision_target_fields(
         if len(ids.intersection(allowed)) >= 2
     ]
     return enum_matches if len(enum_matches) == 1 else []
+
+
+_DISCOVERY_CONTRACT_NOISE_MARKERS: tuple[str, ...] = (
+    "选项菜单不完整",
+    "下一问菜单不完整",
+    "下一问结构不完整",
+    "动作契约不完整",
+    "契约不一致",
+    "不把它当作有效提问",
+    "系统生成的下一问",
+    "策略修改已按工具事件处理",
+    "next_decision requires",
+    "missing or unsupported D1 action",
+    "contract_errors",
+)
+
+
+def _discovery_user_asks_clarification(user_message: str) -> bool:
+    """True when the user is asking what the previous system notice meant."""
+
+    text = _clean_text(user_message)
+    if not text:
+        return False
+    markers = (
+        "什么意思",
+        "啥意思",
+        "什么意思啊",
+        "这是什么意思",
+        "这啥意思",
+        "什么意思？",
+        "啥意思？",
+        "what does that mean",
+        "what do you mean",
+        "what does this mean",
+    )
+    folded = text.casefold()
+    return any(marker.casefold() in folded for marker in markers)
+
+
+def _discovery_history_has_contract_noise(
+    dialogue_history: list[Mapping[str, Any]] | None,
+) -> bool:
+    """Detect recent assistant contract/repair copy the user may be asking about."""
+
+    if not dialogue_history:
+        return False
+    for item in reversed(list(dialogue_history)[-12:]):
+        if not isinstance(item, Mapping):
+            continue
+        role = _clean_text(item.get("role")).lower()
+        if role != "assistant":
+            continue
+        content = _clean_text(item.get("content"))
+        if any(marker in content for marker in _DISCOVERY_CONTRACT_NOISE_MARKERS):
+            return True
+    return False
+
+
+def _discovery_contract_noise_clarification_hint() -> str:
+    """Inject into the Manager user prompt after contract noise + 什么意思."""
+
+    return (
+        "server_hint (authoritative for this turn): The user is asking what a previous "
+        "system/contract notice meant (e.g. incomplete next_decision menu or action "
+        "contract). Explain in plain Chinese that the strategy card may already have "
+        "been updated, but a follow-up option menu was dropped as incomplete—not that "
+        "their science goal is invalid. Do not echo internal English contract_errors. "
+        "If critical_decision_agenda still has unresolved critical items, emit a "
+        "schema-complete next_decision for the highest-priority remaining item "
+        "(question + recommendation.reason + 2-8 options each with strategy_patch) "
+        "or ask one clear free-text question. Prefer action=clarify when presenting "
+        "that follow-up; keep action=advise only if no menu is needed.\n\n"
+    )
+
+
+def _format_discovery_incomplete_next_decision_message() -> str:
+    """User-facing copy when next_decision fails schema and is not repaired yet."""
+
+    return (
+        "刚才准备的下一问选项不完整，我先不把它当作有效提问。"
+        "策略若已更新会保留在卡上；请直接用自然语言说明你的选择，或再说一次数据目标。"
+    )
+
+
+def _format_discovery_contract_noise_clarification_message() -> str:
+    """Explain prior contract noise when the user asks 什么意思."""
+
+    return (
+        "刚才的提示是说：策略可能已写入，但系统生成的下一问选项不完整，所以没有展示菜单。"
+        "这不是说你的目标无效。下面补上当前最关键的待确认问题；你也可以直接用自然语言回答。"
+    )
+
+
+def _synthesize_discovery_next_decision_from_agenda(
+    remaining_critical: list[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Build a schema-valid next_decision when the model omitted or broke one.
+
+    Keeps grilling alive after a successful update_strategy so users are not
+    left with only an internal contract error string.
+    """
+
+    if not remaining_critical:
+        return None
+    item = remaining_critical[0]
+    item_id = _clean_text(item.get("id"))
+    target_fields = [
+        _clean_text(field)
+        for field in item.get("target_fields") or item.get("decision_variables") or []
+        if _clean_text(field)
+    ]
+    reason = _clean_text(item.get("reason")) or "该选择会影响搜索范围与科学可用性。"
+
+    templates: dict[str, dict[str, Any]] = {
+        "generalization_scope": {
+            "focus": "物种范围",
+            "question": "这次搜索的物种范围如何定？",
+            "options": [
+                {
+                    "id": "human_only",
+                    "label": "只要人源",
+                    "reason": "免疫肽/训练场景下人源数据最丰富、注释更全",
+                    "strategy_patch": {
+                        "species": ["human"],
+                        "species_policy": "include_only",
+                        "species_coverage": "none",
+                    },
+                },
+                {
+                    "id": "human_prefer",
+                    "label": "人源优先，其他不排除",
+                    "reason": "先覆盖人源，同时保留其它物种以观察分布",
+                    "strategy_patch": {
+                        "species": ["human"],
+                        "species_policy": "prefer",
+                        "species_coverage": "prefer_listed",
+                    },
+                },
+                {
+                    "id": "species_open",
+                    "label": "保持开放，先看数据分布",
+                    "reason": "由检索结果再决定是否收紧物种",
+                    "strategy_patch": {
+                        "species": [],
+                        "species_policy": "open",
+                        "species_coverage": "broaden",
+                    },
+                },
+            ],
+        },
+        "acquisition_compatibility": {
+            "focus": "采集方式",
+            "question": "采集方式如何限制？",
+            "options": [
+                {
+                    "id": "dda_only",
+                    "label": "只要 DDA",
+                    "reason": "谱图与标签对应更直接，适合多数训练任务",
+                    "strategy_patch": {
+                        "acquisition_mode": "dda",
+                        "mixed_acquisition_policy": "reject_mixed",
+                    },
+                },
+                {
+                    "id": "dda_prefer",
+                    "label": "DDA 优先，混合项目审查",
+                    "reason": "扩大候选池，混合项目单独审查",
+                    "strategy_patch": {
+                        "acquisition_mode": "dda",
+                        "mixed_acquisition_policy": "review_mixed",
+                    },
+                },
+                {
+                    "id": "acq_open",
+                    "label": "暂不限制",
+                    "reason": "先看仓库分布再决定",
+                    "strategy_patch": {
+                        "acquisition_mode": "unknown",
+                        "mixed_acquisition_policy": "review_mixed",
+                    },
+                },
+            ],
+        },
+        "search_scale": {
+            "focus": "搜索规模",
+            "question": "这次希望覆盖多大规模？",
+            "options": [
+                {
+                    "id": "curated_20",
+                    "label": "精选约 20 个项目",
+                    "reason": "质量可控，适合严肃 benchmark 起步",
+                    "strategy_patch": {
+                        "coverage_mode": "curated",
+                        "target_project_count": 20,
+                        "quota_flexibility": "recommended",
+                    },
+                },
+                {
+                    "id": "open_ended",
+                    "label": "尽可能多（开放配额）",
+                    "reason": "最大化候选池，审查时再筛",
+                    "strategy_patch": {
+                        "coverage_mode": "exhaustive",
+                        "target_project_count": None,
+                        "quota_flexibility": "open_ended",
+                    },
+                },
+                {
+                    "id": "balanced_50",
+                    "label": "平衡约 50 个项目",
+                    "reason": "质量与广度折中",
+                    "strategy_patch": {
+                        "coverage_mode": "balanced",
+                        "target_project_count": 50,
+                        "quota_flexibility": "recommended",
+                    },
+                },
+            ],
+        },
+        "delivery_horizon": {
+            "focus": "本次终点",
+            "question": "这次运行做到哪一步？",
+            "options": [
+                {
+                    "id": "candidates_reviewed",
+                    "label": "候选项目 + 审查",
+                    "reason": "可审计后再进入下游",
+                    "strategy_patch": {"run_horizon": "candidates_reviewed"},
+                },
+                {
+                    "id": "candidates_only",
+                    "label": "仅候选列表",
+                    "reason": "先看有哪些项目",
+                    "strategy_patch": {"run_horizon": "candidates_only"},
+                },
+                {
+                    "id": "plan_only",
+                    "label": "仅规划",
+                    "reason": "不访问仓库，只定策略",
+                    "strategy_patch": {"run_horizon": "plan_only"},
+                },
+            ],
+        },
+        "downstream_task": {
+            "focus": "下游任务",
+            "question": "这些数据主要准备用于什么分析？",
+            "options": [
+                {
+                    "id": "browse_only",
+                    "label": "浏览探索",
+                    "reason": "先摸清仓库分布",
+                    "strategy_patch": {"task_type": "browse_only"},
+                },
+                {
+                    "id": "denovo",
+                    "label": "从头测序",
+                    "reason": "需要高质量 MS/MS",
+                    "strategy_patch": {"task_type": "denovo"},
+                },
+                {
+                    "id": "rt_prediction",
+                    "label": "保留时间预测",
+                    "reason": "需要 RT 与肽段配对线索",
+                    "strategy_patch": {"task_type": "rt_prediction"},
+                },
+            ],
+        },
+        "scientific_objective": {
+            "focus": "科学目标",
+            "question": "用一句话描述你想找的数据目标？",
+            "options": [
+                {
+                    "id": "immuno",
+                    "label": "免疫肽 / HLA 配体方向",
+                    "reason": "主题聚焦免疫肽组",
+                    "strategy_patch": {
+                        "objective": "免疫肽组学数据发现",
+                        "special_themes": ["immunopeptidomics"],
+                    },
+                },
+                {
+                    "id": "general_proteomics",
+                    "label": "通用蛋白质组数据",
+                    "reason": "不限定免疫肽主题",
+                    "strategy_patch": {"objective": "蛋白质组学数据发现"},
+                },
+                {
+                    "id": "free_text",
+                    "label": "我用自然语言说明",
+                    "reason": "目标较特殊，稍后文字补充",
+                    "strategy_patch": {"objective": "待用户补充的科学目标"},
+                },
+            ],
+        },
+    }
+
+    template = templates.get(item_id)
+    if template is None and target_fields:
+        # Generic fallback: open vs keep asking via free-ish options on first field.
+        field = target_fields[0]
+        template = {
+            "focus": field,
+            "question": f"还需要确认「{field}」如何设定？",
+            "options": [
+                {
+                    "id": f"{field}_recommend",
+                    "label": "按常见稳妥默认",
+                    "reason": reason,
+                    "strategy_patch": {},
+                },
+                {
+                    "id": f"{field}_open",
+                    "label": "先保持开放",
+                    "reason": "由检索结果再收紧",
+                    "strategy_patch": {},
+                },
+                {
+                    "id": f"{field}_describe",
+                    "label": "我文字说明具体要求",
+                    "reason": "该维度较特殊",
+                    "strategy_patch": {},
+                },
+            ],
+        }
+
+    if template is None:
+        return None
+
+    options = template["options"]
+    recommendation = {
+        **options[0],
+        "reason": _clean_text(options[0].get("reason")) or reason,
+    }
+    raw_decision = {
+        "focus": template["focus"],
+        "target_fields": target_fields or list((options[0].get("strategy_patch") or {}).keys()),
+        "question": template["question"],
+        "recommendation": recommendation,
+        "options": options,
+        "option_mode": "focused",
+        "allow_free_text": True,
+        "revisit_existing": False,
+    }
+    return _normalise_discovery_next_decision(raw_decision)
 
 
 def _normalise_discovery_next_decision(raw: Any) -> dict[str, Any] | None:
@@ -4653,7 +5182,12 @@ def _run_discovery_dialogue_agents_sdk(
         "training tasks, examine downstream labels, acquisition compatibility, biological "
         "generalization, leakage/batch risks, and evidence requirements. Never mutate a strategy, "
         "confirm it, or claim PRIDE facts that have not been retrieved. Return concise structured "
-        "analysis for the user-facing Manager.\n\n"
+        "analysis for the user-facing Manager.\n"
+        "COMPOUND ANSWERS: when the latest user message already packs multiple explicit "
+        "commitments (species, task, scale, acquisition, horizon, themes, etc.), treat those as "
+        "settled. Do not invent a multi-step quiz or re-ask fields they stated. List at most the "
+        "true remaining readiness blockers (usually zero or one). Never invent a downstream "
+        "task_type the user did not state (e.g. immunopeptide topic alone is not rt_prediction).\n\n"
         "Authoritative bounded context:\n"
         + json.dumps(bounded_advisor_context, ensure_ascii=False, indent=2)
     )
@@ -4687,7 +5221,9 @@ def _run_discovery_dialogue_agents_sdk(
             "per turn, and only for open-ended scientific planning, a newly introduced complex "
             "task, or a nontrivial multi-field conflict. Never call for greetings, short topic "
             "commits, exact option selections, single-field edits, straightforward confirmations, "
-            "or any turn that already has a clear terminal action."
+            "compound multi-commitment dumps whose explicit fields are already clear, or any turn "
+            "that already has a clear terminal action. After a compound answer, do not use the "
+            "advisor to invent a multi-step quiz; finish with update_strategy for stated fields."
         ),
         parameters=_DiscoveryScientificAdvisorInput,
         include_input_schema=True,
@@ -4710,9 +5246,12 @@ def _run_discovery_dialogue_agents_sdk(
             name_override="update_strategy",
             description_override=(
                 "Write only strategy choices the user has explicitly committed to in this "
-                "turn, and pass the complete D1 contract object serialized in response_json. "
+                "turn (one field or a full multi-field compound patch when they packed several "
+                "commitments into one message), and pass the complete D1 contract object "
+                "serialized in response_json. Map every explicit commitment in ONE patch. "
                 "Advice, comparisons, examples, hypothetical values, and your own recommended "
-                "defaults must not be written unless the user explicitly accepts them."
+                "defaults must not be written unless the user explicitly accepts them. Do not "
+                "invent task_type or other fields the user did not state."
             ),
             strict_mode=False,
         ),
@@ -4731,20 +5270,23 @@ def _run_discovery_dialogue_agents_sdk(
         f"{system_prompt}\n\n"
         "SDK ACTION PROTOCOL (mandatory): finish by invoking exactly one function tool and never "
         "return assistant text directly. Use respond for a non-mutating turn, update_strategy for "
-        "an explicit user commitment, or confirm_strategy for eligible approval. Put the complete "
-        "D1 response object, serialized as JSON text, in response_json. For update_strategy, also "
-        "supply the canonical patch. The selected function tool is the action authority; a textual "
-        "tool_calls array is only a projection and cannot replace the function call. When "
-        "selected_agent_option is present, it is an explicit commitment: invoke update_strategy, "
-        "not respond. If the option intentionally keeps a field open/default, submit the relevant "
-        "target field with its canonical open, empty, or default value so the decision itself is "
-        "recorded. consult_scientific_advisor is a bounded read-only specialist: call it at most "
-        "once, and only when scientific planning genuinely benefits. Skip it for greetings, short "
-        "topic/theme commits, single-field edits, exact option selections, and confirmation. Prefer "
-        "finishing in one Manager turn with respond/update_strategy/confirm_strategy whenever the "
-        "user commitment is already clear. After any advisor call, continue as the same Manager "
-        "and finish with exactly one of respond/update_strategy/confirm_strategy. Advisor never "
-        "owns the user reply or strategy mutation.\n\n"
+        "an explicit user commitment (including multi-field compound dumps in ONE patch), or "
+        "confirm_strategy for eligible approval. Put the complete D1 response object, serialized "
+        "as JSON text, in response_json. For update_strategy, also supply the canonical patch with "
+        "every field the latest message committed—not a questionnaire. The selected function "
+        "tool is the action authority; a textual tool_calls array is only a projection and cannot "
+        "replace the function call. When selected_agent_option is present, it is an explicit "
+        "commitment: invoke update_strategy, not respond. If the option intentionally keeps a "
+        "field open/default, submit the relevant target field with its canonical open, empty, or "
+        "default value so the decision itself is recorded. consult_scientific_advisor is a bounded "
+        "read-only specialist: call it at most once, and only when scientific planning genuinely "
+        "benefits. Skip it for greetings, short topic/theme commits, single-field edits, exact "
+        "option selections, confirmation, and compound multi-commitment answers whose fields are "
+        "already explicit. Prefer finishing in one Manager turn with respond/update_strategy/"
+        "confirm_strategy whenever the user commitment is already clear. After any advisor call, "
+        "continue as the same Manager and finish with exactly one of respond/update_strategy/"
+        "confirm_strategy. Advisor never owns the user reply or strategy mutation; never use it "
+        "to push a multi-step quiz after a compound answer.\n\n"
         "CURRENT TURN STATE AND OUTPUT CONTRACT (authoritative for this run):\n"
         f"{state_prompt}"
     )
@@ -6185,26 +6727,26 @@ def _discovery_latest_message_clauses(user_message: str) -> list[dict[str, str]]
 def _discovery_grill_turn_system_prompt() -> str:
     return (
         "You are the conversational front of a proteomics data-discovery agent (PRIDE). "
-        "Behave like a real domain agent with tools, not a form wizard: flexible, specific, "
-        "brief, and collaborative. Users may chat or think out loud before committing; do not "
-        "rush them into a card update. You own the dialogue strategy and choose the "
-        "highest-value next decision from the current science context. There is no fixed "
-        "question order. The gap report and any legacy pending question are guidance, not a "
-        "command. Interpret the latest turn together with native dialogue history, respecting "
-        "references, corrections, negation, hypothetical scope, and turn-local instructions. "
-        "Reason by meaning rather than a keyword, species, task, or ontology whitelist. "
-        "Only an explicit update_strategy tool event may change the card. Recommendations stay "
-        "as advice until accepted. Natural-language approval is a separate confirm_strategy "
-        "decision and is valid only for the current snapshot while phase=awaiting_confirm. "
-        "A generic acknowledgement during grilling is not confirmation. You never start PRIDE "
-        "discovery; the server's separate grill_confirmed=true gate remains authoritative. "
-        "Be capability-honest: this surface can execute plan_only (without repository access), "
-        "candidates_only, and candidates_reviewed. ai_ready_table, pre_release, and full_release are "
-        "downstream stages that require a reviewed discovery result and a separate executor. You may "
-        "help plan those stages, but never imply that confirming one will silently run plain discovery "
-        "or that the downstream deliverable is already wired. "
-        "Reply in natural Chinese and always "
-        "return one JSON object matching the turn contract supplied by the user message.\n\n"
+        "Behave like a capable coding-style domain agent with tools (think pi coding-agent: "
+        "act on explicit user intent with tools, not a multi-step form wizard). Be flexible, "
+        "specific, brief, and collaborative. "
+        "MULTI-COMMITMENT FIRST: when the latest user message already states several concrete "
+        "choices (species, task/downstream use, scale, acquisition, horizon, themes, etc.), "
+        "you MUST call update_strategy once with ALL of those fields in a single patch. "
+        "Do not turn a compound request into a questionnaire. Do not ask the user to re-pick "
+        "a value they already gave. Only ask about true gaps that still block readiness. "
+        "There is no fixed question order. The gap report and pending question are guidance, "
+        "not a script. Interpret the latest turn with dialogue history; respect references, "
+        "corrections, negation, and turn-local scope. Reason by meaning, not keyword lists. "
+        "Only an explicit update_strategy tool event may change the card. Pure advice stays "
+        "advice until accepted. Natural-language approval uses confirm_strategy only when "
+        "phase=awaiting_confirm for the current snapshot. A generic ok/yes during grilling "
+        "is not confirmation. You never start PRIDE discovery; grill_confirmed=true remains "
+        "the server gate. Capability-honest: this surface can plan_only, candidates_only, "
+        "candidates_reviewed; ai_ready_table / pre_release / full_release need a reviewed "
+        "result and a separate executor—never imply confirm silently runs those. "
+        "Reply in natural Chinese and always return one JSON object matching the turn "
+        "contract in the user message.\n\n"
         "Repository scientific guidance:\n"
         f"{_discovery_agent_guidance()}"
     )
@@ -6346,11 +6888,21 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         separators=(",", ":"),
     )
     latest_clauses = _discovery_latest_message_clauses(user_message)
+    contract_noise_clarification = (
+        _discovery_user_asks_clarification(user_message)
+        and _discovery_history_has_contract_noise(dialogue_history)
+    )
+    contract_noise_hint = (
+        _discovery_contract_noise_clarification_hint()
+        if contract_noise_clarification
+        else ""
+    )
     user_prompt = (
         "Handle one grill dialogue turn for proteomics data discovery.\n\n"
         f"turn_kind: {turn_kind}\n"
         f"phase: {phase}\n"
         f"user_message: {user_message}\n\n"
+        f"{contract_noise_hint}"
         "latest_message_clauses (generic completeness aid; inspect every C-id):\n"
         f"{json.dumps(latest_clauses, ensure_ascii=False, indent=2)}\n\n"
         "Critical latest-turn scope rule: a 'discuss only / do not update' instruction inside an older history turn ended with that turn unless explicitly declared persistent. The latest user_message is a new turn; a latest acceptance, adoption, replacement, correction, open, or clear is actionable now.\n\n"
@@ -6365,9 +6917,9 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         f"{json.dumps(decision_memory, ensure_ascii=False, indent=2)}\n\n"
         "explicitly_resolved_strategy_fields (an open/unknown value may be an intentional answer):\n"
         f"{json.dumps(sorted(resolved_fields), ensure_ascii=False)}\n\n"
-        "gap_report (guidance only - you choose focus; multi-fill is allowed):\n"
+        "gap_report (guidance only; multi-fill / compound patch is preferred when the user packed multiple commitments):\n"
         f"{json.dumps(input_gap_report, ensure_ascii=False, indent=2)}\n\n"
-        "critical_decision_agenda (priority guard, not a fixed questionnaire):\n"
+        "critical_decision_agenda (apply any items already answered in latest_user_message via update_strategy; only ask about remaining blockers; not a fixed questionnaire):\n"
         f"{json.dumps(critical_decision_agenda, ensure_ascii=False, indent=2)}\n\n"
         "read_only_critic_feedback_from_previous_attempt (findings only; the Manager must independently re-propose any justified patch):\n"
         f"{json.dumps(manager_repair_feedback, ensure_ascii=False, indent=2) if manager_repair_feedback else '(none)'}\n\n"
@@ -6440,14 +6992,17 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         "an actionable requirement. This rule is generic: do not wait for a vocabulary-specific branch.\n"
         "- next_decision must include target_fields (one or more canonical strategy fields) and revisit_existing. Set revisit_existing=true only when the latest user explicitly asks to reconsider an already-set choice.\n"
         "- Every next_decision option must include a non-empty, schema-valid strategy_patch that completely expresses only that option's mutation meaning. All options in one menu must use this contract. target_fields is derived by the server from these patches and is not mutation authority. A later numeric/id/label selection applies exactly the stored option patch; the later model must not add defaults or reinterpret it.\n"
-        "- critical_decision_agenda is not a questionnaire order, but critical items are readiness blockers. Unless the latest turn is consultation or directly resolves another issue, ask the highest-impact unresolved critical item before lower-impact optional preferences. In particular, executable searches need an explicit project scale (or an explicit open-ended quota); do not skip scale in favor of optional labeling or instrument preferences.\n"
-        "- Ask at most one highest-value scientific decision. Give one recommendation and a short task-specific reason. Usually offer 2-5 useful options; when the user explicitly asks what alternatives exist or requests a comparison, include every materially relevant alternative discussed, up to 8. Never collapse an expanded discussion back to the old two-item menu. Always accept free text.\n"
-        "- option_mode=expanded is exceptional: use it only when the latest user message explicitly asks for alternatives, a comparison, or a fuller option inventory. A greeting, topic declaration, or ordinary answer uses focused.\n"
-        "- Keep next_decision.question to one concise question. Do not embed a second bullet list inside question; the structured options array is rendered separately. Use natural Chinese labels for user-facing options.\n"
-        "- assistant_message must not repeat or enumerate next_decision options; the UI renders the question and options immediately afterward. Use assistant_message for acknowledgement, analysis, and the recommendation rationale only.\n"
-        "- Give decision options stable, semantic ids (for example a task or policy id), not generic yes/no ids. If you revisit the same decision, preserve its focus and option ids; after an option is selected, move on rather than paraphrasing and asking it again.\n"
+        "- critical_decision_agenda lists readiness blockers, NOT a forced one-by-one quiz. If the latest user_message already resolves one or more agenda items, apply them via update_strategy in THIS turn and do not re-ask them.\n"
+        "- COMPOUND UPDATES ARE THE DEFAULT when the user packs multiple commitments into one message (including Chinese separators · / ， / 、 / 和 / 以及 / 逗号). Map every explicit commitment into one update_strategy.patch. Example: '人源免疫肽，RT 预测，越多越好，DDA，审查候选' should set species/human+prefer or include_only, special_themes or objective for immunopeptide, task_type=rt_prediction, quota open_ended or exhaustive coverage, acquisition_mode=dda, run_horizon=candidates_reviewed in ONE patch.\n"
+        "- Do NOT invent downstream tasks the user did not state (e.g. do not write task_type=rt_prediction when they only said immunopeptide data). Objective/theme may record the topic; task_type only when a modeling/use task is explicit or they accept a recommendation.\n"
+        "- After applying all explicit commitments, if critical_decision_agenda still lists unresolved critical items (critical=true), you MUST continue grilling: set next_decision for the highest-priority remaining critical item with a complete question + recommendation reason + 2-5 options (or clear free-text ask). Do not go silent after a partial update. Species/generalization_scope is critical for training tasks (denovo/RT/etc.) when species is empty—ask it; do not claim it is optional without user input.\n"
+        "- Prefer ready_to_confirm only when no critical agenda item remains. Non-critical items (e.g. labeling) may be skipped or asked briefly.\n"
+        "- Menus are for unresolved blockers, not a fixed questionnaire. After a compound multi-commit answer, do not re-ask resolved fields; do ask the next critical gap. option_mode=expanded only if they ask for alternatives/comparison.\n"
+        "- Every next_decision you emit must be schema-complete (question, recommendation.reason, 2-8 options each with strategy_patch). Incomplete next_decision is dropped by the server—never leave the user without a follow-up when critical gaps remain.\n"
+        "- Keep next_decision.question to one concise question when present. Do not embed option lists in assistant_message; the UI renders options separately. Use assistant_message to confirm what was written to the card and what (if anything) is still open.\n"
+        "- Give option ids stable semantic ids when you use menus. After an option is selected, move on; never rephrase the same menu.\n"
         "- ready_to_confirm only presents the current strategy for approval; it is not user approval.\n"
-        "- For natural-language approval, return action=confirm_strategy only when confirmation_context.eligible=true and the user unambiguously approves that exact current strategy. Words such as yes/ok/好的/可以 during grilling or while answering a recommendation are not confirmation.\n"
+        "- For natural-language approval, return action=confirm_strategy only when confirmation_context.eligible=true and the user unambiguously approves that exact current strategy. Words such as yes/ok/好的/可以 during grilling or while answering a recommendation are not confirmation. Phrases like 直接确认可搜 / 可以搜了 / 开始搜 after a complete card still require awaiting_confirm eligibility.\n"
         "- confirm_strategy never starts PRIDE. A separate caller may set grill_confirmed=true only after consuming this decision; the backend discovery-start gate remains authoritative.\n"
         "- If asked to search before confirmation, use refuse_search and explain the one remaining confirmation dependency.\n"
         "- During grilling PRIDE has not been queried. Do not invent availability, project counts, repository composition, or metadata coverage.\n"
@@ -6668,6 +7223,31 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         mutation_errors = []
     verification_input_patch = dict(explicit_tool_patch)
     verification_input_patch.update(patch)
+    # Complete under-specified Manager dumps on packed multi-commitment turns
+    # (local flake: model writes only soft keys; user already stated species/DDA/scale).
+    # LC-B write path: after compound fill, verification_input_patch and patch both
+    # become filled so the low-risk skip branch can apply the full card write without
+    # a second verifier pass or soft-reject under-write.
+    if requested_action == "update_strategy" and not mutation_errors:
+        filled = _merge_discovery_compound_commitment_hints(
+            verification_input_patch,
+            user_message,
+            intent_snapshot=intent_snapshot,
+        )
+        if filled and filled != verification_input_patch:
+            verification_input_patch = dict(filled)
+            # Always promote filled to the apply patch (not only when patch ⊆ filled).
+            # Commitment-filtered soft subsets must not win over deterministic
+            # compound recovery of hard whitelist fields (species/DDA/horizon/quota).
+            patch = dict(filled)
+            explicit_tool_patch = {
+                **dict(explicit_tool_patch),
+                **{
+                    field: value
+                    for field, value in filled.items()
+                    if field not in explicit_tool_patch
+                },
+            }
     # The primary tool may include model-authored convenience text that its
     # independent clause audit correctly did not classify as a user
     # commitment.  Keep every reconciled commitment atomic, while allowing the
@@ -6710,6 +7290,31 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         tool_interpretation_difference=tool_interpretation_difference,
         provider_compatibility_recovery=provider_compatibility_recovery,
     )
+    if (
+        low_risk_single_field_skip
+        and verification_input_patch
+        and not mutation_errors
+        and requested_action == "update_strategy"
+    ):
+        # Low-risk skip write:
+        # - No commitment audit → apply full verification dump (tool ∪ compound fill).
+        # - With commitment audit → keep reconciled ``patch`` (drops ungrounded tool
+        #   keys) and only union keys that compound hints added beyond the tool dump.
+        # This recovers soft under-writes without resurrecting uncommitted tool fields.
+        if commitment_authority_patch is None:
+            apply_patch = dict(verification_input_patch)
+        else:
+            compound_extras = {
+                field: value
+                for field, value in verification_input_patch.items()
+                if field not in explicit_tool_patch
+            }
+            apply_patch = {**dict(patch), **compound_extras}
+        patch = _drop_unchanged_discovery_patch_fields(
+            apply_patch,
+            intent_snapshot,
+            preserve_fields=set(explicit_resolution_patch),
+        )
     patch_verification_warranted = bool(
         agent_runtime == "openai_agents"
         and verification_input_patch
@@ -6725,9 +7330,10 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         # action, and field-scope validation above remain authoritative; any
         # out-of-scope field still takes the verifier/rejection path.
         and not selected_option_patch_is_scoped
-        # Low-risk single-field tool patches (whitelist) skip the second
-        # verifier entirely for speed; multi-field / constraints / tool
-        # interpretation gaps still require the critic.
+        # Low-risk whitelist tool patches (single field or small compound dump,
+        # max _DISCOVERY_LOW_RISK_COMPOUND_MAX_FIELDS) skip the second verifier.
+        # scientific_constraints / non-whitelist fields / tool-interpretation gaps
+        # still force the critic (helper returns False → this gate stays open).
         and not low_risk_single_field_skip
         and (
             len(latest_clauses) > 1
@@ -7232,17 +7838,10 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         contract_errors.append(
             "next_decision requires a question, a recommendation reason, and 2-8 options"
         )
-        if action == "clarify":
+        # Repair path filled below after remaining_critical_decisions is known.
+        if action == "clarify" and not patch:
             action = "advise"
-            assistant_message = (
-                "模型给出的下一问缺少完整推荐理由或至少两个可选方向，"
-                "所以本轮不把它当作有效提问；当前策略保持不变。"
-            )
-        elif action == "update_strategy":
-            assistant_message = (
-                f"{assistant_message}\n\n"
-                "策略修改已按工具事件处理；但下一问结构不完整，已明确忽略。"
-            )
+            assistant_message = _format_discovery_incomplete_next_decision_message()
 
     selection_was_applied = _discovery_selected_option_was_applied(
         selected_decision,
@@ -7358,6 +7957,59 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
     remaining_critical_decisions = [
         item for item in remaining_decision_agenda if item.get("critical") is True
     ]
+    # Repair path only — do not re-open grilling after an intentional
+    # redundant-next clear, pure chat, or a model that simply chose not to
+    # ask (except after a successful card write with zero next_decision).
+    # 1) Broken model menu (decision_contract_error)
+    # 2) update_strategy wrote a patch but left next_decision empty (not
+    #    because we suppressed a repeated/resolved menu).
+    if remaining_critical_decisions and (
+        decision_contract_error
+        or (
+            action == "update_strategy"
+            and bool(patch)
+            and next_decision is None
+            and not redundant_next_decision
+        )
+    ):
+        synthesized = _synthesize_discovery_next_decision_from_agenda(
+            remaining_critical_decisions
+        )
+        if synthesized is not None:
+            repaired_from_decision_contract = bool(decision_contract_error)
+            next_decision = synthesized
+            decision_contract_error = False
+            # Drop the next_decision schema error once a full agenda menu was
+            # synthesized; otherwise the turn still looks like a hard failure
+            # even though the user now has a valid follow-up question.
+            _next_decision_contract_msg = (
+                "next_decision requires a question, a recommendation reason, "
+                "and 2-8 options"
+            )
+            contract_errors = [
+                error
+                for error in contract_errors
+                if error != _next_decision_contract_msg
+            ]
+            if action == "update_strategy" and patch:
+                assistant_message = (
+                    f"{assistant_message}\n\n"
+                    "接下来还需要确认一个关键点（见下方选项），以免漏掉影响搜索的设定。"
+                ).strip()
+            elif action in {"advise", "chat", "clarify"} and not patch:
+                action = "clarify"
+                if _discovery_user_asks_clarification(user_message) and (
+                    contract_noise_clarification
+                    or _discovery_history_has_contract_noise(dialogue_history)
+                    or repaired_from_decision_contract
+                ):
+                    assistant_message = (
+                        _format_discovery_contract_noise_clarification_message()
+                    )
+                elif not assistant_message or len(assistant_message) < 12:
+                    assistant_message = (
+                        "好的。当前策略还有关键点未定，请先看下面这一问题。"
+                    )
     ready_for_confirm = bool(
         action in {"ready_to_confirm", "confirm_strategy"}
         or raw.get("ready_for_confirm") is True
@@ -7374,12 +8026,44 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
     if action == "ready_to_confirm" and remaining_critical_decisions:
         action = "clarify" if next_decision is not None else "advise"
         if next_decision is None:
-            assistant_message = (
-                "当前策略还缺少会实质影响搜索或科学可用性的关键决定："
-                + "、".join(
-                    _clean_text(item.get("id")) for item in remaining_critical_decisions
+            synthesized = _synthesize_discovery_next_decision_from_agenda(
+                remaining_critical_decisions
+            )
+            if synthesized is not None:
+                next_decision = synthesized
+                action = "clarify"
+                assistant_message = (
+                    "还不能确认开搜：下面这些关键决定仍会影响结果，请先选一项或文字说明。"
                 )
-                + "。我不会跳过这些问题直接让你确认。"
+            else:
+                assistant_message = (
+                    "当前策略还缺少会实质影响搜索或科学可用性的关键决定："
+                    + "、".join(
+                        _clean_text(item.get("id"))
+                        for item in remaining_critical_decisions
+                    )
+                    + "。我不会跳过这些问题直接让你确认。"
+                )
+
+    # User asked what a prior contract/repair notice meant: ensure friendly
+    # explanation even when no critical agenda item was synthesized above.
+    if (
+        contract_noise_clarification
+        and action in {"advise", "chat", "clarify"}
+        and not patch
+        and not (
+            assistant_message
+            and "刚才的提示是说" in assistant_message
+        )
+    ):
+        action = "clarify" if next_decision is not None else action
+        explanation = _format_discovery_contract_noise_clarification_message()
+        if next_decision is not None:
+            assistant_message = explanation
+        elif not assistant_message or len(assistant_message) < 24:
+            assistant_message = (
+                "刚才的提示是说：系统生成的下一问选项不完整，所以没有展示菜单；"
+                "这不是否定你的科学目标。请直接用自然语言说明你的选择或数据目标。"
             )
 
     if action == "update_strategy" and patch:

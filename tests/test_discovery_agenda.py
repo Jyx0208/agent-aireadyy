@@ -102,7 +102,11 @@ def test_explicit_open_values_are_resolved() -> None:
         target_project_count=None,
         quota_flexibility="open_ended",
         acquisition_mode="unknown",
-        species_policy="open",
+        # Empty species list still grills generalization_scope even when the
+        # card defaults species_policy to open; only an explicit resolved
+        # species scope (user chose open / listed taxa) suppresses it.
+        species=["human"],
+        species_policy="include_only",
         labeling_strategy="any",
     )
 
@@ -112,6 +116,44 @@ def test_explicit_open_values_are_resolved() -> None:
     assert "acquisition_compatibility" not in ids
     assert "generalization_scope" not in ids
     assert "labeling_compatibility" not in ids
+
+
+def test_empty_species_keeps_generalization_scope_despite_open_policy() -> None:
+    """P0-C: species empty + default open policy must still ask species scope."""
+
+    snapshot = _resolved_training_snapshot(
+        task_type="denovo",
+        acquisition_mode="dda",
+        species=[],
+        species_policy="open",
+        labeling_strategy="any",
+    )
+
+    ids = [item.id for item in build_critical_decision_agenda(snapshot)]
+
+    assert "generalization_scope" in ids
+
+
+def test_explicit_open_species_via_resolved_fields_suppresses_scope() -> None:
+    """User-chosen open scope (resolved_fields) may leave species list empty."""
+
+    snapshot = _resolved_training_snapshot(
+        task_type="denovo",
+        acquisition_mode="dda",
+        species=[],
+        species_policy="open",
+        labeling_strategy="any",
+    )
+
+    ids = [
+        item.id
+        for item in build_critical_decision_agenda(
+            snapshot,
+            resolved_fields={"species", "species_policy", "species_coverage"},
+        )
+    ]
+
+    assert "generalization_scope" not in ids
 
 
 def test_resolved_fields_suppress_an_intentionally_open_unknown() -> None:
