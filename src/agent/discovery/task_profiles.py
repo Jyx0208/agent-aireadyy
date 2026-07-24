@@ -193,15 +193,13 @@ def _training_agenda() -> list[CriticalAgendaItem]:
                 "taxa should be mixed or stratified."
             ),
             trigger_conditions=[
+                # Species list empty → still grill. Do NOT AND with species_policy
+                # missing: empty card often defaults policy to "open", which made
+                # generalization_scope vanish and skipped species questions.
                 AgendaTrigger(
                     operator="missing",
                     field="species",
-                    description="No species list is present.",
-                ),
-                AgendaTrigger(
-                    operator="missing",
-                    field="species_policy",
-                    description="No species policy is recorded; open is a resolved policy.",
+                    description="No species list is present; user has not chosen open/include/prefer scope.",
                 ),
             ],
         ),
