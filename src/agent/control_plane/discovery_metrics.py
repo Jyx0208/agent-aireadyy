@@ -69,7 +69,10 @@ def _manifest_counts(manifest: DatasetManifest | None) -> dict[str, int]:
     files = list(manifest.files)
     return {
         "selected_files": int(manifest.summary.get("selected_files") or len(files)),
-        "usable_files": sum(item.validity_status in {"valid", "weak_keep"} for item in files),
+        "usable_files": sum(
+            item.validity_status == "valid" and not item.needs_review
+            for item in files
+        ),
         "valid_files": sum(item.validity_status == "valid" for item in files),
         "review_files": sum(item.validity_status == "needs_review" for item in files),
     }

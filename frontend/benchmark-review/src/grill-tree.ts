@@ -264,6 +264,7 @@ export function absorbFreeTextSignals(spec: IntentSpec, rawInput: string): Inten
     inferred: { ...spec.inferred },
     ptmTypes: [...spec.ptmTypes],
     specialThemes: [...spec.specialThemes],
+    selectedSearchTerms: [...(spec.selectedSearchTerms || [])],
     species: [...spec.species],
   };
   const blob = raw.toLowerCase();
@@ -351,7 +352,7 @@ export function absorbFreeTextSignals(spec: IntentSpec, rawInput: string): Inten
     next = markAnswered(next, "Q1", true);
   }
   if (!next.runHorizon && (/先只找|候选|浏览|找数据/.test(blob) || next.taskType === "browse_only")) {
-    next.runHorizon = "candidates_only";
+    next.runHorizon = "candidates_reviewed";
     next = markAnswered(next, "Q2", true);
   }
 
@@ -463,7 +464,7 @@ const COVERAGE_QUOTAS: Record<
 > = {
   curated: { projects: 20, pool: 80, label: "精选" },
   balanced: { projects: 80, pool: 250, label: "均衡" },
-  exhaustive: { projects: 200, pool: 600, label: "尽量搜全" },
+  exhaustive: { projects: 2000, pool: 20000, label: "尽量搜全（无业务池顶，仅安全顶）" },
 };
 
 const PTM_TRIGGERS =
@@ -498,23 +499,23 @@ export function extractTargetProjectCount(text: string): number | null {
   if (!raw) return null;
 
   const patterns: RegExp[] = [
-    /(?:目标|只要|需要|希望|大约|大概|约|左右)?\s*(\d{1,3})\s*个?\s*(?:可用)?项目/,
-    /(?:target|about|around|only|just)?\s*(\d{1,3})\s*(?:usable\s*)?projects?/i,
-    /(?:改成|调整为|设为|变成|写成|改为)\s*(\d{1,3})/,
-    /我?要\s*(\d{1,3})\s*个/,
+    /(?:目标|只要|需要|希望|大约|大概|约|左右)?\s*(\d{1,5})\s*个?\s*(?:可用)?项目/,
+    /(?:target|about|around|only|just)?\s*(\d{1,5})\s*(?:usable\s*)?projects?/i,
+    /(?:改成|调整为|设为|变成|写成|改为)\s*(\d{1,5})/,
+    /我?要\s*(\d{1,5})\s*个/,
     // free-form N个 mid-sentence
-    /(?:约|大概|大约|只要|目标)?\s*(\d{1,3})\s*个(?:\s*(?:左右|可用|候选|项目))?/,
-    /(\d{1,3})\s*个\s*(?:可用)?(?:项目)?\s*(?:就行|即可|够了|左右|可以)/,
-    /(\d{1,3})\s*个\s*可用/,
-    /项目数\s*(?:为|到|到约|约)?\s*(\d{1,3})/,
-    /max[_\s-]?projects?\s*[=:]\s*(\d{1,3})/i,
+    /(?:约|大概|大约|只要|目标)?\s*(\d{1,5})\s*个(?:\s*(?:左右|可用|候选|项目))?/,
+    /(\d{1,5})\s*个\s*(?:可用)?(?:项目)?\s*(?:就行|即可|够了|左右|可以)/,
+    /(\d{1,5})\s*个\s*可用/,
+    /项目数\s*(?:为|到|到约|约)?\s*(\d{1,5})/,
+    /max[_\s-]?projects?\s*[=:]\s*(\d{1,5})/i,
   ];
 
   for (const re of patterns) {
     const m = raw.match(re);
     if (!m) continue;
     const n = Number(m[1]);
-    if (Number.isFinite(n) && n >= 1 && n <= 300) return Math.round(n);
+    if (Number.isFinite(n) && n >= 1 && n <= 5000) return Math.round(n);
   }
   return null;
 }
@@ -525,7 +526,7 @@ export function applyTargetProjectCount(
   n: number,
   opts?: { flexibility?: "fixed" | "recommended" },
 ): IntentSpec {
-  const count = Math.min(300, Math.max(1, Math.round(Number(n) || 0)));
+  const count = Math.min(5000, Math.max(1, Math.round(Number(n) || 0)));
   if (!Number.isFinite(count) || count < 1) return spec;
 
   let mode: CoverageMode = "balanced";
@@ -535,7 +536,7 @@ export function applyTargetProjectCount(
 
   const q = coverageQuota(mode);
   const pool = Math.min(
-    1000,
+    20000,
     Math.max(count * 4, Math.round(count * (q.pool / Math.max(1, q.projects)))),
   );
 
@@ -575,7 +576,8 @@ export function overlayFilledIntent(base: IntentSpec, overlay: IntentSpec): Inte
   if (overlay.parseReasoning) next.parseReasoning = overlay.parseReasoning;
 
   if (overlay.taskType) next.taskType = overlay.taskType;
-  if (overlay.runHorizon) next.runHorizon = overlay.runHorizon;
+  next.runHorizon = "candidates_reviewed";
+  next.answered.Q2 = true;
   if (overlay.species.length) next.species = overlay.species;
   if (overlay.speciesPolicy && overlay.speciesPolicy !== "open") next.speciesPolicy = overlay.speciesPolicy;
   else if (overlay.answered.Q3 && overlay.speciesPolicy) next.speciesPolicy = overlay.speciesPolicy;
@@ -768,16 +770,16 @@ export function applyLocalParse(prompt: string): IntentSpec {
   }
 
   if (/只.*计划|搜索计划|不要真正搜|plan only/.test(blob)) {
-    spec.runHorizon = "plan_only";
+    spec.runHorizon = "candidates_reviewed";
     spec = markAnswered(spec, "Q2", true);
   } else if (/可训练|ai[- ]?ready|建表|训练表/.test(blob)) {
-    spec.runHorizon = "ai_ready_table";
+    spec.runHorizon = "candidates_reviewed";
     spec = markAnswered(spec, "Q2", true);
   } else if (/审查|复核|review candidate/.test(blob)) {
     spec.runHorizon = "candidates_reviewed";
     spec = markAnswered(spec, "Q2", true);
   } else if (/找.*候选|候选就停|只要候选|发现数据/.test(blob)) {
-    spec.runHorizon = "candidates_only";
+    spec.runHorizon = "candidates_reviewed";
     spec = markAnswered(spec, "Q2", true);
   }
 
@@ -1102,7 +1104,7 @@ export function applyRecommendedDefaults(spec: IntentSpec): IntentSpec {
     next = markAnswered(next, "Q1", true);
   }
   if (!next.runHorizon) {
-    next.runHorizon = "candidates_only";
+    next.runHorizon = "candidates_reviewed";
     next = markAnswered(next, "Q2", true);
   }
   if (!next.answered.Q3) {
@@ -1220,10 +1222,8 @@ export function assessStrategyGaps(spec: IntentSpec): StrategyGapReport {
   const optional_missing: StrategySlot[] = [];
   const resolved = new Set(spec.resolvedFields || []);
   if (!spec.taskType) required_missing.push("task");
-  if (!spec.runHorizon) required_missing.push("horizon");
   if (
-    spec.runHorizon !== "plan_only"
-    && spec.targetProjectCount == null
+    spec.targetProjectCount == null
     && (spec.quotaFlexibility === "fixed" || !spec.coverageMode)
   ) required_missing.push("coverage");
   const objective = text(spec.objective);
@@ -1268,10 +1268,8 @@ export function assessGaps(spec: IntentSpec): GapReport {
   const resolved = new Set(spec.resolvedFields || []);
 
   if (!spec.taskType) requiredMissing.push("task");
-  if (!spec.runHorizon) requiredMissing.push("horizon");
   if (
-    spec.runHorizon !== "plan_only"
-    && spec.targetProjectCount == null
+    spec.targetProjectCount == null
     && (spec.quotaFlexibility === "fixed" || !spec.coverageMode)
   ) requiredMissing.push("coverage");
 
@@ -1352,7 +1350,6 @@ export function optionsForSlot(slot: StrategySlot, spec: IntentSpec): GrillQuest
 
 export function nextQuestion(spec: IntentSpec): GrillQuestion | null {
   if (!spec.answered.Q1) return questionQ1(spec);
-  if (!spec.answered.Q2) return questionQ2(spec);
   if (!spec.answered.Q3) return questionQ3(spec);
   if (!spec.answered.Q4) return questionQ4(spec);
   if (shouldAskQ5(spec) && !spec.answered.Q5) return questionQ5(spec);
@@ -1711,6 +1708,7 @@ export function applyAnswer(spec: IntentSpec, questionId: QuestionId, rawAnswer:
     successCriteria: [...spec.successCriteria],
     ptmTypes: [...spec.ptmTypes],
     specialThemes: [...spec.specialThemes],
+    selectedSearchTerms: [...(spec.selectedSearchTerms || [])],
   };
 
   switch (questionId) {
@@ -1772,7 +1770,7 @@ export function applyAnswer(spec: IntentSpec, questionId: QuestionId, rawAnswer:
         "6": "full_release",
         full_release: "full_release",
       };
-      next.runHorizon = map[key] || map[lower(answer)] || "candidates_only";
+      next.runHorizon = "candidates_reviewed";
       next = markAnswered(next, "Q2");
       break;
     }
@@ -2058,10 +2056,111 @@ export function buildStrategyCard(spec: IntentSpec): StrategyCard {
   };
 }
 
+export function searchTermCandidates(spec: IntentSpec): string[] {
+  const themes: string[] = [];
+  const add = (value: string) => {
+    const normalized = text(value).replaceAll("_", " ");
+    if (
+      normalized &&
+      !themes.some((existing) => existing.toLocaleLowerCase() === normalized.toLocaleLowerCase())
+    ) {
+      themes.push(normalized);
+    }
+  };
+  spec.specialThemes.forEach(add);
+  if (
+    isImmunopeptideContext(spec) &&
+    !themes.some((theme) => /immunopept|HLA|MHC/i.test(theme))
+  ) {
+    add("immunopeptidomics");
+  }
+  if (isImmunopeptideContext(spec) || themes.some((theme) => /immunopept|HLA|MHC/i.test(theme))) {
+    [
+      "immunopeptidomics",
+      "immunopeptidome",
+      "HLA ligandome",
+      "MHC ligandome",
+      "HLA peptidome",
+      "MHC peptidome",
+      "HLA class I ligandome",
+      "HLA class II ligandome",
+      "immunopeptides",
+      "HLA ligands",
+      "MHC ligands",
+      "MHC-associated peptides",
+    ].forEach(add);
+  }
+  spec.ptmTypes
+    .filter((theme) => theme !== "immunopeptide")
+    .forEach(add);
+  if (!themes.length) {
+    const objective = text(spec.objective || spec.originalPrompt);
+    const knownThemeTerms: Array<[RegExp, string]> = [
+      [/phospho(?:proteom|peptid)|磷酸化/i, "phosphoproteomics"],
+      [/glyco(?:proteom|peptid)|糖基化/i, "glycoproteomics"],
+      [/ubiquiti(?:nom|nyl)|泛素化/i, "ubiquitinomics"],
+      [/acetyl(?:proteom|ation)|乙酰化/i, "acetylproteomics"],
+      [/metabolom|代谢组/i, "metabolomics"],
+      [/proteogenom|蛋白基因组/i, "proteogenomics"],
+      [/\bproteomics?\b|蛋白质组/i, "proteomics"],
+    ];
+    knownThemeTerms.forEach(([pattern, term]) => {
+      if (pattern.test(objective)) add(term);
+    });
+  }
+  return themes.slice(0, 12);
+}
+
+export function confirmedSearchThemes(spec: IntentSpec): string[] {
+  const selected = normalizeSearchTerms(spec.selectedSearchTerms || []);
+  return selected.length ? selected.slice(0, 24) : searchTermCandidates(spec);
+}
+
+export function normalizeSearchTerms(values: string[]): string[] {
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const value of values) {
+    const term = String(value || "").trim().replace(/\s+/g, " ");
+    const key = term.toLocaleLowerCase();
+    if (!term || term.length > 240 || seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(term);
+  }
+  return normalized;
+}
+
+export function reconcileSearchTermSelection(
+  previous: string[],
+  spec: IntentSpec,
+): string[] {
+  const candidates = searchTermCandidates(spec);
+  const persisted = (spec.selectedSearchTerms || []).filter((term) => candidates.includes(term));
+  if (persisted.length) return persisted;
+  const stillRelevant = previous.filter((term) => candidates.includes(term));
+  return stillRelevant.length ? stillRelevant : candidates;
+}
+
 export function toDiscoveryJobPayload(spec: IntentSpec): DiscoveryJobPayload {
   const quota = coverageQuota(spec.coverageMode || "balanced");
-  const projects = Math.min(300, Math.max(1, spec.targetProjectCount ?? quota.projects));
-  const pool = Math.min(1000, Math.max(projects, spec.maxCandidateProjects ?? quota.pool));
+  const immunopeptideContext = isImmunopeptideContext(spec);
+  const openEnded =
+    spec.quotaFlexibility === "open_ended" ||
+    (
+      spec.quotaFlexibility !== "fixed" &&
+      (
+        spec.coverageMode === "exhaustive" ||
+        /越多越好|尽可能多|尽量多|as many as possible|maximize/i.test(String(spec.originalPrompt || ""))
+      )
+    );
+  // Soft ambition for selected projects; open-ended / 越多越好 is not a hard knife.
+  const projects = openEnded
+    ? Math.min(5000, Math.max(1, spec.targetProjectCount ?? quota.projects))
+    : Math.min(5000, Math.max(1, spec.targetProjectCount ?? quota.projects));
+  // Business candidate pool: open-ended uses high safety ceiling (not 600/1000 business cap).
+  const rawPool = Math.max(projects, spec.maxCandidateProjects ?? quota.pool);
+  const pool = openEnded
+    ? Math.min(20000, Math.max(rawPool, 20000))
+    : Math.min(20000, rawPool);
 
   const hardFields = ["repository"];
   if (spec.speciesPolicy === "include_only" || spec.speciesPolicy === "exclude") {
@@ -2069,7 +2168,7 @@ export function toDiscoveryJobPayload(spec: IntentSpec): DiscoveryJobPayload {
   }
   if (spec.acquisitionMode === "dda" || spec.acquisitionMode === "dia") hardFields.push("acquisition_mode");
   if (spec.labelingHard) hardFields.push("labeling_strategy");
-  if (spec.ptmTypes.includes("immunopeptide")) hardFields.push("goal");
+  if (immunopeptideContext) hardFields.push("goal");
   else if (spec.ptmTypes.length) hardFields.push("goal", "ptm_type", "ptm_types");
   if (spec.quotaFlexibility === "fixed") {
     hardFields.push("max_projects", "quota_flexibility");
@@ -2088,7 +2187,7 @@ export function toDiscoveryJobPayload(spec: IntentSpec): DiscoveryJobPayload {
   }
 
   let goal = "general";
-  if (spec.ptmTypes.includes("immunopeptide")) goal = "immunopeptidomics";
+  if (immunopeptideContext) goal = "immunopeptidomics";
   else if (spec.ptmTypes.length) goal = "ptm";
 
   let labeling = spec.labelingStrategy || "unknown";
@@ -2140,6 +2239,7 @@ export function toDiscoveryJobPayload(spec: IntentSpec): DiscoveryJobPayload {
     output_language: "zh-CN",
     constraints_enabled: hardFields.length > 1,
     goal,
+    query_terms: confirmedSearchThemes(spec),
     task_type: apiTaskType,
     acquisition_mode: spec.acquisitionMode || "unknown",
     labeling_strategy: labeling,
@@ -2152,13 +2252,16 @@ export function toDiscoveryJobPayload(spec: IntentSpec): DiscoveryJobPayload {
     ptm_types: spec.ptmTypes.filter((x) => x !== "immunopeptide"),
     max_projects: projects,
     max_candidate_projects: pool,
+    continuous_discovery: openEnded,
+    partial_delivery_batch_size: 500,
+    inspection_batch_size: 30,
     use_memory: true,
     save_memory: true,
     hard_constraint_fields: hardFields,
     constraint_provenance: provenance,
     idempotency_key: crypto.randomUUID(),
     grill_confirmed: spec.confirmed === true,
-    run_horizon: spec.runHorizon || "candidates_only",
+    run_horizon: "candidates_reviewed",
     quota_flexibility: spec.quotaFlexibility || "recommended",
     quantity_scope: spec.quotaFlexibility === "open_ended" ? "portfolio" : "unspecified",
     portfolio_size_preference: spec.quotaFlexibility === "open_ended"
@@ -2291,7 +2394,7 @@ export function intentSnapshotForLlm(spec: IntentSpec): Record<string, unknown> 
     objective: spec.objective,
     original_prompt: spec.originalPrompt,
     task_type: spec.taskType,
-    run_horizon: spec.runHorizon,
+    run_horizon: "candidates_reviewed",
     species: spec.species,
     species_policy: spec.speciesPolicy,
     species_coverage: spec.speciesCoverage,
@@ -2310,6 +2413,7 @@ export function intentSnapshotForLlm(spec: IntentSpec): Record<string, unknown> 
     exclude_rules: spec.excludeRules,
     ptm_types: spec.ptmTypes,
     special_themes: spec.specialThemes,
+    selected_search_terms: spec.selectedSearchTerms || [],
     success_criteria: spec.successCriteria,
     scientific_constraints: spec.scientificConstraints,
     notes: spec.notes,
@@ -2416,7 +2520,8 @@ export function formatConfirmMessage(spec: IntentSpec): string {
   return [
     "策略已同步到右侧预览。",
     `当前目标：${deriveObjective(spec)}${countNote ? `；${countNote}` : ""}`,
-    "确认前可以继续用自然语言修改；准备好后说 **确认** 才会开始 PRIDE 搜索。",
+    `待确认检索主题词：${confirmedSearchThemes(spec).join("；") || "尚未形成主题词"}`,
+    "请先确认以上主题词。确认前可以继续用自然语言修改；准备好后说 **确认** 才会开始 PRIDE 搜索。",
   ].join("\n");
 }
 
@@ -3159,7 +3264,7 @@ export function humanizeJobProgress(job: {
     progressEvents.push({
       id: "quality-blocked",
       kind: "action",
-      text: `搜索已结束：约 ${projectCount} 个候选项目。已整理可用文件清单（L1），可下载后送入「批量参数规划」；build-ready 未签发时仅在结果里说明不足，不阻挡使用。`,
+      text: `搜索已结束：约 ${projectCount} 个候选项目。已验证的可交付文件可下载并送入「批量参数规划」；未决文件单列等待复核。`,
     });
   }
   if (status === "cancelled") {
@@ -3245,9 +3350,9 @@ export function formatDoneMessage(
       files;
     return [
       `本轮搜索与审查已结束：约 **${projects}** 个候选项目` +
-        (usable ? `，约 **${usable}** 条可用文件线索（L1）` : "") +
+        (usable ? `，约 **${usable}** 条验证通过的可交付文件` : "") +
         "。",
-      "已为你保留可用文件清单（可下载 batch_inputs_usable / 数据清单 CSV）。严格 build-ready 包未签发时，会在结果里说明元数据/仪器等不足——这不阻止你先做批量参数规划与标准化格式构建。",
+      "已为你保留可交付文件清单（可下载 batch_inputs_usable / 数据清单 CSV）。项目级同质证据继承会明确标注，未决文件不会混入清单。",
       "建议：下载「可用批量输入」→ 打开「批量处理」粘贴或点「送入批量参数规划」→ 运行参数推断 / 准备输入包。",
     ].join("\n");
   }

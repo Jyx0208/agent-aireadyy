@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +13,7 @@ from typer.testing import CliRunner
 from agent.cli import app
 from agent.control_plane.budget_governor import BudgetGovernor
 from agent.control_plane.discovery import DiscoveryToolService, _project_assessments
+from agent.control_plane.openai_agents import compact_agent_tool_json
 from agent.control_plane.models import (
     AgentBudget,
     AgentEvent,
@@ -34,7 +37,7 @@ from agent.discovery.search_environment import (
     QueryYield,
     RepositoryQuery,
 )
-from agent.repositories.metering import record_repository_request
+from agent.repositories.metering import meter_repository_requests, record_repository_request
 
 
 def _run(run_id: str = "run_001") -> AgentRunRecord:
@@ -48,6 +51,19 @@ def _run(run_id: str = "run_001") -> AgentRunRecord:
             max_expensive_actions=1,
         ),
     )
+
+
+def test_compact_agent_tool_json_keeps_bounded_candidate_previews() -> None:
+    previews = [
+        {"project_accession": f"PXD{index:06d}", "title": f"Candidate {index}"}
+        for index in range(35)
+    ]
+
+    compact = json.loads(compact_agent_tool_json({"previews": previews}))
+
+    assert len(compact["previews"]) == 30
+    assert compact["previews"][0]["project_accession"] == "PXD000000"
+    assert compact["previews_truncation"] == {"total": 35, "shown": 30}
 
 
 def _inspection_judgment(
@@ -256,7 +272,19 @@ class _FakeSearchEnvironment:
             request=self.request,
             projects=projects,
             files=files,
-            summary={"selected_projects": len(projects), "selected_files": len(files)},
+            summary={
+                "selected_projects": len(projects),
+                "selected_files": len(files),
+                "inspection_outcomes": [
+                    {
+                        "project_accession": project.project_accession,
+                        "category": "usable_files",
+                        "stage": "score_files",
+                        "usable_file_count": 1,
+                    }
+                    for project in projects
+                ],
+            },
         )
         return CandidateInspectionResult(
             search_id=action.search_id,
@@ -381,7 +409,9 @@ def test_candidate_search_reserves_repository_requests_for_one_inspection_batch(
     stored = store.load_run(run.run_id)
     assert observation.status == "completed"
     assert stored is not None
-    assert stored.dynamic_usage.repository_requests == 20
+    # The grant reserves up to 20 requests, but short result pages settle at
+    # the seven requests actually issued.
+    assert stored.dynamic_usage.repository_requests == 7
     started = next(
         event
         for event in store.list_events(run.run_id)
@@ -431,8 +461,219 @@ def test_quality_first_search_and_inspection_are_separate_control_plane_actions(
     assert inspection.pooled_selected_files == 1
     assert inspection.candidate_search is not None
     assert inspection.candidate_search["search_id"] == "search_0001"
+    assert inspection.inspection_outcomes == [
+        {
+            "project_accession": "PXD000001",
+            "category": "usable_files",
+            "stage": "score_files",
+            "usable_file_count": 1,
+        }
+    ]
     assert environment.search_actions == [search_action]
     assert environment.inspection_actions[0].accessions == ["PXD000001"]
+
+
+def test_candidate_search_pipeline_inspects_new_ranked_accessions_without_duplicates(
+    tmp_path: Path,
+) -> None:
+    class PipelineSearchEnvironment(_FakeSearchEnvironment):
+        def high_relevance_accessions(self, *, limit: int | None = None) -> list[str]:
+            accessions = ["PXD000001", "PXD000002", "PXD000001"]
+            return accessions if limit is None else accessions[:limit]
+
+    request = DatasetRequest(
+        repository="pride",
+        max_projects=2_000,
+        max_files=10_000,
+        partial_delivery_batch_size=30,
+        continuous_discovery=True,
+        harvest_all_qualified=True,
+    )
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("candidate_pipeline").model_copy(
+            update={"status": "running", "dynamic_limits": DynamicBudgetLimits()}
+        )
+    )
+    environment = PipelineSearchEnvironment(request)
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=environment,
+    )
+
+    result = service.search_and_inspect_repository_candidates(
+        CandidateSearchAction(
+            queries=[
+                RepositoryQuery(
+                    query="immunopeptidomics",
+                    depth=200,
+                    budget_role="primary_theme",
+                )
+            ],
+            rationale="Deepen the confirmed primary theme.",
+        )
+    )
+
+    assert result["search"]["status"] == "completed"
+    assert result["pipeline"]["mode"] == "interleaved_search_review"
+    assert result["pipeline"]["first_round_candidate_shortfall"] is True
+    assert result["pipeline"]["next_action"] == "deepen_primary_theme"
+    assert result["automatic_inspection"]["status"] == "completed"
+    assert environment.inspection_actions[0].accessions == ["PXD000001", "PXD000002"]
+
+    second = service.search_and_inspect_repository_candidates(
+        CandidateSearchAction(
+            queries=[
+                RepositoryQuery(
+                    query="immunopeptidomics",
+                    depth=400,
+                    budget_role="primary_theme",
+                )
+            ],
+            rationale="Continue the same primary theme from its saved offset.",
+        )
+    )
+
+    assert second["automatic_inspection"] is None
+    assert second["pipeline"]["skipped_inspection_reason"] == "no_new_ranked_candidates"
+    assert len(environment.inspection_actions) == 1
+
+
+def test_out_of_order_open_ended_theme_is_a_safe_skip_not_a_failed_search(
+    tmp_path: Path,
+) -> None:
+    class OrderedSearchEnvironment(_FakeSearchEnvironment):
+        candidate_accessions = ["PXD000001"]
+
+        def high_relevance_accessions(self, *, limit: int | None = None) -> list[str]:
+            return []
+
+        def search(self, action: CandidateSearchAction) -> CandidateSearchObservation:
+            raise ValueError(
+                "open_ended_theme_order_violation: expected mhc peptidome; "
+                "search that confirmed theme alone until repository_seed_exhausted "
+                "before using another synonym"
+            )
+
+    request = DatasetRequest(repository="pride", max_projects=100)
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("safe_theme_order").model_copy(
+            update={"status": "running", "dynamic_limits": DynamicBudgetLimits()}
+        )
+    )
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=OrderedSearchEnvironment(request),
+    )
+
+    result = service.search_and_inspect_repository_candidates(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="immunopeptides", depth=2_000)],
+            rationale="Try the next synonym.",
+        )
+    )
+
+    assert result["search"]["status"] == "completed"
+    assert result["search"]["query_yields"][0]["skipped_reason"] == (
+        "waiting_for_confirmed_theme:mhc peptidome"
+    )
+    assert result["pipeline"]["next_action"] == (
+        "search_confirmed_theme:mhc peptidome"
+    )
+    assert not any(
+        event.event_type == "candidate_search_failed"
+        for event in store.list_events(run.run_id)
+    )
+
+
+def test_pride_candidate_inspection_uses_four_bounded_workers_and_keeps_metering(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    request = DatasetRequest(repository="pride", max_projects=8, max_files=100)
+    environment = PrideDiscoverySearchEnvironment(
+        request=request,
+        prompt="immunopeptidomics",
+        state_path=tmp_path / "parallel-state.json",
+        client=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    accessions = [f"PXD{index:06d}" for index in range(1, 9)]
+    environment._records = {
+        accession: {"accession": accession, "title": accession}
+        for accession in accessions
+    }
+    environment._latest_search_id = "search_parallel"
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_discover(
+        inspection_request: DatasetRequest,
+        *,
+        candidate_records: list[dict[str, Any]],
+        **_kwargs: Any,
+    ) -> DatasetManifest:
+        nonlocal active, max_active
+        accession = str(candidate_records[0]["accession"])
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        record_repository_request("pride", "get_project")
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+        project = DiscoveredProject(
+            project_accession=accession,
+            project_title=accession,
+        )
+        return DatasetManifest(
+            request=inspection_request,
+            projects=[project],
+            files=[_delivery_file(accession, f"{accession}.raw")],
+            summary={
+                "selected_projects": 1,
+                "selected_files": 1,
+                "eligible_projects_seen": 1,
+                "inspection_outcomes": [
+                    {
+                        "project_accession": accession,
+                        "category": "usable_files",
+                        "usable_file_count": 1,
+                    }
+                ],
+            },
+        )
+
+    monkeypatch.setattr(
+        "agent.discovery.search_environment.discover_pride_dataset",
+        fake_discover,
+    )
+    metered_calls: list[tuple[str, str]] = []
+    with meter_repository_requests(
+        lambda repository, operation: metered_calls.append((repository, operation))
+    ):
+        result = environment.inspect(
+            CandidateInspectionAction(
+                search_id="search_parallel",
+                accessions=accessions,
+                rationale="Review the deduplicated batch concurrently.",
+            )
+        )
+
+    assert max_active == 4
+    assert len(metered_calls) == 8
+    assert result.inspected_accessions == accessions
+    assert result.manifest.summary["inspection_parallelism"] == {
+        "mode": "bounded_parallel",
+        "workers": 4,
+    }
 
 
 def test_agent_can_filter_inspected_projects_during_final_selection(tmp_path: Path) -> None:

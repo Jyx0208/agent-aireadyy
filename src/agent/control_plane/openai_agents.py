@@ -99,6 +99,97 @@ class DiscoveryAgentContext:
             raise InterruptedError("Discovery cancelled.")
 
 
+
+def compact_agent_tool_json(payload: Any, *, max_chars: int = 120_000) -> str:
+    """Serialize tool results for the model without blowing context.
+
+    Full manifests remain on disk / control-plane store; the agent only needs
+    compact counts, paths, accession samples, and blockers.
+    """
+
+    def _trim(value: Any, *, depth: int = 0) -> Any:
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            if len(value) <= 800:
+                return value
+            return value[:400] + f"...[truncated {len(value)} chars]..." + value[-200:]
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            if depth >= 6:
+                return {"_truncated": "max_depth", "keys": list(value.keys())[:20]}
+            out: dict[str, Any] = {}
+            # Drop known huge keys that belong on disk only.
+            drop = {
+                "files",
+                "file_records",
+                "raw_record",
+                "candidate_records",
+                "sdrf_rows",
+                "records",
+                "project_files",
+            }
+            for key, item in value.items():
+                if key == "previews" and isinstance(item, list):
+                    # Candidate previews are the evidence the Agent needs to choose
+                    # accessions for project-level inspection. Keep a bounded window
+                    # instead of replacing the entire business payload with a count.
+                    shown = 30
+                    out[key] = [
+                        _trim(preview, depth=depth + 1)
+                        for preview in item[:shown]
+                    ]
+                    if len(item) > shown:
+                        out[f"{key}_truncation"] = {
+                            "total": len(item),
+                            "shown": shown,
+                        }
+                    continue
+                if key in drop:
+                    if isinstance(item, list):
+                        out[key] = {"_truncated_list": len(item)}
+                    elif isinstance(item, dict):
+                        out[key] = {"_truncated_dict_keys": len(item)}
+                    else:
+                        out[key] = "_truncated"
+                    continue
+                out[str(key)] = _trim(item, depth=depth + 1)
+            return out
+        if isinstance(value, (list, tuple)):
+            items = list(value)
+            limit = 40 if depth <= 2 else 15
+            head = [_trim(item, depth=depth + 1) for item in items[:limit]]
+            if len(items) > limit:
+                head.append({"_truncated_list": len(items), "_shown": limit})
+            return head
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            try:
+                return _trim(model_dump(mode="json"), depth=depth)
+            except TypeError:
+                return _trim(model_dump(), depth=depth)
+        text = str(value)
+        return _trim(text, depth=depth)
+
+    compact = _trim(payload)
+    raw = json.dumps(compact, ensure_ascii=False, default=str)
+    if len(raw) <= max_chars:
+        return raw
+    # Hard ceiling: keep a truncated JSON string the model can still parse as text.
+    keep = max(2_000, max_chars - 200)
+    return json.dumps(
+        {
+            "status": compact.get("status") if isinstance(compact, dict) else "truncated",
+            "truncated": True,
+            "original_chars": len(raw),
+            "note": "Tool result truncated for model context; full data is on disk in the run output directory.",
+            "preview": raw[:keep],
+        },
+        ensure_ascii=False,
+    )
+
+
 def search_repository_datasets(
     wrapper: RunContextWrapper[DiscoveryAgentContext],
     queries: list[str],
@@ -110,7 +201,7 @@ def search_repository_datasets(
     """
     wrapper.context.raise_if_cancelled()
     observation = wrapper.context.service.search_repository_datasets(queries)
-    return observation.model_dump_json()
+    return compact_agent_tool_json(observation)
 
 
 async def request_search_budget(
@@ -134,7 +225,7 @@ async def request_search_budget(
         governor=wrapper.context.budget_governor,
         max_turns=wrapper.context.service.dynamic_limits.budget_agent_max_turns,
     )
-    return result.model_dump_json()
+    return compact_agent_tool_json(result)
 
 
 def search_repository_datasets_with_grant(
@@ -149,7 +240,7 @@ def search_repository_datasets_with_grant(
         queries: Exact approved query list in its approved order.
     """
     wrapper.context.raise_if_cancelled()
-    return wrapper.context.service.search_repository_datasets(queries, grant_id=grant_id).model_dump_json()
+    return compact_agent_tool_json(wrapper.context.service.search_repository_datasets(queries, grant_id=grant_id))
 
 
 def search_repository_candidates(
@@ -162,7 +253,9 @@ def search_repository_candidates(
         action: Query-level search depths, intent dimensions, expected gain, and rationale.
     """
     wrapper.context.raise_if_cancelled()
-    return wrapper.context.service.search_repository_candidates(action).model_dump_json()
+    return compact_agent_tool_json(
+        wrapper.context.service.search_and_inspect_repository_candidates(action)
+    )
 
 
 def search_repository_candidates_with_grant(
@@ -181,10 +274,12 @@ def search_repository_candidates_with_grant(
             are rebound to the approved grant queries before execution.
     """
     wrapper.context.raise_if_cancelled()
-    return wrapper.context.service.search_repository_candidates(
-        action,
-        grant_id=grant_id,
-    ).model_dump_json()
+    return compact_agent_tool_json(
+        wrapper.context.service.search_and_inspect_repository_candidates(
+            action,
+            grant_id=grant_id,
+        )
+    )
 
 
 def inspect_repository_candidates(
@@ -197,7 +292,7 @@ def inspect_repository_candidates(
         action: Latest search id, candidate accessions, and evidence-based rationale.
     """
     wrapper.context.raise_if_cancelled()
-    return wrapper.context.service.inspect_repository_candidates(action).model_dump_json()
+    return compact_agent_tool_json(wrapper.context.service.inspect_repository_candidates(action))
 
 
 def inspect_project_sdrf(
@@ -255,7 +350,7 @@ def audit_discovery_state(wrapper: RunContextWrapper[DiscoveryAgentContext]) -> 
     """
 
     wrapper.context.raise_if_cancelled()
-    return _audit_and_persist(wrapper.context.service).model_dump_json()
+    return compact_agent_tool_json(_audit_and_persist(wrapper.context.service))
 
 
 def _audit_and_persist(
@@ -2398,19 +2493,41 @@ def _quality_first_discovery_instructions(
         + budget_protocol
         + "Capabilities: candidate search observations report query-level yield, duplicates, compact "
         "previews, matched intent terms, semantic coverage, and unresolved terms. "
-        f"For candidate_limit, request enough previews to cover the {request.max_projects} project "
-        f"target, without exceeding the configured {request.max_candidate_projects} candidate-pool ceiling. "
-        "Candidate preview project_score/confidence fields are legacy retrieval heuristics used only "
+        f"For candidate_limit, request enough previews to cover the {request.max_projects} project target. "
+        + (
+            "This is continuous/maximize discovery: there is no candidate-pool count ceiling; "
+            "search one confirmed theme phrase at a time, beginning with the first and most "
+            "important query_terms phrase. Continue that exact phrase in successive chunks until "
+            "the repository explicitly reports repository_seed_exhausted. Do not interleave "
+            "synonyms in the same search action or move to a synonym merely because one chunk "
+            "completed. Each search chunk automatically inspects one globally accession-deduplicated "
+            "batch of newly ranked projects. Use that evidence while continuing to deepen the same "
+            "phrase; when the first chunk contains fewer than one review batch, deepen it before "
+            "broadening. After exhaustion, review the newly found projects before moving to the next "
+            "confirmed synonym, and never schedule "
+            "an exhausted phrase again. "
+            "Continue until the user stops, every confirmed exact phrase is exhausted, or a hard "
+            "safety ceiling is reached. "
+            if bool(request.continuous_discovery) or bool(request.harvest_all_qualified)
+            else (
+                f"For bounded discovery, retain no more than the configured "
+                f"{request.max_candidate_projects} candidates. "
+            )
+        )
+        + "Candidate preview project_score/confidence fields are legacy retrieval heuristics used only "
         "to order inspection work; never copy or mechanically map them into the 0-3 project judgment. "
-        "inspect_repository_candidates accepts only accessions from the latest persisted search and "
+        "inspect_repository_candidates accepts only accessions from the latest persisted search, at most 40 per call, and "
         "returns a validated manifest observation with per-project assessments. "
-        "In maximize / '越多越好' mode, inspect large batches (50-150 accessions when available), "
+        "In maximize / '越多越好' mode, inspect batches of up to 40 accessions, "
         "prioritize high-relevance unscored accessions, and continue inspecting until the high-relevance "
         "pool is substantially covered or safety ceilings are hit. "
         "The inspection observation reports inspected_candidate_count, "
         "minimum_high_relevance_inspections, and selection_ready. When selection_ready is false, "
         "inspect another relevance-coherent batch from the persisted search before finalizing. "
-        "After every candidate search, call submit_project_judgments for the promising previews. "
+        "Candidate search output contains search, automatic_inspection, and pipeline sections. Do "
+        "not inspect accessions from automatic_inspection a second time; submit their judgments and "
+        "follow pipeline.next_action. After every candidate search, call submit_project_judgments "
+        "for the promising previews. "
         "After every inspection batch, call submit_project_judgments for every assessable accession "
         "returned in project_assessments (include, investigate, or exclude). A terminal scientific "
         "exclusion or no_usable_files outcome with no project assessment is already an audited exclusion; "
@@ -2548,7 +2665,7 @@ def _quality_first_runner_input(
         f"User goal:\n{prompt.strip()}\n\n"
         f"Task type: {task_type or 'not specified'}\n"
         f"Deterministic seed ideas: {json.dumps(baseline_queries, ensure_ascii=False)}\n"
-        "Start by covering the most distinctive scientific intent dimensions with a candidate search. "
+        "PRIMARY-THEME SEARCH POLICY: request.query_terms are the scientific search themes confirmed by the user. Search only those themes and close repository synonyms; never introduce a new scientific theme axis without a new user confirmation. Treat the scientific theme (e.g. immunopeptidomics/HLA, phosphoproteomics) as the ONLY deep PRIDE recall axis. Put species, DDA/DIA, labeling, and task suitability in filters — do NOT submit bare 'human'/'mouse'/'DDA' as equal search seeds. In open-ended mode, preserve the confirmed query_terms order: search only the first unfinished phrase and continue it from its saved offset until repository_seed_exhausted. Every search chunk automatically reviews one globally accession-deduplicated batch, so submit judgments for that automatic inspection while continuing to deepen the same core phrase. If the first chunk is smaller than one review batch, deepen it before broadening. Only then start the next confirmed synonym. Do not interleave synonyms. "
         "Use the returned previews and unresolved_intent_terms to choose a small set of accessions for "
         "inspection. Do not treat candidate count alone as quality. After inspection, either target a "
         "remaining high-value gap with a materially different search or finalize the strongest persisted manifest."

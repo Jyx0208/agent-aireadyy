@@ -24,7 +24,8 @@ TaskCandidateTier = Literal[
 ]
 
 USABLE_VALIDITY = {"valid", "weak_keep"}
-TASK_READY_STATUSES = {"ready", "weak_ready"}
+TASK_READY_STATUSES = {"ready"}
+PIPELINE_ELIGIBLE_STATUSES = {"ready", "weak_ready"}
 
 TASK_BUILD_COLUMNS = [
     "run_id",
@@ -242,7 +243,7 @@ def _select_files(
     max_files: int | None,
 ) -> list[DiscoveredFile]:
     if selection == "task_ready":
-        selected = [file for file in files if file.task_readiness_status in TASK_READY_STATUSES]
+        selected = [file for file in files if file.task_readiness_status in PIPELINE_ELIGIBLE_STATUSES]
     elif selection == "usable":
         selected = [file for file in files if file.validity_status in USABLE_VALIDITY]
     elif selection == "valid":
@@ -346,7 +347,7 @@ def _task_build_decision(file: DiscoveredFile, profile: TaskProfile) -> tuple[Ta
             reasons.extend(file.task_readiness_reasons)
         return "future_task_candidate", "batch_parameters", "parameters", _dedupe(reasons)
 
-    if file.task_readiness_status not in TASK_READY_STATUSES:
+    if file.task_readiness_status not in PIPELINE_ELIGIBLE_STATUSES:
         reasons.append(f"task_not_ready:{file.task_readiness_status or 'not_evaluated'}")
         reasons.extend(file.task_readiness_reasons)
         return "not_candidate", "not_available", "skip", _dedupe(reasons)

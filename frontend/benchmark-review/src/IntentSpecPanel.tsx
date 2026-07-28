@@ -1,5 +1,6 @@
 import { Button, Tag, Tile } from "@carbon/react";
 import { Checkmark, Restart } from "@carbon/icons-react";
+import { useState } from "react";
 
 import type { GrillPhase, IntentSpec } from "./intent-spec";
 import {
@@ -7,12 +8,19 @@ import {
   RUN_HORIZON_LABELS,
   TASK_TYPE_LABELS,
 } from "./intent-spec";
-import { assessStrategyGaps, buildStrategyCard } from "./grill-tree";
+import {
+  assessStrategyGaps,
+  buildStrategyCard,
+  normalizeSearchTerms,
+  searchTermCandidates,
+} from "./grill-tree";
 
 type Props = {
   spec: IntentSpec;
   phase: GrillPhase;
-  onConfirm: () => void;
+  onConfirm: (queryTerms: string[]) => void;
+  selectedSearchTerms?: string[];
+  onSelectedSearchTermsChange?: (queryTerms: string[]) => void;
   onApplyDefaults: () => void;
   busy?: boolean;
 };
@@ -148,11 +156,28 @@ function compactStrategy(spec: IntentSpec): {
   };
 }
 
-export function IntentSpecPanel({ spec, phase, onConfirm, onApplyDefaults, busy }: Props) {
+export function IntentSpecPanel({
+  spec,
+  phase,
+  onConfirm,
+  selectedSearchTerms = [],
+  onSelectedSearchTermsChange = () => undefined,
+  onApplyDefaults,
+  busy,
+}: Props) {
   const card = buildStrategyCard(spec);
+  const searchThemes = Array.from(new Set([
+    ...searchTermCandidates(spec),
+    ...selectedSearchTerms,
+  ]));
+  const [customSearchTerm, setCustomSearchTerm] = useState("");
   const compact = compactStrategy(spec);
   const gaps = assessStrategyGaps(spec);
-  const canConfirm = phase === "awaiting_confirm" && gaps.ready_for_confirm && !busy;
+  const canConfirm =
+    phase === "awaiting_confirm" &&
+    gaps.ready_for_confirm &&
+    selectedSearchTerms.length > 0 &&
+    !busy;
   const canDefaults = (phase === "grilling" || phase === "idle" || phase === "awaiting_confirm") && !busy;
 
   const hardConstraints = card.hardConstraints.filter((item) => item !== "（无额外硬约束）");
@@ -185,6 +210,73 @@ export function IntentSpecPanel({ spec, phase, onConfirm, onApplyDefaults, busy 
         <span>当前目标</span>
         <strong>{compact.objective}</strong>
       </div>
+
+      <section className="strategy-search-themes" aria-label="待确认检索主题词">
+        <span>开始前请确认检索主题词</span>
+        {searchThemes.length ? (
+          <ul className="strategy-search-themes__list" tabIndex={0}>
+            {searchThemes.map((theme) => {
+              const selected = selectedSearchTerms.includes(theme);
+              const primary = selected && selectedSearchTerms[0] === theme;
+              return (
+                <li key={theme}>
+                  <button
+                    type="button"
+                    aria-pressed={selected}
+                    disabled={busy || phase !== "awaiting_confirm"}
+                    onClick={() => onSelectedSearchTermsChange(
+                      selectedSearchTerms.includes(theme)
+                        ? selectedSearchTerms.filter((term) => term !== theme)
+                        : [...selectedSearchTerms, theme],
+                    )}
+                  >
+                    {selected ? "✓ " : ""}{theme}
+                  </button>
+                  {primary ? (
+                    <span className="strategy-search-themes__primary">核心词</span>
+                  ) : selected ? (
+                    <button
+                      type="button"
+                      className="strategy-search-themes__make-primary"
+                      disabled={busy || phase !== "awaiting_confirm"}
+                      onClick={() => onSelectedSearchTermsChange([
+                        theme,
+                        ...selectedSearchTerms.filter((term) => term !== theme),
+                      ])}
+                    >
+                      设为核心
+                    </button>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
+        ) : (
+          <p>尚未形成可执行主题词。</p>
+        )}
+        <div className="strategy-search-themes__custom">
+          <input
+            aria-label="添加自定义检索词"
+            placeholder="补充仓库里可能出现的写法"
+            maxLength={240}
+            value={customSearchTerm}
+            disabled={busy || phase !== "awaiting_confirm"}
+            onChange={(event) => setCustomSearchTerm(event.target.value)}
+          />
+          <button
+            type="button"
+            disabled={busy || phase !== "awaiting_confirm" || !customSearchTerm.trim()}
+            onClick={() => {
+              const next = normalizeSearchTerms([...selectedSearchTerms, customSearchTerm]);
+              onSelectedSearchTermsChange(next);
+              setCustomSearchTerm("");
+            }}
+          >
+            添加
+          </button>
+        </div>
+        <p>这些是同一主题在项目元数据里的常见写法；请选择要实际执行的词，并指定一个核心词。核心词优先获得更深检索预算。确认前不会访问仓库。</p>
+      </section>
 
       <dl className="strategy-key-values">
         {compact.keyValues.map((item) => (
@@ -221,11 +313,23 @@ export function IntentSpecPanel({ spec, phase, onConfirm, onApplyDefaults, busy 
                 <dd>{TIME_BUDGET_LABEL[spec.timeBudget] || spec.timeBudget}</dd>
               </div>
             ) : null}
-            {spec.maxCandidateProjects != null ? (
+            {spec.maxCandidateProjects != null && spec.quotaFlexibility !== "open_ended" ? (
               <div>
                 <dt>候选池</dt>
                 <dd>最多约 {spec.maxCandidateProjects} 个项目</dd>
               </div>
+            ) : null}
+            {spec.quotaFlexibility === "open_ended" ? (
+              <>
+                <div>
+                  <dt>候选池</dt>
+                  <dd>不设项目数量上限（仍受时间、请求量和资源安全上限约束）</dd>
+                </div>
+                <div>
+                  <dt>分批交付</dt>
+                  <dd>每 30 个经项目级证据验证的可用项目交付一批</dd>
+                </div>
+              </>
             ) : null}
           </dl>
 
@@ -259,8 +363,14 @@ export function IntentSpecPanel({ spec, phase, onConfirm, onApplyDefaults, busy 
         <Button kind="tertiary" size="sm" renderIcon={Restart} disabled={!canDefaults} onClick={onApplyDefaults}>
           补齐稳妥默认
         </Button>
-        <Button kind="primary" size="sm" renderIcon={Checkmark} disabled={!canConfirm} onClick={onConfirm}>
-          确认，开始搜
+        <Button
+          kind="primary"
+          size="sm"
+          renderIcon={Checkmark}
+          disabled={!canConfirm}
+          onClick={() => onConfirm(selectedSearchTerms)}
+        >
+          确认主题词，开始搜
         </Button>
       </div>
     </Tile>

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import os
+import sys
 import json
 import subprocess
 from pathlib import Path
@@ -312,9 +313,18 @@ def _run_external_adapter(
             "AGENT_MODEL_ADAPTER_SELECTED_COUNT": str((adapter_input.get("summary") or {}).get("selected_count") or 0),
         }
     )
+    run_command: str | list[str] = command
+    use_shell = True
+    stripped = str(command or "").strip()
+    if stripped.lower().startswith("python ") or stripped.lower().startswith("python.exe "):
+        # Avoid PATH/python launcher issues in tests and local Windows.
+        parts = stripped.split(maxsplit=1)
+        script_and_args = parts[1] if len(parts) > 1 else ""
+        run_command = [sys.executable, *script_and_args.split()] if script_and_args else [sys.executable]
+        use_shell = False
     completed = subprocess.run(
-        command,
-        shell=True,
+        run_command,
+        shell=use_shell,
         cwd=output_dir,
         text=True,
         capture_output=True,

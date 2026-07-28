@@ -916,11 +916,14 @@ class IproxAdapter:
     def download_to_path(self, url: str, target_path: str | Path, report: Callable | None = None) -> Path:
         target_path = Path(target_path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
+        part_path = target_path.with_name(f"{target_path.name}.part")
         safe_url = _quote_download_url(url)
         downloaded = 0
         total = 0
         started = monotonic()
-        with urllib.request.urlopen(safe_url, timeout=60) as response, target_path.open("wb") as handle:
+        if part_path.exists():
+            part_path.unlink()
+        with urllib.request.urlopen(safe_url, timeout=60) as response, part_path.open("wb") as handle:
             try:
                 total = int(response.headers.get("Content-Length", "0") or "0")
             except (AttributeError, TypeError, ValueError):
@@ -946,6 +949,11 @@ class IproxAdapter:
                             "complete": False,
                         }
                     )
+            handle.flush()
+            import os as _os
+            _os.fsync(handle.fileno())
+        import os as _os
+        _os.replace(part_path, target_path)
         if report:
             elapsed = max(monotonic() - started, 0.001)
             speed_bps = downloaded / elapsed if downloaded > 0 else 0.0

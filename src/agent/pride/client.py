@@ -1,7 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
+
+try:
+    from agent.assets.download_contract import publish_part_file
+except Exception:  # pragma: no cover
+    publish_part_file = None  # type: ignore
 from time import monotonic, sleep
 from typing import Any
 
@@ -78,22 +83,78 @@ def search_projects_paginated(
     page_size: int,
     max_pages: int,
     max_results: int,
+    start_page: int = 0,
+    on_page: Callable[[int, int, int], None] | None = None,
 ) -> list[dict[str, Any]]:
-    """Use the paged client contract while preserving injected legacy clients."""
-    try:
-        return client.search_projects(
-            keyword,
-            page_size=page_size,
-            max_pages=max_pages,
-            max_results=max_results,
-        )
-    except TypeError as exc:
-        message = str(exc)
-        if "unexpected keyword argument" not in message or not any(
-            name in message for name in ("max_pages", "max_results")
-        ):
-            raise
-        return client.search_projects(keyword, page_size=page_size)
+    """Use the paged client contract while preserving injected legacy clients.
+
+    Prefer ``max_pages``/``max_results`` when the client supports them. Fall back
+    to explicit ``page=`` loops for simple mocks, then single-call pageSize-only.
+    """
+    modern_kwargs: dict[str, Any] = {
+        "page_size": page_size,
+        "max_pages": max_pages,
+        "max_results": max_results,
+        "start_page": start_page,
+        "on_page": on_page,
+    }
+    while True:
+        try:
+            projects = client.search_projects(keyword, **modern_kwargs)
+            if "on_page" not in modern_kwargs and on_page is not None and projects:
+                on_page(max(0, int(start_page)) + 1, len(projects), len(projects))
+            return projects
+        except TypeError as exc:
+            message = str(exc)
+            if "unexpected keyword argument" not in message:
+                raise
+            if "on_page" in message and "on_page" in modern_kwargs:
+                modern_kwargs.pop("on_page")
+                continue
+            if (
+                "start_page" in message
+                and "start_page" in modern_kwargs
+                and int(start_page) <= 0
+            ):
+                modern_kwargs.pop("start_page")
+                continue
+            if not any(name in message for name in ("start_page", "max_pages", "max_results")):
+                raise
+            break
+
+    # Legacy clients that accept page= but not max_pages/max_results.
+    projects: list[dict[str, Any]] = []
+    page_limit = max(1, int(max_pages))
+    effective_page_size = max(1, int(page_size))
+    first_page = max(0, int(start_page))
+    for page in range(first_page, first_page + page_limit):
+        try:
+            batch = client.search_projects(keyword, page_size=effective_page_size, page=page)
+        except TypeError as exc:
+            message = str(exc)
+            if "unexpected keyword argument" not in message or "page" not in message:
+                raise
+            if first_page > 0:
+                raise RuntimeError(
+                    "repository client does not support resumable page cursors"
+                ) from exc
+            batch = client.search_projects(keyword, page_size=effective_page_size)
+            projects.extend(batch or [])
+            if on_page is not None and batch:
+                on_page(1, len(batch), len(projects))
+            break
+        if not batch:
+            break
+        projects.extend(batch)
+        if on_page is not None:
+            on_page(page + 1, len(batch), len(projects))
+        if max_results is not None and len(projects) >= int(max_results):
+            return projects[: max(0, int(max_results))]
+        if len(batch) < effective_page_size:
+            break
+    if max_results is not None:
+        return projects[: max(0, int(max_results))]
+    return projects
 
 
 class PrideClient:
@@ -147,6 +208,8 @@ class PrideClient:
         *,
         max_pages: int | None = None,
         max_results: int | None = None,
+        start_page: int = 0,
+        on_page: Callable[[int, int, int], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Search PRIDE projects, paging until exhausted or a safety bound is hit.
 
@@ -156,9 +219,10 @@ class PrideClient:
         effective_page_size = max(1, min(int(page_size or 100), 100))
         page_limit = 1 if max_pages is None else max(1, int(max_pages))
         projects: list[dict[str, Any]] = []
-        page = 0
+        page = max(0, int(start_page))
+        pages_requested = 0
         while True:
-            if page >= page_limit:
+            if pages_requested >= page_limit:
                 break
             response = self._get(
                 "/search/projects",
@@ -178,11 +242,14 @@ class PrideClient:
             if not batch:
                 break
             projects.extend(batch)
+            if on_page is not None:
+                on_page(page + 1, len(batch), len(projects))
             if max_results is not None and len(projects) >= max_results:
                 return projects[: max(0, int(max_results))]
             if len(batch) < effective_page_size:
                 break
             page += 1
+            pages_requested += 1
         return projects
 
     def get_project(self, accession: str) -> dict[str, Any]:
@@ -296,7 +363,19 @@ class PrideClient:
                                         "complete": False,
                                     }
                                 )
-                temp_path.replace(target_path)
+                        handle.flush()
+                        import os as _os
+                        _os.fsync(handle.fileno())
+                # Atomic publish: .part -> final (WP-D download contract).
+                if publish_part_file is not None:
+                    publish_part_file(
+                        temp_path,
+                        target_path,
+                        expected_size_bytes=total or None,
+                    )
+                else:
+                    import os as _os
+                    _os.replace(temp_path, target_path)
                 last_error = None
                 break
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:

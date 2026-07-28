@@ -8,7 +8,7 @@ from typing import Any
 
 from agent.discovery.models import DatasetManifest, DiscoveredFile, DiscoveryEvidence
 from agent.discovery.task_profiles import active_task_types
-from agent.discovery.task_readiness import annotate_manifest_task_readiness, task_ready_files
+from agent.discovery.task_readiness import annotate_manifest_task_readiness, pipeline_eligible_files, task_ready_files
 from agent.utils import write_json
 
 
@@ -324,7 +324,7 @@ def build_quality_report(manifest: DatasetManifest) -> dict[str, Any]:
     valid_files = _files_with_statuses(manifest.files, {"valid"})
     usable_files = [
         file
-        for file in _files_with_statuses(manifest.files, {"valid", "weak_keep"})
+        for file in _files_with_statuses(manifest.files, {"valid"})
         if not file.needs_review
     ]
     needs_review_files = sum(
@@ -401,7 +401,7 @@ def build_quality_report(manifest: DatasetManifest) -> dict[str, Any]:
         "recommended_outputs": recommended_outputs,
         "notes": [
             "strict exports include validity_status=valid only",
-            "usable exports include valid/weak_keep files that do not still require review",
+            "usable exports include verified valid files that do not still require review",
             *(
                 ["task-ready output is not applicable until a downstream task is chosen"]
                 if not task_type
@@ -598,20 +598,22 @@ def write_dataset_manifest(manifest: DatasetManifest, output_dir: str | Path) ->
     valid_files = _files_with_statuses(manifest.files, {"valid"})
     usable_files = [
         file
-        for file in _files_with_statuses(manifest.files, {"valid", "weak_keep"})
+        for file in _files_with_statuses(manifest.files, {"valid"})
         if not file.needs_review
     ]
     task_files = task_ready_files(manifest)
+    # L1 batch/list delivery keeps weak_ready via pipeline_eligible; strict ready remains separate.
+    pipeline_files = pipeline_eligible_files(manifest)
     judgments = (manifest.summary or {}).get("project_judgments")
     judgments = judgments if isinstance(judgments, dict) else None
     _write_manifest_csv(paths["dataset_manifest_csv"], manifest.files, manifest.run_id, judgments=judgments)
     _write_manifest_csv(paths["dataset_manifest_valid_csv"], valid_files, manifest.run_id, judgments=judgments)
     _write_manifest_csv(paths["dataset_manifest_usable_csv"], usable_files, manifest.run_id, judgments=judgments)
-    _write_manifest_csv(paths["dataset_manifest_task_ready_csv"], task_files, manifest.run_id, judgments=judgments)
+    _write_manifest_csv(paths["dataset_manifest_task_ready_csv"], pipeline_files, manifest.run_id, judgments=judgments)
     _write_batch_inputs(paths["batch_inputs"], manifest.files)
     _write_batch_inputs(paths["batch_inputs_valid"], valid_files)
     _write_batch_inputs(paths["batch_inputs_usable"], usable_files)
-    _write_batch_inputs(paths["batch_inputs_task_ready"], task_files)
+    _write_batch_inputs(paths["batch_inputs_task_ready"], pipeline_files)
 
     return paths
 

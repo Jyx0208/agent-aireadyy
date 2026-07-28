@@ -29,7 +29,7 @@ def _base_file(**overrides: object) -> DiscoveredFile:
     return DiscoveredFile(**payload)  # type: ignore[arg-type]
 
 
-def test_project_level_immuno_with_download_is_weak_keep() -> None:
+def test_homogeneous_project_level_immuno_is_usable_by_inheritance() -> None:
     request = DatasetRequest(
         goal="immunopeptidomics",
         species=["human"],
@@ -38,9 +38,30 @@ def test_project_level_immuno_with_download_is_weak_keep() -> None:
         hard_constraint_fields=["repository", "acquisition_mode"],
     )
     decision = assess_file_validity(_base_file(), request)
-    assert decision.status == "weak_keep"
+    assert decision.status == "valid"
     assert decision.needs_review is False
     assert "project_level_immunopeptide_evidence" in decision.reasons
+    assert "usable_inherited" in decision.reasons
+    assert "missing_instrument" in decision.reasons
+    assert "missing_fragmentation" in decision.reasons
+
+
+def test_unknown_size_does_not_block_an_otherwise_usable_file() -> None:
+    request = DatasetRequest(
+        goal="immunopeptidomics",
+        species=["human"],
+        species_policy="include_only",
+        acquisition_mode="dda",
+        hard_constraint_fields=["repository", "species", "acquisition_mode"],
+    )
+    decision = assess_file_validity(
+        _base_file(expected_size_bytes=None),
+        request,
+    )
+    assert decision.status == "valid"
+    assert decision.needs_review is False
+    assert "missing_file_size" in decision.reasons
+    assert "usable_inherited" in decision.reasons
 
 
 def test_sdrf_matched_with_methods_and_domain_is_valid() -> None:
@@ -69,6 +90,7 @@ def test_sdrf_matched_with_methods_and_domain_is_valid() -> None:
     assert decision.status == "valid"
     assert decision.needs_review is False
     assert "sdrf_matched" in decision.reasons
+    assert "usable_direct" in decision.reasons
 
 
 def test_no_domain_and_no_method_excludes() -> None:

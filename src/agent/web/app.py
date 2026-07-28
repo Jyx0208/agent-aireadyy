@@ -66,6 +66,7 @@ from agent.discovery.constraints import (
     ScientificConstraint,
     constraint_slug,
     normalize_scientific_constraints,
+    normalize_scientific_constraints_result,
 )
 from agent.discovery.manifest import write_dataset_manifest
 from agent.discovery.memory import (
@@ -113,6 +114,12 @@ from agent.repositories.registry import RepositoryRegistry
 from agent.runtime.system_metrics import collect_system_metrics
 from agent.utils import write_json
 from agent.web.history import history_timestamp, merge_project_history_records, with_history_identity
+from agent.web.storage_lifecycle import (
+    clean_item_source_assets,
+    delete_managed_tree,
+    managed_child,
+    path_size_bytes,
+)
 from agent.web.expert_review import ExpertPoolRegistry, expert_review_enabled, expert_review_root
 from agent.web.expert_review.grading import (
     append_human_grade,
@@ -168,6 +175,8 @@ _batches: dict[str, dict[str, Any]] = {}
 _batches_lock = threading.Lock()
 _batch_history_cache: dict[str, Any] = {"ts": 0.0, "records": []}
 _batch_history_cache_lock = threading.Lock()
+_history_delete_confirmations: dict[str, dict[str, Any]] = {}
+_history_delete_confirmations_lock = threading.Lock()
 _discovery_jobs: dict[str, dict[str, Any]] = {}
 _discovery_jobs_lock = threading.RLock()
 _runs_dir = Path("runs")
@@ -949,6 +958,40 @@ def _decorate_history_item(record: dict[str, Any]) -> dict[str, Any]:
     if item.get("usable_partial_outputs"):
         item["status_group"] = "partial"
     item["primary_action"] = _history_primary_action(item)
+    kind = str(item.get("kind") or "task")
+    status = str(item.get("status") or "").lower()
+    if kind == "discovery":
+        item["open_kind"] = "discovery_job" if item.get("job_id") else "discovery_run"
+        item["open_id"] = item.get("job_id") or item.get("discovery_id") or item.get("run_id")
+        discovery_id = _clean_text(item.get("discovery_id") or item.get("run_id"))
+        run_dir = _safe_discovery_dir(discovery_id)
+        result_available = bool(run_dir and run_dir.exists())
+    elif kind == "batch":
+        item["open_kind"] = "batch"
+        item["open_id"] = item.get("batch_id") or item.get("result_id")
+        batch_id = _clean_text(item.get("batch_id") or item.get("result_id"))
+        result_available = bool(
+            batch_id
+            and safe_output_stem(batch_id) == batch_id
+            and _batch_dir(batch_id).exists()
+        )
+    else:
+        item["open_kind"] = "task"
+        item["open_id"] = item.get("task_id") or item.get("result_id")
+        result_available = True
+    if kind in {"discovery", "batch"}:
+        item["result_available"] = result_available
+        item["open_available"] = status in _ACTIVE_STATUSES or result_available
+        item["can_download"] = bool(item.get("can_download") and result_available)
+        if not result_available:
+            item["recorded_size_bytes"] = int(
+                item.get("recorded_size_bytes") or item.get("size_bytes") or 0
+            )
+            item["size_bytes"] = 0
+    item["deletable"] = kind in {"discovery", "batch"} and status not in _ACTIVE_STATUSES
+    item["delete_block_reason"] = (
+        "请先停止运行中的任务。" if status in _ACTIVE_STATUSES else ""
+    )
     return item
 
 
@@ -1033,12 +1076,21 @@ def _zip_compress_level() -> int:
 
 
 def _max_batch_items() -> int:
-    raw = os.getenv("AGENT_MAX_BATCH_ITEMS", "100")
+    """Max lines accepted by POST /api/batches/parameters.
+
+    Default is intentionally high so L1 discovery lists are not truncated at 100.
+    Set AGENT_MAX_BATCH_ITEMS=0 (or negative) for no practical product cap
+    (still clamped to a process safety ceiling to avoid OOM).
+    """
+    raw = os.getenv("AGENT_MAX_BATCH_ITEMS", "10000")
     try:
-        parsed = int(raw)
+        parsed = int(str(raw).strip())
     except (TypeError, ValueError):
-        return 100
-    return max(1, parsed)
+        return 10000
+    # 0 / negative => effectively uncapped for product use.
+    if parsed <= 0:
+        return 100_000
+    return max(1, min(parsed, 100_000))
 
 
 def _max_batch_jobs() -> int:
@@ -1123,6 +1175,7 @@ def _clean_batch_input_records(body: dict[str, Any], inputs: list[str]) -> list[
         "download_url",
         "file_type",
         "file_role",
+        "acquisition_mode",
         "species_policy",
         "canonical_species",
         "organism_taxon_id",
@@ -1147,6 +1200,10 @@ def _clean_batch_input_records(body: dict[str, Any], inputs: list[str]) -> list[
         "instrument_families",
         "fragmentation_methods",
         "lc_gradient_minutes",
+        "source_discovery_job_id",
+        "source_discovery_id",
+        "source_batch_index",
+        "source_file_identifier",
     }
     for raw in raw_records:
         if not isinstance(raw, dict):
@@ -1166,16 +1223,25 @@ def _clean_batch_input_records(body: dict[str, Any], inputs: list[str]) -> list[
                     record[key] = float(value) if value is not None and str(value).strip() else None
                 except (TypeError, ValueError):
                     record[key] = None
+            elif key == "source_batch_index":
+                try:
+                    record[key] = int(value)
+                except (TypeError, ValueError):
+                    continue
             else:
                 text = _clean_text(value)
                 if text:
                     record[key] = text
         cleaned.append(record)
-    if len(cleaned) == len(inputs) and all(record.get("file_name") == inputs[index] for index, record in enumerate(cleaned)):
+    if len(cleaned) == len(inputs) and all(
+        record.get("input") == inputs[index] or record.get("file_name") == inputs[index]
+        for index, record in enumerate(cleaned)
+    ):
         return cleaned
     by_name: dict[str, dict[str, Any]] = {}
     for record in cleaned:
         by_name.setdefault(str(record.get("file_name") or ""), record)
+        by_name.setdefault(str(record.get("input") or ""), record)
     return [by_name.get(input_value) for input_value in inputs]
 
 
@@ -1357,6 +1423,9 @@ def _clean_discovery_ptm_types(value: Any, *, default: list[str] | None = None) 
     return normalized or list(default or [])
 
 
+_FIXED_DISCOVERY_RUN_HORIZON = "candidates_reviewed"
+
+
 def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
     prompt_text = _clean_text(body.get("prompt") or body.get("visible_prompt") or body.get("goal") or "")
     incoming_provenance = body.get("constraint_provenance")
@@ -1398,16 +1467,10 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
     ).lower()
     if mixed_acquisition_policy not in {"reject_mixed", "review_mixed", "allow"}:
         mixed_acquisition_policy = "review_mixed"
-    run_horizon = _clean_text(body.get("run_horizon") or "candidates_only").lower()
-    if run_horizon not in {
-        "plan_only",
-        "candidates_only",
-        "candidates_reviewed",
-        "ai_ready_table",
-        "pre_release",
-        "full_release",
-    }:
-        run_horizon = "candidates_only"
+    # Product invariant: every repository-discovery task finds and reviews
+    # candidates. Older clients may still send another horizon, but execution
+    # must never downgrade to plan-only or candidate-only behavior.
+    run_horizon = _FIXED_DISCOVERY_RUN_HORIZON
     quota_flexibility = _clean_text(
         body.get("quota_flexibility") or "recommended"
     ).lower()
@@ -1465,7 +1528,7 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
         query_terms = [_clean_text(item) for item in raw_query_terms if _clean_text(item)]
     else:
         query_terms = []
-    if goal == "general":
+    if goal == "general" and not query_terms:
         query_terms = [*query_terms, *general_query_terms_from_text(prompt_text or raw_goal)]
     raw_species = body.get("species")
     species = _clean_discovery_species(raw_species, default=[])
@@ -1584,7 +1647,18 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
 
     exclude_rules = _bounded_text_list(body.get("exclude_rules"))
     success_criteria = _bounded_text_list(body.get("success_criteria"))
-    scientific_constraints = normalize_scientific_constraints(body.get("scientific_constraints"))
+    constraint_normalize = normalize_scientific_constraints_result(body.get("scientific_constraints"))
+    if constraint_normalize.rejected:
+        # Fail-closed: do not silently accept a partial hard-constraint array.
+        details = "; ".join(
+            str(item.get("message") or item.get("error_code") or "invalid_constraint")
+            for item in constraint_normalize.rejected[:5]
+        )
+        raise ValueError(
+            "scientific_constraints contains invalid items and was rejected: "
+            f"{details}"
+        )
+    scientific_constraints = list(constraint_normalize.accepted)
     existing_constraint_ids = {item.id.casefold() for item in scientific_constraints}
     if instrument_preference != "none" and "builtin.instrument-era" not in existing_constraint_ids:
         scientific_constraints.append(
@@ -1715,6 +1789,15 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
         ),
         max_files_per_project=_bounded_int(
             body.get("max_files_per_project"), default=500, minimum=1, maximum=5000
+        ),
+        partial_delivery_batch_size=_bounded_int(
+            body.get("partial_delivery_batch_size"), default=500, minimum=1, maximum=5000
+        ),
+        inspection_batch_size=_bounded_int(
+            body.get("inspection_batch_size"), default=30, minimum=1, maximum=100
+        ),
+        continuous_discovery=bool(
+            body.get("continuous_discovery", quantity_scope == "portfolio")
         ),
         quantity_scope=quantity_scope,  # type: ignore[arg-type]
         portfolio_size_preference=portfolio_size_preference,
@@ -2107,7 +2190,7 @@ def _normalise_discovery_goal_parse(raw: dict[str, Any], current: dict[str, Any]
             "task_type": task_type,
             "max_projects": _bounded_int(payload.get("max_projects"), default=_bounded_int(current.get("max_projects"), default=50, minimum=1, maximum=300), minimum=1, maximum=300),
             "max_files": _bounded_int(payload.get("max_files"), default=_bounded_int(current.get("max_files"), default=2000, minimum=1, maximum=10000), minimum=1, maximum=10000),
-            "max_candidate_projects": _bounded_int(payload.get("max_candidate_projects"), default=_bounded_int(current.get("max_candidate_projects"), default=300, minimum=1, maximum=1000), minimum=1, maximum=1000),
+            "max_candidate_projects": _bounded_int(payload.get("max_candidate_projects"), default=_bounded_int(current.get("max_candidate_projects"), default=300, minimum=1, maximum=20000), minimum=1, maximum=20000),
             "max_files_per_project": _bounded_int(payload.get("max_files_per_project"), default=_bounded_int(current.get("max_files_per_project"), default=100, minimum=1, maximum=200), minimum=1, maximum=200),
             "agentic_rounds": _bounded_int(payload.get("agentic_rounds"), default=_bounded_int(current.get("agentic_rounds"), default=1, minimum=1, maximum=2), minimum=1, maximum=2),
             "diversity_strategy": diversity_strategy,
@@ -2268,6 +2351,7 @@ _DISCOVERY_LOW_RISK_SINGLE_FIELD_VERIFIER_SKIP = frozenset(
         "target_project_count",
         "quota_flexibility",
         "labeling_strategy",
+        "labeling_hard",
         "instrument_preference",
         "run_horizon",
         "special_themes",
@@ -2275,7 +2359,12 @@ _DISCOVERY_LOW_RISK_SINGLE_FIELD_VERIFIER_SKIP = frozenset(
     }
 )
 # Max fields in a compound low-risk skip (compound natural-language dumps).
-_DISCOVERY_LOW_RISK_COMPOUND_MAX_FIELDS = 12
+# A complete structured recap currently normalizes to 13 low-risk fields once
+# open-ended quota, mixed-acquisition, and labeling hardness are made explicit.
+# Leave one slot for other first-class preferences while preserving an over-max
+# guard; scientific_constraints and every non-whitelist field still require
+# the independent verifier.
+_DISCOVERY_LOW_RISK_COMPOUND_MAX_FIELDS = 15
 # On hard verifier reject, retain only soft theme/context fields from the
 # primary update_strategy tool call instead of wiping the whole card.
 _DISCOVERY_SOFT_REJECT_KEEP_FIELDS = frozenset(
@@ -2354,14 +2443,7 @@ _DISCOVERY_STRATEGY_PATCH_CONTRACT = {
         "browse_only",
         "other",
     ],
-    "run_horizon": [
-        "plan_only",
-        "candidates_only",
-        "candidates_reviewed",
-        "ai_ready_table",
-        "pre_release",
-        "full_release",
-    ],
+    "run_horizon": ["candidates_reviewed"],
     "species": "array[string], [] clears",
     "species_policy": ["open", "include_only", "prefer", "exclude"],
     "species_coverage": ["none", "prefer_listed", "broaden"],
@@ -2402,7 +2484,10 @@ _DISCOVERY_STRATEGY_FIELD_SEMANTICS = {
         "not a default. Finding or reviewing candidates describes run_horizon and never by itself "
         "authorizes browse_only."
     ),
-    "run_horizon": "交付终点/where this run stops. candidates_reviewed means find candidates and then review them.",
+    "run_horizon": (
+        "Fixed system invariant: every discovery run finds candidates and reviews them. "
+        "It is always candidates_reviewed and must never be offered as a user choice."
+    ),
     "species": "Organism names or taxa chosen by the user.",
     "species_policy": "Whether species are open, mandatory inclusions, preferences, or exclusions.",
     "species_coverage": "Whether to keep species neutral, prefer listed organisms, or broaden coverage.",
@@ -2414,7 +2499,10 @@ _DISCOVERY_STRATEGY_FIELD_SEMANTICS = {
     "labeling_hard": "Whether the labeling choice is a hard filter.",
     "coverage_mode": "Curation-versus-breadth preference, distinct from the exact project target.",
     "target_project_count": "Desired selected-project count, not the candidate-pool size.",
-    "max_candidate_projects": "Maximum candidate pool inspected before selecting final projects.",
+    "max_candidate_projects": (
+        "Bounded-mode retention limit. Compatibility hint only in continuous/maximize mode, "
+        "where candidate count is not capped."
+    ),
     "quota_flexibility": (
         "Whether the project target is fixed, recommended, or open-ended. A numeric target alone "
         "does not mean fixed; fixed requires explicit hard/exact language."
@@ -2448,7 +2536,7 @@ _DISCOVERY_STRATEGY_FIELD_LABELS_ZH = {
     "labeling_hard": "标记硬限制",
     "coverage_mode": "覆盖模式",
     "target_project_count": "目标项目数",
-    "max_candidate_projects": "候选池上限",
+    "max_candidate_projects": "普通模式候选保留上限",
     "quota_flexibility": "数量弹性",
     "time_budget": "时间偏好",
     "on_safety_ceiling": "触顶策略",
@@ -2812,6 +2900,13 @@ def _validate_discovery_strategy_patch(
                 unknown.append((raw_key, value))
             continue
 
+        if key == "run_horizon":
+            # Keep accepting the legacy wire field, but normalize every model
+            # proposal (including null and old enum values) to the fixed task
+            # contract. This prevents a dialogue turn from reintroducing Q2.
+            _store(key, _FIXED_DISCOVERY_RUN_HORIZON, raw_key)
+            continue
+
         if value is None:
             if key in _DISCOVERY_STRATEGY_NULLABLE_FIELDS:
                 _store(key, None, raw_key)
@@ -2855,21 +2950,15 @@ def _validate_discovery_strategy_patch(
                     f"{_DISCOVERY_STRATEGY_ARRAY_MAX_ITEMS} items"
                 )
                 continue
-            constraints: list[dict[str, Any]] = []
-            invalid_constraint = False
-            for item in value:
-                if not isinstance(item, Mapping):
-                    invalid_constraint = True
-                    break
-                try:
-                    constraint = ScientificConstraint.model_validate(dict(item))
-                except Exception:
-                    invalid_constraint = True
-                    break
-                constraints.append(constraint.model_dump(mode="json"))
-            if invalid_constraint:
+            normalize_result = normalize_scientific_constraints_result(
+                list(value),
+                max_items=_DISCOVERY_STRATEGY_ARRAY_MAX_ITEMS,
+            )
+            if normalize_result.rejected:
+                # Atomic fail-closed: one invalid item invalidates the whole write.
                 errors.append("scientific_constraints contains an invalid constraint")
                 continue
+            constraints = [item.model_dump(mode="json") for item in normalize_result.accepted]
             _store(key, constraints, raw_key)
             continue
 
@@ -3415,6 +3504,25 @@ def _discovery_compound_commitment_hints(user_message: str) -> dict[str, Any]:
         return {}
     lower = text.casefold()
     hints: dict[str, Any] = {}
+    recap_labels = (
+        "科学目标",
+        "研究主题",
+        "物种",
+        "采集模式",
+        "下游任务",
+        "交付终点",
+        "规模",
+        "标记方式",
+    )
+    structured_recap = sum(label in text for label in recap_labels) >= 4
+    if structured_recap:
+        objective_match = re.search(
+            r"科学目标\s*[：:]\s*(.+?)(?=研究主题\s*[：:]|物种\s*[：:]|采集模式\s*[：:]|下游任务\s*[：:]|交付终点\s*[：:]|规模\s*[：:]|标记方式\s*[：:]|$)",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if objective_match and _clean_text(objective_match.group(1)):
+            hints["objective"] = _clean_text(objective_match.group(1))[:120]
 
     # Species (generic bilingual cues)
     if re.search(
@@ -3445,6 +3553,12 @@ def _discovery_compound_commitment_hints(user_message: str) -> dict[str, Any]:
         hints["task_type"] = "psm_scoring"
     elif re.search(r"碎片强度|fragment\s*intensity", text, flags=re.IGNORECASE):
         hints["task_type"] = "fragment_intensity"
+    elif structured_recap and re.search(
+        r"下游任务\s*[：:].{0,40}(?:browse_only|纯浏览|浏览探索)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        hints["task_type"] = "browse_only"
 
     # Scale / quota
     if re.search(
@@ -3490,6 +3604,14 @@ def _discovery_compound_commitment_hints(user_message: str) -> dict[str, Any]:
         if "objective" not in hints and len(text) <= 80:
             hints["objective"] = text.strip()[:200]
 
+    if structured_recap and re.search(
+        r"标记方式\s*[：:].{0,30}(?:不限|保持开放|\bany\b)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        hints["labeling_strategy"] = "any"
+        hints["labeling_hard"] = False
+
     return hints
 
 
@@ -3520,7 +3642,18 @@ def _merge_discovery_compound_commitment_hints(
     }
     structural_hits = len(structural_hint_keys.intersection(hints))
     base_structural = len(structural_hint_keys.intersection(base))
-    if base_structural >= 2:
+    recap_labels = (
+        "科学目标",
+        "研究主题",
+        "物种",
+        "采集模式",
+        "下游任务",
+        "交付终点",
+        "规模",
+        "标记方式",
+    )
+    structured_recap = sum(label in user_message for label in recap_labels) >= 4
+    if base_structural >= 2 and not structured_recap:
         # Manager already committed multiple structural fields.
         return base
     if len(base) < 2 and structural_hits < 2:
@@ -3610,17 +3743,105 @@ def _discovery_low_risk_single_field_verifier_skip(
     return True
 
 
+def _discovery_soft_reject_critic_rejected_fields(
+    semantic_verification: Mapping[str, Any] | None,
+) -> set[str]:
+    """Field ids the critic explicitly failed, vetoed, or left ungrounded.
+
+    An empty set means a global reject with no field-level signal (soft-only keep).
+    """
+
+    if not isinstance(semantic_verification, Mapping):
+        return set()
+    rejected: set[str] = set()
+
+    def _add_field(raw: Any) -> None:
+        key = _clean_text(raw)
+        if not key:
+            return
+        field_root = re.split(r"[.\\[]", key, maxsplit=1)[0]
+        field = _DISCOVERY_STRATEGY_PATCH_ALIASES.get(field_root, field_root)
+        if field:
+            rejected.add(field)
+
+    for key in (
+        "missing_fields",
+        "rejected_fields",
+        "ungrounded_fields",
+        "field_errors",
+        "critic_rejected_fields",
+        "removed_uncommitted_fields",
+    ):
+        raw = semantic_verification.get(key)
+        if isinstance(raw, Mapping):
+            for field, value in raw.items():
+                _add_field(field)
+                if isinstance(value, Mapping):
+                    _add_field(value.get("field"))
+                elif isinstance(value, str) and key == "field_errors":
+                    # Mapping of field -> reason.
+                    continue
+        elif isinstance(raw, (list, tuple, set)):
+            for item in raw:
+                if isinstance(item, Mapping):
+                    _add_field(item.get("field") or item.get("name"))
+                else:
+                    _add_field(item)
+
+    raw_evidence = semantic_verification.get("evidence")
+    if isinstance(raw_evidence, list):
+        for item in raw_evidence[:100]:
+            if not isinstance(item, Mapping):
+                continue
+            status = _clean_text(
+                item.get("status") or item.get("verdict") or item.get("result")
+            ).casefold()
+            if status in {"reject", "rejected", "fail", "failed", "ungrounded", "missing"}:
+                _add_field(item.get("field"))
+    return rejected
+
+
 def _discovery_soft_reject_kept_patch(
     explicit_tool_patch: Mapping[str, Any],
+    *,
+    semantic_verification: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Soft subset of a primary tool patch retained after verifier reject."""
+    """Subset of a primary tool patch retained after verifier reject (soft-reject v2).
+
+    Authority is always the explicit SDK tool patch — never critic-authored values.
+    - Field-level critic errors: keep low-risk whitelist tool keys not named by critic.
+    - Global reject (no field list): keep only soft theme/context keys.
+    """
 
     if not isinstance(explicit_tool_patch, Mapping) or not explicit_tool_patch:
         return {}
+    critic_rejected = _discovery_soft_reject_critic_rejected_fields(
+        semantic_verification
+    )
+    if critic_rejected:
+        # Field-level mode: low-risk whitelist minus critic vetoes (hard keys may
+        # survive when the critic did not name them).
+        eligible = {
+            field
+            for field in explicit_tool_patch
+            if (
+                field in _DISCOVERY_LOW_RISK_SINGLE_FIELD_VERIFIER_SKIP
+                and field not in critic_rejected
+            )
+        }
+    else:
+        # Global reject: soft set only — never auto-keep species/DDA/horizon.
+        eligible = {
+            field
+            for field in explicit_tool_patch
+            if field in _DISCOVERY_SOFT_REJECT_KEEP_FIELDS
+        }
+    # scientific_constraints are never soft-kept; they force critic and fail closed.
+    eligible.discard("scientific_constraints")
     candidate = {
         field: value
         for field, value in explicit_tool_patch.items()
-        if field in _DISCOVERY_SOFT_REJECT_KEEP_FIELDS
+        if field in eligible
     }
     if not candidate:
         return {}
@@ -3630,12 +3851,35 @@ def _discovery_soft_reject_kept_patch(
     return normalized
 
 
-def _format_discovery_soft_reject_message(patch: Mapping[str, Any]) -> str:
-    """Chinese copy when verifier rejects hard fields but soft themes remain."""
+def _discovery_soft_reject_dropped_fields(
+    explicit_tool_patch: Mapping[str, Any],
+    kept_patch: Mapping[str, Any],
+) -> list[str]:
+    """Tool keys that did not survive soft-reject (sorted for stable audits)."""
+
+    if not isinstance(explicit_tool_patch, Mapping) or not explicit_tool_patch:
+        return []
+    kept = set(kept_patch) if isinstance(kept_patch, Mapping) else set()
+    return sorted(set(explicit_tool_patch).difference(kept))
+
+
+def _format_discovery_soft_reject_message(
+    patch: Mapping[str, Any],
+    *,
+    dropped_fields: Any = None,
+) -> str:
+    """Chinese copy when verifier rejects some fields but a keep subset remains."""
 
     summary = _format_discovery_strategy_patch_summary(patch)
+    residual = _format_discovery_field_names_zh(dropped_fields)
+    if residual:
+        return (
+            f"已写入可核验部分：{summary}。"
+            f"未写入：{residual}（语义校验未通过或字段不在可软保留集合）。"
+            "本轮未整包清空策略。"
+        )
     return (
-        f"已记录主题相关信息：{summary}。"
+        f"已写入可核验部分：{summary}。"
         "其余字段待确认后再写入；本轮未整包清空策略。"
     )
 
@@ -4295,7 +4539,13 @@ def _normalise_discovery_gap_report(raw: Any) -> dict[str, Any]:
     def _slots(key: str) -> list[str]:
         values = report.get(key) if isinstance(report.get(key), list) else []
         cleaned = [_clean_text(value) for value in values]
-        return list(dict.fromkeys(value for value in cleaned if value))
+        return list(
+            dict.fromkeys(
+                value
+                for value in cleaned
+                if value and value not in {"horizon", "run_horizon", "delivery_horizon"}
+            )
+        )
 
     return {
         "required_missing": _slots("required_missing"),
@@ -4319,11 +4569,22 @@ def _discovery_critical_decision_agenda(
     Repository facts are deliberately excluded because the Agent should fetch
     those during Discovery rather than ask the user to guess them.
     """
-    return agenda_for_manager(
-        intent_snapshot,
+    fixed_snapshot = {
+        **dict(intent_snapshot),
+        "run_horizon": _FIXED_DISCOVERY_RUN_HORIZON,
+    }
+    agenda = agenda_for_manager(
+        fixed_snapshot,
         gap_report=gap_report,
-        resolved_fields=resolved_fields,
+        resolved_fields={*resolved_fields, "run_horizon"},
     )
+    return [
+        item
+        for item in agenda
+        if "run_horizon" not in set(item.get("target_fields") or [])
+        and _clean_text(item.get("focus")).casefold()
+        not in {"horizon", "run_horizon", "delivery_horizon"}
+    ]
 
 
 def _normalise_discovery_dialogue_history(raw: Any) -> list[dict[str, str]]:
@@ -4676,6 +4937,10 @@ _DISCOVERY_EXECUTION_FINGERPRINT_VOLATILE_FIELDS = {
     "strategy_fingerprint",
     "strategy_fingerprint_payload",
     "idempotency_key",
+    # Added only after the HTTP confirmation check when the queued job is
+    # persisted. It is server-owned routing state, not part of what the user
+    # reviewed, so the execution-boundary recheck must ignore it too.
+    "_execution_discovery_id",
 }
 
 
@@ -6214,6 +6479,70 @@ def _resolve_discovery_pending_selection(
     }
 
 
+def _discovery_synthesize_option_patch_from_labels(
+    selected_decision: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Best-effort patch when an option omitted strategy_patch (model under-write).
+
+    Only maps clearly labeled choices; never invents unrelated science fields.
+    """
+    option = selected_decision.get("option")
+    if not isinstance(option, Mapping):
+        return {}
+    blob = " ".join(
+        [
+            _clean_text(option.get("id")),
+            _clean_text(option.get("label")),
+            _clean_text(option.get("reason")),
+            _clean_text(selected_decision.get("focus")),
+            " ".join(
+                _clean_text(field)
+                for field in (selected_decision.get("target_fields") or [])
+                if _clean_text(field)
+            ),
+        ]
+    ).casefold()
+    patch: dict[str, Any] = {}
+    if any(
+        token in blob
+        for token in ("label_free", "label-free", "label free", "无标记", "非标记")
+    ):
+        patch["labeling_strategy"] = "label_free"
+        if any(
+            token in blob
+            for token in ("只要", "仅", "硬", "严格", "排除", "hard", "only")
+        ):
+            patch["labeling_hard"] = True
+        else:
+            patch["labeling_hard"] = False
+    elif any(
+        token in blob
+        for token in (
+            "不限标记",
+            "不限制",
+            "任意标记",
+            "都可以",
+            "open labeling",
+            "any labeling",
+        )
+    ):
+        patch["labeling_strategy"] = "unknown"
+        patch["labeling_hard"] = False
+    elif "tmt" in blob:
+        patch["labeling_strategy"] = "TMT"
+    elif "itraq" in blob:
+        patch["labeling_strategy"] = "iTRAQ"
+    if "仪器不限" in blob or (
+        ("仪器" in blob or "instrument" in blob)
+        and any(token in blob for token in ("不限", "none", "任意", "open"))
+    ):
+        patch["instrument_preference"] = "none"
+    if not patch:
+        return {}
+    normalized, errors = _validate_discovery_strategy_patch(patch)
+    return {} if errors else normalized
+
+
 def _discovery_selected_option_strategy_patch(
     selected_decision: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
@@ -6224,6 +6553,9 @@ def _discovery_selected_option_strategy_patch(
     authority is the schema-validated patch persisted with that option when the
     Manager created it.  A later model call may explain or plan the next step,
     but it cannot widen or reinterpret this patch.
+
+    If the Manager omitted strategy_patch on the option (under-write), synthesize
+    a minimal patch from clear option labels so bare "1" still updates the card.
     """
 
     if not isinstance(selected_decision, Mapping):
@@ -6234,10 +6566,11 @@ def _discovery_selected_option_strategy_patch(
     raw_patch = option.get("strategy_patch")
     if not isinstance(raw_patch, Mapping):
         raw_patch = selected_decision.get("strategy_patch")
-    if not isinstance(raw_patch, Mapping):
-        return {}
-    patch, errors = _validate_discovery_strategy_patch(_json_object(dict(raw_patch)))
-    return {} if errors else patch
+    if isinstance(raw_patch, Mapping) and raw_patch:
+        patch, errors = _validate_discovery_strategy_patch(_json_object(dict(raw_patch)))
+        if not errors and patch:
+            return patch
+    return _discovery_synthesize_option_patch_from_labels(selected_decision)
 
 
 def _same_discovery_decision(
@@ -6726,25 +7059,33 @@ def _discovery_latest_message_clauses(user_message: str) -> list[dict[str, str]]
 
 def _discovery_grill_turn_system_prompt() -> str:
     return (
-        "You are the conversational front of a proteomics data-discovery agent (PRIDE). "
-        "Behave like a capable coding-style domain agent with tools (think pi coding-agent: "
-        "act on explicit user intent with tools, not a multi-step form wizard). Be flexible, "
-        "specific, brief, and collaborative. "
-        "MULTI-COMMITMENT FIRST: when the latest user message already states several concrete "
-        "choices (species, task/downstream use, scale, acquisition, horizon, themes, etc.), "
-        "you MUST call update_strategy once with ALL of those fields in a single patch. "
-        "Do not turn a compound request into a questionnaire. Do not ask the user to re-pick "
-        "a value they already gave. Only ask about true gaps that still block readiness. "
-        "There is no fixed question order. The gap report and pending question are guidance, "
-        "not a script. Interpret the latest turn with dialogue history; respect references, "
-        "corrections, negation, and turn-local scope. Reason by meaning, not keyword lists. "
-        "Only an explicit update_strategy tool event may change the card. Pure advice stays "
-        "advice until accepted. Natural-language approval uses confirm_strategy only when "
-        "phase=awaiting_confirm for the current snapshot. A generic ok/yes during grilling "
-        "is not confirmation. You never start PRIDE discovery; grill_confirmed=true remains "
-        "the server gate. Capability-honest: this surface can plan_only, candidates_only, "
-        "candidates_reviewed; ai_ready_table / pre_release / full_release need a reviewed "
-        "result and a separate executor—never imply confirm silently runs those. "
+        "You are a proteomics notebook partner for PRIDE data discovery — a scientific "
+        "collaborator who takes notes on a strategy card via tools, not a form wizard or "
+        "questionnaire clerk. "
+        "NOTEBOOK DEFAULT: read the full dialogue plus the latest user message; extract every "
+        "explicit scientific commitment; when there is one or more commitments, call "
+        "update_strategy once with all of them in a single patch; when there is none, use "
+        "action=chat or advise and leave the card unchanged. "
+        "Latest user intent wins: corrections overwrite earlier card fields. "
+        "MULTI-COMMITMENT FIRST: compound Chinese/English messages that already state several "
+        "concrete choices (species, task/downstream use, scale, acquisition, horizon, themes, "
+        "etc.) MUST become one update_strategy patch — never a multi-step questionnaire, and "
+        "never re-ask a value the user just gave. "
+        "Ask only about true remaining gaps that still affect search/ranking/feasibility and "
+        "that the user has not covered; prefer one natural-language follow-up sentence. "
+        "A next_decision option menu is optional, useful only when discrete alternatives help; "
+        "never emit a 2–8 option menu when free chat or a single free-text ask is enough; never "
+        "turn a greeting or pure consultation into a menu. "
+        "There is no fixed question order. gap_report, critical_decision_agenda, and pending "
+        "questions are readiness guidance, not a script. Reason by meaning, not keyword lists. "
+        "Only an explicit update_strategy tool event may change the card (SDK tool authority). "
+        "Prose, extra_fields, and advice never write the card. Pure advice stays advice until "
+        "accepted. Natural-language approval uses confirm_strategy only when "
+        "phase=awaiting_confirm for the current snapshot. A generic ok/yes during grilling is "
+        "not confirmation. You never start PRIDE discovery; grill_confirmed=true remains the "
+        "server gate. capability-honest: this surface can plan_only (without repository access), "
+        "candidates_only, candidates_reviewed; ai_ready_table, pre_release, and full_release "
+        "need a reviewed result and a separate executor—never imply confirm silently runs those. "
         "Reply in natural Chinese and always return one JSON object matching the turn "
         "contract in the user message.\n\n"
         "Repository scientific guidance:\n"
@@ -6792,6 +7133,7 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         if isinstance(body.get("intent_snapshot"), dict)
         else {}
     )
+    intent_snapshot["run_horizon"] = _FIXED_DISCOVERY_RUN_HORIZON
     decision_memory = _normalise_discovery_decision_memory(
         body.get("decision_memory")
     )
@@ -6799,6 +7141,7 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         body.get("resolved_fields"),
         intent_snapshot,
     )
+    resolved_fields.add("run_horizon")
     candidate_resolved_decision = _discovery_resolved_decision_record(
         pending_decision,
         selected_decision,
@@ -6898,7 +7241,7 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         else ""
     )
     user_prompt = (
-        "Handle one grill dialogue turn for proteomics data discovery.\n\n"
+        "Handle one notebook dialogue turn for proteomics data discovery (chat freely, extract commitments, tool-write the card, ask only real gaps).\n\n"
         f"turn_kind: {turn_kind}\n"
         f"phase: {phase}\n"
         f"user_message: {user_message}\n\n"
@@ -6982,6 +7325,7 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         "- For an accepted option whose active focus is a canonical strategy field and whose option id is a valid field value, write the scalar delta as {focus: option.id}. Never wrap a patch value in an object containing value/label/reason. If the choice intentionally changes several fields, emit each canonical scalar/array value directly.\n"
         "- Defaults use action=update_strategy. If the resulting card is executable, also set ready_for_confirm=true; this offers confirmation but never confirms or starts search.\n"
         "- Every first-class strategy field may be null to clear it back to the empty-strategy default. Arrays may also use []. Query/runtime extension fields are cleared by omission, not null.\n"
+        "- run_horizon is a fixed system invariant: it is always candidates_reviewed. Never ask the user where the run should stop, never offer plan_only/candidates_only/downstream horizons, and never clear or change this field.\n"
         f"- Canonical patch contract: "
         f"{json.dumps(_DISCOVERY_STRATEGY_PATCH_CONTRACT, ensure_ascii=False, separators=(',', ':'))}.\n"
         f"- Canonical field meanings: {field_semantics}.\n"
@@ -6993,12 +7337,12 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         "- next_decision must include target_fields (one or more canonical strategy fields) and revisit_existing. Set revisit_existing=true only when the latest user explicitly asks to reconsider an already-set choice.\n"
         "- Every next_decision option must include a non-empty, schema-valid strategy_patch that completely expresses only that option's mutation meaning. All options in one menu must use this contract. target_fields is derived by the server from these patches and is not mutation authority. A later numeric/id/label selection applies exactly the stored option patch; the later model must not add defaults or reinterpret it.\n"
         "- critical_decision_agenda lists readiness blockers, NOT a forced one-by-one quiz. If the latest user_message already resolves one or more agenda items, apply them via update_strategy in THIS turn and do not re-ask them.\n"
-        "- COMPOUND UPDATES ARE THE DEFAULT when the user packs multiple commitments into one message (including Chinese separators · / ， / 、 / 和 / 以及 / 逗号). Map every explicit commitment into one update_strategy.patch. Example: '人源免疫肽，RT 预测，越多越好，DDA，审查候选' should set species/human+prefer or include_only, special_themes or objective for immunopeptide, task_type=rt_prediction, quota open_ended or exhaustive coverage, acquisition_mode=dda, run_horizon=candidates_reviewed in ONE patch.\n"
+        "- COMPOUND UPDATES ARE THE DEFAULT when the user packs multiple commitments into one message (including Chinese separators · / ， / 、 / 和 / 以及 / 逗号). Map every explicit commitment into one update_strategy.patch. Example: '人源免疫肽，RT 预测，越多越好，DDA' should set species/human+prefer or include_only, special_themes or objective for immunopeptide, task_type=rt_prediction, quota open_ended or exhaustive coverage, and acquisition_mode=dda in ONE patch. The server supplies the fixed candidates_reviewed horizon.\n"
         "- Do NOT invent downstream tasks the user did not state (e.g. do not write task_type=rt_prediction when they only said immunopeptide data). Objective/theme may record the topic; task_type only when a modeling/use task is explicit or they accept a recommendation.\n"
-        "- After applying all explicit commitments, if critical_decision_agenda still lists unresolved critical items (critical=true), you MUST continue grilling: set next_decision for the highest-priority remaining critical item with a complete question + recommendation reason + 2-5 options (or clear free-text ask). Do not go silent after a partial update. Species/generalization_scope is critical for training tasks (denovo/RT/etc.) when species is empty—ask it; do not claim it is optional without user input.\n"
+        "- After applying all explicit commitments, if critical_decision_agenda still lists unresolved critical items (critical=true), do not go silent: surface the highest-priority remaining gap. Prefer one natural-language follow-up in assistant_message (and next_decision=null when free-text is enough). Emit a next_decision menu only when discrete alternatives genuinely help the user choose; if you do emit one, it must be schema-complete (question + recommendation.reason + 2-8 options each with strategy_patch). Species/generalization_scope remains a real readiness gap for training tasks (denovo/RT/etc.) when species is empty—ask it in notebook language; do not claim it is optional without user input.\n"
         "- Prefer ready_to_confirm only when no critical agenda item remains. Non-critical items (e.g. labeling) may be skipped or asked briefly.\n"
         "- Menus are for unresolved blockers, not a fixed questionnaire. After a compound multi-commit answer, do not re-ask resolved fields; do ask the next critical gap. option_mode=expanded only if they ask for alternatives/comparison.\n"
-        "- Every next_decision you emit must be schema-complete (question, recommendation.reason, 2-8 options each with strategy_patch). Incomplete next_decision is dropped by the server—never leave the user without a follow-up when critical gaps remain.\n"
+        "- When you emit next_decision, it must be schema-complete (question, recommendation.reason, 2-8 options each with strategy_patch); incomplete menus are dropped by the server. Critical gaps may be followed up with natural language alone—do not invent a menu just to satisfy schema.\n"
         "- Keep next_decision.question to one concise question when present. Do not embed option lists in assistant_message; the UI renders options separately. Use assistant_message to confirm what was written to the card and what (if anything) is still open.\n"
         "- Give option ids stable semantic ids when you use menus. After an option is selected, move on; never rephrase the same menu.\n"
         "- ready_to_confirm only presents the current strategy for approval; it is not user approval.\n"
@@ -7066,6 +7410,7 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
     if requested_action == "chat":
         # A social/casual turn stays conversational. Structured choices are
         # reserved for an actual scientific decision, not appended to greetings.
+        # NI-1: incomplete next_decision on chat is never contract chrome.
         next_decision = None
         decision_contract_error = False
     repeated_selected_decision = bool(
@@ -7143,6 +7488,38 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         if selected_enum_repair:
             patch = selected_enum_repair
             mutation_errors = []
+    if (
+        agent_runtime == "openai_agents"
+        and requested_action == "update_strategy"
+        and mutation_errors
+        and mutation_errors != ["update_strategy patch contains no changed fields"]
+        and manager_repair_attempt < 1
+        and selected_decision is None
+    ):
+        remaining_seconds = request_budget_seconds - (monotonic() - turn_started_at)
+        if remaining_seconds >= 6.0:
+            retry_body = dict(body)
+            retry_body["_manager_repair_attempt"] = manager_repair_attempt + 1
+            retry_body["_manager_repair_feedback"] = {
+                "kind": "invalid_strategy_patch",
+                "validation_errors": [
+                    _redact_secrets(_clean_text(error))[:500]
+                    for error in mutation_errors[:12]
+                    if _clean_text(error)
+                ],
+                "instruction": (
+                    "The previous update_strategy arguments failed the deterministic "
+                    "strategy schema. Re-read every latest-message clause and invoke "
+                    "update_strategy once with a complete, canonical, schema-valid "
+                    "patch. Correct only the invalid envelope; do not drop the user's "
+                    "other explicit commitments and do not add recommendations."
+                ),
+            }
+            retry_body["request_timeout_seconds"] = min(
+                remaining_seconds,
+                request_budget_seconds,
+            )
+            return _run_discovery_grill_turn(retry_body)
     commitment_authority_patch, commitment_authority_errors = (
         _discovery_turn_commitment_patch(raw, user_message=user_message)
     )
@@ -7171,14 +7548,20 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         for raw_field in (selected_decision or {}).get("target_fields") or []
         if (field := _clean_text(raw_field))
     }
+    # Predeclared UI option acceptance (bare "1" / exact id / exact label):
+    # server already holds the Manager-authored strategy_patch. Never re-run the
+    # semantic verifier against the bare selection text (rejects "1" as empty).
     selected_option_patch_is_scoped = bool(
         isinstance(selected_decision, Mapping)
         and selected_decision.get("explicit_acceptance") is True
-        and agent_runtime == "openai_agents"
-        and requested_action == "update_strategy"
-        and validated_tool_patch
-        and set(validated_tool_patch).issubset(selected_target_fields)
+        and bool(selected_option_contract_patch)
     )
+    if selected_option_patch_is_scoped and not mutation_errors:
+        # Force the card write to the immutable option contract only.
+        patch = dict(selected_option_contract_patch)
+        if explicit_resolution_patch:
+            for key, value in explicit_resolution_patch.items():
+                patch.setdefault(key, value)
     # Legacy/direct dialogue mode can still acknowledge an already-equal
     # selected value without emitting a client resolution delta.  Production
     # SDK turns use ``explicit_resolution_patch`` below so resolved_fields is
@@ -7262,7 +7645,6 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         requested_action == "update_strategy" and explicit_tool_patch != patch
     )
     semantic_verification: dict[str, Any] | None = None
-    latest_clauses = _discovery_latest_message_clauses(user_message)
     # A separate semantic Agent is read-only. It may flag a Manager omission,
     # after which the same user-facing Manager gets one bounded retry. The
     # critic's candidate values are never applied directly.
@@ -7315,6 +7697,12 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
             intent_snapshot,
             preserve_fields=set(explicit_resolution_patch),
         )
+    # Thin SV warrant (notebook NB-2 / NI-2): do NOT force critic merely because
+    # Chinese punctuation produced multiple clauses or the patch has several
+    # pure low-risk keys. The low-risk helper already encodes the skip matrix
+    # (whitelist subset, no scientific_constraints, compound max, plain-text
+    # recovery, single-field interpretation gap). When that helper is False,
+    # the patch is high-risk and SV stays warranted.
     patch_verification_warranted = bool(
         agent_runtime == "openai_agents"
         and verification_input_patch
@@ -7335,14 +7723,6 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         # scientific_constraints / non-whitelist fields / tool-interpretation gaps
         # still force the critic (helper returns False → this gate stays open).
         and not low_risk_single_field_skip
-        and (
-            len(latest_clauses) > 1
-            or len(verification_input_patch) > 1
-            or "scientific_constraints" in verification_input_patch
-            or tool_interpretation_difference
-            or _clean_text(provider_compatibility_recovery.get("mode"))
-            == "json_action_contract_after_plain_text"
-        )
     )
     verification_warranted = bool(
         patch_verification_warranted or commitment_recovery_warranted
@@ -7425,6 +7805,44 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
             if isinstance(semantic_verification, Mapping)
             else None
         )
+        if (
+            commitment_recovery_warranted
+            and not critic_suggested_fields
+            and isinstance(semantic_verification, Mapping)
+            and _clean_text(semantic_verification.get("verdict")).lower()
+            in {"repair", "reject"}
+        ):
+            # Some verifier providers return the same read-only omission finding
+            # as evidence + missing_fields instead of critic_suggested_fields.
+            # Derive field *names* only; values remain exclusively authored by
+            # the retried Dialogue Manager.
+            missing = {
+                _DISCOVERY_STRATEGY_PATCH_ALIASES.get(
+                    _clean_text(field),
+                    _clean_text(field),
+                )
+                for field in semantic_verification.get("missing_fields") or []
+                if _clean_text(field)
+            }
+            evidence_fields: list[str] = []
+            for item in semantic_verification.get("evidence") or []:
+                if not isinstance(item, Mapping):
+                    continue
+                raw_field = _clean_text(item.get("field"))
+                field = _DISCOVERY_STRATEGY_PATCH_ALIASES.get(
+                    raw_field,
+                    raw_field,
+                )
+                if (
+                    field in _DISCOVERY_STRATEGY_PATCH_FIELDS
+                    and (not missing or field in missing)
+                    and field not in evidence_fields
+                ):
+                    evidence_fields.append(field)
+            if evidence_fields:
+                critic_suggested_fields = evidence_fields
+                semantic_verification["critic_suggested_fields"] = evidence_fields
+                semantic_verification["suggested_fields_derived_from_evidence"] = True
         if (
             commitment_recovery_warranted
             and isinstance(critic_suggested_fields, list)
@@ -7620,13 +8038,14 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
                     "no_commitment_confirmed": True,
                 }
             elif verification_verdict not in {"unavailable", "budget_exhausted"}:
-                # An explicit reject, or an accept/repair verdict whose field
-                # evidence failed deterministic grounding, is authoritative for
-                # hard/execution fields. Soft theme/context keys from the
-                # primary update_strategy tool may still be retained so short
-                # topic turns (e.g. 免疫肽数据) do not blank the strategy card.
+                # Soft-reject v2 (notebook NI-2): start from explicit SDK tool
+                # patch only. Field-level critic errors keep low-risk whitelist
+                # keys not named by the critic; global reject keeps soft set only.
                 soft_kept = (
-                    _discovery_soft_reject_kept_patch(explicit_tool_patch)
+                    _discovery_soft_reject_kept_patch(
+                        explicit_tool_patch,
+                        semantic_verification=semantic_verification,
+                    )
                     if (
                         not commitment_recovery_warranted
                         and explicit_tool_patch
@@ -7640,18 +8059,21 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
                         intent_snapshot,
                         preserve_fields=set(explicit_resolution_patch),
                     )
+                    soft_dropped = _discovery_soft_reject_dropped_fields(
+                        explicit_tool_patch, patch
+                    )
                     semantic_verification = {
                         **semantic_verification,
                         "verified": False,
                         "verdict": "reject",
                         "patch": dict(patch),
                         "soft_reject_kept_fields": sorted(patch),
+                        "soft_reject_dropped_fields": soft_dropped,
                         "rationale": (
                             _clean_text(semantic_verification.get("rationale"))[:1200]
                             or (
-                                "Independent semantic verification rejected hard "
-                                "fields; soft theme/objective fields from the "
-                                "primary tool call were retained."
+                                "Independent semantic verification rejected some "
+                                "fields; evidence-eligible tool fields were retained."
                             )
                         ),
                     }
@@ -7686,12 +8108,18 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         and requested_action == "update_strategy"
         and semantic_verification.get("soft_reject_kept_fields") is None
     ):
-        soft_kept = _discovery_soft_reject_kept_patch(explicit_tool_patch)
+        soft_kept = _discovery_soft_reject_kept_patch(
+            explicit_tool_patch,
+            semantic_verification=semantic_verification,
+        )
         if soft_kept:
             patch = _drop_unchanged_discovery_patch_fields(
                 soft_kept,
                 intent_snapshot,
                 preserve_fields=set(explicit_resolution_patch),
+            )
+            soft_dropped = _discovery_soft_reject_dropped_fields(
+                explicit_tool_patch, patch
             )
             semantic_verification = {
                 **semantic_verification,
@@ -7699,12 +8127,12 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
                 "verdict": "reject",
                 "patch": dict(patch),
                 "soft_reject_kept_fields": sorted(patch),
+                "soft_reject_dropped_fields": soft_dropped,
                 "rationale": (
                     _clean_text(semantic_verification.get("rationale"))[:1200]
                     or (
-                        "Independent semantic verification rejected hard fields; "
-                        "soft theme/objective fields from the primary tool call "
-                        "were retained."
+                        "Independent semantic verification rejected some fields; "
+                        "evidence-eligible tool fields were retained."
                     )
                 ),
             }
@@ -7760,7 +8188,14 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
             else None,
         )
     elif soft_reject_applied:
-        assistant_message = _format_discovery_soft_reject_message(patch)
+        assistant_message = _format_discovery_soft_reject_message(
+            patch,
+            dropped_fields=(
+                semantic_verification.get("soft_reject_dropped_fields")
+                if isinstance(semantic_verification, Mapping)
+                else None
+            ),
+        )
     elif patch_was_reconciled and not mutation_errors:
         assistant_message = _format_discovery_reconciled_update_message(patch)
     if requested_action not in _DISCOVERY_TURN_ACTIONS:
@@ -7834,10 +8269,11 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
                 "自然语言批准才有效；本轮没有启动搜索。"
             )
 
+    next_decision_contract_msg = (
+        "next_decision requires a question, a recommendation reason, and 2-8 options"
+    )
     if decision_contract_error:
-        contract_errors.append(
-            "next_decision requires a question, a recommendation reason, and 2-8 options"
-        )
+        contract_errors.append(next_decision_contract_msg)
         # Repair path filled below after remaining_critical_decisions is known.
         if action == "clarify" and not patch:
             action = "advise"
@@ -7963,7 +8399,10 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
     # 1) Broken model menu (decision_contract_error)
     # 2) update_strategy wrote a patch but left next_decision empty (not
     #    because we suppressed a repeated/resolved menu).
-    if remaining_critical_decisions and (
+    if remaining_critical_decisions and not (
+        # NI-1: pure chat never force-repairs into a questionnaire menu.
+        requested_action == "chat" and not patch
+    ) and (
         decision_contract_error
         or (
             action == "update_strategy"
@@ -7982,14 +8421,10 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
             # Drop the next_decision schema error once a full agenda menu was
             # synthesized; otherwise the turn still looks like a hard failure
             # even though the user now has a valid follow-up question.
-            _next_decision_contract_msg = (
-                "next_decision requires a question, a recommendation reason, "
-                "and 2-8 options"
-            )
             contract_errors = [
                 error
                 for error in contract_errors
-                if error != _next_decision_contract_msg
+                if error != next_decision_contract_msg
             ]
             if action == "update_strategy" and patch:
                 assistant_message = (
@@ -8010,6 +8445,22 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
                     assistant_message = (
                         "好的。当前策略还有关键点未定，请先看下面这一问题。"
                     )
+    if (
+        decision_contract_error
+        and action == "update_strategy"
+        and patch
+        and not remaining_critical_decisions
+    ):
+        # A fully resolved strategy does not need another question. Treat a
+        # malformed optional next_decision as absent once the strategy write
+        # itself succeeded; genuine unresolved decisions still take the
+        # synthesis path above and retain contract visibility if repair fails.
+        decision_contract_error = False
+        contract_errors = [
+            error
+            for error in contract_errors
+            if error != next_decision_contract_msg
+        ]
     ready_for_confirm = bool(
         action in {"ready_to_confirm", "confirm_strategy"}
         or raw.get("ready_for_confirm") is True
@@ -8082,6 +8533,44 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
 
     if action != "update_strategy":
         patch = {}
+    # NI-1 / notebook: pure chat/advise never surface contract chrome to the user.
+    # Semantic verification may remain for server audit; FE hides SV chrome on non-write.
+    # Only for turns that were already non-mutating (not demoted from failed update_strategy).
+    if (
+        action in {"chat", "advise"}
+        and not patch
+        and requested_action in {"chat", "advise"}
+    ):
+        contract_errors = []
+        blocking_contract_error = False
+        raw_msg = _clean_text(raw.get("assistant_message") or raw.get("reply"))
+        chrome_markers = (
+            "可验证的策略修改",
+            "动作契约不完整",
+            "契约不一致",
+            "同一轮不能既修改策略又确认策略",
+            "next_decision requires",
+            "选项菜单不完整",
+            "下一问选项不完整",
+            "下一问结构不完整",
+        )
+        # Restore model prose only when server rewrote into hard contract-failure copy.
+        # Do not undo friendly contract-noise explanations (e.g. 什么意思 → 刚才的提示是说…).
+        hard_failure_markers = (
+            "可验证的策略修改",
+            "动作契约不完整",
+            "契约不一致",
+            "同一轮不能既修改策略又确认策略",
+            "next_decision requires",
+        )
+        if (
+            raw_msg
+            and any(marker in assistant_message for marker in hard_failure_markers)
+            and "刚才的提示是说" not in assistant_message
+        ):
+            assistant_message = raw_msg
+        elif not assistant_message:
+            assistant_message = "我在听。你可以继续说明需求，当前策略保持不变。"
     intent = _legacy_discovery_turn_intent(action, raw_intent)
     answer_text = _clean_text(raw.get("answer_text") or raw.get("mapped_answer"))
     understanding = _clean_text(raw.get("understanding"))
@@ -8164,7 +8653,7 @@ def _project_delivery_quality(
     usable_files = [
         file
         for file in project_files
-        if str(file.get("validity_status") or "") in {"valid", "weak_keep"}
+        if str(file.get("validity_status") or "") == "valid"
         and not bool(file.get("needs_review"))
     ]
     review_files = [
@@ -8591,7 +9080,7 @@ def _public_discovery_record(
     valid_count = sum(1 for file in manifest.files if file.validity_status == "valid")
     weak_keep_count = sum(1 for file in manifest.files if file.validity_status == "weak_keep")
     usable_count = sum(
-        file.validity_status in {"valid", "weak_keep"} and not file.needs_review
+        file.validity_status == "valid" and not file.needs_review
         for file in manifest.files
     )
     graded_projects = sum(1 for item in projects if item.get("has_project_judgment"))
@@ -9086,7 +9575,7 @@ def _list_discovery_history_records(limit: int = 100) -> list[dict[str, Any]]:
                 item["finished_at"] = job.get("finished_at")
                 item["history_time"] = job.get("finished_at")
             item["primary_action"] = "open_discovery"
-            records.append(item)
+            records.append(_decorate_history_item(item))
             if len(records) >= limit:
                 return records
     # Include run dirs not linked from jobs.
@@ -9723,22 +10212,6 @@ def _discovery_confirmation_rejection(
                     "payload. Reconfirm the current strategy before starting search."
                 ),
             }
-    run_horizon = _clean_text(body.get("run_horizon")).lower()
-    if run_horizon == "plan_only":
-        return {
-            "status": "rejected",
-            "code": "discovery_plan_only",
-            "error": "run_horizon=plan_only records a plan and does not authorize repository search.",
-        }
-    if run_horizon in {"ai_ready_table", "pre_release", "full_release"}:
-        return {
-            "status": "rejected",
-            "code": "discovery_downstream_horizon_required",
-            "error": (
-                f"run_horizon={run_horizon} requires its downstream executor; "
-                "plain repository discovery will not be substituted silently."
-            ),
-        }
     return None
 
 
@@ -9753,6 +10226,7 @@ def _run_web_discovery(
     report: Callable[[str], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
     agent_event_callback: Callable[[AgentEvent], None] | None = None,
+    search_event_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     # Keep this at the execution boundary as well as every HTTP entry point so
     # legacy routes and internal callers cannot accidentally bypass grilling.
@@ -9860,8 +10334,13 @@ def _run_web_discovery(
         )
         if config_error or agent_llm_config is None:
             raise ValueError(config_error or "Invalid LLM configuration.")
-        discovery_id = safe_output_stem(
-            f"agents_{datetime.now(_APP_TZ).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        fixed_execution_id = _clean_text(body.get("_execution_discovery_id"))
+        discovery_id = (
+            safe_output_stem(fixed_execution_id)
+            if fixed_execution_id
+            else safe_output_stem(
+                f"agents_{datetime.now(_APP_TZ).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+            )
         )
         output_dir = _discovery_root_dir() / discovery_id
         normalized_task_type = task_type
@@ -9898,6 +10377,7 @@ def _run_web_discovery(
                 client=quality_client,
                 memory=prior_memory,
                 report=_report,
+                search_event=search_event_callback,
                 should_cancel=should_cancel,
             )
         try:
@@ -9921,6 +10401,52 @@ def _run_web_discovery(
                 stream_events=False,
                 should_cancel=should_cancel,
             )
+        except InterruptedError:
+            # A user stop means "stop searching and keep verified work", not
+            # "discard the final short file tranche".  The control-plane store
+            # is authoritative even when the agent call is interrupted before
+            # it can build a public terminal record.
+            try:
+                from agent.control_plane.discovery import DiscoveryToolService
+                from agent.control_plane.store import AgentRunStore
+
+                state_db = output_dir / "agent_control.sqlite"
+                cancel_store = AgentRunStore(
+                    state_db,
+                    event_listener=agent_event_callback,
+                )
+                cancelled_run = cancel_store.load_run(discovery_id)
+                manifest_path = (
+                    Path(cancelled_run.candidate_pool_manifest_path)
+                    if cancelled_run
+                    and cancelled_run.candidate_pool_manifest_path
+                    else None
+                )
+                if (
+                    cancelled_run is not None
+                    and manifest_path is not None
+                    and manifest_path.exists()
+                ):
+                    cancelled_manifest = DatasetManifest.model_validate_json(
+                        manifest_path.read_text(encoding="utf-8")
+                    )
+                    DiscoveryToolService(
+                        run_id=discovery_id,
+                        request=request,
+                        output_dir=output_dir,
+                        store=cancel_store,
+                        task_type=normalized_task_type,
+                    ).publish_verified_file_batches(
+                        manifest=cancelled_manifest,
+                        terminal=True,
+                    )
+                    _report("Stop requested: published the final verified file batch.")
+            except Exception as tail_exc:
+                _report(
+                    "Stop requested: final verified file batch could not be "
+                    f"published ({_redact_secrets(str(tail_exc))})."
+                )
+            raise
         finally:
             if quality_client is not None:
                 quality_client.close()
@@ -10764,6 +11290,123 @@ def _write_batch_manifest(batch: dict[str, Any]) -> None:
     _json_write(Path(batch["output_dir"]) / _BATCH_MANIFEST_FILE, manifest)
 
 
+
+def _infer_batch_stage_from_message(message: str) -> tuple[str, str]:
+    text = str(message or "")
+    lower = text.casefold()
+    if "下载完成" in text or ("download" in lower and "complete" in lower):
+        return "download", "下载完成"
+    if "download_progress" in lower or "正在下载" in text or "下载" in text or "download" in lower:
+        return "download", "下载数据"
+    if any(token in text for token in ("[1/5]", "解析", "resolve", "matching project", "Querying pride")):
+        return "resolve_project", "解析项目/文件"
+    if any(token in text for token in ("[2/5]", "[3/5]", "[4/5]", "SDRF", "属性", "metadata", "workflow", "FASTA", "搜库参数")):
+        return "infer_metadata", "推断元数据/参数"
+    if any(token in text for token in ("[5/5]", "执行计划", "execution plan")):
+        return "plan_ready", "计划已生成"
+    if any(token in lower for token in ("docker", "msdt", "convert", "转换", "proteowizard", "msconvert")):
+        return "convert", "格式转换"
+    if any(token in lower for token in ("fragpipe", "philosopher", "搜库", "execution", "running msdt")):
+        return "execute", "执行工作流"
+    if any(token in text for token in ("Excel", "audit", "打包", "zip", "export")):
+        return "export", "写结果/汇总"
+    if any(token in lower for token in ("error", "failed", "失败", "错误")):
+        return "failed", "失败"
+    return "running", "处理中"
+
+
+def _summarize_batch_error(error: str) -> str:
+    text = _clean_text(error)
+    if not text:
+        return ""
+    # Keep first sentence / clause for list row.
+    for sep in ("。", ". ", "\n", "; ", "；"):
+        if sep in text:
+            text = text.split(sep, 1)[0].strip()
+            break
+    return text[:180]
+
+
+def _enrich_batch_item_progress(item: dict[str, Any], *, ui_language: str) -> dict[str, Any]:
+    """Ensure each public item has progress + error_summary for the status bar."""
+    status = str(item.get("status") or "queued").strip().lower()
+    progress = dict(item.get("progress") or {}) if isinstance(item.get("progress"), dict) else {}
+    log_tail = [str(line) for line in (item.get("log_tail") or []) if str(line).strip()]
+    error = _localize_public_message(item.get("error", ""), ui_language, level="error")
+    existing_summary = item.get("error_summary")
+    if isinstance(existing_summary, dict):
+        error_summary = _summarize_batch_error(
+            str(existing_summary.get("public_message") or existing_summary.get("message") or error)
+        ) or error
+    elif existing_summary:
+        error_summary = _summarize_batch_error(str(existing_summary)) or str(existing_summary)
+    else:
+        error_summary = _summarize_batch_error(error)
+
+    if status == "queued" and not progress:
+        progress = {
+            "stage": "queued",
+            "stage_label": "排队",
+            "percent": None,
+            "message": "等待执行",
+            "updated_at": item.get("started_at") or item.get("updated_at") or "",
+        }
+    elif status == "completed":
+        progress = {
+            "stage": "completed",
+            "stage_label": "完成",
+            "percent": 100.0,
+            "message": progress.get("message") or "已完成",
+            "updated_at": item.get("finished_at") or progress.get("updated_at") or "",
+            **({"download": progress["download"]} if progress.get("download") else {}),
+        }
+    elif status in {"failed", "needs_review", "blocked"}:
+        stage = str(progress.get("stage") or "failed")
+        if stage in {"queued", "running", ""}:
+            stage = "failed" if status == "failed" else status
+        # Infer failed stage from logs when missing.
+        if not progress.get("stage") or progress.get("stage") in {"running", "queued"}:
+            for line in reversed(log_tail[-15:]):
+                inferred, label = _infer_batch_stage_from_message(line)
+                if inferred not in {"running", "queued", "failed"}:
+                    progress = {
+                        "stage": inferred,
+                        "stage_label": label,
+                        "percent": progress.get("percent"),
+                        "message": error_summary or line[:200],
+                        "updated_at": item.get("finished_at") or progress.get("updated_at") or "",
+                        "failed_stage": inferred,
+                    }
+                    break
+        progress.setdefault("stage", stage)
+        progress.setdefault("stage_label", "失败" if status == "failed" else "需复核")
+        progress["message"] = error_summary or progress.get("message") or error or "失败"
+        progress["failed_stage"] = progress.get("failed_stage") or progress.get("stage")
+    elif not progress and log_tail:
+        stage, label = _infer_batch_stage_from_message(log_tail[-1])
+        progress = {
+            "stage": stage,
+            "stage_label": label,
+            "percent": None,
+            "message": log_tail[-1][:300],
+            "updated_at": item.get("updated_at") or "",
+        }
+    elif not progress and status == "running":
+        progress = {
+            "stage": "running",
+            "stage_label": "处理中",
+            "percent": None,
+            "message": "运行中",
+            "updated_at": item.get("started_at") or "",
+        }
+
+    item["progress"] = progress
+    item["error_summary"] = error_summary
+    if progress.get("failed_stage"):
+        item["failed_stage"] = progress.get("failed_stage")
+    return item
+
+
 def _public_batch_record(batch: dict[str, Any]) -> dict[str, Any]:
     output_dir = Path(batch.get("output_dir", ""))
     excel_path = output_dir / _BATCH_EXCEL_FILE
@@ -10778,6 +11421,7 @@ def _public_batch_record(batch: dict[str, Any]) -> dict[str, Any]:
         ]
         audit_path = item_dir / "parameter_audit.json"
         item["audit_path"] = str(audit_path) if audit_path.exists() else ""
+        _enrich_batch_item_progress(item, ui_language=ui_language)
     events = []
     for event in list(batch.get("events") or [])[-500:]:
         public_event = dict(event)
@@ -10787,6 +11431,50 @@ def _public_batch_record(batch: dict[str, Any]) -> dict[str, Any]:
             level=str(public_event.get("level") or "info"),
         )
         events.append(public_event)
+    completed_items = sum(1 for item in items if item.get("status") == "completed")
+    failed_items = sum(1 for item in items if item.get("status") == "failed")
+    needs_review_items = sum(1 for item in items if item.get("status") in {"needs_review", "blocked"})
+    running_items = sum(1 for item in items if item.get("status") == "running")
+    queued_items = sum(1 for item in items if item.get("status") in {"queued", "pending", ""})
+    cleanup_requested = bool(batch.get("delete_source_files_after_success"))
+    cleanup_released_bytes = sum(
+        int((item.get("source_cleanup") or {}).get("released_bytes") or 0)
+        for item in items
+    )
+    cleanup_completed_items = sum(
+        1
+        for item in items
+        if str((item.get("source_cleanup") or {}).get("status") or "")
+        in {"completed", "partial"}
+    )
+    cleanup_failed_items = sum(
+        1
+        for item in items
+        if str((item.get("source_cleanup") or {}).get("status") or "") == "failed"
+    )
+    terminal_items = completed_items + failed_items + needs_review_items
+    total_items = len(items) or 1
+    focus = next((item for item in items if item.get("status") == "running"), None)
+    if focus is None:
+        focus = next((item for item in items if item.get("status") == "failed"), None)
+    summary = {
+        "queued": queued_items,
+        "running": running_items,
+        "completed": completed_items,
+        "failed": failed_items,
+        "needs_review": needs_review_items,
+        "source_cleanup_requested": cleanup_requested,
+        "source_cleanup_completed": cleanup_completed_items,
+        "source_cleanup_failed": cleanup_failed_items,
+        "source_cleanup_released_bytes": cleanup_released_bytes,
+        "percent": round(100.0 * terminal_items / total_items, 1),
+        "focus_item_index": focus.get("index") if isinstance(focus, dict) else None,
+        "focus_message": (
+            str((focus.get("progress") or {}).get("message") or focus.get("error_summary") or focus.get("input") or "")
+            if isinstance(focus, dict)
+            else ""
+        ),
+    }
     return {
         "batch_id": batch.get("batch_id", ""),
         "status": batch.get("status", "unknown"),
@@ -10796,15 +11484,28 @@ def _public_batch_record(batch: dict[str, Any]) -> dict[str, Any]:
         "finished_at": batch.get("finished_at"),
         "updated_at": batch.get("updated_at") or batch.get("finished_at") or batch.get("started_at") or batch.get("created_at"),
         "item_count": len(items),
-        "completed_items": sum(1 for item in items if item.get("status") == "completed"),
-        "failed_items": sum(1 for item in items if item.get("status") == "failed"),
-        "needs_review_items": sum(1 for item in items if item.get("status") in {"needs_review", "blocked"}),
+        "completed_items": completed_items,
+        "failed_items": failed_items,
+        "needs_review_items": needs_review_items,
+        "running_items": running_items,
+        "queued_items": queued_items,
+        "completed_count": completed_items,
+        "failed_count": failed_items,
+        "running_count": running_items,
+        "queued_count": queued_items,
+        "needs_review_count": needs_review_items,
+        "progress_percent": summary["percent"],
+        "summary": summary,
         "jobs": batch.get("jobs", 1),
         "ui_language": ui_language,
         "repository": _clean_repository(batch.get("repository")),
         "run_mode": _clean_batch_run_mode(batch.get("run_mode")),
         "resource_policy": _clean_resource_policy(batch.get("resource_policy")),
         "fasta_preference": "project" if batch.get("prefer_project_fasta") else "llm",
+        "delete_source_files_after_success": cleanup_requested,
+        "source_discovery_job_id": batch.get("source_discovery_job_id"),
+        "source_discovery_id": batch.get("source_discovery_id"),
+        "source_batch_index": batch.get("source_batch_index"),
         "output_dir": str(output_dir),
         "excel_path": str(excel_path),
         "can_download": batch.get("status") == "completed" and excel_path.exists(),
@@ -12327,8 +13028,8 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
             "source": "remote",
             "agentic": _pool_build_explicit_bool(original.get("agentic")),
             "_require_explicit_llm_config": True,
-            "max_projects": _bounded_int(original.get("max_projects"), default=preset["max_projects"], minimum=1, maximum=300),
-            "max_candidate_projects": _bounded_int(original.get("max_candidate_projects"), default=preset["max_candidate_projects"], minimum=1, maximum=1000),
+            "max_projects": _bounded_int(original.get("max_projects"), default=preset["max_projects"], minimum=1, maximum=5000),
+            "max_candidate_projects": _bounded_int(original.get("max_candidate_projects"), default=preset["max_candidate_projects"], minimum=1, maximum=20000),
             "max_files": _bounded_int(original.get("max_files"), default=preset["max_files"], minimum=1, maximum=10000),
             "max_files_per_project": _bounded_int(original.get("max_files_per_project"), default=preset["max_files_per_project"], minimum=1, maximum=200),
             "hard_constraint_fields": list(
@@ -12392,6 +13093,16 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
             request.get("portfolio_size_preference") or "maximize_qualified_projects"
         )
         request["harvest_all_qualified"] = True
+        request["continuous_discovery"] = True
+        # Incremental delivery for "越多越好": emit every N verified usable files.
+        request["partial_delivery_batch_size"] = max(
+            1,
+            min(5000, int(request.get("partial_delivery_batch_size") or 500)),
+        )
+        request["inspection_batch_size"] = max(
+            1,
+            min(100, int(request.get("inspection_batch_size") or 30)),
+        )
         scale_mode = "exhaustive"
         request["scale_mode"] = "exhaustive"
         preset = _POOL_BUILD_SCALE_PRESETS["exhaustive"]
@@ -12403,7 +13114,7 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
         request["max_candidate_projects"] = max(
             int(request.get("max_candidate_projects") or 0),
             int(preset["max_candidate_projects"]),
-            5000,
+            5000,  # Compatibility hint only; continuous discovery does not truncate here.
         )
         request["max_files"] = max(
             int(request.get("max_files") or 0),
@@ -13856,6 +14567,253 @@ async def list_public_results():
     }
 
 
+def _find_discovery_job_for_history_id(identifier: str) -> dict[str, Any] | None:
+    direct = _load_discovery_job(identifier)
+    if direct:
+        return direct
+    jobs_dir = _discovery_jobs_dir()
+    if not jobs_dir.exists():
+        return None
+    for path in jobs_dir.glob("*.json"):
+        job = _read_json_if_exists(path)
+        if not job:
+            continue
+        body = job.get("body") if isinstance(job.get("body"), Mapping) else {}
+        record = job.get("record") if isinstance(job.get("record"), Mapping) else {}
+        aliases = {
+            _clean_text(job.get("job_id")),
+            _clean_text(body.get("_execution_discovery_id")),
+            _clean_text(record.get("discovery_id")),
+            _clean_text(record.get("run_id")),
+        }
+        if identifier in aliases:
+            return job
+    return None
+
+
+def _history_delete_targets(
+    kind: str,
+    identifier: str,
+    *,
+    include_linked_batches: bool,
+) -> list[dict[str, Any]]:
+    kind = _clean_text(kind).lower()
+    identifier = _clean_text(identifier)
+    if kind not in {"discovery", "batch"} or not identifier:
+        raise ValueError("Unsupported history item.")
+    targets: list[dict[str, Any]] = []
+    if kind == "batch":
+        batch = _load_batch_from_disk(identifier)
+        with _batches_lock:
+            batch = _batches.get(identifier) or batch
+        archived = _find_history_record(identifier) or {}
+        if not batch and not archived:
+            raise ValueError("Batch not found.")
+        batch_dir = managed_child(_batch_root_dir(), identifier)
+        targets.append(
+            {
+                "kind": "batch",
+                "id": identifier,
+                "status": str((batch or {}).get("status") or archived.get("status") or "completed"),
+                "path": str(batch_dir),
+                "size_bytes": path_size_bytes(batch_dir),
+                "result_available": batch_dir.exists(),
+            }
+        )
+        return targets
+
+    job = _find_discovery_job_for_history_id(identifier)
+    body = job.get("body") if isinstance(job, Mapping) and isinstance(job.get("body"), Mapping) else {}
+    record = job.get("record") if isinstance(job, Mapping) and isinstance(job.get("record"), Mapping) else {}
+    discovery_id = _clean_text(
+        record.get("discovery_id")
+        or body.get("_execution_discovery_id")
+        or identifier
+    )
+    output_dir = _safe_discovery_dir(discovery_id)
+    if output_dir is None:
+        raise ValueError("Discovery run not found.")
+    archived = _find_history_record(identifier) or {}
+    targets.append(
+        {
+            "kind": "discovery",
+            "id": discovery_id,
+            "job_id": _clean_text(job.get("job_id")) if isinstance(job, Mapping) else "",
+            "status": str((job or {}).get("status") or archived.get("status") or "completed"),
+            "path": str(output_dir),
+            "size_bytes": path_size_bytes(output_dir),
+            "result_available": output_dir.exists(),
+        }
+    )
+    if include_linked_batches:
+        job_id = _clean_text((job or {}).get("job_id"))
+        for history in _list_parameter_batch_history_records(
+            use_cache=False,
+            include_file_stats=True,
+        ):
+            if not (
+                _clean_text(history.get("source_discovery_job_id")) == job_id
+                or _clean_text(history.get("source_discovery_id")) == discovery_id
+            ):
+                continue
+            batch_id = _clean_text(history.get("batch_id") or history.get("result_id"))
+            if not batch_id:
+                continue
+            targets.append(
+                {
+                    "kind": "batch",
+                    "id": batch_id,
+                    "status": str(history.get("status") or "unknown"),
+                    "path": str(managed_child(_batch_root_dir(), batch_id)),
+                    "size_bytes": int(history.get("size_bytes") or 0),
+                }
+            )
+    return targets
+
+
+def _history_delete_preview(
+    kind: str,
+    identifier: str,
+    *,
+    include_linked_batches: bool,
+) -> dict[str, Any]:
+    targets = _history_delete_targets(
+        kind,
+        identifier,
+        include_linked_batches=include_linked_batches,
+    )
+    active = [target for target in targets if target["status"] in _ACTIVE_STATUSES]
+    confirmation_id = secrets.token_urlsafe(24)
+    payload = {
+        "kind": kind,
+        "id": identifier,
+        "include_linked_batches": include_linked_batches,
+        "targets": targets,
+        "estimated_bytes": sum(int(target["size_bytes"]) for target in targets),
+        "deletable": not active,
+        "block_reason": "请先停止所有运行中的关联任务。" if active else "",
+        "confirmation_id": confirmation_id,
+    }
+    with _history_delete_confirmations_lock:
+        now = time.time()
+        for key, value in list(_history_delete_confirmations.items()):
+            if float(value.get("expires_at") or 0) <= now:
+                _history_delete_confirmations.pop(key, None)
+        _history_delete_confirmations[confirmation_id] = {
+            **payload,
+            "expires_at": now + 300,
+        }
+    return payload
+
+
+def _remove_history_index_targets(deleted: list[dict[str, Any]]) -> None:
+    aliases: set[str] = set()
+    for target in deleted:
+        identifier = str(target.get("id") or "")
+        aliases.update(
+            {
+                identifier,
+                f"discovery-{identifier}",
+                f"batch-{identifier}",
+                str(target.get("job_id") or ""),
+            }
+        )
+    aliases.discard("")
+    kept = []
+    for record in _read_history_index():
+        item = with_history_identity(record)
+        values = {
+            str(item.get(field) or "")
+            for field in (
+                "history_id",
+                "run_id",
+                "result_id",
+                "name",
+                "task_id",
+                "discovery_id",
+                "batch_id",
+                "job_id",
+            )
+        }
+        values.add(Path(str(item.get("output_dir") or "")).name)
+        if values & aliases:
+            continue
+        kept.append(item)
+    _write_history_index(kept)
+
+
+def _execute_history_delete(
+    kind: str,
+    identifier: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    confirmation_id = _clean_text(body.get("confirmation_id"))
+    include_linked_batches = body.get("include_linked_batches") is True
+    with _history_delete_confirmations_lock:
+        confirmation = _history_delete_confirmations.pop(confirmation_id, None)
+    if (
+        not confirmation
+        or float(confirmation.get("expires_at") or 0) <= time.time()
+        or confirmation.get("kind") != kind
+        or confirmation.get("id") != identifier
+        or bool(confirmation.get("include_linked_batches")) != include_linked_batches
+    ):
+        raise ValueError("删除确认已失效，请重新预览删除范围。")
+    targets = _history_delete_targets(
+        kind,
+        identifier,
+        include_linked_batches=include_linked_batches,
+    )
+    preview_scope = {
+        (str(target.get("kind") or ""), str(target.get("id") or ""))
+        for target in confirmation.get("targets") or []
+        if isinstance(target, Mapping)
+    }
+    current_scope = {
+        (str(target.get("kind") or ""), str(target.get("id") or ""))
+        for target in targets
+    }
+    if current_scope != preview_scope:
+        raise ValueError(
+            "The deletion scope changed after preview. Preview the deletion again."
+        )
+    if any(target["status"] in _ACTIVE_STATUSES for target in targets):
+        raise ValueError("运行中的任务不能删除，请先停止任务。")
+    deleted: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for target in targets:
+        try:
+            if target["kind"] == "batch":
+                receipt = delete_managed_tree(_batch_root_dir(), target["id"])
+                with _batches_lock:
+                    _batches.pop(target["id"], None)
+            else:
+                receipt = delete_managed_tree(_discovery_root_dir(), target["id"])
+                job_id = _clean_text(target.get("job_id"))
+                if job_id:
+                    with _discovery_jobs_lock:
+                        _discovery_jobs.pop(job_id, None)
+                    job_path = _discovery_job_path(job_id)
+                    if job_path.exists():
+                        job_path.unlink()
+            deleted.append({**target, **receipt})
+        except Exception as exc:
+            failed.append({**target, "error": _redact_secrets(str(exc))})
+    _remove_history_index_targets(deleted)
+    with _batch_history_cache_lock:
+        _batch_history_cache["ts"] = 0.0
+        _batch_history_cache["records"] = []
+    return {
+        "status": "completed" if not failed else "partial",
+        "deleted": deleted,
+        "failed": failed,
+        "estimated_bytes": int(confirmation.get("estimated_bytes") or 0),
+        "released_bytes": sum(
+            int(target.get("released_bytes") or 0) for target in deleted
+        ),
+    }
+
+
 @app.get("/api/history")
 async def list_project_history(fast: bool = True, refresh: bool = False):
     if fast and not refresh:
@@ -13968,6 +14926,34 @@ async def list_project_history(fast: bool = True, refresh: bool = False):
         "results": results,
         "history_mode": "full",
     }
+
+
+@app.get("/api/history/{kind}/{identifier}/delete-preview")
+async def preview_history_delete(
+    kind: str,
+    identifier: str,
+    include_linked_batches: bool = False,
+):
+    try:
+        return _history_delete_preview(
+            kind,
+            identifier,
+            include_linked_batches=include_linked_batches,
+        )
+    except Exception as exc:
+        return {"error": _redact_secrets(str(exc))}
+
+
+@app.delete("/api/history/{kind}/{identifier}")
+async def delete_history_item(
+    kind: str,
+    identifier: str,
+    body: dict[str, Any],
+):
+    try:
+        return _execute_history_delete(kind, identifier, body)
+    except Exception as exc:
+        return {"error": _redact_secrets(str(exc))}
 
 
 @app.get("/api/results/{result_id}/download")
@@ -14904,10 +15890,103 @@ def _slim_discovery_record(record: Any) -> Any:
     return slim
 
 
+def _rebuild_discovery_result_batches(job: Mapping[str, Any]) -> list[dict[str, Any]]:
+    body = job.get("body") if isinstance(job.get("body"), Mapping) else {}
+    record = job.get("record") if isinstance(job.get("record"), Mapping) else {}
+    discovery_id = _clean_text(
+        record.get("discovery_id")
+        or body.get("_execution_discovery_id")
+        or record.get("run_id")
+    )
+    run_dir = _safe_discovery_dir(discovery_id)
+    if run_dir is None:
+        return []
+    batches_root = run_dir / "verified_batches"
+    if not batches_root.is_dir():
+        return []
+    rebuilt: list[dict[str, Any]] = []
+    cumulative_projects: set[str] = set()
+    cumulative_files = 0
+    for batch_dir in sorted(batches_root.glob("batch_[0-9][0-9][0-9]")):
+        manifest_path = batch_dir / "dataset_manifest.json"
+        if not manifest_path.is_file() or not _path_within(
+            manifest_path.resolve(),
+            _discovery_root_dir().resolve(),
+        ):
+            continue
+        try:
+            manifest = load_dataset_manifest(manifest_path)
+            batch_index = int(batch_dir.name.rsplit("_", 1)[-1])
+        except Exception:
+            continue
+        project_accessions = sorted(
+            {
+                _clean_text(project.project_accession).upper()
+                for project in manifest.projects
+                if _clean_text(project.project_accession)
+            }
+        )
+        file_identifiers = []
+        for file in manifest.files:
+            native = _clean_text(file.file_accession_or_path or file.file_name)
+            accession = _clean_text(file.project_accession).upper()
+            repository = _clean_repository(file.repository or "pride")
+            if native:
+                file_identifiers.append(
+                    f"{repository.casefold()}:{accession}:{native}"
+                )
+        cumulative_projects.update(project_accessions)
+        cumulative_files += len(manifest.files)
+        summary = manifest.summary if isinstance(manifest.summary, Mapping) else {}
+        batch_size = int(
+            getattr(manifest.request, "partial_delivery_batch_size", 0)
+            or summary.get("batch_size")
+            or 500
+        )
+        rebuilt.append(
+            {
+                "batch_index": batch_index,
+                "batch_size": batch_size,
+                "project_count": len(project_accessions),
+                "file_count": len(manifest.files),
+                "cumulative_verified_project_count": len(cumulative_projects),
+                "cumulative_verified_file_count": cumulative_files,
+                "project_accessions": project_accessions,
+                "file_identifiers": file_identifiers,
+                "delivery_unit": "file",
+                "manifest_path": str(manifest_path),
+                "terminal": bool(summary.get("terminal")),
+                "status": "ready",
+                "published_at": datetime.fromtimestamp(
+                    manifest_path.stat().st_mtime,
+                    tz=_APP_TZ,
+                ).isoformat(),
+                "message": (
+                    f"Verified file batch {batch_index} is ready: "
+                    f"{len(manifest.files)} files from "
+                    f"{len(project_accessions)} projects."
+                ),
+            }
+        )
+    return rebuilt
+
+
+def _discovery_result_batches(job: Mapping[str, Any]) -> list[dict[str, Any]]:
+    persisted = [
+        dict(item)
+        for item in job.get("result_batches") or []
+        if isinstance(item, Mapping)
+    ]
+    return persisted or _rebuild_discovery_result_batches(job)
+
+
 def _discovery_job_public(job: dict[str, Any], *, detail: bool = False) -> dict[str, Any]:
     record = job.get("record")
     if record is not None and not detail:
         record = _slim_discovery_record(record)
+    if isinstance(record, dict):
+        record = dict(record)
+        record.pop("published_verified_project_batches", None)
     body = job.get("body") if isinstance(job.get("body"), dict) else {}
     output_language = _normalise_pool_build_language(job.get("output_language") or body.get("output_language"))
     logs = []
@@ -14917,6 +15996,22 @@ def _discovery_job_public(job: dict[str, Any], *, detail: bool = False) -> dict[
         entry = dict(raw)
         entry["message"] = _localize_discovery_message(entry.get("message"), output_language)
         logs.append(entry)
+    result_batches = []
+    for raw in _discovery_result_batches(job):
+        if not isinstance(raw, dict):
+            continue
+        batch = {
+            key: value
+            for key, value in raw.items()
+            if key not in {"manifest_path", "files"}
+        }
+        batch_index = int(batch.get("batch_index") or 0)
+        if batch_index > 0:
+            batch["download_url"] = (
+                f"/api/discovery/jobs/{job.get('job_id')}/batches/"
+                f"{batch_index}/download"
+            )
+        result_batches.append(batch)
     return {
         "job_id": job.get("job_id"),
         "idempotency_key": job.get("idempotency_key"),
@@ -14925,8 +16020,10 @@ def _discovery_job_public(job: dict[str, Any], *, detail: bool = False) -> dict[
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
         "cancel_requested": bool(job.get("cancel_requested")),
+        "resumable": bool(job.get("resumable")),
         "output_language": output_language,
         "logs": logs,
+        "result_batches": result_batches,
         "record": record,
         "error": _localize_discovery_message(job.get("error"), output_language) if job.get("error") else None,
         "detail": "full" if detail else "summary",
@@ -15036,17 +16133,52 @@ def _discovery_job_persist_payload(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _persist_discovery_job(job: dict[str, Any]) -> None:
+def _write_json_atomic(path: Path, payload: Any) -> None:
+    """Atomic JSON write used for discovery job durability (WP-D3)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.tmp")
+    data = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    with temp_path.open("w", encoding="utf-8") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
     try:
-        # Persist raw (English) job state so restart recovery keeps real error text.
-        write_json(
-            _discovery_job_path(str(job.get("job_id") or "")),
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+def _persist_discovery_job(job: dict[str, Any], *, required: bool = False) -> None:
+    """Persist discovery job. Disk is authoritative (WP-D3).
+
+    When ``required`` is True (status transitions / terminal states), failure raises
+    and must not leave memory as a success authority without durable state.
+    Log-only appends keep best-effort behavior so UI streaming is not blocked.
+    """
+    job_id = str(job.get("job_id") or "")
+    try:
+        _write_json_atomic(
+            _discovery_job_path(job_id),
             _discovery_job_persist_payload(job),
         )
         # Also keep a line-oriented log for forensic debugging of long runs.
-        _write_discovery_job_log_file(job)
-    except Exception:
-        # Job status persistence is best-effort; the in-memory job remains authoritative.
+        try:
+            _write_discovery_job_log_file(job)
+        except Exception:
+            # Side-channel log file is non-authoritative.
+            pass
+    except Exception as exc:
+        if required:
+            raise RuntimeError(f"discovery_job_persist_failed:{job_id}:{exc}") from exc
+        # Non-required (e.g. high-frequency log append) stays best-effort.
         return
 
 
@@ -15292,14 +16424,22 @@ def _find_discovery_job_by_idempotency_key(key: str) -> dict[str, Any] | None:
 
 
 def _mark_interrupted_discovery_job(job: dict[str, Any]) -> dict[str, Any]:
+    """On process restart, mark in-flight jobs interrupted/resumable (WP-D3).
+
+    Disk remains the authority; we do not invent a success state in memory.
+    """
     if job.get("status") not in {"queued", "running"}:
         return job
     logs = job.setdefault("logs", [])
-    message = "Discovery job was interrupted by a server reload. Please start it again."
+    message = (
+        "Discovery job was interrupted by a server reload and is marked interrupted/resumable. "
+        "Re-submit or resume explicitly; memory is not authoritative."
+    )
     if not any(item.get("message") == message for item in logs if isinstance(item, dict)):
-        logs.append({"ts": _now_app_iso(), "level": "error", "message": message})
-    job["status"] = "failed"
+        logs.append({"ts": _now_app_iso(), "level": "warning", "message": message})
+    job["status"] = "interrupted"
     job["error"] = "discovery_job_interrupted_by_server_reload"
+    job["resumable"] = True
     job["finished_at"] = job.get("finished_at") or _now_app_iso()
     return job
 
@@ -15450,6 +16590,9 @@ def _append_discovery_job_event(job_id: str, event: AgentEvent) -> None:
         event_metrics = event.payload
     elif event.event_type == "candidate_inspection_completed":
         event_metrics = (event.payload.get("observation") or {}).get("metrics") or {}
+    public_event_payload = dict(event.payload)
+    if event.event_type == "verified_project_batch_published":
+        public_event_payload.pop("manifest_path", None)
     entry = {
         "source_sequence": event.sequence,
         "ts": event.created_at,
@@ -15460,7 +16603,55 @@ def _append_discovery_job_event(job_id: str, event: AgentEvent) -> None:
         "reasoning_summary": _redact_secrets(str(event.payload.get("reasoning_summary") or "")),
         "evidence_refs": _sanitize_log_payload(event.payload.get("evidence_refs") or []),
         "metrics": _sanitize_log_payload(event_metrics),
-        "payload": _sanitize_log_payload(event.payload),
+        "payload": _sanitize_log_payload(public_event_payload),
+    }
+    with _discovery_jobs_lock:
+        job = _discovery_jobs.get(job_id)
+        if not job:
+            return
+        if event.event_type == "verified_project_batch_published":
+            batches = job.setdefault("result_batches", [])
+            batch_index = int(event.payload.get("batch_index") or 0)
+            if batch_index > 0 and not any(
+                int(item.get("batch_index") or 0) == batch_index
+                for item in batches
+                if isinstance(item, dict)
+            ):
+                batches.append(
+                    _json_safe(
+                        {
+                            **dict(event.payload),
+                            "status": "ready",
+                            "published_at": event.created_at,
+                        }
+                    )
+                )
+        logs = job.setdefault("logs", [])
+        entry["sequence"] = max(
+            (int(item.get("sequence") or 0) for item in logs if isinstance(item, dict)),
+            default=0,
+        ) + 1
+        logs.append(entry)
+        if len(logs) > _MAX_PERSISTED_LOGS:
+            del logs[: len(logs) - _MAX_PERSISTED_LOGS]
+        _persist_discovery_job(job)
+
+
+def _append_discovery_search_event(
+    job_id: str,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    entry = {
+        "ts": _now_app_iso(),
+        "level": "error" if event_type.endswith("_failed") else "info",
+        "actor": "Repository Search",
+        "type": event_type,
+        "message": "",
+        "reasoning_summary": "",
+        "evidence_refs": [],
+        "metrics": {},
+        "payload": _sanitize_log_payload(payload),
     }
     with _discovery_jobs_lock:
         job = _discovery_jobs.get(job_id)
@@ -15489,11 +16680,12 @@ def _run_discovery_job(job_id: str) -> None:
         if not job:
             return
         job["status"] = "running"
+        job["resumable"] = False
         job["started_at"] = _now_app_iso()
         body = dict(job.get("body") or {})
         # Keep the request credential only in this worker's local copy.
         job["body"].pop("llm_config", None)
-        _persist_discovery_job(job)
+        _persist_discovery_job(job, required=True)
     _append_discovery_job_log(job_id, "info", "Discovery job started.")
 
     def report(message: str) -> None:
@@ -15510,6 +16702,11 @@ def _run_discovery_job(job_id: str) -> None:
             report=report,
             should_cancel=should_cancel,
             agent_event_callback=lambda event: _append_discovery_job_event(job_id, event),
+            search_event_callback=lambda event_type, payload: _append_discovery_search_event(
+                job_id,
+                event_type,
+                payload,
+            ),
         )
         cancelled = should_cancel()
         record_status = _clean_text((record or {}).get("status")).lower() if isinstance(record, dict) else ""
@@ -15534,7 +16731,18 @@ def _run_discovery_job(job_id: str) -> None:
                     or "Discovery failed."
                 )
             job["finished_at"] = _now_app_iso()
-            _persist_discovery_job(job)
+            job["resumable"] = terminal_status == "failed"
+            try:
+                _persist_discovery_job(job, required=True)
+            except Exception as persist_exc:
+                # Durability failure: do not advertise terminal success from memory only.
+                job["status"] = "durability_failed"
+                job["error"] = f"discovery_job_persist_failed:{persist_exc}"
+                try:
+                    _persist_discovery_job(job, required=False)
+                except Exception:
+                    pass
+                raise
         finish_message = {
             "completed": "Discovery job completed.",
             "failed": "Discovery job failed with retained audits.",
@@ -15595,6 +16803,7 @@ def _run_discovery_job(job_id: str) -> None:
             job = _discovery_jobs.get(job_id)
             if job:
                 job["status"] = "failed"
+                job["resumable"] = True
                 job["error"] = _redact_secrets(str(exc))
                 job["finished_at"] = _now_app_iso()
                 _persist_discovery_job(job)
@@ -15621,6 +16830,10 @@ async def start_discovery_job(body: dict[str, Any], background_tasks: Background
         if existing is not None:
             return _discovery_job_public(existing)
         job_id = safe_output_stem(f"discovery_job_{datetime.now(_APP_TZ).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}")
+        persisted_body = dict(body or {})
+        persisted_body["_execution_discovery_id"] = safe_output_stem(
+            f"agents_job_{job_id}"
+        )
         job = {
             "job_id": job_id,
             "idempotency_key": request_key or None,
@@ -15631,12 +16844,13 @@ async def start_discovery_job(body: dict[str, Any], background_tasks: Background
             "cancel_requested": False,
             "output_language": _normalise_pool_build_language(body.get("output_language")),
             "logs": [{"ts": _now_app_iso(), "level": "info", "message": "Discovery job queued."}],
-            "body": dict(body or {}),
+            "result_batches": [],
+            "body": persisted_body,
             "record": None,
             "error": None,
         }
         _discovery_jobs[job_id] = job
-        _persist_discovery_job(job)
+        _persist_discovery_job(job, required=True)
     if background_tasks is None:
         _start_discovery_job_thread(job_id)
     else:
@@ -15678,6 +16892,151 @@ async def cancel_discovery_job(job_id: str):
     _append_discovery_job_log(job_id, "warning", "Cancel requested. The current network call may finish before the job stops.")
     with _discovery_jobs_lock:
         return _discovery_job_public(_discovery_jobs[job_id])
+
+
+@app.post("/api/discovery/jobs/{job_id}/resume")
+async def resume_discovery_job(job_id: str):
+    with _discovery_jobs_lock:
+        job = _discovery_jobs.get(job_id)
+        if not job:
+            job = _load_discovery_job(job_id)
+            if not job:
+                return {"error": "Discovery job not found."}
+            job = _mark_interrupted_discovery_job(job)
+            _discovery_jobs[job_id] = job
+        if job.get("status") not in {"interrupted", "failed", "durability_failed"}:
+            return _discovery_job_public(job)
+        body = job.get("body") if isinstance(job.get("body"), dict) else {}
+        body.setdefault(
+            "_execution_discovery_id",
+            safe_output_stem(f"agents_job_{job_id}"),
+        )
+        job["body"] = body
+        job["status"] = "queued"
+        job["cancel_requested"] = False
+        job["resumable"] = False
+        job["error"] = None
+        job["finished_at"] = None
+        job["record"] = None
+        _persist_discovery_job(job, required=True)
+    _append_discovery_job_log(
+        job_id,
+        "info",
+        "Discovery job resume requested; persisted search cursors will be reused.",
+    )
+    _start_discovery_job_thread(job_id)
+    with _discovery_jobs_lock:
+        return _discovery_job_public(_discovery_jobs[job_id])
+
+
+@app.get("/api/discovery/jobs/{job_id}/batches/{batch_index}/download")
+async def download_discovery_verified_batch(job_id: str, batch_index: int):
+    with _discovery_jobs_lock:
+        job = _discovery_jobs.get(job_id) or _load_discovery_job(job_id)
+    if not job:
+        return {"error": "Discovery job not found."}
+    batch = next(
+        (
+            item
+            for item in _discovery_result_batches(job)
+            if isinstance(item, dict)
+            and int(item.get("batch_index") or 0) == batch_index
+        ),
+        None,
+    )
+    if batch is None:
+        return {"error": "Verified project batch not found."}
+    path = Path(str(batch.get("manifest_path") or "")).resolve()
+    if not path.is_file() or not _path_within(path, _runs_dir.resolve()):
+        return {"error": "Verified project batch artifact is unavailable."}
+    return FileResponse(
+        path=str(path),
+        filename=f"{job_id}_verified_batch_{batch_index:03d}.json",
+        media_type="application/json",
+    )
+
+
+def _discovery_batch_handoff(job: Mapping[str, Any], batch_index: int) -> dict[str, Any]:
+    batch = next(
+        (
+            item
+            for item in _discovery_result_batches(job)
+            if isinstance(item, dict) and int(item.get("batch_index") or 0) == batch_index
+        ),
+        None,
+    )
+    if batch is None:
+        raise ValueError("Verified file batch not found.")
+    path = Path(str(batch.get("manifest_path") or "")).resolve()
+    if not path.is_file() or not _path_within(path, _discovery_root_dir().resolve()):
+        raise ValueError("Verified file batch artifact is unavailable.")
+    manifest = load_dataset_manifest(path)
+    expected_count = int(batch.get("file_count") or 0)
+    batch_size = int(batch.get("batch_size") or 500)
+    if expected_count <= 0 or expected_count > batch_size or len(manifest.files) != expected_count:
+        raise ValueError("Verified file batch count does not match its frozen manifest.")
+    job_id = _clean_text(job.get("job_id"))
+    body = job.get("body") if isinstance(job.get("body"), Mapping) else {}
+    record = job.get("record") if isinstance(job.get("record"), Mapping) else {}
+    discovery_id = _clean_text(
+        record.get("discovery_id")
+        or body.get("_execution_discovery_id")
+        or manifest.run_id
+    )
+    inputs: list[str] = []
+    input_records: list[dict[str, Any]] = []
+    identifiers: set[str] = set()
+    for file in manifest.files:
+        native = _clean_text(file.file_accession_or_path or file.file_name)
+        accession = _clean_text(file.project_accession).upper()
+        repository = _clean_repository(file.repository or "pride")
+        identifier = f"{repository.casefold()}:{accession}:{native}"
+        if not native or identifier in identifiers:
+            raise ValueError("Verified file batch contains a missing or duplicate file identifier.")
+        identifiers.add(identifier)
+        input_value = _clean_text(file.download_url) or (
+            f"{accession}/{native}" if accession else native
+        )
+        inputs.append(input_value)
+        input_records.append(
+            {
+                "input": input_value,
+                "repository": repository,
+                "project_accession": accession,
+                "project_title": _clean_text(file.project_title),
+                "file_name": _clean_text(file.file_name) or native,
+                "download_url": _clean_text(file.download_url),
+                "file_type": _clean_text(file.file_type),
+                "file_role": _clean_text(file.file_role),
+                "acquisition_mode": _clean_text(file.acquisition_mode),
+                "source_discovery_job_id": job_id,
+                "source_discovery_id": discovery_id,
+                "source_batch_index": batch_index,
+                "source_file_identifier": identifier,
+            }
+        )
+    return {
+        "job_id": job_id,
+        "discovery_id": discovery_id,
+        "batch_index": batch_index,
+        "file_count": len(inputs),
+        "project_count": len({record["project_accession"] for record in input_records}),
+        "terminal": bool(batch.get("terminal")),
+        "inputs": inputs,
+        "input_records": input_records,
+    }
+
+
+@app.get("/api/discovery/jobs/{job_id}/batches/{batch_index}/handoff")
+async def handoff_discovery_verified_batch(job_id: str, batch_index: int):
+    with _discovery_jobs_lock:
+        job = _discovery_jobs.get(job_id) or _load_discovery_job(job_id)
+    if not job:
+        return {"error": "Discovery job not found."}
+    try:
+        return _discovery_batch_handoff(job, batch_index)
+    except Exception as exc:
+        return {"error": _redact_secrets(str(exc))}
 
 
 @app.post("/api/discovery")
@@ -15938,24 +17297,151 @@ async def download_ai_ready_build_file(build_id: str, file: str = "build_report_
 
 
 class BatchFileReporter:
-    def __init__(self, output_dir: Path, ui_language: str = "en") -> None:
+    def __init__(
+        self,
+        output_dir: Path,
+        ui_language: str = "en",
+        *,
+        batch_id: str | None = None,
+        item_index: int | None = None,
+    ) -> None:
         self.path = output_dir / "logs" / "runtime.log"
         self.ui_language = _clean_ui_language(ui_language)
+        self.batch_id = str(batch_id or "").strip() or None
+        self.item_index = item_index if isinstance(item_index, int) else None
         self._lock = threading.Lock()
+        self._progress_last_emit: dict[str, float] = {}
 
     def __call__(self, message: Any) -> None:
+        line_for_log: str
         if isinstance(message, dict):
-            text = json.dumps(message, ensure_ascii=False, default=str)
+            kind = str(message.get("kind") or "")
+            if kind == "download_progress":
+                label = _clean_text(message.get("label")) or "download"
+                complete = bool(message.get("complete"))
+                now = monotonic()
+                last_emit = self._progress_last_emit.get(label)
+                if not complete and last_emit is not None and now - last_emit < 0.5:
+                    # Still update structured progress more often than log spam.
+                    self._publish_download_progress(message, complete=complete)
+                    return
+                self._progress_last_emit[label] = now
+                line_for_log = render_download_progress(message, width=16)
+                if complete:
+                    line_for_log = f"下载完成 {line_for_log}"
+                self._publish_download_progress(message, complete=complete)
+            elif kind == "activity_start":
+                label = _clean_text(message.get("label")) or "处理中..."
+                line_for_log = label
+                self._publish_stage_message(label)
+            elif kind == "activity_stop":
+                line_for_log = _clean_text(message.get("message")) or "步骤完成"
+                if line_for_log:
+                    self._publish_stage_message(line_for_log)
+            else:
+                line_for_log = json.dumps(message, ensure_ascii=False, default=str)
+                self._publish_stage_message(line_for_log)
         else:
-            text = _redact_secrets(message)
-        text = _localize_public_message(text, self.ui_language, level="info")
+            line_for_log = _redact_secrets(message)
+            self._publish_stage_message(str(line_for_log))
+
+        text = _localize_public_message(line_for_log, self.ui_language, level="info")
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(text + "\n")
 
+    def _publish_download_progress(self, message: dict[str, Any], *, complete: bool) -> None:
+        if self.batch_id is None or self.item_index is None:
+            return
+        try:
+            downloaded = int(message.get("downloaded") or message.get("downloaded_bytes") or 0)
+        except (TypeError, ValueError):
+            downloaded = 0
+        try:
+            total_raw = message.get("total")
+            if total_raw is None:
+                total_raw = message.get("total_bytes")
+            total = int(total_raw) if total_raw not in (None, "", 0, "0") else None
+        except (TypeError, ValueError):
+            total = None
+        try:
+            speed = message.get("speed_bps")
+            speed_bps = float(speed) if speed is not None else None
+        except (TypeError, ValueError):
+            speed_bps = None
+        try:
+            eta = message.get("eta_seconds")
+            eta_seconds = float(eta) if eta is not None else None
+        except (TypeError, ValueError):
+            eta_seconds = None
+        percent = None
+        if total and total > 0:
+            percent = max(0.0, min(100.0, (downloaded / total) * 100.0))
+            if complete:
+                percent = 100.0
+        label = _clean_text(message.get("label")) or "download"
+        progress = {
+            "stage": "download",
+            "stage_label": "下载完成" if complete else "下载数据",
+            "percent": percent,
+            "message": f"{'下载完成' if complete else '正在下载'} {label}",
+            "download": {
+                "label": label,
+                "downloaded_bytes": downloaded,
+                "total_bytes": total,
+                "speed_bps": speed_bps,
+                "eta_seconds": eta_seconds,
+                "complete": complete,
+            },
+            "updated_at": _now_iso(),
+        }
+        _update_batch_item(
+            self.batch_id,
+            self.item_index,
+            progress=progress,
+            write_manifest=bool(complete),
+        )
+
+    def _publish_stage_message(self, raw_message: str) -> None:
+        if self.batch_id is None or self.item_index is None:
+            return
+        message = _clean_text(raw_message)
+        if not message:
+            return
+        stage, stage_label = _infer_batch_stage_from_message(message)
+        # Do not clobber a live download percent with a weaker stage-only update
+        # unless the message clearly leaves download.
+        with _batches_lock:
+            batch = _batches.get(self.batch_id)
+            if batch is not None:
+                items = batch.get("items") or []
+                if 0 <= self.item_index < len(items):
+                    existing = dict(items[self.item_index].get("progress") or {})
+                    if (
+                        existing.get("stage") == "download"
+                        and stage == "download"
+                        and existing.get("download")
+                        and not str(message).startswith("下载完成")
+                    ):
+                        return
+        progress = {
+            "stage": stage,
+            "stage_label": stage_label,
+            "percent": 100.0 if stage in {"completed", "export"} else None,
+            "message": message[:500],
+            "updated_at": _now_iso(),
+        }
+        _update_batch_item(self.batch_id, self.item_index, progress=progress)
+
 
 def _update_batch_item(batch_id: str, index: int, **fields: Any) -> None:
+    """Update one batch item.
+
+    High-frequency progress ticks may pass write_manifest=False to avoid
+    rewriting batch_manifest.json on every download_progress event.
+    """
+    write_manifest = bool(fields.pop("write_manifest", True))
     with _batches_lock:
         batch = _batches.get(batch_id)
         if batch is None:
@@ -15965,7 +17451,8 @@ def _update_batch_item(batch_id: str, index: int, **fields: Any) -> None:
             return
         items[index].update(fields)
         batch["updated_at"] = _now_iso()
-        _write_batch_manifest(batch)
+        if write_manifest:
+            _write_batch_manifest(batch)
 
 
 def _write_batch_item_error(output_dir: Path, input_value: str, exc: BaseException) -> str:
@@ -16106,6 +17593,40 @@ def _cleanup_batch_instrument_probe_files(output_dir: Path, result: Any, prepare
             pass
 
 
+def _batch_item_source_cleanup(
+    *,
+    requested: bool,
+    output_dir: Path,
+    terminal_status: str,
+) -> dict[str, Any]:
+    if not requested:
+        return {
+            "requested": False,
+            "status": "not_requested",
+            "released_bytes": 0,
+            "removed_paths": [],
+            "errors": [],
+        }
+    if terminal_status != "completed":
+        return {
+            "requested": True,
+            "status": "retained",
+            "reason": f"Source files retained because item status is {terminal_status}.",
+            "released_bytes": 0,
+            "removed_paths": [],
+            "errors": [],
+            "finished_at": _now_iso(),
+        }
+    started_at = _now_iso()
+    receipt = clean_item_source_assets(output_dir)
+    return {
+        "requested": True,
+        "started_at": started_at,
+        "finished_at": _now_iso(),
+        **receipt,
+    }
+
+
 def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
     with _batches_lock:
         batch = _batches[batch_id]
@@ -16115,6 +17636,9 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
         ui_language = _clean_ui_language(batch.get("ui_language"))
         repository = _clean_repository(batch.get("repository"))
         run_mode = _clean_batch_run_mode(batch.get("run_mode"))
+        delete_source_files_after_success = bool(
+            batch.get("delete_source_files_after_success")
+        )
 
     input_value = str(item["input"])
     discovery_context = dict(item.get("discovery_context") or {})
@@ -16126,7 +17650,7 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
         from agent.input.normalizer import normalize_input
         from agent.orchestrator.pipeline import AgentService
 
-        reporter = BatchFileReporter(output_dir, ui_language=ui_language)
+        reporter = BatchFileReporter(output_dir, ui_language=ui_language, batch_id=batch_id, item_index=index)
         service = AgentService(reporter=reporter, llm_reasoner=_task_llm_reasoner(llm_config))
         task = normalize_input(input_value)
         local_source = _known_local_source_from_input(input_value)
@@ -16224,7 +17748,20 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
                         notes=["Prepare input package mode completed; Docker execution was not run."],
                     ),
                 )
-            _update_batch_item(batch_id, index, status="completed", finished_at=_now_iso(), error="", run_mode=run_mode)
+            source_cleanup = _batch_item_source_cleanup(
+                requested=delete_source_files_after_success,
+                output_dir=output_dir,
+                terminal_status="completed",
+            )
+            _update_batch_item(
+                batch_id,
+                index,
+                status="completed",
+                finished_at=_now_iso(),
+                error="",
+                run_mode=run_mode,
+                source_cleanup=source_cleanup,
+            )
             _append_batch_event(batch_id, "info", f"{input_value} {run_mode} completed", item_index=index)
             return {"status": "completed", "error": ""}
 
@@ -16313,26 +17850,64 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
             raise RuntimeError(project_error)
         status = "needs_review" if bool(getattr(result.plan, "needs_review", False)) else "completed"
         error = "; ".join(str(issue) for issue in getattr(result.plan, "blocking_issues", []) or [])
-        _update_batch_item(batch_id, index, status=status, finished_at=_now_iso(), error=error)
+        source_cleanup = _batch_item_source_cleanup(
+            requested=delete_source_files_after_success,
+            output_dir=output_dir,
+            terminal_status=status,
+        )
+        _update_batch_item(
+            batch_id,
+            index,
+            status=status,
+            finished_at=_now_iso(),
+            error=error,
+            source_cleanup=source_cleanup,
+        )
         level = "warning" if status == "needs_review" else "info"
         _append_batch_event(batch_id, level, f"{input_value} {status}", item_index=index)
         return {"status": status, "error": error}
     except Exception as exc:
+        from agent.errors import build_error_record, public_error_summary
+
+        error_record = build_error_record(exc, stage="batch_item", input_file=input_value)
+        classified = public_error_summary(error_record)
         message = _write_batch_item_error(output_dir, input_value, exc)
+        public_message = str(classified.get("public_message") or message or exc)
+        error_summary = _summarize_batch_error(public_message) or public_message
         recovery_fields = _batch_item_recovery_fields(output_dir)
+        source_cleanup = _batch_item_source_cleanup(
+            requested=delete_source_files_after_success,
+            output_dir=output_dir,
+            terminal_status="failed",
+        )
         _update_batch_item(
             batch_id,
             index,
             status="failed",
             finished_at=_now_iso(),
-            error=message,
+            error=public_message,
+            error_summary=error_summary,
+            progress={
+                "stage": str(classified.get("stage") or "failed"),
+                "stage_label": "失败",
+                "percent": 100.0,
+                "message": error_summary,
+                "failed_stage": str(classified.get("stage") or "failed"),
+                "updated_at": _now_iso(),
+            },
+            source_cleanup=source_cleanup,
             **recovery_fields,
         )
         workflow_outcome = recovery_fields.get("workflow_outcome")
         if workflow_outcome:
             _append_batch_event(batch_id, "warning", f"{input_value} recovery outcome: {workflow_outcome}", item_index=index)
-        _append_batch_event(batch_id, "error", f"{input_value} failed: {message}", item_index=index)
-        return {"status": "failed", "error": message, **recovery_fields}
+        _append_batch_event(batch_id, "error", f"{input_value} failed: {public_message}", item_index=index)
+        return {
+            "status": "failed",
+            "error": public_message,
+            "error_summary": error_summary,
+            **recovery_fields,
+        }
     finally:
         if service is not None:
             pride_client = getattr(service, "pride_client", None)
@@ -16367,14 +17942,30 @@ def _run_parameter_batch(batch_id: str) -> None:
                     index = futures[future]
                     with _batches_lock:
                         item = dict(_batches.get(batch_id, {}).get("items", [{}])[index])
-                    message = _write_batch_item_error(Path(item.get("output_dir", "")), str(item.get("input", "")), exc)
+                    from agent.errors import build_error_record, public_error_summary
+
+                    input_value = str(item.get("input", ""))
+                    error_record = build_error_record(exc, stage="batch_item", input_file=input_value)
+                    classified = public_error_summary(error_record)
+                    message = _write_batch_item_error(Path(item.get("output_dir", "")), input_value, exc)
+                    public_message = str(classified.get("public_message") or message or exc)
+                    error_summary = _summarize_batch_error(public_message) or public_message
                     recovery_fields = _batch_item_recovery_fields(Path(item.get("output_dir", "")))
                     _update_batch_item(
                         batch_id,
                         index,
                         status="failed",
                         finished_at=_now_iso(),
-                        error=message,
+                        error=public_message,
+                        error_summary=error_summary,
+                        progress={
+                            "stage": str(classified.get("stage") or "failed"),
+                            "stage_label": "失败",
+                            "percent": 100.0,
+                            "message": error_summary,
+                            "failed_stage": str(classified.get("stage") or "failed"),
+                            "updated_at": _now_iso(),
+                        },
                         **recovery_fields,
                     )
 
@@ -16421,7 +18012,7 @@ async def create_parameter_batch(body: dict[str, Any]):
         return {"error": "Please enter at least one PRIDE file name."}
     max_items = _max_batch_items()
     if len(inputs) > max_items:
-        return {"error": f"Too many batch inputs: {len(inputs)}; maximum is {max_items}."}
+        return {"error": f"批量输入过多：{len(inputs)} 条，当前上限 {max_items}（可用环境变量 AGENT_MAX_BATCH_ITEMS 调整；0 表示接近不限制）。"}
     submitter = _clean_submitter(body.get("submitter"))
     ui_language = _clean_ui_language(body.get("ui_language"))
     repository = _clean_repository(body.get("repository"))
@@ -16453,6 +18044,26 @@ async def create_parameter_batch(body: dict[str, Any]):
     batch_dir = _batch_dir(batch_id)
     jobs = _batch_jobs(body.get("jobs"), len(inputs))
     input_records = _clean_batch_input_records(body, inputs)
+    delete_source_files_after_success = body.get(
+        "delete_source_files_after_success"
+    ) is True
+    first_context = next((record for record in input_records if record), {}) or {}
+    source_discovery_job_id = _clean_text(
+        body.get("source_discovery_job_id")
+        or first_context.get("source_discovery_job_id")
+    )
+    source_discovery_id = _clean_text(
+        body.get("source_discovery_id")
+        or first_context.get("source_discovery_id")
+    )
+    try:
+        source_batch_index = int(
+            body.get("source_batch_index")
+            or first_context.get("source_batch_index")
+            or 0
+        )
+    except (TypeError, ValueError):
+        source_batch_index = 0
     items = [
         {
             "index": index,
@@ -16460,6 +18071,13 @@ async def create_parameter_batch(body: dict[str, Any]):
             "status": "queued",
             "output_dir": str(_batch_item_dir(batch_dir, index, input_value)),
             "error": "",
+            "source_cleanup": {
+                "requested": delete_source_files_after_success,
+                "status": "pending" if delete_source_files_after_success else "not_requested",
+                "released_bytes": 0,
+                "removed_paths": [],
+                "errors": [],
+            },
             **({"discovery_context": input_records[index - 1]} if input_records[index - 1] else {}),
         }
         for index, input_value in enumerate(inputs, start=1)
@@ -16476,6 +18094,10 @@ async def create_parameter_batch(body: dict[str, Any]):
         "run_mode": run_mode,
         "resource_policy": resource_policy,
         "prefer_project_fasta": prefer_project_fasta,
+        "delete_source_files_after_success": delete_source_files_after_success,
+        "source_discovery_job_id": source_discovery_job_id or None,
+        "source_discovery_id": source_discovery_id or None,
+        "source_batch_index": source_batch_index or None,
         "output_dir": str(batch_dir),
         "excel_path": str(batch_dir / _BATCH_EXCEL_FILE),
         "items": items,

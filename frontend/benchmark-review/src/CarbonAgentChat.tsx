@@ -22,6 +22,13 @@ import {
   discoveryProgressMessage,
   renderDiscoveryProgressUserDefined,
 } from "./DiscoveryProgressMessage";
+import {
+  discoveryRecoveryMessage,
+  formatRecoveryFailureDetail,
+  renderDiscoveryRecoveryUserDefined,
+  type DiscoveryRecoveryPayload,
+  type RecoveryAction,
+} from "./DiscoveryRecoveryMessage";
 
 import {
   assessStrategyGaps,
@@ -31,6 +38,7 @@ import {
   formatDoneMessage,
   intentSnapshotForLlm,
   isReadyForConfirm,
+  normalizeSearchTerms,
   toDiscoveryJobPayload,
 } from "./grill-tree";
 import {
@@ -48,6 +56,7 @@ import {
 import { createEmptyIntent, type GrillPhase, type IntentSpec } from "./intent-spec";
 import {
   cancelDiscoveryJob,
+  resumeDiscoveryJob,
   delay,
   getDiscoveryJob,
   grillTurn,
@@ -71,14 +80,22 @@ export type GrillControls = {
   applyDefaults: () => void;
 };
 
+export type GrillExternalCommand =
+  | { type: "confirm"; queryTerms: string[] }
+  | { type: "defaults" };
+
 type Props = {
   onJob: (job: DiscoveryJob) => void;
   onIntentChange: (spec: IntentSpec) => void;
   onPhaseChange: (phase: GrillPhase) => void;
   onNavigate?: (tabIndex: number) => void;
+  /** Open the discovery result modal for the bound terminal job (L1 / batch seed). */
+  onOpenResults?: (jobId: string) => void;
   onRegisterControls?: (controls: GrillControls | null) => void;
-  externalCommand?: "confirm" | "defaults" | null;
+  externalCommand?: GrillExternalCommand | null;
   onExternalCommandConsumed?: () => void;
+  /** Controlled repository terms shared by desktop, mobile, and chat confirmation. */
+  externalSelectedSearchTerms?: string[];
 };
 
 const text = (value: unknown) => String(value || "").trim();
@@ -146,9 +163,11 @@ export function CarbonAgentChat({
   onIntentChange,
   onPhaseChange,
   onNavigate,
+  onOpenResults,
   onRegisterControls,
   externalCommand,
   onExternalCommandConsumed,
+  externalSelectedSearchTerms = [],
 }: Props) {
   const welcomed = useRef(false);
   const instanceRef = useRef<ChatInstance | null>(null);
@@ -163,6 +182,9 @@ export function CarbonAgentChat({
   const dialogueGenerationRef = useRef(0);
   const inFlightGrillControllersRef = useRef(new Set<AbortController>());
   const restartHandlerRegisteredRef = useRef(false);
+  /** Last terminal checkpoint for recovery chips (job-bound). */
+  const lastRecoveryRef = useRef<DiscoveryRecoveryPayload | null>(null);
+  const recoveryHandlerRef = useRef<((action: RecoveryAction, payload: DiscoveryRecoveryPayload) => void) | null>(null);
 
   const setPhase = useCallback(
     (phase: GrillPhase) => {
@@ -205,6 +227,26 @@ export function CarbonAgentChat({
     [abandonDialogueSession, onIntentChange],
   );
 
+  const externalSelectedSearchTermsKey = externalSelectedSearchTerms.join("\u0000");
+  useEffect(() => {
+    const currentKey = (intentRef.current.selectedSearchTerms || []).join("\u0000");
+    if (currentKey === externalSelectedSearchTermsKey) return;
+    if (inFlightGrillControllersRef.current.size > 0) {
+      abandonDialogueSession();
+    }
+    // The parent already owns and renders this controlled selection. Mirror it
+    // into the execution snapshot without emitting a redundant intent update.
+    intentRef.current = {
+      ...intentRef.current,
+      selectedSearchTerms: [...externalSelectedSearchTerms],
+      confirmed: false,
+    };
+  }, [
+    abandonDialogueSession,
+    externalSelectedSearchTermsKey,
+    externalSelectedSearchTerms,
+  ]);
+
   const resetDialogueState = useCallback(() => {
     invalidateGrillRequests();
     const nextSessionId = freshDialogueSessionId();
@@ -213,6 +255,7 @@ export function CarbonAgentChat({
     dialogueHistoryRef.current = [];
     pendingDecisionRef.current = null;
     decisionMemoryRef.current = [];
+    lastRecoveryRef.current = null;
     welcomed.current = false;
     setIntent(createEmptyIntent());
     setPhase("idle");
@@ -239,6 +282,46 @@ export function CarbonAgentChat({
     });
   }, []);
 
+  const pushRecoveryCheckpoint = useCallback(
+    async (
+      outcome: "done" | "failed",
+      job: DiscoveryJob | null,
+      summary: string,
+    ) => {
+      const instance = instanceRef.current;
+      if (!instance) return;
+      const view = job ? buildDiscoveryRunView(job) : null;
+      const jobId =
+        String(job?.job_id || "").trim() || `checkpoint:${crypto.randomUUID()}`;
+      const discoveryId = String(
+        view?.discoveryId
+        || (job as WorkflowRecord | null)?.discovery_id
+        || (job?.record as WorkflowRecord | undefined)?.discovery_id
+        || "",
+      ).trim();
+      const status = String(job?.status || "").toLowerCase();
+      const hasResults = Boolean(
+        job
+        && discoveryId
+        && (status === "completed" || status === "blocked"),
+      );
+      const payload: DiscoveryRecoveryPayload = {
+        kind: "discovery_recovery",
+        jobId,
+        discoveryId,
+        cardGeneration: intentSnapshotKey(intentRef.current),
+        outcome,
+        hasResults,
+        summary: String(summary || "").replace(/\s+/g, " ").trim().slice(0, 240),
+      };
+      lastRecoveryRef.current = payload;
+      await instance.messaging.addMessage(
+        discoveryRecoveryMessage(`recovery:${jobId}:${crypto.randomUUID()}`, payload),
+      );
+    },
+    [],
+  );
+
   const runDiscovery = useCallback(
     async (
       confirmation: ConfirmedAgentExecution,
@@ -258,27 +341,20 @@ export function CarbonAgentChat({
         await pushAssistant("还差最后一步：确认右侧策略后我才会去 PRIDE 搜。");
         return;
       }
+      if (!(intentRef.current.selectedSearchTerms || []).map(text).filter(Boolean).length) {
+        setIntent({ ...intentRef.current, confirmed: false });
+        setPhase("awaiting_confirm");
+        await pushAssistant("请至少选择或补充一个实际检索词；本次没有访问仓库。");
+        return;
+      }
 
-      const confirmed: IntentSpec = { ...intentRef.current, confirmed: true };
+      const confirmed: IntentSpec = {
+        ...intentRef.current,
+        runHorizon: "candidates_reviewed",
+        answered: { ...intentRef.current.answered, Q2: true },
+        confirmed: true,
+      };
       setIntent(confirmed);
-      if (confirmed.runHorizon === "plan_only") {
-        setPhase("done");
-        await pushAssistant(
-          "搜索计划已经确认并保留；按你选择的“只做计划”，这一步没有访问 PRIDE，也没有启动数据发现任务。之后想执行时，直接告诉我把终点改成候选数据或候选审查即可。",
-        );
-        return;
-      }
-      if (["ai_ready_table", "pre_release", "full_release"].includes(confirmed.runHorizon)) {
-        // These horizons require a downstream executor after a reviewed
-        // discovery run. Never pretend that plain repository search fulfilled
-        // a training-table or release request.
-        setIntent({ ...confirmed, confirmed: false });
-        setPhase("grilling");
-        await pushAssistant(
-          `“${confirmed.runHorizon}”需要先完成可审计的候选审查，再交给对应的下游执行器。当前页面不会偷偷降级成普通搜索；请先把本次终点改为“找到并审查候选”，完成后我再衔接下一阶段。`,
-        );
-        return;
-      }
       setPhase("running");
       runningRef.current = true;
 
@@ -320,13 +396,17 @@ export function CarbonAgentChat({
 
         if (job.status === "completed") {
           setPhase("done");
-          await pushAssistant(formatDoneMessage(job, confirmed));
+          const doneText = formatDoneMessage(job, confirmed);
+          await pushAssistant(doneText);
+          await pushRecoveryCheckpoint("done", job, doneText);
         } else if (job.status === "failed") {
           setPhase("failed");
-          const detail =
-            (typeof job.error === "string" && job.error.trim()) ||
-            "数据发现失败，请查看任务日志了解原因。";
-          await pushAssistant(`数据发现失败：${detail}`);
+          const detail = formatRecoveryFailureDetail(
+            (typeof job.error === "string" && job.error.trim()) || "",
+          );
+          const failText = `数据发现失败：${detail}`;
+          await pushAssistant(failText);
+          await pushRecoveryCheckpoint("failed", job, failText);
         } else if (job.status === "blocked") {
           setPhase("done");
           const record = (job.record || {}) as WorkflowRecord;
@@ -338,26 +418,34 @@ export function CarbonAgentChat({
             auditCounts.usable_files ?? summary.usable_files ?? record.usable_files ?? record.file_count ?? 0,
           );
           const strictValid = Number(auditCounts.strict_valid_files ?? summary.strict_valid_files ?? 0);
+          const inherited = Number(
+            auditCounts.inherited_usable_files ?? summary.inherited_usable_files ?? 0,
+          );
           const gaps = Array.isArray(audit.issues)
             ? (audit.issues as WorkflowRecord[])
                 .map((issue) => String(issue.summary || issue.code || "").trim())
                 .filter(Boolean)
                 .slice(0, 3)
             : [];
-          await pushAssistant(
-            [
-              `搜索与审查已结束：约 **${candidates}** 个候选项目，**${usable}** 条可用文件（L1）。`,
-              strictValid > 0
-                ? `其中严格 valid 文件约 ${strictValid} 个；其余多为 weak_keep（证据偏项目级/缺仪器碎裂等），仍可先做批量参数规划。`
-                : `本轮尚无严格 valid 文件（多为 weak_keep）。不足点会列在结果里，但不阻止你使用可用文件列表。`,
-              gaps.length ? `当前主要不足：${gaps.join("；")}。` : "",
-              "请在右侧打开结果：下载「可用批量输入」，或点「送入批量参数规划」继续构建标准化格式。",
-            ]
-              .filter(Boolean)
-              .join("\n"),
-          );
+          const blockedText = [
+            `搜索与审查已结束：约 **${candidates}** 个候选项目，**${usable}** 条验证通过的可交付文件。`,
+            strictValid > 0
+              ? `其中 ${inherited} 个采用项目级同质证据继承；文件级明确冲突仍会被排除。`
+              : `本轮尚无验证通过的可交付文件；未决文件保留在等待复核列表，不会混入下载清单。`,
+            gaps.length ? `当前主要不足：${gaps.join("；")}。` : "",
+            "请在右侧打开结果：下载「可用批量输入」，或点「送入批量参数规划」继续构建标准化格式。",
+          ]
+            .filter(Boolean)
+            .join("\n");
+          await pushAssistant(blockedText);
+          await pushRecoveryCheckpoint("done", job, blockedText);
         } else {
           setPhase("done");
+          await pushRecoveryCheckpoint(
+            "done",
+            job,
+            `任务已结束（状态 ${String(job.status || "unknown")}）。可继续改策略或重置对话。`,
+          );
         }
       } catch (reason) {
         if (reason instanceof DOMException && reason.name === "AbortError" && job?.job_id) {
@@ -367,15 +455,18 @@ export function CarbonAgentChat({
           throw reason;
         }
         setPhase("failed");
-        await pushAssistant(
-          `启动或运行数据发现失败：${reason instanceof Error ? reason.message : String(reason)}`,
+        const failDetail = formatRecoveryFailureDetail(
+          reason instanceof Error ? reason.message : String(reason),
         );
+        const failText = `启动或运行数据发现失败：${failDetail}`;
+        await pushAssistant(failText);
+        await pushRecoveryCheckpoint("failed", job, failText);
         // do not rethrow non-abort errors — avoid Carbon catastrophic "Something went wrong"
       } finally {
         runningRef.current = false;
       }
     },
-    [isRequestSnapshotCurrent, onJob, pushAssistant, setIntent, setPhase],
+    [isRequestSnapshotCurrent, onJob, pushAssistant, pushRecoveryCheckpoint, setIntent, setPhase],
   );
 
   const applyDefaultsCore = useCallback((): IntentSpec => {
@@ -394,8 +485,25 @@ export function CarbonAgentChat({
     );
   }, [applyDefaultsCore, pushAssistant]);
 
-  const handleConfirm = useCallback(async () => {
+  const handleConfirm = useCallback(async (queryTerms?: string[]) => {
     if (phaseRef.current === "running") return;
+    const rawSelectedTerms = queryTerms ?? intentRef.current.selectedSearchTerms ?? [];
+    if (rawSelectedTerms.some((term) => String(term || "").trim().replace(/\s+/g, " ").length > 240)) {
+      await pushAssistant("单个检索词不能超过 240 个字符；请缩短后重新确认。本次没有访问仓库。");
+      return;
+    }
+    const selectedTerms = normalizeSearchTerms(rawSelectedTerms).slice(0, 24);
+    if (!selectedTerms.length) {
+      await pushAssistant("请至少选择或补充一个实际检索词；本次没有访问仓库。");
+      return;
+    }
+    if (queryTerms || selectedTerms.join("\u0000") !== (intentRef.current.selectedSearchTerms || []).join("\u0000")) {
+      setIntent({
+        ...intentRef.current,
+        selectedSearchTerms: selectedTerms,
+        confirmed: false,
+      });
+    }
     if (phaseRef.current !== "awaiting_confirm" || !isReadyForConfirm(intentRef.current)) {
       await pushAssistant(
         "当前策略还没有进入待确认状态；本次没有启动搜索。请先继续和 Agent 对齐策略，或用右侧默认设置补齐。",
@@ -452,10 +560,105 @@ export function CarbonAgentChat({
 
   useEffect(() => {
     if (!externalCommand) return;
-    if (externalCommand === "confirm") void handleConfirm();
-    if (externalCommand === "defaults") void handleDefaults();
+    if (externalCommand.type === "confirm") {
+      void handleConfirm(externalCommand.queryTerms);
+    }
+    if (externalCommand.type === "defaults") void handleDefaults();
     onExternalCommandConsumed?.();
   }, [externalCommand, handleConfirm, handleDefaults, onExternalCommandConsumed]);
+
+  const handleRecoveryAction = useCallback(
+    async (action: RecoveryAction, payload: DiscoveryRecoveryPayload) => {
+      const bound = lastRecoveryRef.current;
+      if (!bound || bound.jobId !== payload.jobId) {
+        await pushAssistant("这组恢复操作已过期；请以最新完成/失败气泡上的芯片为准。");
+        return;
+      }
+
+      if (action === "view_results") {
+        if (!bound.hasResults || !bound.jobId) {
+          await pushAssistant("本轮没有可打开的结果绑定（缺少 job / L1 交付）。");
+          return;
+        }
+        if (onOpenResults) {
+          onOpenResults(bound.jobId);
+        } else {
+          onNavigate?.(0);
+        }
+        await pushAssistant(
+          bound.discoveryId
+            ? `已打开本轮结果（job ${bound.jobId}）。可在右侧下载 L1 或送入批量。`
+            : `已定位本轮任务 ${bound.jobId}；若右侧无结果入口，请检查任务状态。`,
+        );
+        return;
+      }
+
+      if (action === "revise_strategy") {
+        if (runningRef.current || phaseRef.current === "running") {
+          await pushAssistant("当前已有数据发现任务在跑。可点停止取消，或等它完成后再改策略。");
+          return;
+        }
+        // Stay in the same scientific conversation; do not auto-search.
+        setIntent({ ...intentRef.current, confirmed: false });
+        setPhase("grilling");
+        await pushAssistant(
+          "好，我们先改策略。直接说要改的字段（例如物种、终点、数量）；确认前不会访问 PRIDE。",
+        );
+        return;
+      }
+
+      if (action === "research_current_card") {
+        // No dual job: never start while another discovery is running.
+        if (runningRef.current || phaseRef.current === "running") {
+          await pushAssistant("当前已有数据发现任务在跑，不会双开新搜索。可点停止取消，或等它完成。");
+          return;
+        }
+        // Boss condition: re-search defaults to a fresh SDK session.
+        abandonDialogueSession();
+        const next = { ...intentRef.current, confirmed: false };
+        setIntent(next);
+        if (!isReadyForConfirm(next)) {
+          setPhase("grilling");
+          await pushAssistant(
+            "已开新会话准备按当前卡再搜，但策略仍有缺口，还不能确认。先补齐关键字段，再确认后才会启动 PRIDE。",
+          );
+          return;
+        }
+        setPhase("awaiting_confirm");
+        await pushAssistant(
+          "已开新会话，并按**当前策略卡**进入待确认。\n\n"
+          + "重新搜索需要再次确认（不会自动开搜，也不会假绿降级）。\n\n"
+          + formatConfirmMessage(next),
+        );
+        return;
+      }
+
+      if (action === "reset_dialogue") {
+        resetDialogueState();
+        await pushAssistant(
+          "对话已重置。策略卡与历史已清空；直接说新的数据需求即可。",
+        );
+      }
+    },
+    [
+      abandonDialogueSession,
+      onNavigate,
+      onOpenResults,
+      pushAssistant,
+      resetDialogueState,
+      setIntent,
+      setPhase,
+    ],
+  );
+
+  useEffect(() => {
+    recoveryHandlerRef.current = (action, payload) => {
+      void handleRecoveryAction(action, payload);
+    };
+    return () => {
+      recoveryHandlerRef.current = null;
+    };
+  }, [handleRecoveryAction]);
 
   const addWelcomeMessage = useCallback(async (instance: ChatInstance) => {
     instanceRef.current = instance;
@@ -503,9 +706,10 @@ export function CarbonAgentChat({
       if (opts.signal?.aborted) controller.abort();
       else opts.signal?.addEventListener("abort", onOuterAbort);
       // DeepSeek 冷启动/JSON 补全偶发 >25s；给足余量，避免误报「超时」
+      const timeoutMs = opts.timeoutMs ?? AGENT_TURN_TIMEOUT_MS;
       const timer = window.setTimeout(
         () => controller.abort(),
-        opts.timeoutMs ?? AGENT_TURN_TIMEOUT_MS,
+        timeoutMs,
       );
       lastGrillErrorRef.current = "";
       try {
@@ -522,6 +726,9 @@ export function CarbonAgentChat({
           answered: intentRef.current.answered as unknown as WorkflowRecord,
           local_summary: "",
           allow_server_default: true,
+          // Reserve a small network/UI margin while giving the backend enough
+          // total time for Manager -> read-only verifier -> Manager repair.
+          request_timeout_seconds: Math.max(1, Math.floor((timeoutMs - 10_000) / 1_000)),
           gap_report: assessStrategyGaps(intentRef.current) as unknown as WorkflowRecord,
           dialogue_history: dialogueHistoryRef.current,
           ...(opts.phase === "awaiting_confirm"
@@ -664,14 +871,19 @@ export function CarbonAgentChat({
           } finally {
             window.clearInterval(progressTimer);
           }
-          // Never leave STREAMING forever: even if identity/snapshot went stale, close the bubble.
+          // Stale identity after Restart/generation bump must not write late bubbles
+          // (Carbon already owns the reset UI). Only close STREAMING when the HTTP
+          // request was not explicitly aborted — otherwise a late worker finish
+          // resurrects a wiped conversation.
           if (!requestIsCurrent()) {
-            await reply(
-              agentTurn
-                ? `本轮结果已返回，但对话上下文已变化（例如重复发送/重置），未写入策略。请再发一次需求。`
-                : `本轮被中断或会话已过期。请再发一次；若反复发生请 Ctrl+F5 强制刷新。`,
-              MessageState.COMPLETE,
-            );
+            if (!requestOptions.signal?.aborted) {
+              await reply(
+                agentTurn
+                  ? `本轮结果已返回，但对话上下文已变化（例如重复发送/重置），未写入策略。请再发一次需求。`
+                  : `本轮被中断或会话已过期。请再发一次；若反复发生请 Ctrl+F5 强制刷新。`,
+                MessageState.COMPLETE,
+              );
+            }
             return;
           }
           if (agentTurn) {
@@ -681,9 +893,12 @@ export function CarbonAgentChat({
               `${agentTurn.action} · ${agentTurn.tool_calls.length} tool call(s)`,
               Math.round(performance.now() - onlineStarted),
             );
-            const verificationEvent = semanticVerificationTimelineEvent(
-              agentTurn.semantic_verification,
-            );
+            // NI-1: pure chat never shows semantic-verification chrome.
+            // Write turns demoted to advise by an authoritative SV reject still surface SV.
+            const verificationEvent =
+              agentTurn.action === "chat"
+                ? null
+                : semanticVerificationTimelineEvent(agentTurn.semantic_verification);
             if (verificationEvent) {
               events.push(verificationEvent);
               await reply(lastBody || "处理中…", MessageState.STREAMING);
@@ -810,7 +1025,17 @@ export function CarbonAgentChat({
       }}
       messaging={messaging}
       renderUserDefinedResponse={(state) =>
-        renderDiscoveryProgressUserDefined(state) ?? renderCodexUserDefined(state)
+        renderDiscoveryProgressUserDefined(state, (jobId) => {
+          if (!jobId) return;
+          void cancelDiscoveryJob(jobId).then(onJob);
+        }, (jobId) => {
+          if (!jobId) return;
+          void resumeDiscoveryJob(jobId).then(onJob);
+        })
+        ?? renderDiscoveryRecoveryUserDefined(state, (action, payload) => {
+          recoveryHandlerRef.current?.(action, payload);
+        })
+        ?? renderCodexUserDefined(state)
       }
       strings={{
         window_title: "蛋白质组学数据 Agent",

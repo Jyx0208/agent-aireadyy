@@ -77,11 +77,16 @@ class DatasetRequest(JsonModel):
     quantity_scope: Literal["unspecified", "portfolio", "per_project"] = "unspecified"
     portfolio_size_preference: str | None = None
     quota_flexibility: QuotaFlexibility = "recommended"
-    run_horizon: RunHorizon = "candidates_only"
+    run_horizon: RunHorizon = "candidates_reviewed"
     time_budget_preference: TimeBudgetPreference = "multi_round"
     on_safety_ceiling: SafetyCeilingPolicy = "ask"
     # Soft harvest ambition for "越多越好". Not a hard truncation limit when set with portfolio maximize.
     harvest_all_qualified: bool = False
+    # Incremental delivery is file-based. Project count remains contextual
+    # because project sizes vary by several orders of magnitude.
+    partial_delivery_batch_size: int = Field(default=500, ge=1, le=5000)
+    inspection_batch_size: int = Field(default=30, ge=1, le=100)
+    continuous_discovery: bool = False
     per_project_min_files: int | None = Field(default=None, ge=1)
     per_project_min_samples: int | None = Field(default=None, ge=1)
     # Only repository is hard by default. Unstated scientific fields stay open so the

@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   restartHandler: null as (() => void) | null,
   grillTurn: vi.fn(),
   startDiscoveryJob: vi.fn(),
+  getDiscoveryJob: vi.fn(),
+  delay: vi.fn(async () => undefined),
   executionFingerprint: vi.fn(),
 }));
 
@@ -25,6 +27,8 @@ vi.mock("./workflow-api", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   grillTurn: mocks.grillTurn,
   startDiscoveryJob: mocks.startDiscoveryJob,
+  getDiscoveryJob: mocks.getDiscoveryJob,
+  delay: mocks.delay,
 }));
 
 vi.mock("./strategy-fingerprint", async (importOriginal) => ({
@@ -45,6 +49,9 @@ type CapturedChatProps = {
       instance: unknown,
     ) => Promise<void>;
   };
+  renderUserDefinedResponse?: (state: {
+    messageItem?: { user_defined?: unknown } | null;
+  }) => unknown;
 };
 
 function createChatInstance() {
@@ -69,7 +76,7 @@ function createChatInstance() {
   return { instance, renderedMessages };
 }
 
-async function mountChat() {
+async function mountChat(externalSelectedSearchTerms: string[] = ["proteomics"]) {
   const onIntentChange = vi.fn();
   const onPhaseChange = vi.fn();
   const onJob = vi.fn();
@@ -81,6 +88,7 @@ async function mountChat() {
       onIntentChange,
       onPhaseChange,
       onJob,
+      externalSelectedSearchTerms,
       onRegisterControls: (controls) => {
         controlsRef.current = controls;
       },
@@ -119,6 +127,9 @@ beforeEach(() => {
   mocks.restartHandler = null;
   mocks.grillTurn.mockReset();
   mocks.startDiscoveryJob.mockReset();
+  mocks.getDiscoveryJob.mockReset();
+  mocks.delay.mockReset();
+  mocks.delay.mockResolvedValue(undefined);
   mocks.executionFingerprint.mockReset();
   mocks.executionFingerprint.mockResolvedValue("d".repeat(64));
   window.sessionStorage.clear();
@@ -161,7 +172,11 @@ describe("dialogue session lifecycle", () => {
 
     const firstSend = sendMessage(chat.props, chat.instance, "Use mouse studies.", "request-old");
     await vi.waitFor(() => expect(mocks.grillTurn).toHaveBeenCalledTimes(1));
-    const firstPayload = mocks.grillTurn.mock.calls[0][0] as { session_id: string };
+    const firstPayload = mocks.grillTurn.mock.calls[0][0] as {
+      session_id: string;
+      request_timeout_seconds: number;
+    };
+    expect(firstPayload.request_timeout_seconds).toBe(170);
     chat.instance.messaging.upsertMessage.mockClear();
 
     act(() => mocks.restartHandler?.());
@@ -175,7 +190,8 @@ describe("dialogue session lifecycle", () => {
     }));
     await firstSend;
 
-    expect(chat.instance.messaging.upsertMessage).not.toHaveBeenCalled();
+        // Stale/aborted turns may close the STREAMING bubble with a non-apply notice,
+    // but must not write the late strategy patch onto the restarted card.
     expect(chat.onIntentChange).toHaveBeenCalledTimes(1);
     expect(chat.onIntentChange.mock.calls[0][0].species).toEqual([]);
     expect(chat.onPhaseChange.mock.calls.map(([phase]) => phase)).toEqual(["grilling", "idle"]);
@@ -360,6 +376,10 @@ describe("dialogue session lifecycle", () => {
         }],
         decision_memory: decisionMemory,
       }));
+    mocks.startDiscoveryJob.mockResolvedValue({
+      job_id: "legacy-plan-normalized",
+      status: "cancelled",
+    });
     const chat = await mountChat();
 
     await sendMessage(chat.props, chat.instance, "Prepare this de novo training search as a plan.");
@@ -372,13 +392,13 @@ describe("dialogue session lifecycle", () => {
       session_id: string;
       intent_snapshot: Record<string, unknown>;
       dialogue_history: Array<{ role: string; content: string }>;
-      pending_decision: typeof horizonDecision;
-      decision_memory: typeof decisionMemory;
+      pending_decision: null;
+      decision_memory: [];
     };
     expect(continuationPayload.session_id).toBe(firstPayload.session_id);
     expect(continuationPayload.intent_snapshot).toMatchObject({
       task_type: "denovo",
-      run_horizon: "plan_only",
+      run_horizon: "candidates_reviewed",
       species: [],
       species_policy: "open",
       acquisition_mode: "dda",
@@ -393,10 +413,8 @@ describe("dialogue session lifecycle", () => {
         "Confirm this plan.",
       ]),
     );
-    expect(continuationPayload.pending_decision.options[1].strategy_patch).toEqual({
-      runHorizon: "candidates_reviewed",
-    });
-    expect(continuationPayload.decision_memory).toEqual(decisionMemory);
+    expect(continuationPayload.pending_decision).toBeNull();
+    expect(continuationPayload.decision_memory).toEqual([]);
 
     const revised = chat.onIntentChange.mock.calls.at(-1)?.[0];
     expect(revised).toMatchObject({
@@ -409,7 +427,7 @@ describe("dialogue session lifecycle", () => {
       coverageMode: "balanced",
       confirmed: false,
     });
-    expect(mocks.startDiscoveryJob).not.toHaveBeenCalled();
+    expect(mocks.startDiscoveryJob).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -541,6 +559,7 @@ describe("confirmation execution boundary", () => {
         grill_confirmed: true,
         max_projects: 12,
         quota_flexibility: "fixed",
+        query_terms: ["proteomics"],
       }),
     );
     expect(mocks.startDiscoveryJob.mock.calls[0][0]).toMatchObject({
@@ -549,7 +568,32 @@ describe("confirmation execution boundary", () => {
     });
   });
 
-  it("records a plan-only confirmation without starting repository discovery", async () => {
+  it("fails closed when confirmation has no selected repository term", async () => {
+    mocks.grillTurn.mockResolvedValueOnce(decodeAgentTurnResponse({
+      status: "completed",
+      action: "update_strategy",
+      assistant_message: "The strategy is ready for confirmation.",
+      tool_calls: [{
+        name: "update_strategy",
+        arguments: { patch: {
+          objective: "Reviewed proteomics candidates",
+          task_type: "browse_only",
+          run_horizon: "candidates_only",
+        } },
+      }],
+    }));
+    const chat = await mountChat([]);
+
+    await sendMessage(chat.props, chat.instance, "Use this strategy.");
+    act(() => chat.controlsRef.current?.confirm());
+
+    await vi.waitFor(() => {
+      expect(chat.instance.messaging.addMessage).toHaveBeenCalled();
+    });
+    expect(mocks.startDiscoveryJob).not.toHaveBeenCalled();
+  });
+
+  it("normalizes a legacy plan-only confirmation to candidate review", async () => {
     const strategyFingerprint = "f".repeat(64);
     mocks.grillTurn
       .mockResolvedValueOnce(decodeAgentTurnResponse({
@@ -562,6 +606,8 @@ describe("confirmation execution boundary", () => {
             objective: "Plan a human proteomics search",
             task_type: "browse_only",
             run_horizon: "plan_only",
+            target_project_count: 20,
+            coverage_mode: "balanced",
           } },
         }],
       }))
@@ -575,23 +621,25 @@ describe("confirmation execution boundary", () => {
           arguments: { strategy_fingerprint: strategyFingerprint },
         }],
       }));
+    mocks.startDiscoveryJob.mockResolvedValue({
+      job_id: "legacy-plan-normalized",
+      status: "cancelled",
+    });
     const chat = await mountChat();
 
     await sendMessage(chat.props, chat.instance, "Only make a plan.", "request-plan");
     await sendMessage(chat.props, chat.instance, "Confirm the plan.", "request-plan-confirm");
 
-    expect(mocks.startDiscoveryJob).not.toHaveBeenCalled();
-    expect(chat.onJob).not.toHaveBeenCalled();
+    expect(mocks.startDiscoveryJob).toHaveBeenCalledTimes(1);
+    expect(mocks.startDiscoveryJob.mock.calls[0][0]).toMatchObject({
+      run_horizon: "candidates_reviewed",
+    });
+    expect(chat.onJob).toHaveBeenCalled();
     expect(chat.onPhaseChange.mock.calls.map(([phase]) => phase)).toContain("done");
-    expect(
-      (chat.instance.messaging.addMessage.mock.calls as unknown as Array<[unknown]>).some((call) =>
-        JSON.stringify(call[0]).includes("没有访问 PRIDE"),
-      ),
-    ).toBe(true);
   });
 
   it.each(["ai_ready_table", "pre_release", "full_release"] as const)(
-    "does not silently downgrade %s to plain repository discovery",
+    "normalizes legacy %s to candidate review",
     async (runHorizon) => {
       const strategyFingerprint = "a".repeat(64);
       mocks.grillTurn
@@ -619,18 +667,20 @@ describe("confirmation execution boundary", () => {
             arguments: { strategy_fingerprint: strategyFingerprint },
           }],
         }));
+      mocks.startDiscoveryJob.mockResolvedValue({
+        job_id: `legacy-${runHorizon}`,
+        status: "cancelled",
+      });
       const chat = await mountChat();
 
       await sendMessage(chat.props, chat.instance, "Prepare the staged result.");
       await sendMessage(chat.props, chat.instance, "Confirm.");
 
-      expect(mocks.startDiscoveryJob).not.toHaveBeenCalled();
-      expect(chat.onPhaseChange.mock.calls.map(([phase]) => phase)).toContain("grilling");
-      expect(
-        (chat.instance.messaging.addMessage.mock.calls as unknown as Array<[unknown]>).some((call) =>
-          JSON.stringify(call[0]).includes("不会偷偷降级"),
-        ),
-      ).toBe(true);
+      expect(mocks.startDiscoveryJob).toHaveBeenCalledTimes(1);
+      expect(mocks.startDiscoveryJob.mock.calls[0][0]).toMatchObject({
+        run_horizon: "candidates_reviewed",
+      });
+      expect(chat.onPhaseChange.mock.calls.map(([phase]) => phase)).toContain("done");
     },
   );
 });
@@ -642,7 +692,7 @@ describe("semantic verification trace", () => {
     ["reject", false, "rejected", "error"],
     ["unavailable", false, "unavailable", "fallback"],
     ["budget_exhausted", false, "budget_exhausted", "fallback"],
-  ] as const)("surfaces semantic verifier verdict %s honestly", async (
+  ] as const)("surfaces semantic verifier verdict %s honestly on write turns", async (
     verdict,
     verified,
     expectedDetail,
@@ -650,9 +700,9 @@ describe("semantic verification trace", () => {
   ) => {
     mocks.grillTurn.mockResolvedValueOnce(decodeAgentTurnResponse({
       status: "completed",
-      action: "advise",
+      action: "update_strategy",
       assistant_message: "Verification outcome recorded.",
-      tool_calls: [],
+      tool_calls: [{ name: "update_strategy", arguments: { patch: { species: ["human"] } } }],
       semantic_verification: {
         verdict,
         verified,
@@ -669,5 +719,248 @@ describe("semantic verification trace", () => {
     ) as { status?: string; detail?: string } | undefined;
     expect(semanticEvent?.status).toBe(expectedStatus);
     expect(semanticEvent?.detail).toContain(expectedDetail);
+  });
+});
+
+describe("NB-5 recovery chips after done/failed", () => {
+  function recoveryPayloadsFromAddMessage(addMessage: ReturnType<typeof vi.fn>) {
+    return (addMessage.mock.calls as unknown as Array<[Record<string, unknown>]>)
+      .map((call) => {
+        const generic = (call[0]?.output as { generic?: Array<{ user_defined?: { kind?: string } }> } | undefined)
+          ?.generic;
+        return generic?.find((item) => item.user_defined?.kind === "discovery_recovery")?.user_defined;
+      })
+      .filter(Boolean) as Array<Record<string, unknown>>;
+  }
+
+  async function confirmReadyStrategyAndFailJob(chat: Awaited<ReturnType<typeof mountChat>>) {
+    const strategyFingerprint = "b".repeat(64);
+    mocks.grillTurn
+      .mockResolvedValueOnce(decodeAgentTurnResponse({
+        status: "completed",
+        action: "update_strategy",
+        assistant_message: "Strategy ready.",
+        tool_calls: [{
+          name: "update_strategy",
+          arguments: { patch: {
+            objective: "Reviewed human proteomics candidates for recovery tests",
+            task_type: "browse_only",
+            run_horizon: "candidates_only",
+            target_project_count: 20,
+            coverage_mode: "balanced",
+          } },
+        }],
+      }))
+      .mockResolvedValueOnce(decodeAgentTurnResponse({
+        status: "completed",
+        action: "confirm_strategy",
+        assistant_message: "Confirmed.",
+        strategy_fingerprint: strategyFingerprint,
+        tool_calls: [{
+          name: "confirm_strategy",
+          arguments: { strategy_fingerprint: strategyFingerprint },
+        }],
+      }));
+    mocks.startDiscoveryJob.mockResolvedValue({
+      job_id: "discovery-job-failed-1",
+      status: "failed",
+      error: "PRIDE timeout after context explosion " + "x".repeat(500),
+      discovery_id: "",
+      record: {},
+    });
+    mocks.getDiscoveryJob.mockResolvedValue({
+      job_id: "discovery-job-failed-1",
+      status: "failed",
+      error: "PRIDE timeout after context explosion " + "x".repeat(500),
+      discovery_id: "",
+      record: {},
+    });
+
+    await sendMessage(chat.props, chat.instance, "Use a reviewed set of 20.", "request-ready");
+    await sendMessage(chat.props, chat.instance, "Confirm this strategy.", "request-confirm-fail");
+    await vi.waitFor(() => expect(mocks.startDiscoveryJob).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() =>
+      expect(chat.onPhaseChange.mock.calls.map(([phase]) => phase)).toContain("failed"),
+    );
+  }
+
+  it("shows job-bound recovery chips after failed discovery without dumping raw error", async () => {
+    const chat = await mountChat();
+    await confirmReadyStrategyAndFailJob(chat);
+
+    const recoveries = recoveryPayloadsFromAddMessage(chat.instance.messaging.addMessage);
+    expect(recoveries).toHaveLength(1);
+    expect(recoveries[0]).toMatchObject({
+      kind: "discovery_recovery",
+      jobId: "discovery-job-failed-1",
+      outcome: "failed",
+      hasResults: false,
+    });
+    expect(String(recoveries[0].summary || "").length).toBeLessThan(320);
+
+    const rendered = chat.props.renderUserDefinedResponse?.({
+      messageItem: { user_defined: recoveries[0] },
+    });
+    expect(rendered).toBeTruthy();
+  });
+
+  it("re-search opens a new SDK session and requires confirm (no auto-search)", async () => {
+    const chat = await mountChat();
+    await confirmReadyStrategyAndFailJob(chat);
+    const sessionBefore = window.sessionStorage.getItem("pride-agent-dialogue-session");
+    const recoveries = recoveryPayloadsFromAddMessage(chat.instance.messaging.addMessage);
+    const payload = recoveries[0];
+    expect(payload).toBeTruthy();
+
+    const startCallsBefore = mocks.startDiscoveryJob.mock.calls.length;
+    await act(async () => {
+      const node = chat.props.renderUserDefinedResponse?.({
+        messageItem: { user_defined: payload },
+      }) as { props?: { onAction?: (action: string, p: unknown) => void; payload?: unknown } } | null;
+      // React element from renderDiscoveryRecoveryUserDefined
+      const onAction = (node as { props: { onAction: (a: string, p: unknown) => void; payload: unknown } }).props.onAction;
+      const bound = (node as { props: { payload: unknown } }).props.payload;
+      onAction("research_current_card", bound);
+    });
+
+    await vi.waitFor(() => {
+      const sessionAfter = window.sessionStorage.getItem("pride-agent-dialogue-session");
+      expect(sessionAfter).toBeTruthy();
+      expect(sessionAfter).not.toBe(sessionBefore);
+    });
+    expect(mocks.startDiscoveryJob.mock.calls.length).toBe(startCallsBefore);
+    expect(chat.onPhaseChange.mock.calls.map(([phase]) => phase)).toContain("awaiting_confirm");
+    expect(chat.onIntentChange.mock.calls.at(-1)?.[0].confirmed).toBe(false);
+
+    const texts = (chat.instance.messaging.addMessage.mock.calls as unknown as Array<[Record<string, unknown>]>)
+      .map((call) => JSON.stringify(call[0]));
+    expect(texts.some((t) => t.includes("新会话") || t.includes("再次确认"))).toBe(true);
+  });
+
+  it("does not dual-start discovery when re-search is clicked while running", async () => {
+    const strategyFingerprint = "c".repeat(64);
+    mocks.grillTurn
+      .mockResolvedValueOnce(decodeAgentTurnResponse({
+        status: "completed",
+        action: "update_strategy",
+        assistant_message: "Strategy ready.",
+        tool_calls: [{
+          name: "update_strategy",
+          arguments: { patch: {
+            objective: "Reviewed human proteomics candidates",
+            task_type: "browse_only",
+            run_horizon: "candidates_only",
+            target_project_count: 12,
+          } },
+        }],
+      }))
+      .mockResolvedValueOnce(decodeAgentTurnResponse({
+        status: "completed",
+        action: "confirm_strategy",
+        assistant_message: "Confirmed.",
+        strategy_fingerprint: strategyFingerprint,
+        tool_calls: [{
+          name: "confirm_strategy",
+          arguments: { strategy_fingerprint: strategyFingerprint },
+        }],
+      }));
+
+    let resolveJob!: (value: Record<string, unknown>) => void;
+    mocks.startDiscoveryJob.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        resolveJob = resolve;
+      }),
+    );
+
+    const chat = await mountChat();
+    await sendMessage(chat.props, chat.instance, "Use 12 candidates.", "request-running-strategy");
+    const confirmSend = sendMessage(chat.props, chat.instance, "Confirm.", "request-running-confirm");
+    await vi.waitFor(() => expect(mocks.startDiscoveryJob).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() =>
+      expect(chat.onPhaseChange.mock.calls.map(([phase]) => phase)).toContain("running"),
+    );
+
+    // Inject a stale recovery payload as if a previous run finished.
+    const stalePayload = {
+      kind: "discovery_recovery",
+      jobId: "stale-job",
+      discoveryId: "",
+      cardGeneration: "stale",
+      outcome: "failed",
+      hasResults: false,
+      summary: "stale",
+    };
+    // Force lastRecoveryRef by completing a prior path is hard while running;
+    // instead click handler via research when phase is running with bound payload
+    // by first finishing then immediately... Simpler: send NL while running.
+    await sendMessage(chat.props, chat.instance, "start another search please", "request-dual");
+    const dualReplies = (chat.instance.messaging.upsertMessage.mock.calls as Array<unknown[]>)
+      .map((call) => {
+        try {
+          const factory = call[2] as () => Record<string, unknown>;
+          return JSON.stringify(factory());
+        } catch {
+          return "";
+        }
+      })
+      .join("\n");
+    expect(dualReplies).toMatch(/已有数据发现任务在跑|不会双开/);
+    expect(mocks.startDiscoveryJob).toHaveBeenCalledTimes(1);
+
+    resolveJob({
+      job_id: "discovery-job-running-1",
+      status: "failed",
+      error: "stopped",
+      record: {},
+    });
+    mocks.getDiscoveryJob.mockResolvedValue({
+      job_id: "discovery-job-running-1",
+      status: "failed",
+      error: "stopped",
+      record: {},
+    });
+    await confirmSend;
+    void stalePayload;
+  });
+
+  it("revise_strategy re-enters grilling without starting discovery", async () => {
+    const chat = await mountChat();
+    await confirmReadyStrategyAndFailJob(chat);
+    const payload = recoveryPayloadsFromAddMessage(chat.instance.messaging.addMessage)[0];
+    const startCallsBefore = mocks.startDiscoveryJob.mock.calls.length;
+
+    await act(async () => {
+      const node = chat.props.renderUserDefinedResponse?.({
+        messageItem: { user_defined: payload },
+      }) as { props: { onAction: (a: string, p: unknown) => void; payload: unknown } };
+      node.props.onAction("revise_strategy", node.props.payload);
+    });
+
+    expect(mocks.startDiscoveryJob.mock.calls.length).toBe(startCallsBefore);
+    expect(chat.onPhaseChange.mock.calls.map(([phase]) => phase).at(-1)).toBe("grilling");
+    expect(chat.onIntentChange.mock.calls.at(-1)?.[0].confirmed).toBe(false);
+  });
+});
+
+describe("NI-1 semantic chrome policy", () => {
+  it("hides semantic-verification chrome on pure chat turns (NI-1)", async () => {
+    mocks.grillTurn.mockResolvedValueOnce(decodeAgentTurnResponse({
+      status: "completed",
+      action: "chat",
+      assistant_message: "这是术语说明，不是写卡。",
+      tool_calls: [],
+      semantic_verification: {
+        verdict: "reject",
+        verified: false,
+        patch: {},
+        rationale: "should not reach the user chrome",
+      },
+    }));
+    const chat = await mountChat();
+    await sendMessage(chat.props, chat.instance, "免疫肽是什么？");
+    const semanticEvent = latestTimelineEvents(chat.renderedMessages).find(
+      (event) => (event as { name?: string }).name === "semantic-verification",
+    );
+    expect(semanticEvent).toBeUndefined();
   });
 });

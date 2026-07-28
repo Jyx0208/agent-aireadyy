@@ -88,13 +88,19 @@ def test_query_builder_expands_non_phospho_ptm_and_isobaric_labeling_terms() -> 
         max_candidate_projects=20,
     )
 
+    from agent.discovery.query_builder import build_theme_search_plan
+
+    plan = build_theme_search_plan(request)
     queries = build_pride_queries(request)
     joined = " | ".join(queries).casefold()
 
-    assert "rat" in joined or "rattus" in joined
+    # PTS: PTM theme seeds only; species/labeling are post-pool FilterSpec.
     assert "ubiquitin" in joined or "glygly" in joined
-    assert "tmt" in joined
     assert "dia" not in joined
+    assert "rat" not in joined and "rattus" not in joined
+    assert "tmt" not in joined
+    assert any(s.casefold() == "rat" for s in plan.filters.species) or plan.filters.species
+    assert str(plan.filters.labeling_strategy or "").casefold() == "tmt"
 
 
 def test_tmt_and_itraq_are_labeling_evidence_not_acquisition_conflicts() -> None:

@@ -30,6 +30,7 @@ from agent.ai_ready.rt_exporter import (
 )
 from agent.models import JsonModel
 from agent.utils import write_json
+from agent.ai_ready.release_predicates import exporter_status_from_rows
 
 
 DENOVO_SCHEMA_VERSION = "denovo_train_v0"
@@ -138,8 +139,9 @@ def export_denovo_ai_ready(
 
     rows_in = sum(item.rows_in for item in input_reports)
     rows_out = int(len(combined))
+    export_status = exporter_status_from_rows(rows_out)
     report = {
-        "status": "completed",
+        "status": export_status,
         "schema_version": DENOVO_SCHEMA_VERSION,
         "rows_in": rows_in,
         "rows_out": rows_out,
@@ -158,7 +160,7 @@ def export_denovo_ai_ready(
     }
     write_json(report_json, report)
     return DenovoExportResult(
-        status="completed",
+        status=export_status,
         output_parquet=str(output_parquet),
         preview_csv=str(preview_csv),
         report_json=str(report_json),

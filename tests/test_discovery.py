@@ -55,6 +55,13 @@ def _discovered_project() -> DiscoveredProject:
     return build_discovered_project(raw_project, request, score)
 
 
+def test_discovery_defaults_separate_review_and_file_delivery_batch_sizes() -> None:
+    request = DatasetRequest()
+
+    assert request.inspection_batch_size == 30
+    assert request.partial_delivery_batch_size == 500
+
+
 def test_query_builder_phospho_request_generates_pride_keywords():
     request = DatasetRequest(goal="ptm", ptm_type="phospho", species=["human"], acquisition_mode="dda")
 
@@ -64,7 +71,9 @@ def test_query_builder_phospho_request_generates_pride_keywords():
     assert "phosphopeptide enrichment" in queries
     assert any("TiO2" in query or "Ti-IMAC" in query for query in queries)
     assert any("phosphotyrosine" in query for query in queries)
-    assert any("Homo sapiens" in query for query in queries)
+    # PTS: species is a post-pool filter — not an equal PRIDE seed.
+    assert not any("Homo sapiens" in query for query in queries)
+    assert not any(query.strip().casefold() == "dda" for query in queries)
 
 
 def test_query_builder_multi_ptm_request_generates_all_selected_ptm_keywords():
@@ -74,8 +83,8 @@ def test_query_builder_multi_ptm_request_generates_all_selected_ptm_keywords():
 
     assert any("phosphoproteomics" in query for query in queries)
     assert any("acetylome" in query or "acetylation" in query for query in queries)
-    assert any("phosphoproteomics DDA" in query for query in queries)
-    assert any("acetylome DDA" in query or "acetylation DDA" in query for query in queries)
+    # PTS: DDA is a filter, not a cross-product seed peer.
+    assert not any(query.strip().endswith(" DDA") for query in queries)
 
 
 def test_query_builder_general_request_uses_free_text_terms():
@@ -89,9 +98,9 @@ def test_query_builder_general_request_uses_free_text_terms():
     queries = build_pride_queries(request)
 
     assert "drug treatment" in queries
-    assert "drug treatment DDA" in queries
-    assert "kinase inhibitor data dependent" in queries
-    assert any("Homo sapiens drug treatment" in query for query in queries)
+    assert "kinase inhibitor" in queries
+    assert not any("drug treatment DDA" in query for query in queries)
+    assert not any("Homo sapiens drug treatment" in query for query in queries)
 
 
 def test_pride_query_adapter_turns_compound_agent_queries_into_distinct_seeds():
@@ -106,7 +115,23 @@ def test_pride_query_adapter_turns_compound_agent_queries_into_distinct_seeds():
         ]
     )
 
-    assert queries == ["human", "HeLa", "HEK293", "DDA", "label-free", "Orbitrap"]
+    # WP-A: expand ALL distinct seeds from the portfolio, not first-seed-only.
+    assert "human" in queries
+    assert "HeLa" in queries
+    assert "HEK293" in queries
+    assert "DDA" in queries
+    assert "label-free" in queries
+    assert "Orbitrap" in queries
+    assert "q exactive" in queries
+    assert "fusion lumos" in queries
+    # No silent first-only collapse: multi-token inputs contribute multiple seeds.
+    assert len(queries) >= 6
+
+
+def test_prepare_pride_expands_all_atomic_seeds_not_first_only():
+    seeds = prepare_pride_search_queries(["human DDA phospho"])
+    assert seeds[:3] == ["human", "DDA", "phospho"] or set(seeds) >= {"human", "DDA", "phospho"}
+    assert len(seeds) >= 3
 
 
 def test_discovery_executes_high_recall_queries_with_balanced_page_sizes():
@@ -137,14 +162,13 @@ def test_discovery_executes_high_recall_queries_with_balanced_page_sizes():
         ],
     )
 
-    assert client.calls == [
-        ("human", 100),
-        ("HeLa", 100),
-        ("HEK293", 100),
-        ("DDA", 100),
-        ("label-free", 100),
-        ("Orbitrap", 100),
-    ]
+    # WP-A multi-seed portfolio: each compound query expands to multiple seeds.
+    # Require core high-recall seeds; additional instrument/label seeds are allowed.
+    keywords = [keyword for keyword, _page in client.calls]
+    for required in ("human", "HeLa", "HEK293"):
+        assert required in keywords
+    assert all(page == 100 for _keyword, page in client.calls)
+    assert len(client.calls) >= 6
 
 
 def test_discovery_ranks_relevant_older_candidates_before_inspection():
@@ -412,6 +436,28 @@ def test_manifest_respects_project_and_file_limits():
     assert len(manifest.files) == 2
     assert all(project.selected_file_count == 1 for project in manifest.projects)
     assert all(file.file_name.endswith((".raw", ".mzML")) for file in manifest.files)
+
+
+def test_discovery_reports_project_metadata_score_and_evidence_fields():
+    messages: list[str] = []
+    request = DatasetRequest(
+        goal="ptm",
+        ptm_type="phospho",
+        max_projects=1,
+        max_files=1,
+    )
+
+    discover_pride_dataset(
+        request,
+        client=FakePrideClient(),
+        report=messages.append,
+    )
+
+    scored = next(message for message in messages if "metadata scored" in message)
+    assert "PXD000001" in scored
+    assert "retrieval score" in scored
+    assert "confidence" in scored
+    assert "evidence fields" in scored
 
 
 def test_discovery_extracts_instrument_and_fragmentation_from_metadata():
@@ -897,11 +943,13 @@ def test_manifest_writer_outputs_valid_and_usable_subsets(tmp_path: Path):
     quality = json.loads(paths["quality_report"].read_text(encoding="utf-8"))
 
     assert [row["file_name"] for row in valid_rows] == ["valid.raw"]
-    assert [row["file_name"] for row in usable_rows] == ["valid.raw", "weak.mzML"]
+    assert [row["file_name"] for row in usable_rows] == ["valid.raw"]
     assert paths["batch_inputs_valid"].read_text(encoding="utf-8").splitlines() == ["PXD000001/valid.raw"]
-    assert paths["batch_inputs_usable"].read_text(encoding="utf-8").splitlines() == ["PXD000001/valid.raw", "PXD000001/weak.mzML"]
+    assert paths["batch_inputs_usable"].read_text(encoding="utf-8").splitlines() == [
+        "PXD000001/valid.raw"
+    ]
     assert quality["valid_files"] == 1
-    assert quality["usable_files"] == 2
+    assert quality["usable_files"] == 1
     assert quality["needs_review_files"] == 2
     assert quality["excluded_files"] == 2
     assert quality["task_readiness_applicability"] == "not_applicable_task_undecided"

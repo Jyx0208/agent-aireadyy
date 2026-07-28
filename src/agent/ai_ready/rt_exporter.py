@@ -10,6 +10,7 @@ from pydantic import Field
 
 from agent.models import JsonModel
 from agent.utils import write_json
+from agent.ai_ready.release_predicates import exporter_status_from_rows
 
 
 RT_SCHEMA_VERSION = "rt_train_v0"
@@ -22,6 +23,7 @@ RT_TRAIN_COLUMNS = [
     "charge",
     "retention_time",
     "retention_time_unit",
+    "rt_unit_source",
     "spectrum_id",
     "q_value",
     "psm_probability",
@@ -45,6 +47,7 @@ RT_PEPTIDE_COLUMNS = [
     "retention_time_median",
     "retention_time_mean",
     "retention_time_unit",
+    "rt_unit_source",
     "psm_count",
     "best_q_value",
     "best_psm_probability",
@@ -132,7 +135,8 @@ class RtExportOptions(JsonModel):
     q_value_threshold: float = 0.01
     probability_threshold: float = 0.9
     require_confidence: bool = False
-    retention_time_unit: str = "minute"
+    retention_time_unit: str | None = None
+    retention_time_unit_source: str = "unknown"
 
 
 class RtSearchInput(JsonModel):
@@ -176,16 +180,20 @@ def export_rt_ai_ready(
     q_value_threshold: float = 0.01,
     probability_threshold: float = 0.9,
     require_confidence: bool = False,
+    retention_time_unit: str | None = None,
     search_engine: str | None = None,
 ) -> RtExportResult:
     if not search_results:
         raise ValueError("At least one --search-result is required.")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    unit_source = "user_supplied" if retention_time_unit else "unknown"
     options = RtExportOptions(
         q_value_threshold=q_value_threshold,
         probability_threshold=probability_threshold,
         require_confidence=require_confidence,
+        retention_time_unit=retention_time_unit,
+        retention_time_unit_source=unit_source,
     )
     metadata = _load_task_build_metadata(task_build_plan)
 
@@ -230,11 +238,22 @@ def export_rt_ai_ready(
 
     rows_in = sum(item.rows_in for item in input_reports)
     rows_out = int(len(combined))
+    export_status = exporter_status_from_rows(rows_out)
+    rt_unit_sources = (
+        sorted({str(v) for v in combined["rt_unit_source"].dropna().astype(str)})
+        if rows_out and "rt_unit_source" in combined.columns
+        else []
+    )
     report = {
-        "status": "completed",
+        "status": export_status,
         "schema_version": RT_SCHEMA_VERSION,
         "rows_in": rows_in,
         "rows_out": rows_out,
+        "rt_unit_source": rt_unit_sources[0] if len(rt_unit_sources) == 1 else ("mixed" if rt_unit_sources else "unknown"),
+        "has_confidence_column": any(
+            item.column_map.get("q_value") is not None or item.column_map.get("psm_probability") is not None
+            for item in input_reports
+        ),
         "rows_filtered": rows_in - rows_out,
         "filter_counts": dict(sorted(total_filter_counts.items())),
         "warnings": sorted(set(global_warnings)),
@@ -267,7 +286,7 @@ def export_rt_ai_ready(
     write_json(peptide_report_json, peptide_report)
     write_json(validation_report_json, validation_report)
     return RtExportResult(
-        status="completed",
+        status=export_status,
         output_parquet=str(output_parquet),
         preview_csv=str(preview_csv),
         peptide_parquet=str(peptide_parquet),
@@ -332,8 +351,15 @@ def _load_one_result(
     )
     output["charge"] = pd.to_numeric(_series(frame, column_map["charge"]), errors="coerce")
     output["retention_time"] = pd.to_numeric(_series(frame, column_map["retention_time"]), errors="coerce")
-    rt_unit = _retention_time_unit(str(column_map["retention_time"]))
+    if options.retention_time_unit:
+        rt_unit = str(options.retention_time_unit)
+        rt_unit_source = "user_supplied"
+    else:
+        rt_unit, rt_unit_source = _retention_time_unit_with_source(str(column_map["retention_time"]))
+        if rt_unit_source != "column_explicit":
+            warnings.append("rt_unit_unknown")
     output["retention_time_unit"] = rt_unit
+    output["rt_unit_source"] = rt_unit_source
     output["spectrum_id"] = _optional_series(frame, column_map.get("spectrum_id"))
     output["q_value"] = pd.to_numeric(_optional_series(frame, column_map.get("q_value")), errors="coerce")
     output["psm_probability"] = pd.to_numeric(_optional_series(frame, column_map.get("psm_probability")), errors="coerce")
@@ -473,10 +499,22 @@ def _first_nonempty(values: pd.Series) -> str | None:
 
 
 def _retention_time_unit(column: str) -> str:
+    unit, _source = _retention_time_unit_with_source(column)
+    return unit
+
+
+def _retention_time_unit_with_source(column: str) -> tuple[str, str]:
+    """Infer RT unit from column name.
+
+    Display may still use minute when evidence is missing, but source is
+    inferred_default/unknown so release science fails closed.
+    """
     text = _normalize_column(column)
-    if "sec" in text or text.endswith(" s") or "(s)" in text:
-        return "second"
-    return "minute"
+    if "sec" in text or text.endswith(" s") or "(s)" in text or text.endswith("_s"):
+        return "second", "column_explicit"
+    if "min" in text or "(min)" in text or text.endswith("_min"):
+        return "minute", "column_explicit"
+    return "minute", "inferred_default"
 
 
 def _guess_search_engine(path: Path) -> str:
@@ -566,6 +604,7 @@ def _aggregate_peptide_level(frame: pd.DataFrame) -> pd.DataFrame:
                 "retention_time_median": _float_or_none(group["retention_time"].median()),
                 "retention_time_mean": _float_or_none(group["retention_time"].mean()),
                 "retention_time_unit": _first_value(group["retention_time_unit"]),
+                "rt_unit_source": _first_value(group["rt_unit_source"]) if "rt_unit_source" in group.columns else "unknown",
                 "psm_count": int(len(group)),
                 "best_q_value": _float_or_none(group["q_value"].min(skipna=True)),
                 "best_psm_probability": _float_or_none(group["psm_probability"].max(skipna=True)),
@@ -590,7 +629,7 @@ def _aggregate_peptide_level(frame: pd.DataFrame) -> pd.DataFrame:
 
 def _peptide_aggregation_report(psm_frame: pd.DataFrame, peptide_frame: pd.DataFrame) -> dict[str, Any]:
     return {
-        "status": "completed",
+        "status": exporter_status_from_rows(len(peptide_frame)),
         "schema_version": RT_SCHEMA_VERSION,
         "psm_rows": int(len(psm_frame)),
         "peptide_rows": int(len(peptide_frame)),
@@ -625,10 +664,20 @@ def _validation_report(
         missing_columns.update(item.missing_required_columns)
         matched_sources.update(item.task_build_plan_matched_sources)
         unmatched_sources.update(item.task_build_plan_unmatched_sources)
+    unit_sources = []
+    if not combined.empty and "rt_unit_source" in combined.columns:
+        unit_sources = sorted({str(v) for v in combined["rt_unit_source"].dropna().astype(str)})
+    rt_unit_source = unit_sources[0] if len(unit_sources) == 1 else ("mixed" if unit_sources else "unknown")
+    has_confidence = any(
+        item.column_map.get("q_value") is not None or item.column_map.get("psm_probability") is not None
+        for item in input_reports
+    )
     return {
-        "status": "completed",
+        "status": exporter_status_from_rows(len(combined)),
         "schema_version": RT_SCHEMA_VERSION,
         "input_files": len(input_reports),
+        "rt_unit_source": rt_unit_source,
+        "has_confidence_column": has_confidence,
         "rows_in": sum(item.rows_in for item in input_reports),
         "psm_rows_out": int(len(combined)),
         "peptide_rows_out": int(len(peptide_frame)),
@@ -710,7 +759,8 @@ def _schema_payload() -> dict[str, Any]:
             "modified_sequence": "Modified peptide string when available, otherwise peptide_sequence.",
             "charge": "Precursor charge.",
             "retention_time": "Observed retention time.",
-            "retention_time_unit": "minute or second, inferred from column name; defaults to minute.",
+            "retention_time_unit": "minute, second, or unknown when column/user evidence exists.",
+            "rt_unit_source": "column_explicit | user_supplied | unknown provenance for release gates.",
             "spectrum_id": "Spectrum/scan identifier when available.",
             "q_value": "PSM or peptide q-value when available.",
             "psm_probability": "PSM probability when available.",

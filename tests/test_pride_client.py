@@ -3,7 +3,49 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from agent.pride.client import PrideClient, PrideInvalidResponseError
+from agent.pride.client import (
+    PrideClient,
+    PrideInvalidResponseError,
+    search_projects_paginated,
+)
+
+
+def test_paginated_resume_fails_closed_when_legacy_client_has_no_page_cursor() -> None:
+    class LegacyClient:
+        def search_projects(self, _keyword: str, page_size: int = 100):
+            return [{"accession": "PXD000001"}][:page_size]
+
+    with pytest.raises(RuntimeError, match="does not support resumable page cursors"):
+        search_projects_paginated(
+            LegacyClient(),
+            "immunopeptidomics",
+            page_size=100,
+            max_pages=2,
+            max_results=150,
+            start_page=1,
+        )
+
+
+def test_paginated_legacy_client_internal_type_error_is_not_retried() -> None:
+    class BrokenClient:
+        def search_projects(
+            self,
+            _keyword: str,
+            page_size: int = 100,
+            *,
+            page: int = 0,
+        ):
+            del page_size, page
+            raise TypeError("internal decoding failure")
+
+    with pytest.raises(TypeError, match="internal decoding failure"):
+        search_projects_paginated(
+            BrokenClient(),
+            "immunopeptidomics",
+            page_size=100,
+            max_pages=2,
+            max_results=150,
+        )
 
 
 class _FakeResponse:

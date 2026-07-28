@@ -333,8 +333,6 @@ def test_selected_manifest_cannot_be_invalidated_by_a_late_judgment(
         ("file_accession_or_path", None),
         ("download_url", None),
         ("file_role", "unknown"),
-        ("evidence_level", "unknown"),
-        ("expected_size_bytes", None),
     ],
 )
 def test_delivery_assets_are_revalidated_instead_of_trusting_status_flags(
@@ -353,6 +351,31 @@ def test_delivery_assets_are_revalidated_instead_of_trusting_status_flags(
     assert report.ready_for_selection is False
     assert report.counts["delivery_eligible_projects"] == 0
     assert any(issue.code == "qualified_project_has_no_delivery_assets" for issue in report.issues)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("evidence_level", "project"),
+        ("expected_size_bytes", None),
+    ],
+)
+def test_delivery_allows_inherited_evidence_and_unknown_size(
+    tmp_path: Path,
+    field: str,
+    value: Any,
+) -> None:
+    service, _store, _manifest_path = _service(
+        tmp_path,
+        file_updates={field: value},
+    )
+    assert service.record_project_judgments([_include_judgment()])["status"] == "completed"
+
+    report = service.audit_discovery_state(meter_tool=False)
+
+    assert report.ready_for_selection is True
+    assert report.counts["delivery_eligible_projects"] == 1
+    assert report.counts["usable_files"] == 1
 
 
 def test_quality_audit_requests_rescoring_for_inspected_but_unjudged_projects(
@@ -914,7 +937,7 @@ def test_constraint_evidence_must_support_the_claimed_observed_value(
     ]
 
 
-def test_ready_audit_discloses_when_delivery_relies_on_weak_keep_files(
+def test_weak_keep_files_are_pending_and_not_silently_delivered(
     tmp_path: Path,
 ) -> None:
     service, _store, _manifest_path = _service(
@@ -929,17 +952,16 @@ def test_ready_audit_discloses_when_delivery_relies_on_weak_keep_files(
 
     audit = service.audit_discovery_state(meter_tool=False)
 
-    assert audit.status == "ready"
-    assert audit.ready_for_selection is True
+    assert audit.status == "repair_required"
+    assert audit.ready_for_selection is False
     assert audit.counts["strict_valid_files"] == 0
-    assert audit.counts["weak_keep_files"] == 1
-    warning = next(
-        issue for issue in audit.issues
-        if issue.code == "delivery_relies_on_weak_keep_files"
+    assert audit.counts["weak_keep_files"] == 0
+    assert audit.counts["pending_files"] == 1
+    assert audit.counts["usable_files"] == 0
+    assert any(
+        issue.code == "qualified_project_has_no_delivery_assets"
+        for issue in audit.issues
     )
-    assert warning.severity == "warning"
-    assert "not strict-valid" in warning.summary
-    assert warning.summary in audit.limitations
 
 
 @pytest.mark.parametrize(

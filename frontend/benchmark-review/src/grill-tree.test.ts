@@ -10,6 +10,10 @@ import {
   applyTargetProjectCount,
   buildStrategyCard,
   composeNextQuestionBody,
+  confirmedSearchThemes,
+  searchTermCandidates,
+  reconcileSearchTermSelection,
+  normalizeSearchTerms,
   shouldDeferConfirmCard,
   nextQuestion,
   deriveObjective,
@@ -37,6 +41,104 @@ import {
 import { createEmptyIntent } from "./intent-spec";
 
 describe("grill decision tree", () => {
+  it("fixes every discovery task to candidate review without asking Q2", () => {
+    const draft = createEmptyIntent("Find human immunopeptidomics projects");
+    draft.answered.Q1 = true;
+
+    expect(draft.runHorizon).toBe("candidates_reviewed");
+    expect(draft.answered.Q2).toBe(true);
+    expect(nextQuestion(draft)?.id).not.toBe("Q2");
+
+    draft.runHorizon = "plan_only";
+    expect(toDiscoveryJobPayload(draft).run_horizon).toBe("candidates_reviewed");
+  });
+
+  it("shows and submits the exact user-confirmed primary search themes", () => {
+    const draft = createEmptyIntent("尽可能多找人源免疫肽项目");
+    draft.objective = "尽可能多找人源免疫肽项目";
+    draft.ptmTypes = ["immunopeptide"];
+    draft.specialThemes = ["immunopeptidomics"];
+    draft.selectedSearchTerms = ["immunopeptidomics"];
+    draft.confirmed = true;
+
+    expect(confirmedSearchThemes(draft)).toEqual(["immunopeptidomics"]);
+    expect(formatConfirmMessage(draft)).toContain(
+      "待确认检索主题词：immunopeptidomics",
+    );
+    expect(toDiscoveryJobPayload(draft).query_terms).toEqual(confirmedSearchThemes(draft));
+  });
+
+  it("offers repository wording variants for immunopeptidomics and submits only the user selection", () => {
+    const draft = createEmptyIntent("Find human immunopeptidomics projects");
+    draft.ptmTypes = ["immunopeptide"];
+
+    expect(searchTermCandidates(draft)).toEqual(expect.arrayContaining([
+      "immunopeptidomics",
+      "immunopeptidome",
+      "HLA ligandome",
+      "MHC ligandome",
+      "HLA peptidome",
+      "MHC peptidome",
+    ]));
+
+    draft.selectedSearchTerms = ["immunopeptidome", "HLA ligandome"];
+    expect(confirmedSearchThemes(draft)).toEqual(["immunopeptidome", "HLA ligandome"]);
+    expect(toDiscoveryJobPayload(draft).query_terms).toEqual([
+      "immunopeptidome",
+      "HLA ligandome",
+    ]);
+  });
+
+  it("serializes an immunopeptidomics special theme as the immunopeptidomics goal", () => {
+    const draft = createEmptyIntent("Explore public data");
+    draft.specialThemes = ["immunopeptidomics"];
+    draft.selectedSearchTerms = ["immunopeptidomics", "HLA ligandome"];
+
+    const payload = toDiscoveryJobPayload(draft);
+
+    expect(payload.goal).toBe("immunopeptidomics");
+    expect(payload.hard_constraint_fields).toContain("goal");
+  });
+
+  it("drops stale immunopeptide selections when the scientific theme changes", () => {
+    const phospho = createEmptyIntent("Find phosphoproteomics projects");
+    phospho.ptmTypes = ["phosphorylation"];
+
+    expect(reconcileSearchTermSelection(["HLA ligandome"], phospho)).toEqual([
+      "phosphorylation",
+    ]);
+  });
+
+  it("keeps a custom term added after all twelve immunopeptide suggestions", () => {
+    const draft = createEmptyIntent("Find human immunopeptidomics projects");
+    draft.ptmTypes = ["immunopeptide"];
+    draft.selectedSearchTerms = [
+      ...searchTermCandidates(draft),
+      "custom antigen presentation phrase",
+    ];
+
+    expect(toDiscoveryJobPayload(draft).query_terms).toContain(
+      "custom antigen presentation phrase",
+    );
+    expect(toDiscoveryJobPayload(draft).query_terms).toHaveLength(13);
+  });
+
+  it("normalizes repository terms using the backend-equivalent duplicate key", () => {
+    expect(normalizeSearchTerms([
+      " HLA   ligandome ",
+      "hla ligandome",
+      "MHC ligandome",
+      "x".repeat(241),
+    ])).toEqual(["HLA ligandome", "MHC ligandome"]);
+  });
+
+  it("never turns a full free-text objective into an implicit repository query", () => {
+    const draft = createEmptyIntent("Find datasets for a novel context and explain every decision");
+    draft.objective = "Find datasets for a novel context and explain every decision";
+
+    expect(confirmedSearchThemes(draft)).toEqual([]);
+  });
+
   it("does not start-ready on bare hi and asks Q1 first", () => {
     const draft = applyLocalParse("hi");
     expect(isReadyForConfirm(draft)).toBe(false);
@@ -65,7 +167,7 @@ describe("grill decision tree", () => {
     expect(draft.answered.Q3).toBe(true);
     expect(draft.answered.Q4).toBe(true);
     expect(draft.answered.Q7).toBe(true);
-    expect(nextQuestion(draft)?.id).toBe("Q2");
+    expect(nextQuestion(draft)?.id).toBe("Q6");
   });
 
   it("requires confirm gate: defaults fill then payload has grill_confirmed", () => {
@@ -251,6 +353,23 @@ describe("explicit project count / strategy revise", () => {
     expect(extractTargetProjectCount("我要20个你为啥写80")).toBe(20);
     expect(extractTargetProjectCount("目标项目数约 15")).toBe(15);
     expect(extractTargetProjectCount("随便找点数据")).toBeNull();
+    expect(extractTargetProjectCount("target 2000 usable projects")).toBe(2000);
+  });
+
+  it("preserves a confirmed fixed target above the old 300-project cap", () => {
+    const draft = applyTargetProjectCount(
+      createEmptyIntent("target 2000 usable projects"),
+      2000,
+      { flexibility: "fixed" },
+    );
+    draft.specialThemes = ["proteogenomics"];
+
+    const payload = toDiscoveryJobPayload(draft);
+
+    expect(draft.targetProjectCount).toBe(2000);
+    expect(payload.max_projects).toBe(2000);
+    expect(payload.max_candidate_projects).toBeGreaterThanOrEqual(8000);
+    expect(payload.continuous_discovery).toBe(false);
   });
 
   it("applyLocalParse writes target 20 from natural language", () => {
@@ -792,7 +911,7 @@ describe("agentic soft-fill (true agent, not form walk)", () => {
 describe("semantic strategy gap validator", () => {
   it("keys gaps by semantic slots instead of Q1-Q10 progress", () => {
     const empty = assessStrategyGaps(createEmptyIntent());
-    expect(empty.required_missing).toEqual(["task", "horizon", "coverage", "objective"]);
+    expect(empty.required_missing).toEqual(["task", "coverage", "objective"]);
     expect(empty.ready_for_confirm).toBe(false);
 
     const semantic = {
@@ -915,8 +1034,8 @@ describe("autonomous multi-field patch mid-conversation", () => {
     expect(s.taskType).toBe("rt_prediction");
     expect(s.species).toContain("human");
     expect(s.targetProjectCount).toBe(20);
-    expect(isReadyForConfirm(s)).toBe(false);
-    expect(assessStrategyGaps(s).required_missing).toContain("horizon");
+    expect(isReadyForConfirm(s)).toBe(true);
+    expect(assessStrategyGaps(s).required_missing).not.toContain("horizon");
   });
 
   it("mergeLlmFields patch overwrites arbitrary extra_fields", () => {

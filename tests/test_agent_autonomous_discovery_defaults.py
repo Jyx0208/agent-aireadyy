@@ -140,24 +140,64 @@ def test_execution_contract_preserves_soft_labeling_and_open_ended_controls() ->
     assert request.on_safety_ceiling == "auto_continue_within_safety"
 
 
-def test_plan_only_confirmation_never_authorizes_repository_search() -> None:
+def test_every_discovery_request_is_forced_to_candidates_reviewed() -> None:
+    for requested_horizon in (
+        None,
+        "plan_only",
+        "candidates_only",
+        "candidates_reviewed",
+        "ai_ready_table",
+        "pre_release",
+        "full_release",
+    ):
+        request = web_app._clean_dataset_request(
+            {
+                "prompt": "Find human immunopeptidomics projects",
+                "repository": "pride",
+                "run_horizon": requested_horizon,
+            }
+        )
+
+        assert request.run_horizon == "candidates_reviewed"
+
+
+def test_delivery_horizon_is_not_a_dialogue_gap_or_decision() -> None:
+    gap_report = web_app._normalise_discovery_gap_report(
+        {
+            "required_missing": ["horizon", "objective"],
+            "optional_missing": ["run_horizon", "species"],
+            "ready_for_confirm": False,
+        }
+    )
+    agenda = web_app._discovery_critical_decision_agenda(
+        {},
+        gap_report,
+        set(),
+    )
+
+    assert "horizon" not in gap_report["required_missing"]
+    assert "run_horizon" not in gap_report["optional_missing"]
+    assert all(
+        "run_horizon" not in item.get("target_fields", [])
+        for item in agenda
+    )
+
+
+def test_legacy_plan_only_confirmation_is_accepted_then_normalized_at_execution() -> None:
     rejection = web_app._discovery_confirmation_rejection(
         {"grill_confirmed": True, "run_horizon": "plan_only"}
     )
 
-    assert rejection is not None
-    assert rejection["code"] == "discovery_plan_only"
+    assert rejection is None
 
 
-def test_unwired_downstream_horizons_fail_closed_instead_of_running_plain_discovery() -> None:
+def test_legacy_downstream_horizons_are_accepted_then_normalized_at_execution() -> None:
     for horizon in ("ai_ready_table", "pre_release", "full_release"):
         rejection = web_app._discovery_confirmation_rejection(
             {"grill_confirmed": True, "run_horizon": horizon}
         )
 
-        assert rejection is not None
-        assert rejection["code"] == "discovery_downstream_horizon_required"
-        assert horizon in rejection["error"]
+        assert rejection is None
 
 
 def test_dialogue_agent_is_told_the_real_execution_boundary() -> None:
@@ -257,3 +297,27 @@ def test_autonomous_instructions_do_not_require_budget_grant_chain() -> None:
     assert "Autonomous budget mode" in text
     assert "硬" in text or "hard ceilings" in text or "hard server ceilings" in text
     assert "越多越好" in text or "as many as possible" in text
+
+
+def test_open_ended_search_exhausts_primary_theme_before_synonyms() -> None:
+    request = DatasetRequest(
+        repository="pride",
+        goal="immunopeptidomics",
+        query_terms=["immunopeptidomics", "immunopeptidome", "HLA ligandome"],
+        quantity_scope="portfolio",
+        portfolio_size_preference="maximize_qualified_projects",
+        quota_flexibility="open_ended",
+        harvest_all_qualified=True,
+        max_projects=30,
+    )
+
+    text = _quality_first_discovery_instructions(
+        request,
+        task_type=None,
+        dynamic_budget=False,
+    )
+
+    assert "one confirmed theme phrase at a time" in text
+    assert "repository_seed_exhausted" in text
+    assert "Do not interleave synonyms" in text
+    assert "review the newly found projects before moving to the next confirmed synonym" in text

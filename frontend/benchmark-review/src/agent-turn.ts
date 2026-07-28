@@ -116,6 +116,8 @@ export type AgentSemanticVerification = {
   rationale: string;
   error?: string;
   errors: string[];
+  soft_reject_kept_fields?: string[];
+  soft_reject_dropped_fields?: string[];
 };
 
 export type AgentDialogueMessage = {
@@ -380,6 +382,9 @@ function decodeStrategyPatch(value: unknown): AgentStrategyPatch | null {
     writable[field.key] = decoded[0];
   }
 
+  if (hasOwn(writable, "runHorizon")) {
+    writable.runHorizon = "candidates_reviewed";
+  }
   return Object.keys(patch).length > 0 ? patch : null;
 }
 
@@ -445,11 +450,19 @@ function decodeNextDecision(value: unknown): AgentNextDecision | null {
     ? raw.options.map(decodeOption).filter((item): item is AgentDecisionOption => item != null).slice(0, 8)
     : [];
   if (!question || !recommendation?.reason || options.length < 2) return null;
+  const focus = cleanString(raw.focus);
+  const targetFields = Array.isArray(raw.target_fields)
+    ? Array.from(new Set(raw.target_fields.map(cleanString).filter(Boolean))).slice(0, 8)
+    : [];
+  if (
+    ["horizon", "run_horizon", "delivery_horizon"].includes(focus.toLowerCase())
+    || targetFields.includes("run_horizon")
+  ) {
+    return null;
+  }
   return {
-    focus: cleanString(raw.focus),
-    target_fields: Array.isArray(raw.target_fields)
-      ? Array.from(new Set(raw.target_fields.map(cleanString).filter(Boolean))).slice(0, 8)
-      : [],
+    focus,
+    target_fields: targetFields,
     option_mode: cleanString(raw.option_mode) === "expanded" ? "expanded" : "focused",
     question,
     recommendation: { ...recommendation, reason: recommendation.reason },
@@ -465,11 +478,19 @@ function decodeResolvedDecision(value: unknown): AgentResolvedDecision | null {
   if (!raw || !Array.isArray(raw.option_ids)) return null;
   const optionIds = Array.from(new Set(raw.option_ids.map(cleanString).filter(Boolean))).slice(0, 8);
   if (optionIds.length < 2) return null;
+  const focus = cleanString(raw.focus);
+  const targetFields = Array.isArray(raw.target_fields)
+    ? Array.from(new Set(raw.target_fields.map(cleanString).filter(Boolean))).slice(0, 8)
+    : [];
+  if (
+    ["horizon", "run_horizon", "delivery_horizon"].includes(focus.toLowerCase())
+    || targetFields.includes("run_horizon")
+  ) {
+    return null;
+  }
   return {
-    focus: cleanString(raw.focus),
-    target_fields: Array.isArray(raw.target_fields)
-      ? Array.from(new Set(raw.target_fields.map(cleanString).filter(Boolean))).slice(0, 8)
-      : [],
+    focus,
+    target_fields: targetFields,
     option_ids: optionIds,
     selected_option_id: cleanString(raw.selected_option_id),
     ...(cleanString(raw.selected_option_label)
@@ -502,9 +523,12 @@ function slotList(value: unknown): StrategySlot[] {
 function decodeGapReport(value: unknown): AgentTurnGapReport | null {
   const raw = record(value);
   if (!raw) return null;
+  const fixedSlots = new Set(["horizon", "run_horizon", "delivery_horizon"]);
   return {
-    required_missing: slotList(raw.required_missing ?? raw.requiredMissing),
-    optional_missing: slotList(raw.optional_missing ?? raw.optionalMissing),
+    required_missing: slotList(raw.required_missing ?? raw.requiredMissing)
+      .filter((slot) => !fixedSlots.has(slot)),
+    optional_missing: slotList(raw.optional_missing ?? raw.optionalMissing)
+      .filter((slot) => !fixedSlots.has(slot)),
     ready_for_confirm: raw.ready_for_confirm === true || raw.readyForConfirm === true,
   };
 }
@@ -544,6 +568,12 @@ function decodeSemanticVerification(value: unknown): AgentSemanticVerification |
     ? raw.errors.map(cleanString).filter(Boolean).map((item) => item.slice(0, 500)).slice(0, 50)
     : [];
   const error = cleanString(raw.error).slice(0, 500);
+  const softKept = Array.isArray(raw.soft_reject_kept_fields)
+    ? raw.soft_reject_kept_fields.map(cleanString).filter(Boolean).slice(0, 50)
+    : [];
+  const softDropped = Array.isArray(raw.soft_reject_dropped_fields)
+    ? raw.soft_reject_dropped_fields.map(cleanString).filter(Boolean).slice(0, 50)
+    : [];
   return {
     verified: successful && raw.verified === true,
     verdict,
@@ -552,6 +582,8 @@ function decodeSemanticVerification(value: unknown): AgentSemanticVerification |
     rationale: cleanString(raw.rationale).slice(0, 1200),
     ...(error ? { error } : {}),
     errors,
+    ...(softKept.length ? { soft_reject_kept_fields: softKept } : {}),
+    ...(softDropped.length ? { soft_reject_dropped_fields: softDropped } : {}),
   };
 }
 
@@ -613,10 +645,33 @@ export function decodeAgentTurnResponse(value: unknown): AgentTurn {
     semanticVerification?.verdict === "rejected"
     && (updatePatch != null || rawHasUpdateTool)
   ) {
-    // The primary typed tool remains authoritative when the bounded verifier
-    // is unavailable, but an explicit authoritative rejection must fail closed.
-    action = "advise";
-    toolCalls = toolCalls.filter((call) => call.name !== "update_strategy");
+    // Soft-reject v2: only an explicit soft_reject_kept_fields list authorizes
+    // a partial write. The verifier's `patch` alone is the rejected proposal,
+    // not a keep set — bare reject must fail closed.
+    const softKeepFields = semanticVerification.soft_reject_kept_fields ?? [];
+    const softKeepPatch = semanticVerification.patch;
+    const hasSoftKeep = softKeepFields.length > 0;
+    if (hasSoftKeep) {
+      action = "update_strategy";
+      if (softKeepPatch != null && Object.keys(softKeepPatch).length > 0) {
+        const kept: Record<string, unknown> = {};
+        const source = softKeepPatch as Record<string, unknown>;
+        for (const field of softKeepFields) {
+          if (Object.prototype.hasOwnProperty.call(source, field)) {
+            kept[field] = source[field];
+          }
+        }
+        toolCalls = Object.keys(kept).length
+          ? [{ name: "update_strategy", arguments: kept }]
+          : toolCalls.filter((call) => call.name !== "update_strategy");
+        if (!Object.keys(kept).length) action = "advise";
+      }
+    } else {
+      // Keep action=update_strategy so write-attempt SV chrome can still surface
+      // the rejection; strip the unauthorized tool patch (fail closed).
+      action = "update_strategy";
+      toolCalls = toolCalls.filter((call) => call.name !== "update_strategy");
+    }
   } else if (hasConfirmTool) {
     action = "confirm_strategy";
   } else if (action === "update_strategy" && updatePatch == null) {
@@ -683,6 +738,7 @@ function cloneIntent(spec: IntentSpec): IntentSpec {
     species: [...spec.species],
     ptmTypes: [...spec.ptmTypes],
     specialThemes: [...spec.specialThemes],
+    selectedSearchTerms: [...(spec.selectedSearchTerms || [])],
     excludeRules: [...spec.excludeRules],
     successCriteria: [...spec.successCriteria],
     scientificConstraints: spec.scientificConstraints.map((item) => ({ ...item })),

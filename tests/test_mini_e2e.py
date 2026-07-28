@@ -54,7 +54,7 @@ def test_mini_e2e_exports_rt_from_agent_run(tmp_path: Path):
     run_dir = tmp_path / "run"
     _write_tsv(
         run_dir / "fragpipe" / "exp" / "peptide.tsv",
-        [{"Peptide": "PEPTIDEK", "Charge": 2, "Retention": 12.5, "PSM Q-Value": 0.001}],
+        [{"Peptide": "PEPTIDEK", "Charge": 2, "Retention Time (min)": 12.5, "PSM Q-Value": 0.001}],
     )
 
     result = validate_agent_run_ai_ready_mini(
@@ -75,7 +75,7 @@ def test_mini_e2e_reports_upstream_partial_outputs(tmp_path: Path):
     _write_failed_upstream_log(run_dir)
     _write_tsv(
         run_dir / "fragpipe" / "exp" / "peptide.tsv",
-        [{"Peptide": "PEPTIDEK", "Charge": 2, "Retention": 12.5, "PSM Q-Value": 0.001}],
+        [{"Peptide": "PEPTIDEK", "Charge": 2, "Retention Time (min)": 12.5, "PSM Q-Value": 0.001}],
     )
 
     result = validate_agent_run_ai_ready_mini(
@@ -255,7 +255,7 @@ def test_validate_agent_run_ai_ready_mini_cli_writes_summary(tmp_path: Path):
     run_dir = tmp_path / "run"
     _write_tsv(
         run_dir / "fragpipe" / "exp" / "peptide.tsv",
-        [{"Peptide": "PEPTIDEK", "Charge": 2, "Retention": 12.5, "PSM Q-Value": 0.001}],
+        [{"Peptide": "PEPTIDEK", "Charge": 2, "Retention Time (min)": 12.5, "PSM Q-Value": 0.001}],
     )
     output_dir = tmp_path / "mini"
     runner = CliRunner()

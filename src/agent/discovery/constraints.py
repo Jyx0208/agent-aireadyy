@@ -132,25 +132,119 @@ class ConstraintAssessment(JsonModel):
         return self
 
 
-def normalize_scientific_constraints(value: Any) -> list[ScientificConstraint]:
+def may_be_hard(source: str | None) -> bool:
+    """Hard strength is only allowed for user or accepted_recommendation provenance."""
+
+    normalized = str(source or "").strip().casefold()
+    return normalized in {"user", "accepted_recommendation"}
+
+
+def constraint_may_be_hard(constraint: ScientificConstraint) -> bool:
+    """Whether a constraint is eligible to act as a hard scientific gate."""
+
+    return constraint.strength == "hard" and may_be_hard(constraint.source)
+
+
+class ConstraintNormalizeResult(JsonModel):
+    """Outcome of normalizing scientific constraints without silent loss.
+
+    accepted are valid constraints. rejected retains raw payloads that failed
+    validation so callers can fail-closed or surface diagnostics.
+    """
+
+    accepted: list[ScientificConstraint] = Field(default_factory=list)
+    rejected: list[dict[str, Any]] = Field(default_factory=list)
+    open_notes: list[str] = Field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.rejected
+
+
+def normalize_scientific_constraints_result(
+    value: Any,
+    *,
+    max_items: int = 100,
+) -> ConstraintNormalizeResult:
+    """Normalize constraints and record every rejected item (no silent drop)."""
+
+    if value is None:
+        return ConstraintNormalizeResult()
     if not isinstance(value, list):
-        return []
-    constraints: list[ScientificConstraint] = []
+        return ConstraintNormalizeResult(
+            rejected=[
+                {
+                    "raw": value,
+                    "error_code": "not_a_list",
+                    "message": "scientific_constraints must be a list",
+                }
+            ],
+            open_notes=["scientific_constraints payload was not a list"],
+        )
+
+    accepted: list[ScientificConstraint] = []
+    rejected: list[dict[str, Any]] = []
     by_id: dict[str, int] = {}
-    for raw in value[:100]:
-        if not isinstance(raw, dict):
+    for index, raw in enumerate(value[:max_items]):
+        if isinstance(raw, ScientificConstraint):
+            constraint = raw
+        elif isinstance(raw, dict):
+            item = dict(raw)
+            # Missing provenance is inferred (soft), never invent user.
+            if not str(item.get("source") or "").strip():
+                item["source"] = "inferred"
+            source = str(item.get("source") or "").strip().casefold()
+            item["source"] = {
+                "accepted_preference": "accepted_recommendation",
+                "system_default": "inferred",
+                "default": "inferred",
+            }.get(
+                source,
+                source if source in {"user", "accepted_recommendation", "inferred"} else "inferred",
+            )
+            if item.get("strength") == "hard" and not may_be_hard(item.get("source")):
+                item["strength"] = "soft"
+            try:
+                constraint = ScientificConstraint.model_validate(item)
+            except Exception as exc:
+                rejected.append(
+                    {
+                        "raw": raw,
+                        "error_code": "validation_error",
+                        "message": str(exc),
+                        "index": index,
+                    }
+                )
+                continue
+        else:
+            rejected.append(
+                {
+                    "raw": raw,
+                    "error_code": "not_an_object",
+                    "message": "constraint item must be an object",
+                    "index": index,
+                }
+            )
             continue
-        try:
-            constraint = ScientificConstraint.model_validate(raw)
-        except Exception:
-            continue
+        if constraint.strength == "hard" and not may_be_hard(constraint.source):
+            constraint = constraint.model_copy(update={"strength": "soft"})
         key = constraint.id.casefold()
         if key in by_id:
-            constraints[by_id[key]] = constraint
+            accepted[by_id[key]] = constraint
         else:
-            by_id[key] = len(constraints)
-            constraints.append(constraint)
-    return constraints
+            by_id[key] = len(accepted)
+            accepted.append(constraint)
+    return ConstraintNormalizeResult(accepted=accepted, rejected=rejected)
+
+
+def normalize_scientific_constraints(value: Any) -> list[ScientificConstraint]:
+    """Return accepted constraints only.
+
+    Prefer normalize_scientific_constraints_result for fail-closed ingress so
+    rejected items remain visible to callers.
+    """
+
+    return list(normalize_scientific_constraints_result(value).accepted)
 
 
 def constraint_slug(label: str, *, fallback: str = "constraint") -> str:
@@ -158,26 +252,45 @@ def constraint_slug(label: str, *, fallback: str = "constraint") -> str:
     return (normalized or fallback)[:96]
 
 
-def normalize_constraint_bindings(value: Any) -> list[ScientificConstraint]:
-    """Normalize first-class strategy bindings into the existing constraint model.
+def normalize_constraint_bindings_result(
+    value: Any,
+    *,
+    max_items: int = 100,
+) -> ConstraintNormalizeResult:
+    """Normalize compact bindings without silently dropping invalid items."""
 
-    This is a compatibility adapter, not a second constraint hierarchy.  Legacy
-    ``ScientificConstraint`` payloads keep their explicit ids/labels, while the
-    compact binding shape used by strategy/publication contracts receives stable
-    defaults and maps ``evidence_scope`` onto ``scope``.
-    """
-
+    if value is None:
+        return ConstraintNormalizeResult()
     if not isinstance(value, list):
-        return []
-    normalized: list[ScientificConstraint] = []
+        return ConstraintNormalizeResult(
+            rejected=[
+                {
+                    "raw": value,
+                    "error_code": "not_a_list",
+                    "message": "constraint bindings must be a list",
+                }
+            ],
+            open_notes=["constraint bindings payload was not a list"],
+        )
+
+    accepted: list[ScientificConstraint] = []
+    rejected: list[dict[str, Any]] = []
     by_id: dict[str, int] = {}
-    for index, raw in enumerate(value[:100], start=1):
+    for index, raw in enumerate(value[:max_items], start=1):
         if isinstance(raw, ScientificConstraint):
             constraint = raw
         elif isinstance(raw, dict):
             item = dict(raw)
             dimension = " ".join(str(item.get("dimension") or "").split()).strip()
             if not dimension:
+                rejected.append(
+                    {
+                        "raw": raw,
+                        "error_code": "missing_dimension",
+                        "message": "binding requires dimension",
+                        "index": index - 1,
+                    }
+                )
                 continue
             item.setdefault(
                 "id",
@@ -189,25 +302,64 @@ def normalize_constraint_bindings(value: Any) -> list[ScientificConstraint]:
             item.setdefault("label", dimension.replace("_", " "))
             if "scope" not in item and item.get("evidence_scope") is not None:
                 item["scope"] = item.pop("evidence_scope")
-            source = str(item.get("source") or "user").strip().casefold()
+            source = str(item.get("source") or "").strip().casefold()
+            # Missing/unknown provenance is soft (inferred), never invent user.
+            if not source:
+                source = "inferred"
             item["source"] = {
                 "accepted_preference": "accepted_recommendation",
                 "system_default": "inferred",
                 "default": "inferred",
-            }.get(source, source)
+            }.get(
+                source,
+                source if source in {"user", "accepted_recommendation", "inferred"} else "inferred",
+            )
+            # Inferred provenance cannot carry hard strength.
+            if item.get("strength") == "hard" and not may_be_hard(item.get("source")):
+                item["strength"] = "soft"
             try:
                 constraint = ScientificConstraint.model_validate(item)
-            except Exception:
+            except Exception as exc:
+                rejected.append(
+                    {
+                        "raw": raw,
+                        "error_code": "validation_error",
+                        "message": str(exc),
+                        "index": index - 1,
+                    }
+                )
                 continue
         else:
+            rejected.append(
+                {
+                    "raw": raw,
+                    "error_code": "not_an_object",
+                    "message": "binding item must be an object",
+                    "index": index - 1,
+                }
+            )
             continue
         key = constraint.id.casefold()
         if key in by_id:
-            normalized[by_id[key]] = constraint
+            accepted[by_id[key]] = constraint
         else:
-            by_id[key] = len(normalized)
-            normalized.append(constraint)
-    return normalized
+            by_id[key] = len(accepted)
+            accepted.append(constraint)
+    return ConstraintNormalizeResult(accepted=accepted, rejected=rejected)
+
+
+def normalize_constraint_bindings(value: Any) -> list[ScientificConstraint]:
+    """Normalize first-class strategy bindings into the existing constraint model.
+
+    This is a compatibility adapter, not a second constraint hierarchy.  Legacy
+    ``ScientificConstraint`` payloads keep their explicit ids/labels, while the
+    compact binding shape used by strategy/publication contracts receives stable
+    defaults and maps ``evidence_scope`` onto ``scope``.
+
+    Prefer normalize_constraint_bindings_result when rejection audit is required.
+    """
+
+    return list(normalize_constraint_bindings_result(value).accepted)
 
 
 def evaluate_constraint_value(

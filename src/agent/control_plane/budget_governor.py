@@ -178,20 +178,16 @@ class BudgetGovernor:
             if query_hash != grant.query_hash:
                 raise ValueError("search_grant_query_mismatch")
             consumed_queries = canonical_queries
-        consumed = self.store.consume_search_grant(self.run_id, grant_id, query_hash)
-        self._set_active_grant(None)
-        self.store.increment_dynamic_usage(
+        # WP-D5: grant consume + active clear + usage + event + attempt ledger
+        # are one SQLite transaction inside AgentRunStore.consume_search_grant.
+        consumed = self.store.consume_search_grant(
             self.run_id,
-            query_units=consumed.query_units,
-            search_batches=1,
-        )
-        self.store.append_event(
-            self.run_id,
-            "search_grant_consumed",
-            {
-                **consumed.model_dump(mode="json"),
-                "executed_queries": consumed_queries,
-            },
+            grant_id,
+            query_hash,
+            executed_queries=consumed_queries,
+            record_usage=True,
+            clear_active_grant=True,
+            append_consumed_event=True,
         )
         return consumed
 
