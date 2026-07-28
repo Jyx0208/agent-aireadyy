@@ -1224,6 +1224,83 @@ def test_run_parameter_batch_writes_excel_and_manifest(monkeypatch, tmp_path):
         web_app._batches.pop(batch_id, None)
 
 
+
+
+def test_batch_file_reporter_writes_item_progress_and_public_summary(tmp_path):
+    batch_id = "bsb-progress"
+    item_dir = tmp_path / "items" / "001_sample"
+    item_dir.mkdir(parents=True)
+    batch = {
+        "batch_id": batch_id,
+        "status": "running",
+        "submitter": "Alice",
+        "ui_language": "zh-CN",
+        "output_dir": str(tmp_path),
+        "jobs": 1,
+        "repository": "pride",
+        "run_mode": "parameters",
+        "resource_policy": "balanced",
+        "prefer_project_fasta": True,
+        "items": [
+            {
+                "index": 0,
+                "input": "sample.raw",
+                "status": "running",
+                "output_dir": str(item_dir),
+                "error": "",
+            },
+            {
+                "index": 1,
+                "input": "other.raw",
+                "status": "queued",
+                "output_dir": str(tmp_path / "items" / "002_other"),
+                "error": "",
+            },
+        ],
+        "events": [],
+        "errors": [],
+    }
+    with web_app._batches_lock:
+        web_app._batches[batch_id] = batch
+    try:
+        reporter = web_app.BatchFileReporter(
+            item_dir,
+            ui_language="zh-CN",
+            batch_id=batch_id,
+            item_index=0,
+        )
+        reporter(
+            {
+                "kind": "download_progress",
+                "label": "sample.raw",
+                "downloaded": 25,
+                "total": 100,
+                "speed_bps": 10.0,
+                "eta_seconds": 7.5,
+                "complete": False,
+            }
+        )
+        item = web_app._batches[batch_id]["items"][0]
+        progress = item["progress"]
+        assert progress["stage"] == "download"
+        assert progress["percent"] == 25.0
+        assert progress["download"]["downloaded_bytes"] == 25
+        assert progress["download"]["total_bytes"] == 100
+        assert progress["download"]["complete"] is False
+
+        public = web_app._public_batch_record(web_app._batches[batch_id])
+        assert public["running_items"] == 1
+        assert public["queued_items"] == 1
+        assert public["summary"]["running"] == 1
+        assert public["summary"]["queued"] == 1
+        assert public["progress_percent"] == 0.0
+        assert public["items"][0]["progress"]["percent"] == 25.0
+        assert public["items"][1]["progress"]["stage"] == "queued"
+    finally:
+        with web_app._batches_lock:
+            web_app._batches.pop(batch_id, None)
+
+
 def test_public_batch_record_localizes_english_log_tail_and_events(tmp_path):
     batch_dir = tmp_path / "batch"
     item_dir = batch_dir / "items" / "001_sample"

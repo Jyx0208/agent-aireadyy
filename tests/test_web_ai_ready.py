@@ -26,7 +26,7 @@ def test_web_ai_ready_profile_inputs_writes_profile(monkeypatch, tmp_path: Path)
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     search_result = _write_tsv(
         tmp_path / "psm.tsv",
-        [{"Peptide": "PEPTIDEK", "Charge": 2, "Spectrum": "scan=101", "Retention": 12.5}],
+        [{"Peptide": "PEPTIDEK", "Charge": 2, "Spectrum": "scan=101", "Retention Time (min)": 12.5}],
     )
 
     result = asyncio.run(
@@ -65,6 +65,9 @@ def test_web_ai_ready_validate_build_returns_report_downloads(monkeypatch, tmp_p
                 "rows_filtered": 0,
                 "filter_counts": {},
                 "warnings": [],
+                "rt_unit": "minute",
+                "retention_time_unit": "minute",
+                "rt_unit_source": "column_explicit",
                 "outputs": {"rt_train_parquet": str(parquet)},
             }
         ),
@@ -135,7 +138,7 @@ def test_web_ai_ready_locate_inputs_from_search_dir(monkeypatch, tmp_path: Path)
     search_dir.mkdir()
     _write_tsv(
         search_dir / "psm.tsv",
-        [{"Peptide": "PEPTIDEK", "Charge": 2, "Spectrum": "scan=101", "Retention": 12.5}],
+        [{"Peptide": "PEPTIDEK", "Charge": 2, "Spectrum": "scan=101", "Retention Time (min)": 12.5}],
     )
 
     result = asyncio.run(
@@ -158,7 +161,7 @@ def test_web_ai_ready_real_smoke_returns_task_cards(monkeypatch, tmp_path: Path)
     search_dir.mkdir()
     _write_tsv(
         search_dir / "peptide.tsv",
-        [{"Peptide": "PEPTIDEK", "Charge": 2, "Retention": 12.5, "PSM Q-Value": 0.001}],
+        [{"Peptide": "PEPTIDEK", "Charge": 2, "Retention Time (min)": 12.5, "PSM Q-Value": 0.001}],
     )
 
     result = asyncio.run(
@@ -901,7 +904,7 @@ def test_web_ai_ready_locates_agent_run_outputs(monkeypatch, tmp_path: Path):
     agent_run_dir = tmp_path / "run"
     _write_tsv(
         agent_run_dir / "fragpipe" / "exp" / "peptide.tsv",
-        [{"Peptide": "PEPTIDEK", "Charge": 2, "Retention": 12.5}],
+        [{"Peptide": "PEPTIDEK", "Charge": 2, "Retention Time (min)": 12.5}],
     )
     (agent_run_dir / "msdt").mkdir(parents=True)
     (agent_run_dir / "msdt" / "sample_fp_msdt.parquet").write_bytes(b"placeholder")
@@ -925,7 +928,7 @@ def test_web_ai_ready_builds_from_agent_run(monkeypatch, tmp_path: Path):
     agent_run_dir = tmp_path / "run"
     _write_tsv(
         agent_run_dir / "fragpipe" / "exp" / "peptide.tsv",
-        [{"Peptide": "PEPTIDEK", "Charge": 2, "Retention": 12.5, "PSM Q-Value": 0.001}],
+        [{"Peptide": "PEPTIDEK", "Charge": 2, "Retention Time (min)": 12.5, "PSM Q-Value": 0.001}],
     )
 
     result = asyncio.run(
@@ -959,7 +962,7 @@ def test_web_ai_ready_validates_mini_e2e_from_agent_run(monkeypatch, tmp_path: P
     )
     _write_tsv(
         agent_run_dir / "fragpipe" / "exp" / "peptide.tsv",
-        [{"Peptide": "PEPTIDEK", "Charge": 2, "Retention": 12.5, "PSM Q-Value": 0.001}],
+        [{"Peptide": "PEPTIDEK", "Charge": 2, "Retention Time (min)": 12.5, "PSM Q-Value": 0.001}],
     )
 
     result = asyncio.run(

@@ -71,11 +71,56 @@ def load_sdrf_rows(table_text: str) -> list[dict[str, Any]]:
     return frame.to_dict(orient="records")
 
 
-def select_sdrf_rows_for_file(rows: list[dict[str, Any]], file_name: str) -> list[dict[str, Any]]:
+def build_sdrf_file_index(
+    rows: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Index SDRF file columns once instead of rescanning all rows per file."""
+    if not rows:
+        return {}
+    index: dict[str, list[dict[str, Any]]] = {}
+    columns = _sdrf_candidate_columns(rows[0].keys())
+    for row in rows:
+        seen_keys: set[str] = set()
+        for column in columns:
+            value = str(row.get(column, "") or "")
+            normalized_value = _normalize_name(value)
+            value_stem = PurePath(value).stem.lower()
+            keys = [
+                f"name:{normalized_value}" if normalized_value else "",
+                f"stem:{value_stem}" if value_stem else "",
+            ]
+            for key in keys:
+                if not key or key in seen_keys:
+                    continue
+                index.setdefault(key, []).append(row)
+                seen_keys.add(key)
+    return index
+
+
+def select_sdrf_rows_for_file(
+    rows: list[dict[str, Any]],
+    file_name: str,
+    *,
+    file_index: dict[str, list[dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
     if not rows:
         return []
     normalized_target = _normalize_name(file_name)
     target_stem = PurePath(file_name).stem.lower()
+    if file_index is not None:
+        matches: list[dict[str, Any]] = []
+        seen_rows: set[int] = set()
+        for key in (
+            f"name:{normalized_target}" if normalized_target else "",
+            f"stem:{target_stem}" if target_stem else "",
+        ):
+            for row in file_index.get(key, []):
+                row_id = id(row)
+                if row_id in seen_rows:
+                    continue
+                seen_rows.add(row_id)
+                matches.append(row)
+        return matches
     matches: list[dict[str, Any]] = []
     columns = _sdrf_candidate_columns(rows[0].keys())
     for row in rows:
@@ -118,6 +163,7 @@ def summarize_sdrf_rows(
     errors: list[str] | None = None,
     max_values_per_field: int = 12,
     max_examples: int = 8,
+    file_index: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Build a bounded, Agent-safe SDRF projection without returning raw rows."""
     columns = list(rows[0].keys()) if rows else []
@@ -153,7 +199,11 @@ def summarize_sdrf_rows(
     match_status_counts = {"matched": 0, "no_file_match": 0, "no_sdrf": 0}
     examples: list[dict[str, Any]] = []
     for file_name in file_names:
-        matched_rows = select_sdrf_rows_for_file(rows, file_name) if rows else []
+        matched_rows = (
+            select_sdrf_rows_for_file(rows, file_name, file_index=file_index)
+            if rows
+            else []
+        )
         match_status = "matched" if matched_rows else ("no_file_match" if rows else "no_sdrf")
         match_status_counts[match_status] += 1
         if len(examples) < max_examples:

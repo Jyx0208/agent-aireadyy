@@ -13,7 +13,7 @@ export type WorkflowRecord = Record<string, unknown> & {
 };
 
 /** Job lifecycle statuses — domain failures use status+error, not transport failures. */
-export const DISCOVERY_JOB_STATUSES = ["queued", "running", "failed", "blocked", "cancelled", "completed"] as const;
+export const DISCOVERY_JOB_STATUSES = ["queued", "running", "failed", "blocked", "cancelled", "completed", "interrupted", "durability_failed"] as const;
 
 export function isDiscoveryJobStatus(status: unknown): boolean {
   return DISCOVERY_JOB_STATUSES.includes(String(status || "").toLowerCase() as (typeof DISCOVERY_JOB_STATUSES)[number]);
@@ -83,6 +83,49 @@ export const startBatch = (payload: WorkflowRecord) =>
 export const getBatch = (batchId: string, signal?: AbortSignal) =>
   workflowJson<WorkflowRecord>(`/api/batches/${encodeURIComponent(batchId)}`, { signal });
 
+export type DiscoveryBatchHandoff = WorkflowRecord & {
+  job_id: string;
+  discovery_id: string;
+  batch_index: number;
+  file_count: number;
+  inputs: string[];
+  input_records: WorkflowRecord[];
+};
+
+export const getDiscoveryBatchHandoff = (jobId: string, batchIndex: number) =>
+  workflowJson<DiscoveryBatchHandoff>(
+    `/api/discovery/jobs/${encodeURIComponent(jobId)}/batches/${batchIndex}/handoff`,
+  );
+
+export const getDiscoveryRun = (discoveryId: string, signal?: AbortSignal) =>
+  workflowJson<WorkflowRecord>(`/api/discovery/${encodeURIComponent(discoveryId)}`, { signal });
+
+export const previewHistoryDelete = (
+  kind: string,
+  id: string,
+  includeLinkedBatches = false,
+) =>
+  workflowJson<WorkflowRecord>(
+    `/api/history/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/delete-preview?include_linked_batches=${includeLinkedBatches ? "true" : "false"}`,
+  );
+
+export const deleteHistoryItem = (
+  kind: string,
+  id: string,
+  confirmationId: string,
+  includeLinkedBatches = false,
+) =>
+  workflowJson<WorkflowRecord>(
+    `/api/history/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`,
+    {
+      method: "DELETE",
+      body: JSON.stringify({
+        confirmation_id: confirmationId,
+        include_linked_batches: includeLinkedBatches,
+      }),
+    },
+  );
+
 export type DiscoveryPublicationProgress = {
   candidate_projects?: number;
   candidate_files?: number;
@@ -118,6 +161,7 @@ export type DiscoveryJob = WorkflowRecord & {
   job_id?: string;
   logs?: WorkflowRecord[];
   record?: DiscoveryJobRecord;
+  resumable?: boolean;
 };
 
 const isRecordValue = (value: unknown): value is Record<string, unknown> =>
@@ -221,6 +265,7 @@ export const grillTurn = async (
     answered?: WorkflowRecord;
     local_summary?: string;
     allow_server_default?: boolean;
+    request_timeout_seconds?: number;
     gap_report?: WorkflowRecord | null;
     dialogue_history?: AgentDialogueMessage[];
   },
@@ -267,6 +312,10 @@ export const getDiscoveryJob = (jobId: string, detail = false, signal?: AbortSig
 
 export const cancelDiscoveryJob = (jobId: string) =>
   workflowJson<DiscoveryJob>(`/api/discovery/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+
+export const resumeDiscoveryJob = (jobId: string) =>
+  workflowJson<DiscoveryJob>(`/api/discovery/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST" })
+    .then(normalizeDiscoveryJobForUi);
 
 export type AiReadyAction =
   | "profile-inputs"

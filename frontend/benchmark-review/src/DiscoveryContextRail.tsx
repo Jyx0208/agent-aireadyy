@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Button,
   ComposedModal,
@@ -13,17 +13,21 @@ import { DataBase, Download } from "@carbon/icons-react";
 import { buildDiscoveryRunView, type DiscoveryRunStatus, type DiscoveryRunView } from "./DiscoveryProgressMessage";
 import { IntentSpecPanel } from "./IntentSpecPanel";
 import type { GrillPhase, IntentSpec } from "./intent-spec";
-import type { DiscoveryJob } from "./workflow-api";
+import { getDiscoveryBatchHandoff, type DiscoveryBatchHandoff, type DiscoveryJob } from "./workflow-api";
 
 type Props = {
   spec: IntentSpec;
   phase: GrillPhase;
   job: DiscoveryJob | null;
-  onConfirm: () => void;
+  onConfirm: (queryTerms: string[]) => void;
+  selectedSearchTerms?: string[];
+  onSelectedSearchTermsChange?: (queryTerms: string[]) => void;
   onApplyDefaults: () => void;
   onNavigate: (tabIndex: number) => void;
   /** Load discovery L1 usable file list into batch planner. */
-  onSeedBatchInputs?: (text: string) => void;
+  onSeedBatchInputs?: (handoff: DiscoveryBatchHandoff) => void;
+  /** Chat recovery chip: open result modal when job matches. */
+  openResultRequest?: { jobId: string; token: number } | null;
 };
 
 function tagType(status: DiscoveryRunStatus): "blue" | "green" | "red" | "gray" | "magenta" | "purple" {
@@ -32,25 +36,6 @@ function tagType(status: DiscoveryRunStatus): "blue" | "green" | "red" | "gray" 
   if (status === "blocked") return "purple";
   if (status === "cancelled") return "gray";
   return "blue";
-}
-
-async function fetchUsableBatchInputs(discoveryId: string): Promise<string> {
-  const id = encodeURIComponent(discoveryId);
-  const urls = [
-    `/api/discovery/${id}/download?file=batch_inputs_usable`,
-    `/api/discovery/${id}/download?file=batch_inputs`,
-  ];
-  for (const url of urls) {
-    try {
-      const response = await fetch(url);
-      if (!response.ok) continue;
-      const text = (await response.text()).trim();
-      if (text) return text;
-    } catch {
-      // try next
-    }
-  }
-  throw new Error("未找到可用文件列表（batch_inputs_usable）。可下载完整运行包后手动整理。");
 }
 
 function RunStatusCard({
@@ -100,17 +85,17 @@ function RunStatusCard({
           <dl className="context-metrics">
             <div><dt>项目</dt><dd>{view.metrics.projects}</dd></div>
             <div><dt>文件线索</dt><dd>{view.metrics.files}</dd></div>
-            <div><dt>可用文件 L1</dt><dd>{usable}</dd></div>
+            <div><dt>可交付文件</dt><dd>{usable}</dd></div>
             <div><dt>待复核</dt><dd>{view.metrics.reviews}</dd></div>
           </dl>
 
           {view.status === "completed" || view.status === "blocked" ? (
             <div className="discovery-result-entry">
-              <p className="eyebrow">L1 可用清单</p>
+              <p className="eyebrow">已验证文件清单</p>
               <h3>{view.status === "blocked" ? "可用文件清单已就绪" : "发现结果已就绪"}</h3>
               <p>
                 {view.status === "blocked"
-                  ? `约 ${usable} 条可用文件（valid + weak_keep）。可下载清单或一键送入批量参数规划。`
+                  ? `约 ${usable} 条验证通过的可交付文件。项目证据继承会单独计数；未决文件不会混入下载清单。`
                   : view.summary}
               </p>
               <Button size="sm" onClick={onOpenResult}>查看结果与送入批量</Button>
@@ -142,9 +127,9 @@ function ResultModal({
   open: boolean;
   onClose: () => void;
   onNavigate: (tabIndex: number) => void;
-  onSeedBatchInputs?: (text: string) => void;
+  onSeedBatchInputs?: (handoff: DiscoveryBatchHandoff) => void;
 }) {
-  const [seedBusy, setSeedBusy] = useState(false);
+  const [seedBusy, setSeedBusy] = useState<number | null>(null);
   const [seedError, setSeedError] = useState("");
 
   if (!open || !view || !["completed", "blocked"].includes(view.status)) return null;
@@ -154,22 +139,22 @@ function ResultModal({
   const usable = view.metrics.usableFiles ?? view.metrics.selectedProjects ?? 0;
   const strictValid = view.metrics.strictValidFiles ?? 0;
 
-  const sendToBatch = async () => {
-    if (!view.discoveryId) {
-      setSeedError("缺少 discovery_id，无法拉取列表。");
+  const sendToBatch = async (batchIndex: number) => {
+    if (!view.jobId) {
+      setSeedError("缺少 discovery job id，无法拉取冻结批次。");
       return;
     }
-    setSeedBusy(true);
+    setSeedBusy(batchIndex);
     setSeedError("");
     try {
-      const text = await fetchUsableBatchInputs(view.discoveryId);
-      onSeedBatchInputs?.(text);
+      const handoff = await getDiscoveryBatchHandoff(view.jobId, batchIndex);
+      onSeedBatchInputs?.(handoff);
       onClose();
       onNavigate(2);
     } catch (reason) {
       setSeedError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setSeedBusy(false);
+      setSeedBusy(null);
     }
   };
 
@@ -185,18 +170,19 @@ function ResultModal({
         <p className="discovery-result-summary">{view.summary}</p>
         <dl className="result-modal-metrics">
           <div><dt>候选项目</dt><dd>{view.metrics.projects}</dd></div>
-          <div><dt>可用文件 L1</dt><dd>{usable}</dd></div>
-          <div><dt>严格 valid</dt><dd>{strictValid}</dd></div>
+          <div><dt>可交付文件</dt><dd>{usable}</dd></div>
+          <div><dt>直接文件证据</dt><dd>{view.metrics.directUsableFiles ?? strictValid}</dd></div>
+          <div><dt>项目证据继承</dt><dd>{view.metrics.inheritedUsableFiles ?? 0}</dd></div>
           <div><dt>文件线索</dt><dd>{view.metrics.files}</dd></div>
         </dl>
 
         <section className="result-modal-section">
-          <h3>当前不足（说明，不阻挡 L1 使用）</h3>
+          <h3>当前不足与待复核项</h3>
           {view.qualityIssues.length ? (
             <div className="discovery-audit-summary">
               <ul>{view.qualityIssues.map((issue) => <li key={issue}>{issue}</li>)}</ul>
               <p className="empty-copy">
-                以上多指严格 build-ready / 元数据完整度。你要的可用文件列表仍可下载，并送入批量参数规划与标准化构建。
+                不足项不会混入可交付文件清单；已验证文件仍可下载并送入批量参数规划与标准化构建。
               </p>
             </div>
           ) : (
@@ -225,15 +211,42 @@ function ResultModal({
             <p className="empty-copy">结果正在归档，下载入口尚未生成。</p>
           )}
           {seedError ? <p className="empty-copy" role="alert">{seedError}</p> : null}
+          {view.resultBatches.length ? (
+            <div className="history-list" style={{ marginTop: "0.75rem" }}>
+              {view.resultBatches.map((batch) => (
+                <div className="history-row" key={batch.batchIndex}>
+                  <div>
+                    <div className="history-title">文件批次 {batch.batchIndex}</div>
+                    <div className="history-meta">
+                      {batch.fileCount} 个文件 · {batch.projectCount} 个项目
+                      {batch.cumulativeFileCount ? ` · 累计 ${batch.cumulativeFileCount}` : ""}
+                      {` · ${batch.terminal ? "尾批已就绪" : "已就绪"}`}
+                      {batch.publishedAt
+                        ? ` · ${new Date(batch.publishedAt).toLocaleString("zh-CN", { hour12: false })}`
+                        : ""}
+                    </div>
+                  </div>
+                  <div className="button-row">
+                    <Button size="sm" kind="ghost" renderIcon={Download} href={batch.downloadUrl}>下载清单</Button>
+                    <Button
+                      size="sm"
+                      kind="primary"
+                      disabled={seedBusy != null || !onSeedBatchInputs}
+                      onClick={() => void sendToBatch(batch.batchIndex)}
+                    >
+                      {seedBusy === batch.batchIndex ? "正在加载…" : "送入批量处理"}
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <>
+              <p className="empty-copy">尚未形成冻结文件批次；累计清单仅供下载，不会自动送入批量处理。</p>
+              <Button size="sm" kind="primary" disabled>送入批量参数规划</Button>
+            </>
+          )}
           <div className="button-row" style={{ marginTop: "0.75rem" }}>
-            <Button
-              size="sm"
-              kind="primary"
-              disabled={seedBusy || !view.discoveryId || !onSeedBatchInputs}
-              onClick={() => void sendToBatch()}
-            >
-              {seedBusy ? "正在加载列表…" : "送入批量参数规划"}
-            </Button>
             <Button size="sm" kind="tertiary" onClick={() => { onClose(); onNavigate(2); }}>
               仅打开批量页
             </Button>
@@ -249,9 +262,12 @@ export function DiscoveryContextRail({
   phase,
   job,
   onConfirm,
+  selectedSearchTerms,
+  onSelectedSearchTermsChange,
   onApplyDefaults,
   onNavigate,
   onSeedBatchInputs,
+  openResultRequest,
 }: Props) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [resultOpen, setResultOpen] = useState(false);
@@ -261,6 +277,15 @@ export function DiscoveryContextRail({
     setResultOpen(true);
   };
 
+  useEffect(() => {
+    if (!openResultRequest?.jobId || !job) return;
+    const currentId = String(job.job_id || "").trim();
+    if (!currentId || currentId !== openResultRequest.jobId) return;
+    const status = String(job.status || "").toLowerCase();
+    if (status !== "completed" && status !== "blocked") return;
+    setResultOpen(true);
+  }, [openResultRequest, job]);
+
   const content = (
     <>
       <IntentSpecPanel
@@ -268,6 +293,8 @@ export function DiscoveryContextRail({
         phase={phase}
         busy={phase === "running"}
         onConfirm={onConfirm}
+        selectedSearchTerms={selectedSearchTerms}
+        onSelectedSearchTermsChange={onSelectedSearchTermsChange}
         onApplyDefaults={onApplyDefaults}
       />
       <RunStatusCard view={view} onOpenResult={openResult} />

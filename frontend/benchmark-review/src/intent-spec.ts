@@ -76,6 +76,8 @@ export interface IntentSpec {
   mixedAcquisitionPolicy: MixedAcquisitionPolicy;
   ptmTypes: string[];
   specialThemes: string[];
+  /** Exact repository query variants selected by the user at confirmation time. */
+  selectedSearchTerms: string[];
   labelingStrategy: LabelingStrategy;
   labelingHard: boolean;
   coverageMode: CoverageMode;
@@ -134,6 +136,7 @@ export interface DiscoveryJobPayload {
   output_language: string;
   constraints_enabled: boolean;
   goal: string;
+  query_terms: string[];
   task_type: string;
   acquisition_mode: string;
   labeling_strategy: string;
@@ -146,6 +149,9 @@ export interface DiscoveryJobPayload {
   ptm_types: string[];
   max_projects: number;
   max_candidate_projects: number;
+  continuous_discovery: boolean;
+  partial_delivery_batch_size: number;
+  inspection_batch_size: number;
   use_memory: boolean;
   save_memory: boolean;
   hard_constraint_fields: string[];
@@ -196,7 +202,7 @@ export function createEmptyIntent(prompt = ""): IntentSpec {
     objective: prompt.trim(),
     originalPrompt: prompt.trim(),
     taskType: "",
-    runHorizon: "",
+    runHorizon: "candidates_reviewed",
     species: [],
     speciesPolicy: "open",
     speciesCoverage: "none",
@@ -204,6 +210,7 @@ export function createEmptyIntent(prompt = ""): IntentSpec {
     mixedAcquisitionPolicy: "review_mixed",
     ptmTypes: [],
     specialThemes: [],
+    selectedSearchTerms: [],
     labelingStrategy: "",
     labelingHard: false,
     coverageMode: "",
@@ -222,7 +229,7 @@ export function createEmptyIntent(prompt = ""): IntentSpec {
     resolvedFields: [],
     repository: "pride",
     confirmed: false,
-    answered: {},
+    answered: { Q2: true },
     inferred: {},
     parseWarnings: [],
     parseReasoning: "",

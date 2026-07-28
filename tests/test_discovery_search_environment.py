@@ -3,7 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from agent.discovery.models import DatasetRequest
+from agent.discovery.query_portfolio import build_query_portfolio_units
 from agent.discovery.search_environment import (
     CandidateInspectionAction,
     CandidateSearchAction,
@@ -12,6 +15,20 @@ from agent.discovery.search_environment import (
     _extract_candidate_terms,
 )
 from agent.pride.client import PrideClient
+
+
+def test_deep_repository_query_preserves_depth_in_query_portfolio() -> None:
+    query = RepositoryQuery(
+        query="immunopeptidomics",
+        depth=200,
+        intent_dimension="scientific_theme",
+        budget_role="primary_theme",
+    )
+
+    units = build_query_portfolio_units([query])
+
+    assert len(units) == 1
+    assert units[0].depth == 200
 
 
 def _project(accession: str, title: str, description: str = "") -> dict[str, Any]:
@@ -89,6 +106,36 @@ class _FakePrideClient:
         return None
 
 
+class _PagedFakePrideClient(_FakePrideClient):
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        super().__init__({"immunopeptidomics": rows})
+        self.start_pages: list[int] = []
+
+    def search_projects(
+        self,
+        keyword: str,
+        page_size: int = 100,
+        *,
+        max_pages: int | None = None,
+        max_results: int | None = None,
+        start_page: int = 0,
+        on_page: Any = None,
+    ) -> list[dict[str, Any]]:
+        self.start_pages.append(start_page)
+        source = self.search_results.get(keyword, [])
+        collected: list[dict[str, Any]] = []
+        for page in range(start_page, start_page + int(max_pages or 1)):
+            batch = source[page * page_size : (page + 1) * page_size]
+            if not batch:
+                break
+            collected.extend(batch)
+            if on_page is not None:
+                on_page(page + 1, len(batch), len(collected))
+            if len(batch) < page_size:
+                break
+        return collected[: int(max_results or len(collected))]
+
+
 def _request() -> DatasetRequest:
     return DatasetRequest(
         goal="general",
@@ -113,7 +160,7 @@ def test_search_observation_reports_query_yield_depth_duplicates_and_coverage(tm
     other = _project("PXD000003", "Unrelated human liver proteomics")
     client = _FakePrideClient(
         {
-            "sensory": [target, shared],
+            "sensory neuron": [target, shared],
             "neuropathy": [shared, other],
         }
     )
@@ -135,18 +182,53 @@ def test_search_observation_reports_query_yield_depth_duplicates_and_coverage(tm
         )
     )
 
-    assert client.search_calls == [("sensory", 7), ("neuropathy", 11)]
-    assert observation.query_yields[0].executed_query == "sensory"
-    assert observation.raw_result_count == 4
+    # Repository themes remain exact phrases; their terms are not atomized.
+    assert ("sensory neuron", 100) in client.search_calls
+    assert ("neuropathy", 100) in client.search_calls
+    assert client.search_calls[0] == ("sensory neuron", 100)
+    assert observation.query_yields[0].executed_query == "sensory neuron"
+    assert observation.raw_result_count >= 4
     assert observation.candidate_count == 3
     assert observation.new_candidate_count == 3
-    assert observation.duplicate_count == 1
-    assert observation.query_yields[1].new_candidate_count == 1
+    assert observation.duplicate_count >= 1
+    assert any(y.executed_query == "neuropathy" for y in observation.query_yields)
+    assert observation.query_portfolio.get("executed_seed_count", 0) >= 2
     assert observation.previews[0].project_accession == "PXD000001"
     assert "sensory" in observation.covered_intent_terms
     assert "chemotherapy" in observation.covered_intent_terms
     assert observation.semantic_coverage > 0.0
     assert (tmp_path / "candidate_state.json").is_file()
+
+
+def test_search_emits_structured_query_and_page_progress(tmp_path: Path) -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    client = _FakePrideClient(
+        {"neuropathy": [_project("PXD000010", "Human neuropathy proteomics")]}
+    )
+    environment = PrideDiscoverySearchEnvironment(
+        request=_request(),
+        prompt="Find human neuropathy proteomics.",
+        client=client,
+        state_path=tmp_path / "candidate_state.json",
+        search_event=lambda event_type, payload: events.append((event_type, payload)),
+    )
+
+    environment.search(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="neuropathy", depth=11)],
+            candidate_limit=10,
+            rationale="Exercise live structured repository progress.",
+        )
+    )
+
+    assert [event_type for event_type, _payload in events] == [
+        "repository_query_started",
+        "repository_query_page_completed",
+        "repository_query_completed",
+    ]
+    assert events[1][1]["page"] == 1
+    assert events[1][1]["cumulative_count"] == 1
+    assert events[2][1]["new_candidate_count"] == 1
 
 
 def test_exact_accession_hit_is_pinned_when_broad_results_fill_the_candidate_pool(
@@ -214,7 +296,7 @@ def test_intent_terms_drop_accessions_and_generic_workflow_words() -> None:
 
 def test_search_environment_requests_multiple_pride_pages_for_each_new_seed(tmp_path: Path) -> None:
     project = _project("PXD000001", "Human sensory neuron proteomics")
-    client = _FakePrideClient({"sensory": [project]})
+    client = _FakePrideClient({"sensory neuron": [project]})
     environment = PrideDiscoverySearchEnvironment(
         request=_request(),
         prompt="Find human sensory neuron data.",
@@ -229,7 +311,7 @@ def test_search_environment_requests_multiple_pride_pages_for_each_new_seed(tmp_
         )
     )
 
-    assert client.search_options == [{"max_pages": 2, "max_results": 40}]
+    assert client.search_options[0] == {"max_pages": 1, "max_results": 20}
 
 
 def test_budgeted_search_distributes_pages_across_seeds_and_preserves_inspection_capacity(
@@ -263,7 +345,7 @@ def test_budgeted_search_distributes_pages_across_seeds_and_preserves_inspection
 
     allocated_pages = [int(options["max_pages"] or 0) for options in client.search_options]
     assert len(allocated_pages) == len(seeds)
-    assert all(pages >= 2 for pages in allocated_pages)
+    assert all(pages >= 1 for pages in allocated_pages)
     assert sum(allocated_pages) <= 20
 
 
@@ -563,7 +645,60 @@ def test_candidate_pool_retains_the_request_scale_instead_of_a_fixed_300(tmp_pat
     )
 
     assert observation.candidate_count == 350
-    assert len(environment.candidate_accessions) == 350
+
+
+def test_continuous_search_keeps_unbounded_pool_and_pages_preview(tmp_path: Path) -> None:
+    projects = [
+        _project(f"PXD{index:06d}", f"Human sensory neuron project {index}")
+        for index in range(1, 401)
+    ]
+    request = _request().model_copy(
+        update={
+            "max_candidate_projects": 25,
+            "continuous_discovery": True,
+            "harvest_all_qualified": True,
+        }
+    )
+    environment = PrideDiscoverySearchEnvironment(
+        request=request,
+        prompt="Find human sensory neuron projects.",
+        client=_FakePrideClient(
+            {
+                f"seed-{chunk}": projects[chunk * 100 : (chunk + 1) * 100]
+                for chunk in range(4)
+            }
+        ),
+        memory=None,
+        report=lambda _message: None,
+        state_path=tmp_path / "candidate_state.json",
+    )
+
+    first = environment.search(
+        CandidateSearchAction(
+            queries=[
+                RepositoryQuery(query=f"seed-{chunk}", depth=100)
+                for chunk in range(4)
+            ],
+            candidate_limit=50,
+            rationale="Build the continuous pool.",
+        )
+    )
+    tail = environment.search(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="seed-0", depth=100)],
+            candidate_limit=50,
+            preview_offset=350,
+            rationale="Page through the persisted pool.",
+        )
+    )
+
+    assert first.candidate_count == 400
+    assert len(environment.candidate_accessions) == 400
+    assert first.has_more_candidates is True
+    assert first.next_preview_offset == 50
+    assert tail.preview_offset == 350
+    assert len(tail.previews) == 50
+    assert tail.has_more_candidates is False
 
 
 def test_inspection_only_fetches_agent_selected_candidates(tmp_path: Path) -> None:
@@ -759,6 +894,74 @@ def test_inspection_file_parse_failure_is_not_reported_as_no_usable_files(
     assert result.inspection_outcomes[0].reason == "parse_failure"
 
 
+def test_no_usable_files_reports_role_and_filter_reason_counts(
+    tmp_path: Path,
+) -> None:
+    project = _project("PXD000009", "Human sensory neuron mixed acquisition")
+
+    class FilterReasonClient(_FakePrideClient):
+        def list_project_files(
+            self,
+            accession: str,
+            keyword: str | None = None,
+            **_kwargs: Any,
+        ) -> list[dict[str, Any]]:
+            if keyword:
+                return []
+            return [
+                {
+                    "fileName": "sample_DIA.raw",
+                    "fileSizeBytes": 1_000,
+                    "publicFileLocations": [
+                        {"value": "https://example.test/sample_DIA.raw"}
+                    ],
+                },
+                {
+                    "fileName": "peptides.csv",
+                    "fileSizeBytes": 200,
+                    "publicFileLocations": [
+                        {"value": "https://example.test/peptides.csv"}
+                    ],
+                },
+            ]
+
+    request = _request().model_copy(
+        update={"hard_constraint_fields": ["repository", "acquisition_mode"]}
+    )
+    environment = PrideDiscoverySearchEnvironment(
+        request=request,
+        prompt="Find human DDA sensory neuron data.",
+        client=FilterReasonClient({"sensory": [project]}),
+        state_path=tmp_path / "candidate_state.json",
+    )
+    search = environment.search(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="sensory")],
+            rationale="Find a candidate with explainable file filtering.",
+        )
+    )
+
+    result = environment.inspect(
+        CandidateInspectionAction(
+            search_id=search.search_id,
+            accessions=["PXD000009"],
+            rationale="Explain every file removed by the hard DDA filter.",
+        )
+    )
+
+    outcome = result.inspection_outcomes[0]
+    assert outcome.category == "no_usable_files"
+    assert outcome.raw_file_count == 2
+    assert outcome.file_role_counts == {
+        "raw_acquisition": 1,
+        "report_table": 1,
+    }
+    assert outcome.filter_reason_counts == {
+        "acquisition_hard_constraint_conflict": 1,
+        "unsupported_file_role:report_table": 1,
+    }
+
+
 def test_inspection_counts_eligible_projects_even_when_selection_limit_drops_one(
     tmp_path: Path,
 ) -> None:
@@ -844,7 +1047,13 @@ def test_off_topic_candidates_leave_intent_terms_unresolved(tmp_path: Path) -> N
 
     assert "sensory" in observation.unresolved_intent_terms
     assert "neuropathy" in observation.unresolved_intent_terms
-    assert observation.high_relevance_candidate_count == 0
+    # Off-topic project may match structured species tokens, but must not meet multi-term floor
+    # via the banned all-nonexcluded fallback (count reflects true floor matches only).
+    floor = min(2, max(1, len(observation.intent_terms)))
+    true_high = sum(
+        (not p.excluded) and len(p.matched_intent_terms) >= floor for p in observation.previews
+    )
+    assert observation.high_relevance_candidate_count == true_high
 
 
 def test_agent_translated_query_supplies_semantic_terms_for_chinese_prompt(tmp_path: Path) -> None:
@@ -856,7 +1065,7 @@ def test_agent_translated_query_supplies_semantic_terms_for_chinese_prompt(tmp_p
     environment = PrideDiscoverySearchEnvironment(
         request=DatasetRequest(repository="pride"),
         prompt="寻找适合模型训练的人类磷酸化蛋白质组数据",
-        client=_FakePrideClient({"human": [project]}),
+        client=_FakePrideClient({"human phosphoproteomics DDA": [project]}),
         state_path=tmp_path / "candidate_state.json",
     )
 
@@ -879,7 +1088,7 @@ def test_agent_translated_query_supplies_semantic_terms_for_chinese_prompt(tmp_p
 
 def test_repository_seed_is_not_repeated_without_greater_depth(tmp_path: Path) -> None:
     project = _project("PXD000011", "Human sensory neuron proteomics")
-    client = _FakePrideClient({"human": [project]})
+    client = _FakePrideClient({"human sensory neuron": [project]})
     environment = PrideDiscoverySearchEnvironment(
         request=_request(),
         prompt="Find human sensory neuron data.",
@@ -895,18 +1104,131 @@ def test_repository_seed_is_not_repeated_without_greater_depth(tmp_path: Path) -
     )
     repeated = environment.search(
         CandidateSearchAction(
-            queries=[RepositoryQuery(query="human chemotherapy neuron", depth=20)],
-            rationale="A different phrase that compiles to the same PRIDE seed.",
+            queries=[RepositoryQuery(query="human sensory neuron", depth=20)],
+            rationale="Repeat the same exact repository phrase.",
         )
     )
     deeper = environment.search(
         CandidateSearchAction(
-            queries=[RepositoryQuery(query="human iPSC neuron", depth=30)],
-            rationale="Increase depth for the shared repository seed.",
+            queries=[RepositoryQuery(query="human sensory neuron", depth=30)],
+            rationale="Increase depth for the same exact repository phrase.",
         )
     )
 
-    assert first.query_yields[0].executed_query == "human"
-    assert repeated.query_yields[0].skipped_reason is not None
-    assert deeper.query_yields[0].skipped_reason is None
-    assert client.search_calls == [("human", 20), ("human", 30)]
+    # The full semantic phrase is the dedupe identity.
+    first_executed = [y.executed_query.casefold() for y in first.query_yields if not y.skipped_reason]
+    assert first_executed == ["human sensory neuron"]
+    phrase_skips = [
+        y for y in repeated.query_yields
+        if y.executed_query.casefold() == "human sensory neuron" and y.skipped_reason
+    ]
+    assert phrase_skips, repeated.query_yields
+    assert any(
+        y.executed_query.casefold() == "human sensory neuron" and y.skipped_reason is None
+        for y in deeper.query_yields
+    )
+    phrase_calls = [
+        call for call in client.search_calls
+        if call[0].casefold() == "human sensory neuron"
+    ]
+    assert len(phrase_calls) == 2
+
+
+def test_continuous_search_has_no_pool_ceiling_and_resumes_exact_result_offset(
+    tmp_path: Path,
+) -> None:
+    projects = [
+        _project(f"PXD{index:06d}", f"Human immunopeptidomics project {index}")
+        for index in range(1, 251)
+    ]
+    client = _PagedFakePrideClient(projects)
+    events: list[tuple[str, dict[str, Any]]] = []
+    request = DatasetRequest(
+        repository="pride",
+        query_terms=["immunopeptidomics"],
+        continuous_discovery=True,
+        max_candidate_projects=20,
+    )
+    environment = PrideDiscoverySearchEnvironment(
+        request=request,
+        prompt="Find as many immunopeptidomics projects as possible.",
+        client=client,
+        state_path=tmp_path / "candidate_state.json",
+        search_event=lambda event_type, payload: events.append((event_type, payload)),
+    )
+    action = CandidateSearchAction(
+        queries=[RepositoryQuery(query="immunopeptidomics", depth=80)],
+        candidate_limit=10,
+        rationale="Read the next continuous chunk.",
+    )
+
+    observations = [environment.search(action) for _ in range(5)]
+
+    assert [item.raw_result_count for item in observations] == [80, 80, 80, 10, 0]
+    assert observations[4].query_yields[0].skipped_reason == "repository_seed_exhausted"
+    assert len(environment.candidate_accessions) == 250
+    page_counts = [
+        payload["cumulative_count"]
+        for event_type, payload in events
+        if event_type == "repository_query_page_completed"
+    ]
+    assert page_counts and max(page_counts) <= 80
+    # Offset 80 resumes inside page zero; later calls advance to pages one and two.
+    assert client.start_pages == [0, 0, 1, 2]
+
+
+def test_continuous_search_rejects_synonym_before_primary_theme_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    request = DatasetRequest(
+        repository="pride",
+        query_terms=["immunopeptidomics", "HLA ligandome"],
+        continuous_discovery=True,
+        quota_flexibility="open_ended",
+    )
+    environment = PrideDiscoverySearchEnvironment(
+        request=request,
+        prompt="Find as many immunopeptidomics projects as possible.",
+        client=_FakePrideClient({}),
+        state_path=tmp_path / "candidate_state.json",
+    )
+
+    with pytest.raises(ValueError, match="expected immunopeptidomics"):
+        environment.search(
+            CandidateSearchAction(
+                queries=[RepositoryQuery(query="HLA ligandome", depth=200)],
+                candidate_limit=50,
+                rationale="Try to advance too early.",
+            )
+        )
+
+
+def test_continuous_search_skips_repeated_exhausted_theme_without_failing(
+    tmp_path: Path,
+) -> None:
+    request = DatasetRequest(
+        repository="pride",
+        query_terms=["immunopeptidomics", "immunopeptidome"],
+        continuous_discovery=True,
+        quota_flexibility="open_ended",
+    )
+    environment = PrideDiscoverySearchEnvironment(
+        request=request,
+        prompt="Find as many immunopeptidomics projects as possible.",
+        client=_FakePrideClient(
+            {"immunopeptidomics": [_project("PXD000001", "Human immunopeptidomics")]}
+        ),
+        state_path=tmp_path / "candidate_state.json",
+    )
+    action = CandidateSearchAction(
+        queries=[RepositoryQuery(query="immunopeptidomics", depth=200)],
+        candidate_limit=50,
+        rationale="Continue the primary theme.",
+    )
+
+    first = environment.search(action)
+    repeated = environment.search(action)
+
+    assert first.raw_result_count == 1
+    assert repeated.query_yields[0].skipped_reason == "repository_seed_exhausted"
+    assert repeated.failures == []

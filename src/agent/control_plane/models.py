@@ -182,7 +182,12 @@ class RoundMetrics(JsonModel):
     query_repetition: float = Field(ge=0.0, le=1.0)
     budget_pressure: float = Field(ge=0.0, le=1.0)
     semantic_coverage_gap: float = Field(default=1.0, ge=0.0, le=1.0)
+    corpus_term_coverage_gap: float = Field(default=1.0, ge=0.0, le=1.0)
     hard_constraint_evidence_gap: float = Field(default=1.0, ge=0.0, le=1.0)
+    n_hard_conjunction_pass: int = Field(default=0, ge=0)
+    n_hard_pass_inspected: int = Field(default=0, ge=0)
+    unknown_hard_rate: float = Field(default=1.0, ge=0.0, le=1.0)
+    candidate_level_conjunction_coverage: float = Field(default=0.0, ge=0.0, le=1.0)
     duplicate_rate: float = Field(default=0.0, ge=0.0, le=1.0)
     high_relevance_gain: float = Field(default=0.0, ge=0.0, le=1.0)
     inspection_yield: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -304,6 +309,21 @@ class AgentEvent(JsonModel):
     created_at: str
 
 
+class VerifiedProjectBatch(JsonModel):
+    batch_index: int = Field(ge=1)
+    batch_size: int = Field(ge=1)
+    project_count: int = Field(ge=1)
+    file_count: int = Field(ge=1)
+    cumulative_verified_project_count: int = Field(ge=1)
+    cumulative_verified_file_count: int = Field(default=0, ge=0)
+    project_accessions: list[str] = Field(min_length=1)
+    file_identifiers: list[str] = Field(default_factory=list)
+    delivery_unit: Literal["project", "file"] = "project"
+    manifest_path: str
+    terminal: bool = False
+    message: str
+
+
 class AgentRunRecord(JsonModel):
     schema_version: str = "agent-control/v1"
     run_id: str
@@ -320,10 +340,14 @@ class AgentRunRecord(JsonModel):
     candidate_search_count: int = 0
     candidate_inspection_count: int = 0
     inspected_candidate_accessions: list[str] = Field(default_factory=list)
+    verified_project_accessions: list[str] = Field(default_factory=list)
+    verified_project_batch_size: int = Field(default=500, ge=1, le=5000)
+    published_verified_project_batches: list[VerifiedProjectBatch] = Field(default_factory=list)
     no_gain_action_count: int = 0
     latest_candidate_search_id: str | None = None
     latest_high_relevance_candidate_count: int = 0
     latest_semantic_coverage: float = Field(default=0.0, ge=0.0, le=1.0)
+    latest_corpus_term_coverage: float = Field(default=0.0, ge=0.0, le=1.0)
     model_requests: int = 0
     sdk_turn_count: int = Field(default=0, ge=0)
     model_input_tokens: int = 0
@@ -400,6 +424,9 @@ class DiscoveryRoundObservation(JsonModel):
     unknown_counts: dict[str, int] = Field(default_factory=dict)
     candidate_search: dict[str, Any] | None = None
     project_assessments: list[dict[str, Any]] = Field(default_factory=list)
+    inspection_outcomes: list[dict[str, Any]] = Field(default_factory=list)
+    verified_project_count: int = Field(default=0, ge=0)
+    published_verified_project_batches: list[VerifiedProjectBatch] = Field(default_factory=list)
     inspected_candidate_count: int = Field(default=0, ge=0)
     minimum_high_relevance_inspections: int = Field(default=0, ge=0)
     selection_ready: bool = False

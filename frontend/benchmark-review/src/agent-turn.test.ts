@@ -73,7 +73,7 @@ describe("agent-turn response boundary", () => {
     expect(turn.next_decision?.focus).toBe("species");
     // Free text is a UI invariant, even if a model returns false.
     expect(turn.next_decision?.allow_free_text).toBe(true);
-    expect(turn.gap_report?.required_missing).toEqual(["horizon"]);
+    expect(turn.gap_report?.required_missing).toEqual([]);
   });
 
   it("canonicalizes predeclared option strategy patches at the shared response boundary", () => {
@@ -111,13 +111,7 @@ describe("agent-turn response boundary", () => {
       },
     });
 
-    expect(turn.next_decision?.recommendation.strategy_patch).toEqual({
-      runHorizon: "candidates_reviewed",
-    });
-    expect(turn.next_decision?.options.map((option) => option.strategy_patch)).toEqual([
-      { runHorizon: "plan_only" },
-      { runHorizon: "candidates_reviewed", targetProjectCount: 20 },
-    ]);
+    expect(turn.next_decision).toBeNull();
   });
 
   it.each([
@@ -162,11 +156,13 @@ describe("agent-turn response boundary", () => {
     });
 
     expect(turn.semantic_verification?.verdict).toBe("rejected");
-    expect(turn.action).toBe("advise");
+    // Write attempt stays labeled update_strategy for FE chrome; patch is stripped.
+    expect(turn.action).toBe("update_strategy");
     expect(turn.tool_calls).toEqual([]);
     expect(turn.strategy_patch).toBeNull();
     expect(turn.extra_fields).toEqual({});
     expect(reduceAgentTurn(original, turn).spec).toBe(original);
+    expect(reduceAgentTurn(original, turn).strategyUpdated).toBe(false);
   });
 
   it.each(["unavailable", "budget_exhausted"] as const)(
@@ -292,7 +288,7 @@ describe("Agent-owned defaults boundary", () => {
     expect(reduction.strategyUpdated).toBe(true);
     expect(reduction.spec).toMatchObject({
       taskType: "browse_only",
-      runHorizon: "candidates_only",
+      runHorizon: "candidates_reviewed",
     });
   });
 
@@ -514,7 +510,7 @@ describe("agent-turn strategy reducer", () => {
       specialThemes: ["drug_treated_cell_line"],
       labelingStrategy: "tmt",
       coverageMode: "curated",
-      runHorizon: "ai_ready_table",
+      runHorizon: "candidates_reviewed",
       objective: "Fish DIA RT benchmark",
       confirmed: false,
     });

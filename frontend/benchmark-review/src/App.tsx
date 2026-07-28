@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Column,
   Content,
@@ -18,13 +18,14 @@ import { IbmWatsonDiscovery } from "@carbon/icons-react";
 import { AiReadyPanel } from "./AiReadyPanel";
 import { BatchPanel } from "./BatchPanel";
 import { buildInfoLabel, buildInfoTitle } from "./build-info";
-import { CarbonAgentChat } from "./CarbonAgentChat";
+import { CarbonAgentChat, type GrillExternalCommand } from "./CarbonAgentChat";
 import { DiscoveryContextRail } from "./DiscoveryContextRail";
 import { HistoryPanel } from "./HistoryPanel";
 import { SettingsPanel } from "./SettingsPanel";
 import { SingleTaskPanel } from "./SingleTaskPanel";
 import { createEmptyIntent, type GrillPhase, type IntentSpec } from "./intent-spec";
-import type { DiscoveryJob } from "./workflow-api";
+import { reconcileSearchTermSelection, searchTermCandidates } from "./grill-tree";
+import { getDiscoveryJob, getDiscoveryRun, type DiscoveryBatchHandoff, type DiscoveryJob, type WorkflowRecord } from "./workflow-api";
 
 const terminal = (status: unknown) =>
   ["completed", "failed", "blocked", "cancelled"].includes(String(status || "").toLowerCase());
@@ -35,18 +36,41 @@ export default function App() {
   const [taskId, setTaskId] = useState("");
   const [batchId, setBatchId] = useState("");
   const [batchSeedInputs, setBatchSeedInputs] = useState("");
+  const [batchSeedRecords, setBatchSeedRecords] = useState<WorkflowRecord[]>([]);
+  const [batchSeedSource, setBatchSeedSource] = useState<{ jobId?: string; discoveryId?: string; batchIndex?: number }>({});
   const [batchSeedToken, setBatchSeedToken] = useState(0);
   const [historyKey, setHistoryKey] = useState(0);
   const [intent, setIntent] = useState<IntentSpec>(() => createEmptyIntent());
+  const [selectedSearchTerms, setSelectedSearchTerms] = useState<string[]>([]);
   const [phase, setPhase] = useState<GrillPhase>("idle");
-  const [externalCommand, setExternalCommand] = useState<"confirm" | "defaults" | null>(null);
+  const [externalCommand, setExternalCommand] = useState<GrillExternalCommand | null>(null);
+  const [resultOpenRequest, setResultOpenRequest] = useState<{ jobId: string; token: number } | null>(null);
+  const searchTermCandidatesForIntent = useMemo(
+    () => searchTermCandidates(intent),
+    [intent],
+  );
+  const searchTermCandidateKey = searchTermCandidatesForIntent.join("\u0000");
+
+  useEffect(() => {
+    setSelectedSearchTerms((current) => {
+      return reconcileSearchTermSelection(current, intent);
+    });
+    // A scientific-theme change deliberately resets stale selections.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchTermCandidateKey]);
 
   const changed = () => setHistoryKey((value) => value + 1);
   const onNavigate = useCallback((tabIndex: number) => setSelectedTab(tabIndex), []);
-  const onSeedBatchInputs = useCallback((text: string) => {
-    const next = String(text || "").trim();
+  const onSeedBatchInputs = useCallback((handoff: Pick<DiscoveryBatchHandoff, "inputs" | "input_records" | "job_id" | "discovery_id" | "batch_index">) => {
+    const next = (handoff.inputs || []).join("\n").trim();
     if (!next) return;
     setBatchSeedInputs(next);
+    setBatchSeedRecords(handoff.input_records || []);
+    setBatchSeedSource({
+      jobId: handoff.job_id,
+      discoveryId: handoff.discovery_id,
+      batchIndex: handoff.batch_index,
+    });
     setBatchSeedToken((token) => token + 1);
     setSelectedTab(2);
   }, []);
@@ -103,7 +127,14 @@ export default function App() {
                           }}
                           onIntentChange={setIntent}
                           onPhaseChange={setPhase}
+                          externalSelectedSearchTerms={selectedSearchTerms}
                           onNavigate={onNavigate}
+                          onOpenResults={(jobId) => {
+                            setResultOpenRequest((prev) => ({
+                              jobId,
+                              token: (prev?.token || 0) + 1,
+                            }));
+                          }}
                           externalCommand={externalCommand}
                           onExternalCommandConsumed={() => setExternalCommand(null)}
                         />
@@ -113,10 +144,13 @@ export default function App() {
                       spec={intent}
                       phase={phase}
                       job={job}
-                      onConfirm={() => setExternalCommand("confirm")}
-                      onApplyDefaults={() => setExternalCommand("defaults")}
+                      onConfirm={(queryTerms) => setExternalCommand({ type: "confirm", queryTerms })}
+                      selectedSearchTerms={selectedSearchTerms}
+                      onSelectedSearchTermsChange={setSelectedSearchTerms}
+                      onApplyDefaults={() => setExternalCommand({ type: "defaults" })}
                       onNavigate={onNavigate}
                       onSeedBatchInputs={onSeedBatchInputs}
+                      openResultRequest={resultOpenRequest}
                     />
                   </div>
                 </TabPanel>
@@ -130,6 +164,8 @@ export default function App() {
                     onChanged={changed}
                     initialInputs={batchSeedInputs}
                     initialInputsToken={batchSeedToken}
+                    initialInputRecords={batchSeedRecords}
+                    initialSource={batchSeedSource}
                   />
                 </TabPanel>
                 <TabPanel>
@@ -145,6 +181,25 @@ export default function App() {
                     onOpenBatch={(id) => {
                       setBatchId(id);
                       setSelectedTab(2);
+                    }}
+                    onOpenDiscovery={async (item) => {
+                      const jobId = String(item.job_id || "");
+                      const discoveryId = String(item.discovery_id || item.run_id || "");
+                      const next = jobId
+                        ? await getDiscoveryJob(jobId, true)
+                        : {
+                            job_id: discoveryId,
+                            status: String(item.status || "completed"),
+                            record: await getDiscoveryRun(discoveryId),
+                            result_batches: [],
+                            logs: [],
+                          };
+                      setJob(next as DiscoveryJob);
+                      setSelectedTab(0);
+                      setResultOpenRequest({
+                        jobId: String(next.job_id || discoveryId),
+                        token: Date.now(),
+                      });
                     }}
                   />
                 </TabPanel>

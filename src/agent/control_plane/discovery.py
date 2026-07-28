@@ -20,6 +20,7 @@ from agent.control_plane.models import (
     DynamicBudgetLimits,
     RoundMetrics,
     SearchDiagnosis,
+    VerifiedProjectBatch,
     minimum_high_relevance_inspections,
 )
 from agent.control_plane.policy import evaluate_tool_policy
@@ -216,16 +217,39 @@ class DiscoveryToolService:
                     )
                 else:
                     observation = self.search_environment.search(bound_action)
+            if self.dynamic_budget and grant_id:
+                try:
+                    self.store.mark_search_attempt_executed(
+                        self.run_id,
+                        grant_id,
+                        status="executed",
+                        extra={"search_id": getattr(observation, "search_id", None)},
+                    )
+                except Exception:
+                    pass
             metered_run = self._require_run()
             previous_high = metered_run.latest_high_relevance_candidate_count
             high_gain_count = max(
                 0,
                 observation.high_relevance_candidate_count - previous_high,
             )
-            coverage_gain = max(
-                0.0,
-                observation.semantic_coverage - metered_run.latest_semantic_coverage,
+            # corpus_term_coverage is the diagnostic rename of semantic_coverage.
+            # Treat 0.0 default as "unset" when semantic_coverage is the only filled alias.
+            semantic_coverage_value = float(getattr(observation, "semantic_coverage", 0.0) or 0.0)
+            corpus_coverage_value = float(
+                getattr(observation, "corpus_term_coverage", 0.0) or 0.0
             )
+            corpus_coverage = (
+                corpus_coverage_value
+                if corpus_coverage_value > 0.0 or semantic_coverage_value <= 0.0
+                else semantic_coverage_value
+            )
+            previous_corpus = float(
+                getattr(metered_run, "latest_corpus_term_coverage", 0.0)
+                or metered_run.latest_semantic_coverage
+                or 0.0
+            )
+            coverage_gain = max(0.0, corpus_coverage - previous_corpus)
             no_gain = high_gain_count <= 0 and coverage_gain <= 0.001
             no_gain_streak = metered_run.no_gain_action_count + 1 if no_gain else 0
             recommended_action = (
@@ -239,6 +263,7 @@ class DiscoveryToolService:
                 update={
                     "new_high_relevance_candidate_count": high_gain_count,
                     "semantic_coverage_gain": coverage_gain,
+                    "corpus_term_coverage_gain": coverage_gain,
                     "recommended_action": recommended_action,
                 }
             )
@@ -251,9 +276,27 @@ class DiscoveryToolService:
                         0.0,
                         1.0 - min(observation.candidate_count, 10) / 10.0,
                     ),
-                    "quality_gap": 1.0 - observation.semantic_coverage,
-                    "semantic_coverage_gap": 1.0 - observation.semantic_coverage,
-                    "hard_constraint_evidence_gap": review_count / max(1, preview_count),
+                    "quality_gap": 1.0 - corpus_coverage,
+                    "semantic_coverage_gap": 1.0 - corpus_coverage,
+                    "corpus_term_coverage_gap": 1.0 - corpus_coverage,
+                    "hard_constraint_evidence_gap": (
+                        float(observation.hard_constraint_evidence_gap)
+                        if getattr(observation, "cem_summary", None)
+                        else 1.0  # open gap when CEM not computed; never needs_review ratio
+                    ),
+                    "n_hard_conjunction_pass": int(
+                        getattr(observation, "n_hard_conjunction_pass", 0) or 0
+                    ),
+                    "n_hard_pass_inspected": int(
+                        getattr(observation, "n_hard_pass_inspected", 0) or 0
+                    ),
+                    "unknown_hard_rate": float(
+                        getattr(observation, "unknown_hard_rate", 1.0) or 1.0
+                    ),
+                    "candidate_level_conjunction_coverage": float(
+                        getattr(observation, "candidate_level_conjunction_coverage", 0.0)
+                        or 0.0
+                    ),
                     "duplicate_rate": observation.duplicate_rate,
                     "high_relevance_gain": high_gain_count
                     / max(1, observation.high_relevance_candidate_count),
@@ -274,7 +317,8 @@ class DiscoveryToolService:
                     "candidate_search_count": metered_run.candidate_search_count + 1,
                     "latest_candidate_search_id": observation.search_id,
                     "latest_high_relevance_candidate_count": observation.high_relevance_candidate_count,
-                    "latest_semantic_coverage": observation.semantic_coverage,
+                    "latest_semantic_coverage": corpus_coverage,
+                    "latest_corpus_term_coverage": corpus_coverage,
                     "no_gain_action_count": no_gain_streak,
                     "search_recovery_required": no_gain_streak >= 2,
                     "latest_metrics": metrics,
@@ -296,6 +340,70 @@ class DiscoveryToolService:
             )
             return observation
         except Exception as exc:
+            order_violation = re.match(
+                r"open_ended_theme_order_violation:\s*expected\s+(.+?);\s*search",
+                str(exc),
+                flags=re.IGNORECASE,
+            )
+            if order_violation:
+                expected_theme = order_violation.group(1).strip()
+                candidate_accessions = list(
+                    getattr(self.search_environment, "candidate_accessions", []) or []
+                )
+                high_relevance = getattr(
+                    self.search_environment,
+                    "high_relevance_accessions",
+                    None,
+                )
+                high_relevance_count = (
+                    len(list(high_relevance()))
+                    if callable(high_relevance)
+                    else 0
+                )
+                observation = CandidateSearchObservation(
+                    status="completed",
+                    search_id=run.latest_candidate_search_id or "search_order_wait",
+                    query_yields=[
+                        {
+                            "query": item.query,
+                            "executed_query": item.query,
+                            "intent_dimension": item.intent_dimension,
+                            "requested_depth": item.depth,
+                            "raw_result_count": 0,
+                            "new_candidate_count": 0,
+                            "duplicate_count": 0,
+                            "skipped_reason": (
+                                f"waiting_for_confirmed_theme:{expected_theme}"
+                            ),
+                        }
+                        for item in bound_action.queries
+                    ],
+                    raw_result_count=0,
+                    candidate_count=len(candidate_accessions),
+                    new_candidate_count=0,
+                    duplicate_count=0,
+                    duplicate_rate=0.0,
+                    high_relevance_candidate_count=high_relevance_count,
+                    recommended_action=f"search_confirmed_theme:{expected_theme}",
+                    rationale=action.rationale,
+                )
+                self.store.complete_tool_call(
+                    tool_call.idempotency_key,
+                    observation.model_dump(mode="json"),
+                )
+                self.store.append_event(
+                    self.run_id,
+                    "candidate_search_completed",
+                    {
+                        "queries": queries,
+                        "observation": observation.model_dump(mode="json"),
+                        "safe_reorder": {
+                            "status": "waiting_for_preceding_theme",
+                            "expected_theme": expected_theme,
+                        },
+                    },
+                )
+                return observation
             failed = CandidateSearchObservation(
                 status="failed",
                 search_id=run.latest_candidate_search_id or "search_failed",
@@ -418,222 +526,528 @@ class DiscoveryToolService:
             )
             return observation
 
-    def _persist_environment_inspection(
+    def search_and_inspect_repository_candidates(
         self,
-        *,
-        run: AgentRunRecord,
-        round_index: int,
-        action: CandidateInspectionAction,
-        result_manifest: DatasetManifest,
-        usable_files: int,
-        successful_accessions: list[str],
-        failed_accessions: list[str],
-        previous_pool: DatasetManifest | None,
-        tool_call_id: str,
-    ) -> DiscoveryRoundObservation:
-        manifest = result_manifest
-        if self.task_type:
-            manifest = annotate_manifest_task_readiness(manifest, self.task_type)
-        summary = dict(manifest.summary)
-        summary["openai_agents_control_plane"] = {
-            "run_id": self.run_id,
-            "round_index": round_index,
-            "runtime": "openai_agents",
-            "search_id": action.search_id,
-        }
-        manifest = manifest.model_copy(update={"run_id": self.run_id, "summary": summary})
-        round_dir = self.output_dir / f"round_{round_index:02d}"
-        paths = write_dataset_manifest(manifest, round_dir)
-        events = self.store.list_events(self.run_id)
-        search_event = next(
+        action: CandidateSearchAction,
+        grant_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Search one chunk, then review its new ranked projects immediately."""
+        search = self.search_repository_candidates(action, grant_id=grant_id)
+        refreshed_run = self._require_run()
+        batch_size = min(
+            40,
+            max(1, int(getattr(self.request, "inspection_batch_size", 30) or 30)),
+        )
+        first_round_shortfall = (
+            refreshed_run.candidate_search_count == 1
+            and search.candidate_count < batch_size
+        )
+        exhausted = any(
+            item.skipped_reason == "repository_seed_exhausted"
+            for item in search.query_yields
+        )
+        waiting_for_theme = next(
             (
-                event
-                for event in reversed(events)
-                if event.event_type == "candidate_search_completed"
-                and (event.payload.get("observation") or {}).get("search_id") == action.search_id
+                str(item.skipped_reason).split(":", 1)[1]
+                for item in search.query_yields
+                if str(item.skipped_reason or "").startswith(
+                    "waiting_for_confirmed_theme:"
+                )
             ),
             None,
         )
-        candidate_search = (
-            dict(search_event.payload.get("observation") or {})
-            if search_event is not None
-            else {"search_id": action.search_id}
+        pipeline: dict[str, Any] = {
+            "mode": "interleaved_search_review",
+            "global_dedupe_key": "project_accession",
+            "inspection_batch_size": batch_size,
+            "first_round_candidate_shortfall": first_round_shortfall,
+            "next_action": (
+                "search_failed"
+                if search.status != "completed"
+                else f"search_confirmed_theme:{waiting_for_theme}"
+                if waiting_for_theme
+                else "advance_to_next_confirmed_theme"
+                if exhausted
+                else "deepen_primary_theme"
+                if first_round_shortfall
+                else "continue_primary_theme_and_review_new_candidates"
+            ),
+            "skipped_inspection_reason": None,
+        }
+        automatic_inspection: DiscoveryRoundObservation | None = None
+
+        ranked_accessions: list[str] = []
+        high_relevance = getattr(
+            self.search_environment,
+            "high_relevance_accessions",
+            None,
         )
-        queries = [str(value) for value in (search_event.payload.get("queries") or [])] if search_event else []
-        observation = _observation_from_manifest(
-            manifest,
-            round_index=round_index,
-            queries=queries,
-            paths=paths,
-        ).model_copy(update={"candidate_search": candidate_search})
-        diagnosis = self._diagnose_search_result(
-            run=run,
-            proposed_queries=queries or ["candidate_pool_inspection"],
-            summary=manifest.summary,
-        )
-        artifacts = dict(run.artifacts)
-        artifacts[f"discovery_round_{round_index:02d}"] = ArtifactReference(
-            path=str(paths["dataset_manifest_json"]),
-            artifact_type="dataset_manifest",
-            schema_version="dataset-manifest/v1",
-        )
-        round_manifests = [
-            _load_manifest(Path(reference.path))
-            for name, reference in sorted(artifacts.items())
-            if name.startswith("discovery_round_") and Path(reference.path).exists()
-        ]
-        pool_manifest = _merge_discovery_manifests(
-            round_manifests,
-            request=self.request,
-            run_id=self.run_id,
-            retain_all_candidates=True,
-        )
-        pool_paths = write_dataset_manifest(pool_manifest, self.output_dir / "candidate_pool")
-        pool_observation = _observation_from_manifest(
-            pool_manifest,
-            round_index=round_index,
-            queries=queries,
-            paths=pool_paths,
-        )
-        metered_run = self._require_run()
-        prior_queries = [
-            str(query)
-            for event in events
-            if event.event_type == "candidate_search_completed"
-            and event is not search_event
-            for query in event.payload.get("queries", [])
-        ]
-        metrics = evaluate_round_metrics(
-            pool_manifest,
-            previous_pool,
-            request=self.request,
-            queries=queries,
-            prior_queries=prior_queries,
-            usage=metered_run.dynamic_usage,
-            limits=metered_run.dynamic_limits,
-            round_index=round_index,
-        )
-        rich_metrics = metered_run.latest_metrics
-        selected_count = max(1, len(manifest.files))
-        needs_review = sum(file.needs_review for file in manifest.files)
-        metrics = metrics.model_copy(
-            update={
-                "semantic_coverage_gap": (
-                    rich_metrics.semantic_coverage_gap if rich_metrics else 1.0
-                ),
-                "hard_constraint_evidence_gap": needs_review / selected_count,
-                "duplicate_rate": rich_metrics.duplicate_rate if rich_metrics else 0.0,
-                "high_relevance_gain": (
-                    rich_metrics.high_relevance_gain if rich_metrics else 0.0
-                ),
-                "inspection_yield": min(1.0, usable_files / selected_count),
-                "no_gain_streak": metered_run.no_gain_action_count,
-            }
-        )
-        inspected_accessions = _normalize_accessions(
-            [*metered_run.inspected_candidate_accessions, *successful_accessions]
-        )
-        minimum_inspections = minimum_high_relevance_inspections(
-            metered_run.latest_high_relevance_candidate_count,
-            self.request.max_projects,
-        )
-        harvest_all = bool(getattr(self.request, "harvest_all_qualified", False)) or (
-            str(getattr(self.request, "quantity_scope", "") or "") == "portfolio"
-            and str(getattr(self.request, "portfolio_size_preference", "") or "").startswith("maximize")
-        )
-        inspection_budget_remaining = round_index < metered_run.budget.max_discovery_rounds
-        # In maximize mode, do not claim selection_ready merely because round budget
-        # ended after inspecting a tiny batch. Require either enough inspections or
-        # an explicit stop / exhausted high-relevance pool.
-        if harvest_all:
-            selection_ready = (
-                len(inspected_accessions) >= minimum_inspections
-                or metered_run.search_stopped
-                or (
-                    not inspection_budget_remaining
-                    and len(inspected_accessions) >= max(25, min(minimum_inspections, 100))
+        if search.status == "completed" and callable(high_relevance):
+            ranked_accessions = list(high_relevance())
+        already_inspected = {
+            str(accession).strip().upper()
+            for accession in refreshed_run.inspected_candidate_accessions
+        }
+        pending: list[str] = []
+        seen = set(already_inspected)
+        for raw_accession in ranked_accessions:
+            accession = str(raw_accession).strip().upper()
+            if not accession or accession in seen:
+                continue
+            seen.add(accession)
+            pending.append(accession)
+            if len(pending) >= batch_size:
+                break
+
+        if search.status != "completed":
+            pipeline["skipped_inspection_reason"] = "search_not_completed"
+        elif not pending:
+            pipeline["skipped_inspection_reason"] = "no_new_ranked_candidates"
+        else:
+            self.store.append_event(
+                self.run_id,
+                "candidate_pipeline_review_started",
+                {
+                    "search_id": search.search_id,
+                    "accessions": pending,
+                    "dedupe_key": "project_accession",
+                    "batch_size": batch_size,
+                    "first_round_candidate_shortfall": first_round_shortfall,
+                },
+            )
+            automatic_inspection = self.inspect_repository_candidates(
+                CandidateInspectionAction(
+                    search_id=search.search_id,
+                    accessions=pending,
+                    rationale=(
+                        "Automatically review newly discovered high-relevance projects "
+                        "while the next primary-theme search chunk can continue."
+                    ),
                 )
             )
-        else:
-            selection_ready = (
-                len(inspected_accessions) >= minimum_inspections
-                or metered_run.search_stopped
-                or not inspection_budget_remaining
+            self.store.append_event(
+                self.run_id,
+                "candidate_pipeline_review_completed",
+                {
+                    "search_id": search.search_id,
+                    "accessions": pending,
+                    "status": automatic_inspection.status,
+                    "next_action": pipeline["next_action"],
+                },
             )
-        artifacts["candidate_pool"] = ArtifactReference(
-            path=str(pool_paths["dataset_manifest_json"]),
-            artifact_type="dataset_manifest",
-            schema_version="dataset-manifest/v1",
+
+        return {
+            "search": search.model_dump(mode="json"),
+            "automatic_inspection": (
+                automatic_inspection.model_dump(mode="json")
+                if automatic_inspection is not None
+                else None
+            ),
+            "pipeline": pipeline,
+        }
+
+    def publish_verified_file_batches(
+        self,
+        *,
+        manifest: DatasetManifest,
+        terminal: bool = False,
+    ) -> dict[str, Any] | None:
+        """Publish every complete verified-file batch and an optional final tail."""
+
+        return self._maybe_emit_partial_l1_delivery(
+            run=self._require_run(),
+            manifest=manifest,
+            terminal=terminal,
         )
-        unresolved = candidate_search.get("unresolved_intent_terms") or []
-        if not selection_ready:
-            recommendation = "inspect_more_high_relevance_candidates"
-        elif unresolved and usable_files > 0:
-            recommendation = "search_unresolved_intent_or_finalize_with_explicit_gaps"
-        else:
-            recommendation = observation.recommended_action
-        observation = observation.model_copy(
-            update={
-                "candidate_pool_manifest_path": str(pool_paths["dataset_manifest_json"]),
-                "pooled_selected_projects": pool_observation.selected_projects,
-                "pooled_selected_files": pool_observation.selected_files,
-                "metrics": metrics,
-                "diagnosis": diagnosis,
-                "project_assessments": _project_assessments(
-                    manifest,
-                    candidate_search,
-                ),
-                "inspected_candidate_count": len(inspected_accessions),
-                "minimum_high_relevance_inspections": minimum_inspections,
-                "selection_ready": selection_ready,
-                "recommended_action": recommendation,
-                "warnings": _dedupe(
-                    [
-                        *observation.warnings,
-                        *(
-                            ["inspection_failed_accessions:" + ",".join(failed_accessions)]
-                            if failed_accessions
-                            else []
-                        ),
-                    ]
-                ),
-            }
+
+    def _maybe_emit_partial_l1_delivery(
+        self,
+        *,
+        run: AgentRunRecord,
+        manifest: DatasetManifest,
+        terminal: bool = False,
+    ) -> dict[str, Any] | None:
+        """Emit incremental L1 usable batch files every N verified usable files.
+
+        "越多越好" keeps searching under safety ceilings, but operators can start
+        batch work when each tranche of ~N qualified files is ready.  A terminal
+        call also publishes the final short tranche.
+        """
+        batch_size = int(getattr(self.request, "partial_delivery_batch_size", None) or 0)
+        if batch_size <= 0:
+            # Default 500 files when maximize / open-ended harvest is on.
+            maximize = bool(getattr(self.request, "harvest_all_qualified", False)) or str(
+                getattr(self.request, "portfolio_size_preference", "") or ""
+            ).startswith("maximize")
+            batch_size = 500 if maximize else 0
+        if batch_size <= 0:
+            return None
+        projects_by_accession = {
+            project.project_accession: project
+            for project in manifest.projects
+            if project.project_accession
+        }
+        qualified_projects = {
+            accession
+            for accession, judgment in run.project_judgments.items()
+            if is_qualified_project_judgment(judgment)
+        }
+
+        def file_identifier(file: DiscoveredFile) -> str:
+            repository = str(file.repository or "unknown").strip().casefold()
+            accession = str(file.project_accession or "").strip().upper()
+            native = str(
+                file.file_accession_or_path or file.file_name or ""
+            ).strip()
+            return f"{repository}:{accession}:{native}"
+
+        files = sorted(
+            (
+                file
+                for file in manifest.files
+                if _is_delivery_eligible(
+                    projects_by_accession.get(file.project_accession),
+                    file,
+                )
+                and file.task_readiness_status != "not_ready"
+                and file.project_accession in qualified_projects
+            ),
+            key=file_identifier,
         )
-        self.store.complete_tool_call(tool_call_id, observation.model_dump(mode="json"))
-        run = metered_run.model_copy(
-            update={
-                "artifacts": artifacts,
-                "candidate_pool_manifest_path": str(pool_paths["dataset_manifest_json"]),
-                "current_manifest_path": (
-                    str(pool_paths["dataset_manifest_json"])
-                    if pool_observation.selected_files > 0
-                    else str(paths["dataset_manifest_json"])
+        projects = sorted({file.project_accession for file in files})
+        published = list(run.published_verified_project_batches)
+        published_file_identifiers: set[str] = set()
+        published_project_accessions: set[str] = set()
+        for item in published:
+            published_project_accessions.update(
+                str(accession).strip().upper()
+                for accession in item.project_accessions
+            )
+            published_file_identifiers.update(item.file_identifiers)
+            if item.file_identifiers or not Path(item.manifest_path).exists():
+                continue
+            legacy_manifest = _load_manifest(Path(item.manifest_path))
+            published_file_identifiers.update(
+                file_identifier(file) for file in legacy_manifest.files
+            )
+        unpublished_files = [
+            file
+            for file in files
+            if file_identifier(file) not in published_file_identifiers
+        ]
+        latest_payload: dict[str, Any] | None = None
+        while len(unpublished_files) >= batch_size or (
+            terminal and unpublished_files
+        ):
+            batch_index = len(published) + 1
+            batch_files = unpublished_files[:batch_size]
+            unpublished_files = unpublished_files[len(batch_files):]
+            terminal_batch = terminal and not unpublished_files
+            batch_file_identifiers = [
+                file_identifier(file) for file in batch_files
+            ]
+            batch_accessions = sorted(
+                {file.project_accession for file in batch_files}
+            )
+            keep = set(batch_accessions)
+            batch_projects = [
+                project
+                for project in manifest.projects
+                if project.project_accession in keep
+            ]
+            batch_manifest = manifest.model_copy(
+                update={
+                    "projects": batch_projects,
+                    "files": batch_files,
+                    "summary": {
+                        **dict(manifest.summary),
+                        "artifact_type": "verified_file_batch",
+                        "batch_index": batch_index,
+                        "batch_size": batch_size,
+                        "delivery_unit": "file",
+                        "terminal": terminal_batch,
+                        "verified_project_count": len(batch_projects),
+                        "verified_file_count": len(batch_files),
+                    },
+                }
+            )
+            paths = write_dataset_manifest(
+                batch_manifest,
+                self.output_dir / "verified_batches" / f"batch_{batch_index:03d}",
+            )
+            batch_record = VerifiedProjectBatch(
+                batch_index=batch_index,
+                batch_size=batch_size,
+                project_count=len(batch_projects),
+                file_count=len(batch_files),
+                cumulative_verified_project_count=len(
+                    published_project_accessions | set(batch_accessions)
                 ),
-                "warnings": pool_observation.warnings,
-                "blockers": pool_observation.blockers,
-                "latest_metrics": metrics,
-                "consecutive_zero_yield": diagnosis.consecutive_zero_yield,
-                "search_recovery_required": diagnosis.recovery_required,
-                "last_search_strategy": diagnosis.strategy,
-                "inspected_candidate_accessions": inspected_accessions,
-            }
+                cumulative_verified_file_count=(
+                    len(published_file_identifiers)
+                    + len(batch_file_identifiers)
+                ),
+                project_accessions=batch_accessions,
+                file_identifiers=batch_file_identifiers,
+                delivery_unit="file",
+                manifest_path=str(paths["dataset_manifest_json"]),
+                terminal=terminal_batch,
+                message=(
+                    f"Verified file batch {batch_index} is ready: "
+                    f"{len(batch_files)} files from "
+                    f"{len(batch_projects)} projects."
+                ),
+            )
+            latest_payload = batch_record.model_dump(mode="json")
+            published.append(batch_record)
+            published_project_accessions.update(batch_accessions)
+            published_file_identifiers.update(batch_file_identifiers)
+            self.store.append_event(
+                self.run_id,
+                "verified_project_batch_published",
+                latest_payload,
+            )
+        self.store.save_run(
+            run.model_copy(
+                update={
+                    "verified_project_accessions": projects,
+                    "verified_project_batch_size": batch_size,
+                    "published_verified_project_batches": published,
+                }
+            )
         )
-        self.store.save_run(run)
-        self.store.append_event(
-            self.run_id,
-            "candidate_inspection_completed",
-            {
+        return latest_payload
+
+    def _persist_environment_inspection(
+            self,
+            *,
+            run: AgentRunRecord,
+            round_index: int,
+            action: CandidateInspectionAction,
+            result_manifest: DatasetManifest,
+            usable_files: int,
+            successful_accessions: list[str],
+            failed_accessions: list[str],
+            previous_pool: DatasetManifest | None,
+            tool_call_id: str,
+        ) -> DiscoveryRoundObservation:
+            manifest = result_manifest
+            if self.task_type:
+                manifest = annotate_manifest_task_readiness(manifest, self.task_type)
+            summary = dict(manifest.summary)
+            summary["openai_agents_control_plane"] = {
+                "run_id": self.run_id,
                 "round_index": round_index,
-                "action": action.model_dump(mode="json"),
-                "observation": observation.model_dump(mode="json"),
-            },
-        )
-        self.store.append_event(
-            self.run_id,
-            "round_value_evaluated",
-            metrics.model_dump(mode="json"),
-        )
-        return observation
+                "runtime": "openai_agents",
+                "search_id": action.search_id,
+            }
+            manifest = manifest.model_copy(update={"run_id": self.run_id, "summary": summary})
+            round_dir = self.output_dir / f"round_{round_index:02d}"
+            paths = write_dataset_manifest(manifest, round_dir)
+            events = self.store.list_events(self.run_id)
+            search_event = next(
+                (
+                    event
+                    for event in reversed(events)
+                    if event.event_type == "candidate_search_completed"
+                    and (event.payload.get("observation") or {}).get("search_id") == action.search_id
+                ),
+                None,
+            )
+            candidate_search = (
+                dict(search_event.payload.get("observation") or {})
+                if search_event is not None
+                else {"search_id": action.search_id}
+            )
+            queries = [str(value) for value in (search_event.payload.get("queries") or [])] if search_event else []
+            observation = _observation_from_manifest(
+                manifest,
+                round_index=round_index,
+                queries=queries,
+                paths=paths,
+            ).model_copy(update={"candidate_search": candidate_search})
+            diagnosis = self._diagnose_search_result(
+                run=run,
+                proposed_queries=queries or ["candidate_pool_inspection"],
+                summary=manifest.summary,
+            )
+            artifacts = dict(run.artifacts)
+            artifacts[f"discovery_round_{round_index:02d}"] = ArtifactReference(
+                path=str(paths["dataset_manifest_json"]),
+                artifact_type="dataset_manifest",
+                schema_version="dataset-manifest/v1",
+            )
+            round_manifests = [
+                _load_manifest(Path(reference.path))
+                for name, reference in sorted(artifacts.items())
+                if name.startswith("discovery_round_") and Path(reference.path).exists()
+            ]
+            pool_manifest = _merge_discovery_manifests(
+                round_manifests,
+                request=self.request,
+                run_id=self.run_id,
+                retain_all_candidates=True,
+            )
+            pool_paths = write_dataset_manifest(pool_manifest, self.output_dir / "candidate_pool")
+            pool_observation = _observation_from_manifest(
+                pool_manifest,
+                round_index=round_index,
+                queries=queries,
+                paths=pool_paths,
+            )
+            metered_run = self._require_run()
+            prior_queries = [
+                str(query)
+                for event in events
+                if event.event_type == "candidate_search_completed"
+                and event is not search_event
+                for query in event.payload.get("queries", [])
+            ]
+            metrics = evaluate_round_metrics(
+                pool_manifest,
+                previous_pool,
+                request=self.request,
+                queries=queries,
+                prior_queries=prior_queries,
+                usage=metered_run.dynamic_usage,
+                limits=metered_run.dynamic_limits,
+                round_index=round_index,
+            )
+            rich_metrics = metered_run.latest_metrics
+            selected_count = max(1, len(manifest.files))
+            needs_review = sum(file.needs_review for file in manifest.files)
+            metrics = metrics.model_copy(
+                update={
+                    "semantic_coverage_gap": (
+                        rich_metrics.semantic_coverage_gap if rich_metrics else 1.0
+                    ),
+                    # WP-A: keep CEM gap from search metrics; needs_review ratio is not hard gap.
+                    "hard_constraint_evidence_gap": float(
+                        getattr(rich_metrics, "hard_constraint_evidence_gap", 1.0)
+                        if rich_metrics is not None
+                        else 1.0
+                    ),
+                    "duplicate_rate": rich_metrics.duplicate_rate if rich_metrics else 0.0,
+                    "high_relevance_gain": (
+                        rich_metrics.high_relevance_gain if rich_metrics else 0.0
+                    ),
+                    "inspection_yield": min(1.0, usable_files / selected_count),
+                    "no_gain_streak": metered_run.no_gain_action_count,
+                }
+            )
+            inspected_accessions = _normalize_accessions(
+                [*metered_run.inspected_candidate_accessions, *successful_accessions]
+            )
+            minimum_inspections = minimum_high_relevance_inspections(
+                metered_run.latest_high_relevance_candidate_count,
+                self.request.max_projects,
+            )
+            harvest_all = bool(getattr(self.request, "harvest_all_qualified", False)) or (
+                str(getattr(self.request, "quantity_scope", "") or "") == "portfolio"
+                and str(getattr(self.request, "portfolio_size_preference", "") or "").startswith("maximize")
+            )
+            inspection_budget_remaining = round_index < metered_run.budget.max_discovery_rounds
+            # In maximize mode, do not claim selection_ready merely because round budget
+            # ended after inspecting a tiny batch. Require either enough inspections or
+            # an explicit stop / exhausted high-relevance pool.
+            if harvest_all:
+                selection_ready = (
+                    len(inspected_accessions) >= minimum_inspections
+                    or metered_run.search_stopped
+                    or (
+                        not inspection_budget_remaining
+                        and len(inspected_accessions) >= max(25, min(minimum_inspections, 100))
+                    )
+                )
+            else:
+                selection_ready = (
+                    len(inspected_accessions) >= minimum_inspections
+                    or metered_run.search_stopped
+                    or not inspection_budget_remaining
+                )
+            artifacts["candidate_pool"] = ArtifactReference(
+                path=str(pool_paths["dataset_manifest_json"]),
+                artifact_type="dataset_manifest",
+                schema_version="dataset-manifest/v1",
+            )
+            unresolved = candidate_search.get("unresolved_intent_terms") or []
+            if not selection_ready:
+                recommendation = "inspect_more_high_relevance_candidates"
+            elif unresolved and usable_files > 0:
+                recommendation = "search_unresolved_intent_or_finalize_with_explicit_gaps"
+            else:
+                recommendation = observation.recommended_action
+            observation = observation.model_copy(
+                update={
+                    "candidate_pool_manifest_path": str(pool_paths["dataset_manifest_json"]),
+                    "pooled_selected_projects": pool_observation.selected_projects,
+                    "pooled_selected_files": pool_observation.selected_files,
+                    "metrics": metrics,
+                    "diagnosis": diagnosis,
+                    "project_assessments": _project_assessments(
+                        manifest,
+                        candidate_search,
+                    ),
+                    "inspection_outcomes": list(
+                        manifest.summary.get("inspection_outcomes") or []
+                    ),
+                    "verified_project_count": len(
+                        metered_run.verified_project_accessions
+                    ),
+                    "published_verified_project_batches": (
+                        metered_run.published_verified_project_batches
+                    ),
+                    "inspected_candidate_count": len(inspected_accessions),
+                    "minimum_high_relevance_inspections": minimum_inspections,
+                    "selection_ready": selection_ready,
+                    "recommended_action": recommendation,
+                    "warnings": _dedupe(
+                        [
+                            *observation.warnings,
+                            *(
+                                ["inspection_failed_accessions:" + ",".join(failed_accessions)]
+                                if failed_accessions
+                                else []
+                            ),
+                        ]
+                    ),
+                }
+            )
+            self.store.complete_tool_call(tool_call_id, observation.model_dump(mode="json"))
+            run = metered_run.model_copy(
+                update={
+                    "artifacts": artifacts,
+                    "candidate_pool_manifest_path": str(pool_paths["dataset_manifest_json"]),
+                    "current_manifest_path": (
+                        str(pool_paths["dataset_manifest_json"])
+                        if pool_observation.selected_files > 0
+                        else str(paths["dataset_manifest_json"])
+                    ),
+                    "warnings": pool_observation.warnings,
+                    "blockers": pool_observation.blockers,
+                    "latest_metrics": metrics,
+                    "consecutive_zero_yield": diagnosis.consecutive_zero_yield,
+                    "search_recovery_required": diagnosis.recovery_required,
+                    "last_search_strategy": diagnosis.strategy,
+                    "inspected_candidate_accessions": inspected_accessions,
+                }
+            )
+            self.store.save_run(run)
+            self.store.append_event(
+                self.run_id,
+                "candidate_inspection_completed",
+                {
+                    "round_index": round_index,
+                    "action": action.model_dump(mode="json"),
+                    "observation": observation.model_dump(mode="json"),
+                },
+            )
+            self.store.append_event(
+                self.run_id,
+                "round_value_evaluated",
+                metrics.model_dump(mode="json"),
+            )
+            return observation
 
     def _repository_request_callback(self) -> Callable[[str, str], None]:
         if self.dynamic_budget:
@@ -1414,6 +1828,23 @@ class DiscoveryToolService:
                 }
             )
         )
+        candidate_pool_path = str(run.candidate_pool_manifest_path or "").strip()
+        if candidate_pool_path and Path(candidate_pool_path).exists():
+            try:
+                self._maybe_emit_partial_l1_delivery(
+                    run=run,
+                    manifest=_load_manifest(Path(candidate_pool_path)),
+                )
+            except Exception as exc:
+                warnings = _dedupe(
+                    [*self._require_run().warnings, f"verified_project_batch_retryable:{exc}"]
+                )
+                self.store.save_run(self._require_run().model_copy(update={"warnings": warnings}))
+                self.store.append_event(
+                    self.run_id,
+                    "verified_project_batch_failed",
+                    {"error": str(exc), "retryable": True},
+                )
         payload = {
             "status": "completed",
             "project_accessions": accessions,
@@ -2093,7 +2524,7 @@ class DiscoveryToolService:
                 break
             if len(inspected) >= target_inspections and batches_done > 0:
                 break
-            batch = remaining[: max(1, min(batch_size, 150))]
+            batch = remaining[: max(1, min(batch_size, 40))]
             action = CandidateInspectionAction(
                 search_id=str(latest_search_id),
                 accessions=batch,
@@ -2452,6 +2883,13 @@ class DiscoveryToolService:
                 if str(manifest_path) and manifest_path.exists() and manifest_path.is_file()
                 else None
             )
+        if manifest is not None and (run.search_stopped or final_selection):
+            self._maybe_emit_partial_l1_delivery(
+                run=run,
+                manifest=manifest,
+                terminal=True,
+            )
+            run = self._require_run()
         issues: list[DiscoveryAuditIssue] = []
         actions: list[DiscoveryRepairAction] = []
         limitations: list[str] = []
@@ -3144,35 +3582,28 @@ class DiscoveryToolService:
             file.validity_status == "valid" and not file.needs_review
             for file in audited_delivery_files
         )
+        inherited_usable_file_count = sum(
+            "usable_inherited" in file.validity_reasons
+            or (
+                "usable_direct" not in file.validity_reasons
+                and file.evidence_level == "project"
+            )
+            for file in audited_delivery_files
+        )
+        direct_usable_file_count = max(
+            0,
+            strict_valid_file_count - inherited_usable_file_count,
+        )
         weak_keep_file_count = sum(
             file.validity_status == "weak_keep" and not file.needs_review
             for file in audited_delivery_files
         )
-        if weak_keep_file_count:
-            weak_keep_projects = sorted(
-                {
-                    file.project_accession.upper()
-                    for file in audited_delivery_files
-                    if file.validity_status == "weak_keep" and not file.needs_review
-                }
-            )
-            limitation = (
-                f"Delivery relies on {weak_keep_file_count} weak-keep file(s); "
-                "they have sufficient delivery evidence for this request but are not strict-valid."
-            )
-            limitations.append(limitation)
-            issues.append(
-                DiscoveryAuditIssue(
-                    code="delivery_relies_on_weak_keep_files",
-                    severity="warning",
-                    summary=limitation,
-                    project_accessions=weak_keep_projects,
-                    evidence_refs=[
-                        "selected_manifest.files.validity_status",
-                        "project_judgments.limitations",
-                    ],
-                )
-            )
+        pending_file_count = sum(
+            file.needs_review
+            or file.validity_status in {"needs_review", "weak_keep"}
+            for file in manifest.files
+        )
+        usable_file_count = len(audited_delivery_files)
 
         # Wave A policy: qualified progress with zero strict-valid is not graduation.
         if (
@@ -3182,7 +3613,7 @@ class DiscoveryToolService:
         ):
             limitations.append(
                 "zero_strict_valid_files_continue_search:"
-                f"qualified={len(qualified)},weak_keep_files={weak_keep_file_count}"
+                f"qualified={len(qualified)},pending_files={pending_file_count}"
             )
             issues.append(
                 DiscoveryAuditIssue(
@@ -3557,6 +3988,9 @@ class DiscoveryToolService:
                 "delivery_eligible_projects": len(delivery_eligible),
                 "usable_files": usable_file_count,
                 "strict_valid_files": strict_valid_file_count,
+                "direct_usable_files": direct_usable_file_count,
+                "inherited_usable_files": inherited_usable_file_count,
+                "pending_files": pending_file_count,
                 "weak_keep_files": weak_keep_file_count,
                 "needs_review_files": needs_review_file_count,
                 "agent_turns_used": agent_turns_used,
@@ -3766,6 +4200,12 @@ class DiscoveryToolService:
                         previous.intent_dimension if previous is not None else "general"
                     ),
                     expected_gain=previous.expected_gain if previous is not None else "",
+                    budget_role=(
+                        getattr(previous, "budget_role", None)
+                        if previous is not None
+                        else "primary_theme"
+                    )
+                    or "primary_theme",
                 )
             )
         if not bound_queries:
@@ -4036,17 +4476,16 @@ def _is_delivery_eligible(
         return False
     if file is None:
         return True
-    if file.needs_review or file.validity_status not in {"valid", "weak_keep"}:
+    # Files, rather than projects, are the delivery unit.  Project-level
+    # evidence may make a file valid by inheritance, but weak_keep is never
+    # silently promoted into a downloadable delivery.
+    if file.needs_review or file.validity_status != "valid":
         return False
     if not str(file.file_accession_or_path or "").strip():
         return False
     if not str(file.download_url or "").strip():
         return False
     if file.file_role == "unknown":
-        return False
-    if file.evidence_level not in {"file", "mixed"}:
-        return False
-    if file.expected_size_bytes is None or int(file.expected_size_bytes) <= 0:
         return False
     return True
 
@@ -4272,7 +4711,7 @@ def _file_rank(file: DiscoveredFile) -> tuple[int, int, float, float, float, flo
 def _manifest_rank(manifest: DatasetManifest) -> tuple[int, int, int, float]:
     valid = sum(1 for file in manifest.files if file.validity_status == "valid")
     usable = sum(1 for file in manifest.files if file.validity_status in {"valid", "weak_keep"})
-    ready = sum(1 for file in manifest.files if file.task_readiness_status in {"ready", "weak_ready"})
+    ready = sum(1 for file in manifest.files if file.task_readiness_status == "ready")
     mean_trust = (
         sum(float(file.trust_score or file.confidence or 0.0) for file in manifest.files) / len(manifest.files)
         if manifest.files

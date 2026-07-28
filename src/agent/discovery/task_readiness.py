@@ -57,6 +57,22 @@ def annotate_manifest_task_readiness(manifest: DatasetManifest, task_type: str |
 
 
 def task_ready_files(manifest: DatasetManifest) -> list[DiscoveredFile]:
+    """Strict task-ready files only (not weak_ready).
+
+    Use pipeline_eligible_files for L1 batch-parameter handoff which may include
+    weak_ready candidates that still need label generation.
+    """
+
+    return [
+        file
+        for file in manifest.files
+        if file.task_readiness_status == "ready"
+    ]
+
+
+def pipeline_eligible_files(manifest: DatasetManifest) -> list[DiscoveredFile]:
+    """Files eligible for L1 parameter planning (ready + weak_ready)."""
+
     return [
         file
         for file in manifest.files
@@ -295,5 +311,7 @@ def _task_readiness_summary(files: list[DiscoveredFile]) -> dict[str, object]:
         "spectra_requirement_status_counts": dict(sorted(spectra_status_counts.items())),
         "metadata_requirement_status_counts": dict(sorted(metadata_status_counts.items())),
         "ai_ready_target_schema_counts": dict(sorted(schemas.items())),
-        "task_ready_files": status_counts.get("ready", 0) + status_counts.get("weak_ready", 0),
+        "task_ready_files": status_counts.get("ready", 0),
+        "weak_ready_files": status_counts.get("weak_ready", 0),
+        "pipeline_eligible_files": status_counts.get("ready", 0) + status_counts.get("weak_ready", 0),
     }

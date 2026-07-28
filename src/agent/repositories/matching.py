@@ -178,6 +178,7 @@ def canonical_file_to_asset(
         local_path=local_path,
         prepared_path=prepared_path,
         expected_size_bytes=file.size_bytes,
+        checksum=file.checksum,
         requires_conversion=requires_conversion,
         asset_confidence=confidence,
         match_type=match_type,

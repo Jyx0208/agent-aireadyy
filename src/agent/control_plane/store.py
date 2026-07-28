@@ -113,6 +113,22 @@ class AgentRunStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_agent_search_grants_run
                 ON agent_search_grants(run_id, created_at);
+                CREATE TABLE IF NOT EXISTS agent_search_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    grant_id TEXT NOT NULL,
+                    query_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES agent_runs(run_id),
+                    FOREIGN KEY(grant_id) REFERENCES agent_search_grants(grant_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_search_attempts_run
+                ON agent_search_attempts(run_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_agent_search_attempts_grant
+                ON agent_search_attempts(grant_id, created_at);
                 """
             )
 
@@ -415,7 +431,25 @@ class AgentRunStore:
         run_id: str,
         grant_id: str,
         query_hash: str | None = None,
+        *,
+        executed_queries: list[str] | None = None,
+        record_usage: bool = True,
+        clear_active_grant: bool = True,
+        append_consumed_event: bool = True,
     ) -> SearchGrant:
+        """Consume a grant with crash-consistent ledger side effects (WP-D5).
+
+        Single BEGIN IMMEDIATE transaction covers:
+        - grant status issued -> consumed
+        - optional active_grant_id clear on run payload
+        - optional dynamic usage increments (query_units + search_batches)
+        - search_attempt row (consumed_pending_execution)
+        - immutable search_grant_consumed event
+
+        Network I/O must remain outside this method.
+        """
+        import uuid
+
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -432,7 +466,8 @@ class AgentRunStore:
             if str(row["status"]) != "issued":
                 raise ValueError(f"grant_already_{row['status']}")
             grant = SearchGrant.model_validate(json.loads(row["payload_json"]))
-            consumed = grant.model_copy(update={"status": "consumed", "updated_at": utc_now_iso()})
+            now = utc_now_iso()
+            consumed = grant.model_copy(update={"status": "consumed", "updated_at": now})
             connection.execute(
                 """
                 UPDATE agent_search_grants
@@ -445,8 +480,153 @@ class AgentRunStore:
                     grant_id,
                 ),
             )
+
+            run_row = connection.execute(
+                "SELECT payload_json, sdk_state_json FROM agent_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise KeyError(f"Unknown agent run: {run_id}")
+            run = self._run_record(run_row)
+            updated_run = run
+            if clear_active_grant and run.active_grant_id == grant_id:
+                updated_run = updated_run.model_copy(update={"active_grant_id": None, "updated_at": now})
+            if record_usage:
+                usage = updated_run.dynamic_usage.model_copy(
+                    update={
+                        "query_units": updated_run.dynamic_usage.query_units + int(consumed.query_units),
+                        "search_batches": updated_run.dynamic_usage.search_batches + 1,
+                    }
+                )
+                limits = updated_run.dynamic_limits
+                if usage.query_units > limits.max_query_units:
+                    raise ValueError("query_unit_budget_exhausted")
+                updated_run = updated_run.model_copy(update={"dynamic_usage": usage, "updated_at": now})
+            if updated_run is not run:
+                connection.execute(
+                    "UPDATE agent_runs SET payload_json = ?, updated_at = ? WHERE run_id = ?",
+                    (
+                        canonical_json(updated_run.model_dump(mode="json", exclude={"sdk_state_json"})),
+                        updated_run.updated_at,
+                        run_id,
+                    ),
+                )
+
+            attempt_id = f"attempt_{uuid.uuid4().hex}"
+            attempt_payload = {
+                "attempt_id": attempt_id,
+                "run_id": run_id,
+                "grant_id": grant_id,
+                "query_hash": consumed.query_hash,
+                "status": "consumed_pending_execution",
+                "executed_queries": list(executed_queries or consumed.approved_queries),
+                "query_units": consumed.query_units,
+            }
+            connection.execute(
+                """
+                INSERT INTO agent_search_attempts (
+                    attempt_id, run_id, grant_id, query_hash, status, payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    run_id,
+                    grant_id,
+                    consumed.query_hash,
+                    "consumed_pending_execution",
+                    canonical_json(attempt_payload),
+                    now,
+                    now,
+                ),
+            )
+
+            event_payload: dict[str, Any] | None = None
+            if append_consumed_event:
+                event_payload = {
+                    **consumed.model_dump(mode="json"),
+                    "executed_queries": list(executed_queries or consumed.approved_queries),
+                    "attempt_id": attempt_id,
+                }
+                connection.execute(
+                    "INSERT INTO agent_events (run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                    (run_id, "search_grant_consumed", canonical_json(event_payload), now),
+                )
+
             connection.commit()
+            if append_consumed_event and event_payload is not None:
+                try:
+                    sequence_row = connection.execute(
+                        "SELECT sequence FROM agent_events WHERE run_id = ? ORDER BY sequence DESC LIMIT 1",
+                        (run_id,),
+                    ).fetchone()
+                    if sequence_row is not None:
+                        self._notify_event(
+                            AgentEvent(
+                                sequence=int(sequence_row["sequence"]),
+                                run_id=run_id,
+                                event_type="search_grant_consumed",
+                                payload=event_payload,
+                                created_at=now,
+                            )
+                        )
+                except Exception:
+                    pass
             return consumed
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def list_search_attempts(self, run_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload_json FROM agent_search_attempts
+                WHERE run_id = ? ORDER BY created_at, attempt_id
+                """,
+                (run_id,),
+            ).fetchall()
+        return [json.loads(row["payload_json"]) for row in rows]
+
+    def mark_search_attempt_executed(
+        self,
+        run_id: str,
+        grant_id: str,
+        *,
+        status: str = "executed",
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Mark the latest pending attempt for a grant as executed/failed after network search."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT attempt_id, payload_json FROM agent_search_attempts
+                WHERE run_id = ? AND grant_id = ? AND status = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (run_id, grant_id, "consumed_pending_execution"),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+            payload = json.loads(row["payload_json"])
+            now = utc_now_iso()
+            payload.update(extra or {})
+            payload["status"] = status
+            payload["updated_at"] = now
+            connection.execute(
+                """
+                UPDATE agent_search_attempts
+                SET status = ?, payload_json = ?, updated_at = ?
+                WHERE attempt_id = ?
+                """,
+                (status, canonical_json(payload), now, row["attempt_id"]),
+            )
+            connection.commit()
+            return payload
         except Exception:
             connection.rollback()
             raise

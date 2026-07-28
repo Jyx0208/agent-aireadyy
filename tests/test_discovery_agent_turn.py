@@ -222,8 +222,12 @@ def test_web_critical_agenda_is_a_thin_profile_engine_delegate(monkeypatch):
 
     actual = web_app._discovery_critical_decision_agenda(snapshot, gaps, resolved)
 
-    assert actual is expected
-    assert captured == {"snapshot": snapshot, "gaps": gaps, "resolved": resolved}
+    assert actual == expected
+    assert captured == {
+        "snapshot": {**snapshot, "run_horizon": "candidates_reviewed"},
+        "gaps": gaps,
+        "resolved": resolved,
+    }
 
 
 def test_web_browse_only_agenda_does_not_load_training_questions():
@@ -478,6 +482,68 @@ def test_update_strategy_with_broken_next_decision_still_grills_species(monkeypa
     )
 
 
+def test_complete_strategy_ignores_malformed_optional_next_decision(monkeypatch):
+    invalid = {
+        "focus": "labeling",
+        "question": "还有其他要求吗？",
+        "recommendation": {"id": "any", "label": "不限"},
+        "options": [{"id": "any", "label": "不限"}],
+    }
+    patch = {
+        "objective": "免疫肽组学数据发现",
+        "task_type": "browse_only",
+        "run_horizon": "candidates_reviewed",
+        "species": ["human"],
+        "species_policy": "include_only",
+        "acquisition_mode": "dda",
+        "mixed_acquisition_policy": "reject_mixed",
+        "special_themes": ["immunopeptidomics"],
+        "labeling_strategy": "any",
+        "labeling_hard": False,
+        "coverage_mode": "exhaustive",
+        "quota_flexibility": "open_ended",
+    }
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "已记录完整策略。",
+            "tool_calls": [
+                {"name": "update_strategy", "arguments": {"patch": patch}}
+            ],
+            "next_decision": invalid,
+            "gap_report": {
+                "required_missing": [],
+                "optional_missing": [],
+                "ready_for_confirm": True,
+            },
+        },
+        user_message=(
+            "科学目标：免疫肽组学数据发现；研究主题：immunopeptidomics；"
+            "物种：仅限人；采集模式：仅 DDA；下游任务：纯浏览探索；"
+            "交付终点：候选加审查；规模：越多越好，开放上限；"
+            "标记方式：不限。"
+        ),
+    )
+
+    assert result["action"] == "update_strategy"
+    assert {
+        field: result["extra_fields"].get(field)
+        for field in patch
+        if field != "run_horizon"
+    } == {
+        field: value
+        for field, value in patch.items()
+        if field != "run_horizon"
+    }
+    assert result["extra_fields"].get("target_project_count") is None
+    assert result.get("next_decision") is None
+    assert not any(
+        "next_decision requires" in error
+        for error in result.get("contract_errors") or []
+    )
+
+
 def test_clarify_what_does_that_mean_repairs_with_friendly_copy(monkeypatch):
     """P1-B: user asks 什么意思 after a broken menu; explain and re-ask."""
 
@@ -590,7 +656,7 @@ def test_grill_turn_exposes_agent_owned_update_and_preserves_next_decision(monke
         {"name": "update_strategy", "arguments": {"patch": patch}}
     ]
     assert result["extra_fields"] == patch
-    assert result["next_decision"]["focus"] == "horizon"
+    assert result.get("next_decision") is None
     assert len(llm.calls) == 1
 
     prompts = "\n".join(llm.calls[0].values()).lower()
@@ -671,6 +737,88 @@ def test_social_chat_does_not_turn_into_a_structured_questionnaire(monkeypatch):
     assert "next_decision" not in result
 
 
+def test_notebook_system_prompt_is_notebook_partner_not_form_wizard(monkeypatch):
+    """NI-1: system prompt is notebook-style; MUST-menu grilling is weakened."""
+
+    result, llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "chat",
+            "assistant_message": "你好，我可以帮你记策略笔记。",
+            "tool_calls": [],
+            "next_decision": None,
+        },
+        user_message="你好",
+    )
+
+    system = llm.calls[0]["system_prompt"]
+    user = llm.calls[0]["user_prompt"]
+    assert "notebook partner" in system.casefold() or "记笔记" in system or "notebook" in system.casefold()
+    assert "MUST continue grilling" not in user
+    assert "MUST continue grilling" not in system
+    assert "natural-language follow-up" in user or "natural language" in user.casefold()
+    assert result["action"] == "chat"
+    assert result.get("contract_errors") in (None, [])
+    assert result.get("semantic_verification") is None
+
+
+@pytest.mark.parametrize("action", ["chat", "advise"])
+def test_chat_advise_never_surfaces_contract_or_sv_chrome(monkeypatch, action: str):
+    """NI-1: pure chat/advise fail-soft — no contract_errors chrome in user text."""
+
+    raw_next = (
+        {
+            "focus": "broken",
+            "question": "不完整菜单",
+        }
+        if action == "chat"
+        else None
+    )
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": action,
+            "assistant_message": "免疫肽一般指 MHC 呈递肽段的蛋白质组学，不是固定问卷。",
+            "tool_calls": [],
+            "next_decision": raw_next,
+            "intent": "chitchat" if action == "chat" else "explain",
+        },
+        user_message="免疫肽是什么？",
+    )
+
+    assert result["action"] == action
+    assert result.get("contract_errors") in (None, [])
+    assert "可验证" not in result["assistant_message"]
+    assert "契约" not in result["assistant_message"]
+    assert "next_decision requires" not in result["assistant_message"]
+    assert "免疫肽" in result["assistant_message"] or "MHC" in result["assistant_message"]
+    if action == "chat":
+        assert "next_decision" not in result
+
+
+
+def test_failed_update_still_reports_when_demoted_from_write(monkeypatch):
+    """NI-1: demoted failed update_strategy keeps honest non-write notice (not silent green)."""
+
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "我已经把物种写成人类了。",
+            "tool_calls": [],  # no tool → mutation failure
+            "extra_fields": {"species": ["Homo sapiens"]},
+        },
+        user_message="物种改成人类",
+    )
+
+    assert result["extra_fields"] == {}
+    assert result["tool_calls"] == []
+    # Still not a successful write; message must not claim the card was updated via tool.
+    assert result["action"] in {"advise", "clarify"}
+    # Failed write path may keep contract_errors (not pure chat fail-soft).
+    assert result.get("contract_errors") not in (None, []) or "可验证" in result["assistant_message"] or "保持不变" in result["assistant_message"]
+
+
 @pytest.mark.parametrize("action", ["chat", "advise", "clarify", "ready_to_confirm"])
 def test_non_update_actions_cannot_mutate_strategy(monkeypatch, action: str):
     result, _llm = _run_turn(
@@ -693,7 +841,7 @@ def test_non_update_actions_cannot_mutate_strategy(monkeypatch, action: str):
     assert result["tool_calls"] == []
     assert result["extra_fields"] == {}
     if action == "clarify":
-        assert result["next_decision"]["focus"] == "horizon"
+        assert result.get("next_decision") is None
 
 
 @pytest.mark.parametrize(
@@ -777,10 +925,10 @@ def test_invalid_supported_values_reject_the_entire_patch_and_keep_next_decision
         },
     )
 
-    assert result["action"] == "clarify"
+    assert result["action"] == "advise"
     assert result["tool_calls"] == []
     assert result["extra_fields"] == {}
-    assert result["next_decision"]["focus"] == "horizon"
+    assert result.get("next_decision") is None
     assert result["contract_errors"]
 
 
@@ -845,10 +993,11 @@ def test_generic_multi_field_patch_accepts_unseen_categories_without_phrase_bran
     )
 
     assert result["action"] == "update_strategy"
+    expected_patch = {key: value for key, value in patch.items() if key != "run_horizon"}
     assert result["tool_calls"] == [
-        {"name": "update_strategy", "arguments": {"patch": patch}}
+        {"name": "update_strategy", "arguments": {"patch": expected_patch}}
     ]
-    assert result["extra_fields"] == patch
+    assert result["extra_fields"] == expected_patch
 
 
 def test_patch_preserves_explicit_clear_and_unset_values(monkeypatch):
@@ -895,7 +1044,13 @@ def test_every_first_class_strategy_field_accepts_null_as_canonical_clear(field:
     patch, errors = web_app._validate_discovery_strategy_patch({field: None})
 
     assert errors == []
-    assert patch == {field: None}
+    assert patch == {
+        field: (
+            "candidates_reviewed"
+            if field == "run_horizon"
+            else None
+        )
+    }
 
 
 def test_d1_canonical_fields_are_strictly_isomorphic_with_frontend_strategy_fields():
@@ -3761,6 +3916,113 @@ def test_read_only_critic_feedback_triggers_one_same_manager_retry(monkeypatch):
     }
 
 
+def test_critic_evidence_fields_trigger_manager_retry_without_suggested_fields(
+    monkeypatch,
+):
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=30)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    manager_calls: list[dict[str, Any]] = []
+
+    def manager(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        manager_calls.append(kwargs)
+        if len(manager_calls) == 1:
+            return {
+                "action": "clarify",
+                "assistant_message": "你对 HLA 类别有偏好吗？",
+                "tool_calls": [],
+                "_agent_runtime": "openai_agents",
+            }
+        return {
+            "action": "update_strategy",
+            "assistant_message": "已写入你明确给出的完整策略。",
+            "turn_interpretation": {
+                "commitments": [
+                    {
+                        "field": "objective",
+                        "value": "免疫肽组学数据发现",
+                        "source": "科学目标：免疫肽组学数据发现",
+                    },
+                    {
+                        "field": "special_themes",
+                        "value": ["immunopeptidomics"],
+                        "source": "研究主题：immunopeptidomics",
+                    },
+                ],
+            },
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "objective": "免疫肽组学数据发现",
+                            "special_themes": ["immunopeptidomics"],
+                        }
+                    },
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+        }
+
+    monkeypatch.setattr(web_app, "_complete_discovery_dialogue_json", manager)
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        lambda *_args, **_kwargs: {
+            "verified": False,
+            "verdict": "repair",
+            "model_verdict": "repair",
+            "patch": {},
+            "missing_fields": ["objective", "special_themes"],
+            "evidence": [
+                {
+                    "field": "objective",
+                    "source": "科学目标：免疫肽组学数据发现",
+                },
+                {
+                    "field": "special_themes",
+                    "source": "研究主题：immunopeptidomics",
+                },
+            ],
+            "tool_authority": "verify_strategy_patch",
+        },
+    )
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": (
+                    "科学目标：免疫肽组学数据发现"
+                    "研究主题：immunopeptidomics"
+                ),
+                "phase": "grilling",
+                "request_timeout_seconds": 30,
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["objective"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert len(manager_calls) == 2
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {
+        "objective": "免疫肽组学数据发现",
+        "special_themes": ["immunopeptidomics"],
+    }
+    assert result["manager_repair"]["trigger"]["kind"] == "omitted_commitment"
+    assert result["manager_repair"]["trigger"]["suggested_fields"] == [
+        "objective",
+        "special_themes",
+    ]
+
+
 def test_short_topic_plain_text_recovery_is_audited_and_repaired(monkeypatch):
     client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=30)
     monkeypatch.setattr(
@@ -3850,6 +4112,95 @@ def test_short_topic_plain_text_recovery_is_audited_and_repaired(monkeypatch):
     assert result["manager_repair"]["trigger"]["provider_compatibility_recovery"][
         "mode"
     ] == "plain_text_as_non_mutating"
+
+
+def test_invalid_compound_strategy_patch_gets_one_manager_repair(monkeypatch):
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=30)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    manager_calls: list[dict[str, Any]] = []
+
+    def manager(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        manager_calls.append(kwargs)
+        coverage_mode = "infinite" if len(manager_calls) == 1 else "exhaustive"
+        return {
+            "action": "update_strategy",
+            "assistant_message": "已读取完整策略。",
+            "turn_interpretation": {
+                "commitments": [
+                    {
+                        "field": "objective",
+                        "value": "免疫肽组学数据发现",
+                        "source": "科学目标：免疫肽组学数据发现",
+                    },
+                    {
+                        "field": "coverage_mode",
+                        "value": coverage_mode,
+                        "source": "规模：越多越好",
+                    },
+                    {
+                        "field": "quota_flexibility",
+                        "value": "open_ended",
+                        "source": "规模：越多越好，开放上限（exhaustive + open_ended）",
+                    },
+                    {
+                        "field": "special_themes",
+                        "value": ["immunopeptidomics"],
+                        "source": "研究主题：immunopeptidomics",
+                    },
+                ],
+            },
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "objective": "免疫肽组学数据发现",
+                            "special_themes": ["immunopeptidomics"],
+                            "coverage_mode": coverage_mode,
+                            "quota_flexibility": "open_ended",
+                        }
+                    },
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+        }
+
+    monkeypatch.setattr(web_app, "_complete_discovery_dialogue_json", manager)
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": (
+                    "科学目标：免疫肽组学数据发现\n"
+                    "研究主题：immunopeptidomics\n"
+                    "规模：越多越好，开放上限（exhaustive + open_ended）"
+                ),
+                "phase": "grilling",
+                "request_timeout_seconds": 30,
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["objective", "coverage"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert len(manager_calls) == 2
+    assert "invalid_strategy_patch" in manager_calls[1]["user_prompt"]
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {
+        "objective": "免疫肽组学数据发现",
+        "special_themes": ["immunopeptidomics"],
+        "coverage_mode": "exhaustive",
+        "quota_flexibility": "open_ended",
+    }
+    assert result["manager_repair"]["trigger"]["kind"] == "invalid_strategy_patch"
 
 
 def test_semantic_verifier_retries_once_to_repair_a_partial_primary_omission(
@@ -4097,6 +4448,104 @@ def test_semantic_verifier_reject_blocks_strategy_write_and_persists_final_memor
     assert '"species":["mouse"]' not in history[-1]["content"]
 
 
+
+def test_bare_digit_applies_predeclared_labeling_soft_option(monkeypatch):
+    pending = {
+        "focus": "labeling_strategy",
+        "target_fields": ["labeling_strategy", "labeling_hard"],
+        "question": "标记方式？",
+        "recommendation": {
+            "id": "prefer_lf",
+            "label": "优先 label-free（软性偏好）",
+            "reason": "最直接",
+        },
+        "options": [
+            {
+                "id": "prefer_lf",
+                "label": "优先 label-free（软性偏好）",
+                "reason": "软",
+                "strategy_patch": {
+                    "labeling_strategy": "label_free",
+                    "labeling_hard": False,
+                },
+            },
+            {
+                "id": "hard_lf",
+                "label": "只要 label-free",
+                "reason": "硬",
+                "strategy_patch": {
+                    "labeling_strategy": "label_free",
+                    "labeling_hard": True,
+                },
+            },
+            {
+                "id": "any_lab",
+                "label": "不限标记方式",
+                "reason": "开放",
+                "strategy_patch": {
+                    "labeling_strategy": "unknown",
+                    "labeling_hard": False,
+                },
+            },
+        ],
+        "option_mode": "focused",
+        "revisit_existing": False,
+        "allow_free_text": True,
+    }
+    # Model wrongly returns advise; server must still apply option 1 contract
+    # and must NOT run semantic verifier that would reject bare "1".
+    def boom_verifier(*_a, **_k):
+        raise AssertionError("semantic verifier must not run for bare option index")
+
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        boom_verifier,
+    )
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "_agent_runtime": "openai_agents",
+            "action": "advise",
+            "assistant_message": "好的。",
+            "tool_calls": [],
+        },
+        user_message="1",
+        phase="grilling",
+        pending_decision=pending,
+        intent_snapshot={"labeling_strategy": "unknown", "labeling_hard": False},
+        gap_report={"required_missing": [], "optional_missing": ["labeling"], "ready_for_confirm": False},
+    )
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"]["labeling_strategy"] == "label_free"
+    assert result["extra_fields"]["labeling_hard"] is False
+    assert result.get("semantic_verification", {}).get("verdict") in {
+        None,
+        "skipped",
+        "not_required",
+        "accepted",
+        "pass",
+    } or result.get("semantic_verification") in (None, {})
+    # Must not be rejected
+    assert (result.get("semantic_verification") or {}).get("verdict") != "rejected"
+
+
+def test_synthesize_labeling_soft_when_option_missing_strategy_patch():
+    selected = {
+        "focus": "labeling",
+        "target_fields": ["labeling_strategy"],
+        "explicit_acceptance": True,
+        "option": {
+            "id": "prefer_lf",
+            "label": "优先 label-free（软性偏好）",
+            "reason": "软性",
+        },
+    }
+    patch = web_app._discovery_selected_option_strategy_patch(selected)
+    assert patch.get("labeling_strategy") == "label_free"
+    assert patch.get("labeling_hard") is False
+
+
 def test_low_risk_single_field_skip_helper_whitelists_objective_and_species():
     assert web_app._discovery_low_risk_single_field_verifier_skip(
         {"objective": "免疫肽数据"},
@@ -4181,7 +4630,151 @@ def test_low_risk_single_field_skip_helper_whitelists_objective_and_species():
         },
     )
 
+
+def test_soft_reject_v2_global_reject_does_not_keep_species():
+    """Boss condition: global critic reject keeps soft set only (no species/DDA)."""
+
+    tool_patch = {
+        "objective": "免疫肽数据",
+        "special_themes": ["immunopeptidomics"],
+        "species": ["mouse"],
+        "acquisition_mode": "dia",
+        "run_horizon": "candidates_reviewed",
+        "ptm_types": ["phospho"],
+    }
+    kept = web_app._discovery_soft_reject_kept_patch(
+        tool_patch,
+        semantic_verification={
+            "verdict": "reject",
+            "rationale": "Global reject without field granularity.",
+        },
+    )
+    assert kept == {
+        "objective": "免疫肽数据",
+        "special_themes": ["immunopeptidomics"],
+    }
+    assert "species" not in kept
+    assert "acquisition_mode" not in kept
+    assert "run_horizon" not in kept
+    dropped = web_app._discovery_soft_reject_dropped_fields(tool_patch, kept)
+    assert "species" in dropped
+    assert "acquisition_mode" in dropped
+    assert "ptm_types" in dropped
+    assert "objective" not in dropped
+    msg = web_app._format_discovery_soft_reject_message(
+        kept, dropped_fields=dropped
+    )
+    assert "已写入" in msg
+    assert "未写入" in msg
+    assert "策略完全未更新" not in msg
+
+
+def test_soft_reject_v2_field_level_keeps_unnamed_hard_keys():
+    """Field-level critic veto drops only named keys; other whitelist hard keys stay."""
+
+    tool_patch = {
+        "objective": "人源免疫肽",
+        "species": ["human"],
+        "acquisition_mode": "dda",
+        "run_horizon": "candidates_reviewed",
+        "special_themes": ["immunopeptidomics"],
+        "ptm_types": ["phospho"],
+    }
+    kept = web_app._discovery_soft_reject_kept_patch(
+        tool_patch,
+        semantic_verification={
+            "verdict": "reject",
+            "missing_fields": ["species", "ptm_types"],
+            "rationale": "species and ptm ungrounded; acquisition ok.",
+        },
+    )
+    assert kept.get("objective") == "人源免疫肽"
+    assert kept.get("special_themes") == ["immunopeptidomics"]
+    assert kept.get("acquisition_mode") == "dda"
+    assert kept.get("run_horizon") == "candidates_reviewed"
+    assert "species" not in kept
+    assert "ptm_types" not in kept
+    dropped = web_app._discovery_soft_reject_dropped_fields(tool_patch, kept)
+    assert set(dropped) == {"ptm_types", "species"}
+
+
+def test_soft_reject_v2_end_to_end_emits_dropped_fields(monkeypatch):
+    """Grill turn soft-reject path exposes soft_reject_dropped_fields + 已写入 copy."""
+
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "I will update the strategy.",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "objective": "免疫肽数据",
+                            "special_themes": ["immunopeptidomics"],
+                            "species": ["mouse"],
+                            "acquisition_mode": "dia",
+                            "ptm_types": ["phospho"],
+                        }
+                    },
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        lambda *_args, **_kwargs: {
+            "verified": False,
+            "verdict": "reject",
+            "patch": {},
+            "rationale": "Hard fields are not grounded in the latest message.",
+        },
+    )
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "免疫肽主题，顺带提了 mouse DIA phospho。",
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {
+        "objective": "免疫肽数据",
+        "special_themes": ["immunopeptidomics"],
+    }
+    sv = result["semantic_verification"]
+    assert sv["verdict"] == "reject"
+    assert sv["soft_reject_kept_fields"] == ["objective", "special_themes"]
+    assert "species" in sv["soft_reject_dropped_fields"]
+    assert "acquisition_mode" in sv["soft_reject_dropped_fields"]
+    assert "ptm_types" in sv["soft_reject_dropped_fields"]
+    assert "已写入" in result["assistant_message"]
+    assert "未写入" in result["assistant_message"]
+
+
 def test_soft_reject_kept_patch_retains_only_soft_keys():
+    """Global reject (no field list) keeps soft set only — not species/DDA."""
+
     kept = web_app._discovery_soft_reject_kept_patch(
         {
             "objective": "免疫肽数据",
@@ -4197,6 +4790,73 @@ def test_soft_reject_kept_patch_retains_only_soft_keys():
     assert web_app._discovery_soft_reject_kept_patch(
         {"species": ["mouse"], "acquisition_mode": "dia"}
     ) == {}
+
+
+def test_soft_reject_v2_global_reject_does_not_keep_species():
+    tool = {
+        "objective": "免疫肽数据",
+        "species": ["mouse"],
+        "acquisition_mode": "dda",
+        "run_horizon": "candidates_reviewed",
+        "notes": "user notes",
+    }
+    # No field-level critic signal → soft set only.
+    kept = web_app._discovery_soft_reject_kept_patch(
+        tool,
+        semantic_verification={"verdict": "reject", "rationale": "global reject"},
+    )
+    assert kept == {"objective": "免疫肽数据", "notes": "user notes"}
+    assert "species" not in kept
+    assert "acquisition_mode" not in kept
+    assert "run_horizon" not in kept
+    dropped = web_app._discovery_soft_reject_dropped_fields(tool, kept)
+    assert dropped == ["acquisition_mode", "run_horizon", "species"]
+
+
+def test_soft_reject_v2_field_level_keeps_unnamed_low_risk_hard_keys():
+    tool = {
+        "objective": "免疫肽数据",
+        "species": ["human"],
+        "acquisition_mode": "dda",
+        "run_horizon": "candidates_reviewed",
+        "ptm_types": ["phospho"],
+    }
+    kept = web_app._discovery_soft_reject_kept_patch(
+        tool,
+        semantic_verification={
+            "verdict": "reject",
+            "missing_fields": ["ptm_types"],
+            "rationale": "ptm not grounded",
+        },
+    )
+    # Field-level: keep low-risk whitelist keys not named by critic.
+    assert kept.get("objective") == "免疫肽数据"
+    assert kept.get("species") == ["human"]
+    assert kept.get("acquisition_mode") == "dda"
+    assert kept.get("run_horizon") == "candidates_reviewed"
+    assert "ptm_types" not in kept
+    dropped = web_app._discovery_soft_reject_dropped_fields(tool, kept)
+    assert dropped == ["ptm_types"]
+
+
+def test_soft_reject_v2_field_level_drops_only_named_veto():
+    tool = {
+        "objective": "免疫肽数据",
+        "species": ["human"],
+        "acquisition_mode": "dda",
+    }
+    kept = web_app._discovery_soft_reject_kept_patch(
+        tool,
+        semantic_verification={
+            "verdict": "reject",
+            "rejected_fields": ["species"],
+        },
+    )
+    assert kept == {
+        "objective": "免疫肽数据",
+        "acquisition_mode": "dda",
+    }
+    assert "species" not in kept
 
 
 def test_low_risk_single_field_objective_skips_semantic_verifier(monkeypatch):
@@ -4346,6 +5006,8 @@ def test_low_risk_compound_multi_field_patch_skips_semantic_verifier(monkeypatch
     # (species_coverage / mixed_acquisition_policy / coverage_mode, etc.).
     extra = result["extra_fields"]
     for key, value in compound_patch.items():
+        if key == "run_horizon":
+            continue
         assert key in extra, key
         assert extra[key] == value
     assert result["tool_calls"]
@@ -4378,6 +5040,52 @@ def test_compound_commitment_hints_extracts_packed_sentence_without_inventing_rt
     assert "acquisition_mode" not in immuno_only
     assert "run_horizon" not in immuno_only
     assert immuno_only.get("special_themes") == ["immunopeptidomics"]
+
+    recap_text = (
+        "科学目标：免疫肽组学数据发现"
+        "研究主题：immunopeptidomics"
+        "物种：仅限人（Homo sapiens），硬约束"
+        "采集模式：仅 DDA，硬约束"
+        "下游任务：纯浏览探索（browse_only）\n"
+        "交付终点：候选加审查（candidates_reviewed）\n"
+        "规模：越多越好，开放上限（exhaustive + open_ended）\n"
+        "标记方式：不限（保持开放）"
+    )
+    recap = web_app._discovery_compound_commitment_hints(recap_text)
+    assert recap["objective"] == "免疫肽组学数据发现"
+    assert recap["special_themes"] == ["immunopeptidomics"]
+    assert recap["species"] == ["human"]
+    assert recap["species_policy"] == "include_only"
+    assert recap["acquisition_mode"] == "dda"
+    assert recap["task_type"] == "browse_only"
+    assert recap["run_horizon"] == "candidates_reviewed"
+    assert recap["coverage_mode"] == "exhaustive"
+    assert recap["quota_flexibility"] == "open_ended"
+    assert recap["labeling_strategy"] == "any"
+    assert recap["labeling_hard"] is False
+
+    manager_underwrite = {
+        "objective": "免疫肽组学数据发现",
+        "task_type": "browse_only",
+        "run_horizon": "candidates_reviewed",
+        "species": ["human"],
+        "acquisition_mode": "dda",
+        "special_themes": ["immunopeptidomics"],
+    }
+    filled_recap = web_app._merge_discovery_compound_commitment_hints(
+        manager_underwrite,
+        recap_text,
+    )
+    assert filled_recap["species_policy"] == "include_only"
+    assert filled_recap["labeling_strategy"] == "any"
+    assert filled_recap["labeling_hard"] is False
+    assert filled_recap["quota_flexibility"] == "open_ended"
+    assert filled_recap["coverage_mode"] == "exhaustive"
+    assert len(filled_recap) == 13
+    assert web_app._discovery_low_risk_single_field_verifier_skip(
+        filled_recap,
+        tool_interpretation_difference=True,
+    )
 
 
 def test_merge_compound_hints_fills_soft_only_manager_dump_and_keeps_skip_true():
@@ -4488,7 +5196,7 @@ def test_soft_only_compound_manager_underwrite_skips_verifier_with_hint_fill(
     assert len(extra) >= 6
     assert extra["species"] == ["human"]
     assert extra["acquisition_mode"] == "dda"
-    assert extra["run_horizon"] == "candidates_reviewed"
+    assert "run_horizon" not in extra
     assert extra["task_type"] == "rt_prediction"
     assert extra["quota_flexibility"] == "open_ended"
     assert result.get("semantic_verification") is None
@@ -4577,6 +5285,7 @@ def test_non_whitelist_field_forces_semantic_verifier_even_with_soft_keys(
     assert sv["verdict"] == "reject"
     assert sv["verified"] is False
     assert sv["soft_reject_kept_fields"] == ["objective", "special_themes"]
+    assert "ptm_types" in sv["soft_reject_dropped_fields"]
 
 
 def test_soft_reject_keeps_objective_from_explicit_tool_patch(monkeypatch):
@@ -4664,11 +5373,17 @@ def test_soft_reject_keeps_objective_from_explicit_tool_patch(monkeypatch):
     assert sv["verdict"] == "reject"
     assert sv["verified"] is False
     assert sv["soft_reject_kept_fields"] == ["objective", "special_themes"]
+    assert set(sv["soft_reject_dropped_fields"]) == {
+        "acquisition_mode",
+        "ptm_types",
+        "species",
+    }
     assert sv["patch"] == {
         "objective": "免疫肽数据",
         "special_themes": ["immunopeptidomics"],
     }
-    assert "已记录主题" in result["assistant_message"]
+    assert ("已写入" in result["assistant_message"] or "可核验" in result["assistant_message"])
+    assert "未写入" in result["assistant_message"]
     assert not any(
         "semantic verification" in error
         for error in result.get("contract_errors") or []
@@ -4740,6 +5455,222 @@ def test_soft_reject_without_soft_keys_still_blocks_hard_fields(monkeypatch):
     assert any(
         "semantic verification" in error for error in result["contract_errors"]
     )
+
+
+def test_soft_reject_v2_global_reject_drops_species_in_turn(monkeypatch):
+    """Global critic reject must not soft-keep species (NI-2 fixture)."""
+
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "I will update the strategy.",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "objective": "免疫肽数据",
+                            "species": ["mouse"],
+                            "acquisition_mode": "dia",
+                            "ptm_types": ["phospho"],
+                        }
+                    },
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        lambda *_args, **_kwargs: {
+            "verified": False,
+            "verdict": "reject",
+            "patch": {},
+            "rationale": "Global reject without field list.",
+        },
+    )
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "mouse DIA immunopeptidomics",
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {"objective": "免疫肽数据"}
+    assert "species" not in result["extra_fields"]
+    sv = result["semantic_verification"]
+    assert sv["soft_reject_kept_fields"] == ["objective"]
+    assert "species" in sv["soft_reject_dropped_fields"]
+    assert "acquisition_mode" in sv["soft_reject_dropped_fields"]
+    assert "已写入可核验部分" in result["assistant_message"]
+    assert "未写入" in result["assistant_message"]
+
+
+def test_soft_reject_v2_field_level_keeps_species_when_only_ptm_vetoed(monkeypatch):
+    """Field-level critic veto drops only named keys; low-risk hard keys stay."""
+
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "I will update the strategy.",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "objective": "免疫肽数据",
+                            "species": ["human"],
+                            "acquisition_mode": "dda",
+                            "ptm_types": ["phospho"],
+                        }
+                    },
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_run_discovery_patch_verifier_agents_sdk",
+        lambda *_args, **_kwargs: {
+            "verified": False,
+            "verdict": "reject",
+            "patch": {},
+            "missing_fields": ["ptm_types"],
+            "rationale": "ptm_types not grounded in latest message.",
+        },
+    )
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                "user_message": "人源免疫肽 DDA，顺带看 phospho",
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert result["action"] == "update_strategy"
+    extra = result["extra_fields"]
+    assert extra["objective"] == "免疫肽数据"
+    assert extra["species"] == ["human"]
+    assert extra["acquisition_mode"] == "dda"
+    assert "ptm_types" not in extra
+    sv = result["semantic_verification"]
+    assert set(sv["soft_reject_kept_fields"]) == {
+        "acquisition_mode",
+        "objective",
+        "species",
+    }
+    assert sv["soft_reject_dropped_fields"] == ["ptm_types"]
+    assert "已写入可核验部分" in result["assistant_message"]
+    assert "未写入" in result["assistant_message"]
+
+
+def test_thin_warrant_multi_clause_chinese_whitelist_skips_sv(monkeypatch):
+    """Multi-clause Chinese + pure whitelist patch must not force SV (NI-2)."""
+
+    patch = {
+        "objective": "人源免疫肽",
+        "species": ["human"],
+        "task_type": "rt_prediction",
+    }
+    assert web_app._discovery_low_risk_single_field_verifier_skip(
+        patch,
+        tool_interpretation_difference=False,
+    )
+
+    client = OpenAICompatibleDiscoveryLLM(api_key="test", timeout=10)
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_complete_discovery_dialogue_json",
+        lambda *_args, **_kwargs: {
+            "action": "update_strategy",
+            "assistant_message": "已记录。",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {"patch": patch},
+                }
+            ],
+            "_agent_runtime": "openai_agents",
+            "_sdk_session_managed": False,
+        },
+    )
+    verifier_calls: list[dict] = []
+
+    def verify(*_args, **kwargs):
+        verifier_calls.append(kwargs)
+        return {
+            "verified": False,
+            "verdict": "reject",
+            "patch": {},
+            "rationale": "must not run for multi-clause whitelist",
+        }
+
+    monkeypatch.setattr(web_app, "_run_discovery_patch_verifier_agents_sdk", verify)
+
+    result = asyncio.run(
+        web_app.discovery_grill_turn(
+            {
+                # Chinese commas create multiple clauses; thin warrant ignores that.
+                "user_message": "人源免疫肽，要做 RT 预测。",
+                "phase": "grilling",
+                "intent_snapshot": {},
+                "gap_report": {
+                    "required_missing": ["task"],
+                    "optional_missing": [],
+                    "ready_for_confirm": False,
+                },
+            }
+        )
+    )
+
+    assert verifier_calls == []
+    assert result["action"] == "update_strategy"
+    for key, value in patch.items():
+        assert result["extra_fields"][key] == value
+    assert result.get("semantic_verification") is None
 
 
 def test_semantic_verifier_runs_for_final_reconciled_multi_field_patch(monkeypatch):
@@ -5616,6 +6547,21 @@ def test_confirmation_fingerprint_is_bound_to_exact_execution_payload(
         with web_app._discovery_jobs_lock:
             for job_id in set(web_app._discovery_jobs) - before:
                 web_app._discovery_jobs.pop(job_id, None)
+
+
+def test_confirmation_fingerprint_survives_server_internal_execution_id():
+    canonical = '{"grill_confirmed":true,"prompt":"Find human immunopeptidomics"}'
+    body = {
+        "grill_confirmed": True,
+        "prompt": "Find human immunopeptidomics",
+        "strategy_fingerprint_payload": canonical,
+        "strategy_fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
+
+    assert web_app._discovery_confirmation_rejection(body) is None
+    assert web_app._discovery_confirmation_rejection(
+        {**body, "_execution_discovery_id": "agents_job_discovery_job_123"}
+    ) is None
 
 
 def test_arbitrary_confirmation_fingerprint_is_rejected():

@@ -24,8 +24,14 @@ from agent.discovery.models import (
 )
 from agent.discovery.ontology import interpret_immunopeptide_metadata
 from agent.discovery.query_builder import build_pride_queries, prepare_pride_search_queries
-from agent.discovery.scoring import build_discovered_project, score_file, score_project
+from agent.discovery.scoring import (
+    build_discovered_project,
+    classify_file_role,
+    score_file,
+    score_project,
+)
 from agent.metadata.context import (
+    build_sdrf_file_index,
     detect_sdrf_file,
     extract_sdrf_assay_values,
     load_sdrf_rows,
@@ -253,6 +259,8 @@ def discover_pride_dataset(
             raw_file_count: int = 0,
             usable_file_count: int = 0,
             excluded_file_count: int = 0,
+            file_role_counts: dict[str, int] | None = None,
+            filter_reason_counts: dict[str, int] | None = None,
         ) -> None:
             inspection_outcomes[accession] = {
                 "project_accession": accession,
@@ -263,6 +271,10 @@ def discover_pride_dataset(
                 "raw_file_count": raw_file_count,
                 "usable_file_count": usable_file_count,
                 "excluded_file_count": excluded_file_count,
+                "file_role_counts": dict(sorted((file_role_counts or {}).items())),
+                "filter_reason_counts": dict(
+                    sorted((filter_reason_counts or {}).items())
+                ),
             }
 
         for candidate in candidates:
@@ -304,6 +316,21 @@ def discover_pride_dataset(
                 )
                 _report(f"Project metadata parsing failed for {accession}: {exc}")
                 continue
+            evidence_fields = sorted(
+                {
+                    str(item.field)
+                    for item in project_score.evidence
+                    if str(item.field).strip()
+                }
+            )
+            _report(
+                f"{accession}: metadata scored; retrieval score "
+                f"{project_score.project_score:.2f}, confidence "
+                f"{project_score.confidence:.0%}, species "
+                f"{', '.join(project_score.species) or 'unknown'}, acquisition "
+                f"{project_score.acquisition_mode or 'unknown'}, evidence fields "
+                f"{', '.join(evidence_fields[:8]) or 'none'}."
+            )
             if project_score.excluded:
                 excluded_projects += 1
                 reason = project_score.exclusion_reason or "project excluded by request constraints"
@@ -406,6 +433,7 @@ def discover_pride_dataset(
                     sdrf_errors.append("SDRF file record has no public download URL")
 
             project_features = extract_project_features(project_record, sdrf_rows)
+            sdrf_file_index = build_sdrf_file_index(sdrf_rows)
             project = build_discovered_project(
                 project_record,
                 request,
@@ -418,12 +446,20 @@ def discover_pride_dataset(
             scored_files: list[DiscoveredFile] = []
             project_excluded_files = 0
             file_parse_errors: list[str] = []
+            file_role_counts: Counter[str] = Counter()
+            filter_reason_counts: Counter[str] = Counter()
             for raw_file in raw_files:
                 _check_cancel()
                 file_name = str(raw_file.get("fileName") or raw_file.get("name") or "")
+                role = classify_file_role(file_name)
+                file_role_counts[role.role] += 1
                 try:
                     matched_sdrf_rows = (
-                        select_sdrf_rows_for_file(sdrf_rows, file_name)
+                        select_sdrf_rows_for_file(
+                            sdrf_rows,
+                            file_name,
+                            file_index=sdrf_file_index,
+                        )
                         if sdrf_rows and file_name
                         else []
                     )
@@ -473,8 +509,23 @@ def discover_pride_dataset(
                     if scored_file.validity_status == "exclude":
                         excluded_files += 1
                         project_excluded_files += 1
+                        for reason in scored_file.validity_reasons:
+                            filter_reason_counts[str(reason)] += 1
                     else:
                         scored_files.append(scored_file)
+                else:
+                    project_excluded_files += 1
+                    if role.role in {"raw_acquisition", "converted_peaklist"}:
+                        # score_file has one supported-role early return: a
+                        # file-level acquisition observation conflicts with the
+                        # user's hard acquisition mode.
+                        filter_reason_counts[
+                            "acquisition_hard_constraint_conflict"
+                        ] += 1
+                    else:
+                        filter_reason_counts[
+                            f"unsupported_file_role:{role.role}"
+                        ] += 1
             if not scored_files:
                 if file_parse_errors:
                     _record_inspection_outcome(
@@ -485,6 +536,8 @@ def discover_pride_dataset(
                         error=f"{len(file_parse_errors)} file record(s) could not be parsed",
                         raw_file_count=len(raw_files),
                         excluded_file_count=project_excluded_files,
+                        file_role_counts=dict(file_role_counts),
+                        filter_reason_counts=dict(filter_reason_counts),
                     )
                     _report(
                         f"{accession}: failed to parse {len(file_parse_errors)} file record(s)."
@@ -497,6 +550,8 @@ def discover_pride_dataset(
                         reason="no usable acquisition/peaklist file candidates after filtering",
                         raw_file_count=len(raw_files),
                         excluded_file_count=project_excluded_files,
+                        file_role_counts=dict(file_role_counts),
+                        filter_reason_counts=dict(filter_reason_counts),
                     )
                     _report(
                         f"{accession}: no usable acquisition/peaklist file candidates after filtering."
@@ -513,6 +568,7 @@ def discover_pride_dataset(
                         content_sha256=sdrf_hash,
                         status=sdrf_status,
                         errors=sdrf_errors,
+                        file_index=sdrf_file_index,
                     ),
                 }
             )
@@ -524,6 +580,8 @@ def discover_pride_dataset(
                 raw_file_count=len(raw_files),
                 usable_file_count=len(scored_files),
                 excluded_file_count=project_excluded_files,
+                file_role_counts=dict(file_role_counts),
+                filter_reason_counts=dict(filter_reason_counts),
             )
             _report(f"{accession}: kept {len(scored_files)} file candidate(s).")
             if early_stop_on_limits:

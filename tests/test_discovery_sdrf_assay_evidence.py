@@ -4,7 +4,11 @@ from typing import Any
 
 from agent.discovery.models import DatasetRequest
 from agent.discovery.pride_discovery import discover_pride_dataset
-from agent.metadata.context import load_sdrf_rows
+from agent.metadata.context import (
+    build_sdrf_file_index,
+    load_sdrf_rows,
+    select_sdrf_rows_for_file,
+)
 
 
 class _SdrfAssayPrideClient:
@@ -83,6 +87,31 @@ def test_load_sdrf_rows_detects_csv_delimiter() -> None:
     ]
 
 
+def test_sdrf_file_index_preserves_name_and_stem_matching_without_duplicate_rows() -> None:
+    rows = [
+        {
+            "comment[data file]": "folder/sample_01.raw",
+            "comment[technical replicate]": "1",
+        },
+        {
+            "comment[data file]": "sample_02.mzML",
+            "comment[technical replicate]": "2",
+        },
+    ]
+    index = build_sdrf_file_index(rows)
+
+    assert select_sdrf_rows_for_file(
+        rows,
+        "sample_01.raw",
+        file_index=index,
+    ) == [rows[0]]
+    assert select_sdrf_rows_for_file(
+        rows,
+        "sample_02.raw",
+        file_index=index,
+    ) == [rows[1]]
+
+
 def test_matched_immunopeptidomics_assay_becomes_auditable_file_evidence() -> None:
     file = _discover_file(
         "source name,comment[data file],assay,comment[instrument],"
@@ -101,7 +130,7 @@ def test_matched_immunopeptidomics_assay_becomes_auditable_file_evidence() -> No
     assert "project_level_immunopeptide_evidence" not in file.validity_reasons
 
 
-def test_unmatched_sdrf_assay_keeps_file_in_review() -> None:
+def test_unmatched_sdrf_does_not_demote_homogeneous_project_inheritance() -> None:
     file = _discover_file(
         "source name,comment[data file],assay\n"
         "sample-elsewhere,another_file.raw,Immunopeptidomics_class_I\n",
@@ -109,8 +138,9 @@ def test_unmatched_sdrf_assay_keeps_file_in_review() -> None:
     )
 
     assert file.sdrf_match_status == "no_file_match"
-    # sdrf_no_file_match is soft under Wave A: domain evidence may yield weak_keep.
-    assert file.validity_status in {"needs_review", "weak_keep"}
+    assert file.validity_status == "valid"
+    assert file.needs_review is False
+    assert "usable_inherited" in file.validity_reasons
     assert "sdrf_no_file_match" in file.validity_reasons
     assert not any(
         item.source == "immunopeptidomics" and item.field.startswith("sdrf:")

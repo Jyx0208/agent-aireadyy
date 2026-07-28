@@ -38,7 +38,7 @@ describe("proteomics operational workbench", () => {
     }
     expect(screen.getByText("自然语言对齐科学需求，确认策略后再检索、审查并交付可追溯结果。")).toBeTruthy();
     expect(screen.getByText("策略预览")).toBeTruthy();
-    expect(screen.getByText("确认，开始搜")).toBeTruthy();
+    expect(screen.getByText("确认主题词，开始搜")).toBeTruthy();
     expect(screen.getByText("补齐稳妥默认")).toBeTruthy();
     expect(screen.getByText("查看完整策略")).toBeTruthy();
     expect(screen.getByText(/这里只显示真实运行状态、关键计数和结果入口/)).toBeTruthy();

@@ -35,6 +35,21 @@ function Get-Sha256Fingerprint {
     }
 }
 
+function Get-FileSha256Fingerprint {
+    param([string]$LiteralPath)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::OpenRead($LiteralPath)
+        $digest = $sha.ComputeHash($stream)
+        return "sha256:" + ([System.BitConverter]::ToString($digest).Replace("-", "").ToLowerInvariant())
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        $sha.Dispose()
+    }
+}
+
 function Get-SafeScalar {
     param([object]$Value)
     $normalized = [string]$Value
@@ -128,7 +143,7 @@ $evidence = [ordered]@{
         receipt_ref_fingerprint = Get-Sha256Fingerprint (Get-Field $builder "receipt_ref")
     }
     fingerprints = [ordered]@{
-        source_json = "sha256:" + (Get-FileHash -LiteralPath $resolvedRunJson -Algorithm SHA256).Hash.ToLowerInvariant()
+        source_json = Get-FileSha256Fingerprint $resolvedRunJson
         publication_token = Get-Sha256Fingerprint (Get-Field $authority "issuance_token")
         completion_token = Get-Sha256Fingerprint (Get-Field $completion "issuance_token")
         completion_nonce = Get-Sha256Fingerprint (Get-Field $completion "repair_attempt_nonce")

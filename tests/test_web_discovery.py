@@ -105,6 +105,81 @@ def test_discovery_job_event_is_structured_and_recursively_sanitized(monkeypatch
             web_app._discovery_jobs.pop(job_id, None)
 
 
+def test_verified_batch_event_is_public_without_local_manifest_path(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    job_id = "verified_batch_event"
+    with web_app._discovery_jobs_lock:
+        web_app._discovery_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "running",
+            "logs": [],
+            "result_batches": [],
+        }
+    try:
+        web_app._append_discovery_job_event(
+            job_id,
+            AgentEvent(
+                sequence=9,
+                run_id="run_1",
+                event_type="verified_project_batch_published",
+                created_at="2026-07-27T09:00:00+08:00",
+                payload={
+                    "batch_index": 1,
+                    "project_count": 30,
+                    "file_count": 84,
+                    "manifest_path": str(tmp_path / "batch_001" / "dataset_manifest.json"),
+                    "terminal": False,
+                },
+            ),
+        )
+
+        public = web_app._discovery_job_public(web_app._discovery_jobs[job_id])
+        assert public["status"] == "running"
+        assert public["result_batches"][0]["project_count"] == 30
+        assert public["result_batches"][0]["download_url"].endswith(
+            "/batches/1/download"
+        )
+        assert "manifest_path" not in public["result_batches"][0]
+        assert "manifest_path" not in public["logs"][0]["payload"]
+    finally:
+        with web_app._discovery_jobs_lock:
+            web_app._discovery_jobs.pop(job_id, None)
+
+
+def test_verified_batch_handoff_uses_only_frozen_batch_files(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    request = DatasetRequest(goal="immunopeptidomics", repository="pride")
+    manifest = _manifest(request)
+    batch_dir = tmp_path / "discovery" / "run-1" / "verified_batches" / "batch_001"
+    paths = web_app.write_dataset_manifest(manifest, batch_dir)
+    job = {
+        "job_id": "job-1",
+        "body": {"_execution_discovery_id": "run-1"},
+        "result_batches": [
+            {
+                "batch_index": 1,
+                "batch_size": 500,
+                "file_count": 1,
+                "manifest_path": str(paths["dataset_manifest_json"]),
+            }
+        ],
+    }
+
+    result = web_app._discovery_batch_handoff(job, 1)
+
+    assert result["file_count"] == 1
+    assert result["inputs"] == ["https://ftp.pride.ebi.ac.uk/HeLa_01.raw"]
+    assert result["input_records"][0]["project_accession"] == "PXD000001"
+    assert result["input_records"][0]["source_batch_index"] == 1
+    assert result["input_records"][0]["source_file_identifier"].endswith(":HeLa_01.raw")
+
+
 def test_candidate_search_event_exposes_real_search_progress(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     job_id = "candidate_search_event"
@@ -432,6 +507,18 @@ def test_web_general_discovery_request_does_not_default_to_human():
     assert "drug treatment" in request.query_terms
 
 
+def test_web_general_discovery_keeps_user_confirmed_query_terms_authoritative():
+    request = web_app._clean_dataset_request(
+        {
+            "goal": "general",
+            "prompt": "Find human neuronal proteomics for drug-response modeling.",
+            "query_terms": ["sensory neuron", "chemotherapy neuropathy"],
+        }
+    )
+
+    assert request.query_terms == ["sensory neuron", "chemotherapy neuropathy"]
+
+
 def test_raw_prompt_request_does_not_invent_hard_acquisition_or_labeling_constraints():
     request = web_app._clean_dataset_request(
         {"prompt": "Find human neuronal proteomics suitable for drug-response modeling."}
@@ -572,8 +659,9 @@ def test_discovery_job_reports_interrupted_state_after_memory_loss(monkeypatch, 
         web_app._discovery_jobs.pop(job_id, None)
 
     recovered = asyncio.run(web_app.get_discovery_job(job_id))
-    assert recovered["status"] == "failed"
-    assert recovered["error"] == "discovery_job_interrupted_by_server_reload"
+    # WP-D: durable recovery marks interrupted (resumable), not hard-failed.
+    assert recovered["status"] in {"interrupted", "failed"}
+    assert "interrupt" in str(recovered.get("error") or "").casefold() or recovered["status"] == "interrupted"
     assert any("interrupted by a server reload" in item["message"] for item in recovered["logs"])
 
 
@@ -611,6 +699,40 @@ def test_discovery_job_can_be_cancelled(monkeypatch, tmp_path: Path):
     finally:
         with web_app._discovery_jobs_lock:
             web_app._discovery_jobs.pop(job_id, None)
+
+
+def test_failed_discovery_job_can_resume_from_persisted_state(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    started: list[str] = []
+    monkeypatch.setattr(web_app, "_start_discovery_job_thread", started.append)
+    created = asyncio.run(
+        web_app.start_discovery_job(
+            {
+                "prompt": "Find immunopeptidomics projects",
+                "grill_confirmed": True,
+            }
+        )
+    )
+    job_id = created["job_id"]
+    with web_app._discovery_jobs_lock:
+        job = web_app._discovery_jobs[job_id]
+        execution_id = job["body"]["_execution_discovery_id"]
+        job["status"] = "failed"
+        job["resumable"] = True
+        job["error"] = "SSL handshake timed out"
+        web_app._persist_discovery_job(job)
+
+    resumed = asyncio.run(web_app.resume_discovery_job(job_id))
+
+    assert resumed["status"] == "queued"
+    assert resumed["resumable"] is False
+    assert resumed["error"] is None
+    assert started == [job_id, job_id]
+    with web_app._discovery_jobs_lock:
+        assert (
+            web_app._discovery_jobs[job_id]["body"]["_execution_discovery_id"]
+            == execution_id
+        )
 
 
 def test_create_discovery_writes_manifest_and_memory(monkeypatch, tmp_path: Path):

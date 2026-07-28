@@ -9,6 +9,7 @@ from typing import Any, Literal
 from pydantic import Field
 
 from agent.discovery.task_profiles import get_task_profile
+from agent.ai_ready.release_predicates import evaluate_export_science, evaluate_release
 from agent.models import JsonModel
 from agent.utils import write_json
 
@@ -39,6 +40,7 @@ class AiReadyValidationRow(JsonModel):
     next_pipeline_steps: list[str] = Field(default_factory=list)
     quality_gate: list[str] = Field(default_factory=list)
     spectrum_evidence: dict[str, Any] = Field(default_factory=dict)
+    science_contract: dict[str, Any] = Field(default_factory=dict)
 
 
 class AiReadyValidationReport(JsonModel):
@@ -154,6 +156,21 @@ def validate_ai_ready_build(build_dir: str | Path, task_type: str) -> dict[str, 
     }
 
 
+def _science_contract_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "rt_unit_source",
+        "retention_time_unit",
+        "has_confidence_column",
+        "confidence_column",
+        "target_count",
+        "decoy_count",
+        "unknown_decoy_count",
+        "decoy_fraction",
+        "decoy_label_source",
+    ]
+    return {key: payload.get(key) for key in keys if key in payload}
+
+
 def _active_exporter_row(build_dir: Path, task_type: str, task_plan: dict[str, Any]) -> AiReadyValidationRow:
     config = EXPORTER_REPORTS[task_type]
     report_path = _first_existing(build_dir, config["report_names"])
@@ -189,6 +206,7 @@ def _active_exporter_row(build_dir: Path, task_type: str, task_plan: dict[str, A
         next_pipeline_steps=list(task_plan.get("next_pipeline_steps") or []),
         quality_gate=list(task_plan.get("quality_gate") or []),
         spectrum_evidence=payload.get("spectrum_evidence") if isinstance(payload.get("spectrum_evidence"), dict) else {},
+        science_contract=_science_contract_fields(payload),
     )
 
 
@@ -206,12 +224,31 @@ def _planned_row(profile, task_plan: dict[str, Any]) -> AiReadyValidationRow:
 
 
 def _overall_status(row: AiReadyValidationRow) -> str:
-    if row.status == "export_completed":
-        return "completed"
     if row.status == "planned_not_exported":
         return "planned_not_exported"
     if row.status == "export_missing":
         return "export_missing"
+    if row.status == "export_empty":
+        return "export_empty"
+    if row.status == "export_completed":
+        science = evaluate_export_science(
+            row.task_type,
+            export_report={
+                "status": "completed",
+                "rows_out": row.rows_out,
+                "parquet_path": row.parquet_path,
+                "parquet_exists": row.parquet_exists,
+                "warnings": row.warnings,
+                "quality_gate": row.quality_gate,
+                "filter_counts": row.filter_counts,
+                **(row.science_contract or {}),
+            },
+            validation_row=row.model_dump(mode="json"),
+        )
+        if not science.ok:
+            # Zero-row already handled; science contract failures are needs_review not completed.
+            return "needs_review"
+        return "completed"
     return "needs_review"
 
 
@@ -296,6 +333,7 @@ def _write_validation_csv(path: Path, rows: list[AiReadyValidationRow]) -> None:
         "next_pipeline_steps",
         "quality_gate",
         "spectrum_evidence",
+        "science_contract",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -362,6 +400,21 @@ def _row_blockers(row: AiReadyValidationRow) -> list[str]:
         blockers.append("export_missing")
     if row.status == "export_empty":
         blockers.append("export_empty")
+    if row.status == "export_completed":
+        science = evaluate_export_science(
+            row.task_type,
+            export_report={
+                "status": "completed",
+                "rows_out": row.rows_out,
+                "parquet_path": row.parquet_path,
+                "parquet_exists": row.parquet_exists,
+                "warnings": row.warnings,
+                "quality_gate": row.quality_gate,
+                **(row.science_contract or {}),
+            },
+            validation_row=row.model_dump(mode="json"),
+        )
+        blockers.extend(science.blockers)
     if row.status == "planned_not_exported":
         blockers.append("planned_task_exporter_not_implemented")
     if "spectrum_not_matched" in row.filter_counts:
@@ -375,7 +428,22 @@ def _row_blockers(row: AiReadyValidationRow) -> list[str]:
 
 def _row_recommendations(row: AiReadyValidationRow) -> list[str]:
     if row.status == "export_completed":
-        recommendations = ["ready_for_training_preview"]
+        science = evaluate_export_science(
+            row.task_type,
+            export_report={
+                "status": "completed",
+                "rows_out": row.rows_out,
+                "parquet_path": row.parquet_path,
+                "parquet_exists": row.parquet_exists,
+                "warnings": row.warnings,
+                "quality_gate": row.quality_gate,
+                **(row.science_contract or {}),
+            },
+            validation_row=row.model_dump(mode="json"),
+        )
+        recommendations = [] if not science.ok else ["ready_for_training_preview"]
+        if not science.ok:
+            recommendations.extend(f"science_blocker:{b}" for b in science.blockers)
         methods = row.spectrum_evidence.get("fragmentation_methods") if isinstance(row.spectrum_evidence, dict) else None
         if row.task_type == "fragment_intensity_prediction":
             if methods:

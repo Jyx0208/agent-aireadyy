@@ -4,6 +4,7 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -421,10 +422,71 @@ class ExpertPoolRegistry:
 
     @staticmethod
     def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+        """Atomically write JSON; tolerate Windows file locks with retries.
+
+        Concurrent expert workers may race on registry.json. On Windows,
+        os.replace fails with PermissionError when the destination is briefly
+        open for read/scan. Retry with backoff and a replace-via-backup fallback.
+        """
+        path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temporary.replace(path)
+        payload_text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(payload_text)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+
+        last_error: Exception | None = None
+        for attempt in range(12):
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError as exc:
+                last_error = exc
+            except OSError as exc:
+                winerror = getattr(exc, "winerror", None)
+                if winerror not in {5, 32}:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise
+                last_error = exc
+
+            if path.exists():
+                backup = path.with_name(f".{path.name}.{uuid.uuid4().hex}.bak")
+                try:
+                    os.replace(path, backup)
+                    try:
+                        os.replace(temporary, path)
+                        try:
+                            backup.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        return
+                    except OSError as exc:
+                        last_error = exc
+                        try:
+                            if not path.exists() and backup.exists():
+                                os.replace(backup, path)
+                        except OSError:
+                            pass
+                except OSError as exc:
+                    last_error = exc
+
+            time.sleep(min(0.05 * (2 ** min(attempt, 5)), 0.5))
+
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if last_error is not None:
+            raise last_error
+        raise PermissionError(f"failed to atomically write {path}")
 
     def _write_record(self, pool_id: str, record: Mapping[str, Any]) -> None:
         pool_dir = self.root / pool_id

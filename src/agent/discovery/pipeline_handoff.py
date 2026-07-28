@@ -18,7 +18,8 @@ HandoffSelection = Literal["auto", "task_ready", "usable", "valid", "review", "a
 HandoffStatus = Literal["ready_for_batch_parameters", "needs_review", "not_ready"]
 
 USABLE_VALIDITY = {"valid", "weak_keep"}
-TASK_READY_STATUSES = {"ready", "weak_ready"}
+TASK_READY_STATUSES = {"ready"}
+PIPELINE_ELIGIBLE_STATUSES = {"ready", "weak_ready"}
 HANDOFF_FILE_ROLES = {"raw_acquisition", "converted_peaklist"}
 
 
@@ -182,7 +183,7 @@ def select_handoff_files(
 ) -> list[DiscoveredFile]:
     resolved = resolve_handoff_selection(manifest, selection)
     if resolved == "task_ready":
-        files = [file for file in manifest.files if file.task_readiness_status in TASK_READY_STATUSES]
+        files = [file for file in manifest.files if file.task_readiness_status in PIPELINE_ELIGIBLE_STATUSES]
     elif resolved == "usable":
         files = [file for file in manifest.files if file.validity_status in USABLE_VALIDITY]
     elif resolved == "valid":
@@ -229,7 +230,7 @@ def _handoff_decision(file: DiscoveredFile, *, require_task_ready: bool) -> tupl
         reasons.append("file_role_unknown_or_unconfirmed")
         return "needs_review", "manual_review", "review", reasons
 
-    if require_task_ready and file.task_readiness_status not in TASK_READY_STATUSES:
+    if require_task_ready and file.task_readiness_status not in PIPELINE_ELIGIBLE_STATUSES:
         reasons.append(f"task_not_ready:{file.task_readiness_status or 'not_evaluated'}")
         return "not_ready", "not_available", "skip", reasons
 

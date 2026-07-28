@@ -466,9 +466,12 @@ def species_from_text(text: str) -> tuple[list[str], list[str]]:
 
 
 def normalize_ptm_type(value: str | None) -> str:
-    text = str(value or "phospho").strip().casefold()
+    """Map PTM tokens; empty/None is unknown_ptm (never invent phospho)."""
+    if value is None:
+        return "unknown_ptm"
+    text = str(value).strip().casefold()
     if not text:
-        return "phospho"
+        return "unknown_ptm"
     if text in {"unknown", "unknown_ptm", "any", "unspecified"}:
         return "unknown_ptm"
     for term in PTM_TERMS:
@@ -649,9 +652,12 @@ def _dedupe_preserve(values: Iterable[str]) -> list[str]:
 
 
 def normalize_labeling_strategy(value: str | None) -> str:
-    text = str(value or "label_free").strip().casefold()
+    """Map labeling tokens; empty/None is unknown (never invent label_free)."""
+    if value is None:
+        return "unknown"
+    text = str(value).strip().casefold()
     if not text:
-        return "label_free"
+        return "unknown"
     if text in {"any", "unknown"}:
         return "unknown"
     for term in LABELING_TERMS:

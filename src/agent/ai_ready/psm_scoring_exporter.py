@@ -29,6 +29,7 @@ from agent.ai_ready.rt_exporter import (
 )
 from agent.models import JsonModel
 from agent.utils import write_json
+from agent.ai_ready.release_predicates import exporter_status_from_rows
 
 
 PSM_SCORING_SCHEMA_VERSION = "psm_scoring_train_v0"
@@ -41,6 +42,7 @@ PSM_SCORING_COLUMNS = [
     "modified_sequence",
     "charge",
     "is_decoy",
+    "decoy_state",
     "target_decoy_label",
     "q_value",
     "psm_probability",
@@ -100,6 +102,9 @@ class PsmScoringExportResult(JsonModel):
     rows_out: int = 0
     target_count: int = 0
     decoy_count: int = 0
+    unknown_decoy_count: int = 0
+    decoy_fraction: float = 0.0
+    decoy_label_source: str = "unknown"
     filter_counts: dict[str, int] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
     inputs: list[PsmScoringInput] = Field(default_factory=list)
@@ -153,16 +158,38 @@ def export_psm_scoring_ai_ready(
 
     rows_in = sum(item.rows_in for item in input_reports)
     rows_out = int(len(combined))
-    decoy_count = int(combined["is_decoy"].fillna(False).sum()) if rows_out else 0
-    target_count = rows_out - decoy_count
+    export_status = exporter_status_from_rows(rows_out)
+    if rows_out and "decoy_state" in combined.columns:
+        decoy_count = int((combined["decoy_state"] == "decoy").sum())
+        target_count = int((combined["decoy_state"] == "target").sum())
+        unknown_decoy_count = int((combined["decoy_state"] == "unknown").sum())
+    else:
+        decoy_count = int(combined["is_decoy"].fillna(False).sum()) if rows_out else 0
+        target_count = max(rows_out - decoy_count, 0)
+        unknown_decoy_count = 0
+    labeled = target_count + decoy_count
+    decoy_fraction = (decoy_count / labeled) if labeled else 0.0
+    decoy_label_source = "unknown"
+    for item in input_reports:
+        for warning in item.warnings:
+            if str(warning).startswith("decoy_label_source:"):
+                decoy_label_source = str(warning).split(":", 1)[1]
+                break
+        if decoy_label_source != "unknown":
+            break
+    if decoy_label_source == "protein_heuristic":
+        warnings.append("protein_heuristic_decoy")
     report = {
-        "status": "completed",
+        "status": export_status,
         "schema_version": PSM_SCORING_SCHEMA_VERSION,
         "rows_in": rows_in,
         "rows_out": rows_out,
         "rows_filtered": rows_in - rows_out,
         "target_count": target_count,
         "decoy_count": decoy_count,
+        "unknown_decoy_count": unknown_decoy_count,
+        "decoy_fraction": decoy_fraction,
+        "decoy_label_source": decoy_label_source,
         "filter_counts": dict(sorted(total_filter_counts.items())),
         "warnings": sorted(set(warnings)),
         "charge_distribution": _value_distribution(combined.get("charge")),
@@ -176,7 +203,7 @@ def export_psm_scoring_ai_ready(
     }
     write_json(report_json, report)
     return PsmScoringExportResult(
-        status="completed",
+        status=export_status,
         output_parquet=str(output_parquet),
         preview_csv=str(preview_csv),
         report_json=str(report_json),
@@ -185,6 +212,9 @@ def export_psm_scoring_ai_ready(
         rows_out=rows_out,
         target_count=target_count,
         decoy_count=decoy_count,
+        unknown_decoy_count=unknown_decoy_count,
+        decoy_fraction=decoy_fraction,
+        decoy_label_source=decoy_label_source,
         filter_counts=dict(sorted(total_filter_counts.items())),
         warnings=sorted(set(warnings)),
         inputs=input_reports,
@@ -220,6 +250,7 @@ def _load_one_result(
         )
         return pd.DataFrame(columns=PSM_SCORING_COLUMNS), report
 
+    warnings: list[str] = []
     output = pd.DataFrame()
     output["peptide_sequence"] = _series(frame, column_map["peptide_sequence"]).map(_clean_sequence)
     modified_column = column_map.get("modified_sequence")
@@ -260,9 +291,17 @@ def _load_one_result(
     output["labeling_strategy"] = [
         source_metadata[str(source)][0].get("labeling_strategy") or "" for source in output["source_file"]
     ]
-    decoy_series = _decoy_series(frame, column_map)
-    output["is_decoy"] = decoy_series
-    output["target_decoy_label"] = decoy_series.map(lambda value: 0 if bool(value) else 1)
+    decoy_state, decoy_source = _decoy_state_series(frame, column_map)
+    output["decoy_state"] = decoy_state
+    output["is_decoy"] = decoy_state.map(lambda value: True if value == "decoy" else (False if value == "target" else pd.NA))
+    output["target_decoy_label"] = decoy_state.map(lambda value: 0 if value == "decoy" else (1 if value == "target" else pd.NA))
+    if decoy_source == "protein_heuristic":
+        warnings.append("protein_heuristic_decoy")
+        warnings.append("decoy_label_source:protein_heuristic")
+    elif decoy_source == "target_decoy_column":
+        warnings.append("decoy_label_source:target_decoy_column")
+    else:
+        warnings.append("decoy_label_source:unknown")
 
     score_columns = _score_columns(frame, column_map)
     output["score_features_json"] = [
@@ -289,6 +328,7 @@ def _load_one_result(
         rows_out=int(len(filtered)),
         column_map=column_map,
         score_columns=score_columns,
+        warnings=warnings,
         filter_counts={key: value for key, value in sorted(filter_counts.items()) if value},
     )
     return filtered, report
@@ -310,28 +350,47 @@ def _detect_columns(columns: pd.Index) -> dict[str, str | None]:
     }
 
 
-def _decoy_series(frame: pd.DataFrame, column_map: dict[str, str | None]) -> pd.Series:
+def _decoy_state_series(frame, column_map):
     target_decoy_column = column_map.get("target_decoy")
     if target_decoy_column:
-        return frame[target_decoy_column].fillna("").map(_is_decoy_value)
+        states = frame[target_decoy_column].fillna("").map(_decoy_state_value)
+        return states, "target_decoy_column"
     protein_column = column_map.get("protein")
     if protein_column:
-        return frame[protein_column].fillna("").map(_is_decoy_protein)
-    return pd.Series([pd.NA] * len(frame), index=frame.index)
+        states = frame[protein_column].fillna("").map(_decoy_state_protein)
+        return states, "protein_heuristic"
+    return pd.Series(["unknown"] * len(frame), index=frame.index), "unknown"
 
-
-def _is_decoy_value(value: Any) -> bool:
+def _decoy_state_value(value):
     text = _clean_text(value).casefold()
     if text in {"true", "t", "yes", "decoy", "reverse", "rev", "-1"}:
-        return True
-    if text in {"0", "false", "f", "no", "target", "forward", "1"}:
-        return False
-    return "decoy" in text or text.startswith("rev_") or "reverse" in text
+        return "decoy"
+    if text in {"false", "f", "no", "target", "forward", "1"}:
+        return "target"
+    if "decoy" in text or text.startswith("rev_") or "reverse" in text:
+        return "decoy"
+    if text in {"", "nan", "none", "null"}:
+        return "unknown"
+    return "unknown"
 
-
-def _is_decoy_protein(value: Any) -> bool:
+def _decoy_state_protein(value):
     text = _clean_text(value).casefold()
-    return "decoy" in text or "rev_" in text or "reverse" in text
+    if not text:
+        return "unknown"
+    if "decoy" in text or "rev_" in text or "reverse" in text:
+        return "decoy"
+    return "target"
+
+def _decoy_series(frame, column_map):
+    states, _source = _decoy_state_series(frame, column_map)
+    return states.map(lambda value: True if value == "decoy" else (False if value == "target" else pd.NA))
+
+def _is_decoy_value(value):
+    return _decoy_state_value(value) == "decoy"
+
+def _is_decoy_protein(value):
+    return _decoy_state_protein(value) == "decoy"
+
 
 
 def _score_columns(frame: pd.DataFrame, column_map: dict[str, str | None]) -> list[str]:
@@ -368,7 +427,8 @@ def _schema_payload() -> dict[str, Any]:
         "target_schema": "psm_scoring_train.parquet",
         "columns": {
             "target_decoy_label": "1 for target PSM, 0 for decoy PSM.",
-            "is_decoy": "Boolean decoy indicator inferred from target/decoy or protein columns.",
+            "is_decoy": "Boolean decoy indicator; null when decoy_state is unknown.",
+            "decoy_state": "Three-state target|decoy|unknown. unknown is never treated as target.",
             "score_features_json": "JSON object containing numeric search score features retained from input TSV.",
         },
         "notes": [

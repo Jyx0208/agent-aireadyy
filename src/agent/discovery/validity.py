@@ -288,10 +288,10 @@ def assess_project_validity(project: DiscoveredProject, request: DatasetRequest)
         # review_mixed: project stays soft-keep until file-level acquisition resolves uncertainty.
         status = "weak_keep"
     elif has_domain or "strong_immunopeptide_evidence" in reasons or "strong_ptm_evidence" in reasons:
-        if "missing_instrument" in reasons or "missing_fragmentation" in reasons:
-            status = "weak_keep"
-        else:
-            status = "valid"
+        # Instrument family and fragmentation are useful annotations, not user
+        # constraints. A homogeneous project can authorize inheritance without
+        # those optional method fields.
+        status = "valid"
     elif any(reason in soft_method for reason in reasons):
         status = "weak_keep"
     else:
@@ -401,7 +401,9 @@ def assess_file_validity(file: DiscoveredFile, request: DatasetRequest) -> Valid
 
     has_domain = _has_domain_evidence(reasons)
     missing_method = "missing_instrument" in reasons or "missing_fragmentation" in reasons
-    has_delivery = bool(file.download_url) and file.expected_size_bytes is not None
+    # A resolvable download handle is required. PRIDE does not consistently
+    # publish sizes, so an unknown size is a warning rather than a blocker.
+    has_delivery = bool(file.download_url)
 
     # No domain and no instrument/fragmentation → exclude (do not queue for review).
     if not has_domain and missing_method and not general_goal:
@@ -419,25 +421,34 @@ def assess_file_validity(file: DiscoveredFile, request: DatasetRequest) -> Valid
         "needs_file_level_acquisition_confirmation",
         "conflicting_sdrf_assay_evidence",
         "missing_download_url",
-        "missing_file_size",
     }
     if request.species_policy == "include_only":
         hard_review.add("missing_species_evidence")
 
-    # Soft reasons that block strict-valid (DDA hard method expectation) but keep weak_keep.
+    # Only genuine domain uncertainty blocks a usable decision. Optional method
+    # annotations, missing SDRF, project inheritance, converted peaklists and
+    # unknown size remain visible reasons but do not demote an otherwise
+    # compatible acquisition asset.
     blocks_valid = {
-        "missing_instrument",
-        "missing_fragmentation",
-        "converted_peaklist",
-        "project_level_evidence_only",
-        "project_level_immunopeptide_evidence",
-        "project_level_ptm_evidence",
         "filename_immunopeptide_hint",
-        "sdrf_no_file_match",
         "mixed_acquisition_project",
         "weak_immunopeptide_evidence",
         "weak_ptm_evidence",
     }
+    if not immunopeptidomics_goal:
+        # The inheritance policy in this workflow is specific to homogeneous
+        # immunopeptidomics projects. Other discovery goals retain the existing
+        # conservative method/file-level evidence requirements.
+        blocks_valid.update(
+            {
+                "missing_instrument",
+                "missing_fragmentation",
+                "converted_peaklist",
+                "project_level_evidence_only",
+                "sdrf_no_file_match",
+                "project_level_ptm_evidence",
+            }
+        )
     if request.species_policy == "include_only":
         blocks_valid.add("missing_species_evidence")
 
@@ -454,12 +465,14 @@ def assess_file_validity(file: DiscoveredFile, request: DatasetRequest) -> Valid
     elif has_domain and has_delivery:
         # Strong file-level domain / general target without soft blocks can be valid;
         # project-level domain reasons stay in blocks_valid → weak_keep.
-        soft_or_method = any(reason in blocks_valid for reason in reasons) or missing_method
+        soft_or_method = any(reason in blocks_valid for reason in reasons)
         if soft_or_method:
             status = "weak_keep"
         elif (
             "strong_immunopeptide_evidence" in reasons
+            or "project_level_immunopeptide_evidence" in reasons
             or "strong_ptm_evidence" in reasons
+            or "project_level_ptm_evidence" in reasons
             or "general_discovery_target" in reasons
             or "sdrf_matched" in reasons
         ):
@@ -483,4 +496,11 @@ def assess_file_validity(file: DiscoveredFile, request: DatasetRequest) -> Valid
         and "strong_immunopeptide_evidence" not in reasons
     ):
         status = "weak_keep"
+    if status == "valid":
+        direct_domain = (
+            "strong_immunopeptide_evidence" in reasons
+            or "strong_ptm_evidence" in reasons
+            or "sdrf_matched" in reasons
+        )
+        reasons.append("usable_direct" if direct_domain else "usable_inherited")
     return ValidityDecision(status, reasons, status == "needs_review")

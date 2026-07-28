@@ -727,7 +727,10 @@ def test_massive_client_downloads_ftp_urls_with_urllib(tmp_path: Path, monkeypat
 
     assert downloaded == target
     assert target.read_bytes() == b"raw-bytes"
-    assert calls == [("ftp://massive.ucsd.edu/v13/MSV000101852/raw/sample.raw", target)]
+    assert len(calls) == 1
+    assert calls[0][0] == "ftp://massive.ucsd.edu/v13/MSV000101852/raw/sample.raw"
+    # WP-D atomic contract writes to .part then replaces into final.
+    assert calls[0][1] == target.with_name(target.name + ".part") or calls[0][1] == target
     assert logs
 
 

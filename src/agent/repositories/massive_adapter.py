@@ -305,17 +305,23 @@ class MassiveClient:
     def download_to_path(self, url: str, target_path: str | Path, report: Callable | None = None) -> Path:
         target_path = Path(target_path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
+        part_path = target_path.with_name(f"{target_path.name}.part")
+        if part_path.exists():
+            part_path.unlink()
         if url.startswith("ftp://"):
-            urllib.request.urlretrieve(url, target_path)
-            if report:
-                report(f"Download complete: {target_path}")
-            return target_path
-        with self._client.stream("GET", url) as response:
-            response.raise_for_status()
-            with target_path.open("wb") as handle:
-                for chunk in response.iter_bytes():
-                    if chunk:
-                        handle.write(chunk)
+            urllib.request.urlretrieve(url, part_path)
+        else:
+            with self._client.stream("GET", url) as response:
+                response.raise_for_status()
+                with part_path.open("wb") as handle:
+                    for chunk in response.iter_bytes():
+                        if chunk:
+                            handle.write(chunk)
+                    handle.flush()
+                    import os as _os
+                    _os.fsync(handle.fileno())
+        import os as _os
+        _os.replace(part_path, target_path)
         if report:
             report(f"Download complete: {target_path}")
         return target_path

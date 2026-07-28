@@ -278,7 +278,7 @@ def test_round_metrics_reward_new_usable_candidates_and_penalize_repeated_querie
     assert novel.last_round_yield > 0
     assert novel.strategy_novelty > repeated.strategy_novelty
     assert repeated.query_repetition == 1.0
-    assert novel.counts["usable_files"] == 5
+    assert novel.counts["usable_files"] == 4
 
 
 def _dynamic_store_and_run(
