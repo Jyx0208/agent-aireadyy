@@ -25,6 +25,61 @@ Object.defineProperty(window, "matchMedia", {
 });
 
 describe("DiscoveryContextRail", () => {
+  it("restores detailed progress for a running discovery opened from history", () => {
+    render(
+      <DiscoveryContextRail
+        spec={createEmptyIntent()}
+        phase="idle"
+        job={{
+          job_id: "discovery_job_running",
+          status: "running",
+          execution_state: {
+            schema_version: "discovery-execution/v1",
+            phase: "reviewing",
+            active_term_index: 1,
+            candidate_count: 612,
+            reviewed_project_count: 436,
+            pending_review_count: 83,
+            active_review_batch_size: 30,
+            review_workers: 4,
+            terms: [
+              {
+                term: "immunopeptidomics",
+                term_index: 1,
+                term_count: 34,
+                status: "running",
+                new_candidate_count: 305,
+                exhausted: true,
+              },
+            ],
+          },
+          logs: [
+            {
+              type: "candidate_inspection_started",
+              message: "Inspecting 2 candidate project(s): PXD004233, PXD027408",
+              payload: {
+                action: { accessions: ["PXD004233", "PXD027408"] },
+              },
+            },
+            {
+              type: "job_message",
+              message: "Inspecting project PXD004233.",
+            },
+          ],
+        }}
+        onConfirm={vi.fn()}
+        onApplyDefaults={vi.fn()}
+        onNavigate={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByLabelText("当前任务与流程")).toBeTruthy();
+    expect(screen.getByLabelText("仓库检索过程")).toBeTruthy();
+    expect(screen.getByLabelText("项目审查过程")).toBeTruthy();
+    expect(screen.getByText("已审项目")).toBeTruthy();
+    expect(screen.getByText("PXD004233")).toBeTruthy();
+  });
+
   it("keeps one compact result entry and puts downloads in its result dialog", () => {
     const spec = {
       ...createEmptyIntent("探索人类免疫肽项目"),

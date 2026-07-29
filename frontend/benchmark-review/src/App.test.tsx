@@ -1,12 +1,37 @@
 /* @vitest-environment jsdom */
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
+
+const { getDiscoveryJobMock } = vi.hoisted(() => ({
+  getDiscoveryJobMock: vi.fn(),
+}));
 
 vi.mock("./CarbonAgentChat", () => ({
   CarbonAgentChat: () => <div>Agent chat</div>,
 }));
+vi.mock("./HistoryPanel", () => ({
+  HistoryPanel: ({ onOpenDiscovery }: { onOpenDiscovery: (item: Record<string, unknown>) => void }) => (
+    <button
+      type="button"
+      onClick={() => onOpenDiscovery({
+        kind: "discovery",
+        job_id: "discovery_job_running",
+        status: "running",
+      })}
+    >
+      Open running discovery
+    </button>
+  ),
+}));
+vi.mock("./workflow-api", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./workflow-api")>();
+  return {
+    ...original,
+    getDiscoveryJob: getDiscoveryJobMock,
+  };
+});
 vi.stubGlobal(
   "ResizeObserver",
   class {
@@ -25,7 +50,53 @@ Object.defineProperty(window, "matchMedia", {
 });
 vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({}))));
 
+afterEach(() => {
+  cleanup();
+  getDiscoveryJobMock.mockReset();
+});
+
 describe("proteomics operational workbench", () => {
+  it("keeps polling a running discovery restored from history", async () => {
+    getDiscoveryJobMock.mockResolvedValue({
+      job_id: "discovery_job_running",
+      status: "running",
+      execution_state: {
+        schema_version: "discovery-execution/v1",
+        phase: "reviewing",
+        active_term_index: 1,
+        candidate_count: 612,
+        reviewed_project_count: 466,
+        pending_review_count: 83,
+        review_workers: 4,
+        terms: [{
+          term: "immunopeptidomics",
+          term_index: 1,
+          term_count: 34,
+          status: "running",
+          exhausted: true,
+        }],
+      },
+      logs: [{
+        type: "candidate_inspection_started",
+        payload: { action: { accessions: ["PXD004233"] } },
+      }],
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "运行历史" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open running discovery" }));
+
+    await waitFor(() => {
+      expect(screen.getAllByLabelText("当前任务与流程").length).toBeGreaterThan(0);
+      expect(getDiscoveryJobMock.mock.calls.length).toBeGreaterThan(1);
+    }, { timeout: 3000 });
+    expect(getDiscoveryJobMock).toHaveBeenCalledWith(
+      "discovery_job_running",
+      false,
+      expect.any(AbortSignal),
+    );
+  });
+
   it("uses one compact discovery workspace without duplicate progress surfaces", () => {
     render(<App />);
 

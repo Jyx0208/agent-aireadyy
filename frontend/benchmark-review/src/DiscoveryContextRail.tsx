@@ -10,7 +10,13 @@ import {
 } from "@carbon/react";
 import { DataBase, Download } from "@carbon/icons-react";
 
-import { buildDiscoveryRunView, type DiscoveryRunStatus, type DiscoveryRunView } from "./DiscoveryProgressMessage";
+import {
+  buildDiscoveryRunView,
+  DiscoveryProgressMessage,
+  toDiscoveryProgressPayload,
+  type DiscoveryRunStatus,
+  type DiscoveryRunView,
+} from "./DiscoveryProgressMessage";
 import { IntentSpecPanel } from "./IntentSpecPanel";
 import type { GrillPhase, IntentSpec } from "./intent-spec";
 import { getDiscoveryBatchHandoff, type DiscoveryBatchHandoff, type DiscoveryJob } from "./workflow-api";
@@ -57,6 +63,8 @@ function RunStatusCard({
       </div>
       {!view ? (
         <p className="empty-copy">策略确认后，这里只显示真实运行状态、关键计数和结果入口。</p>
+      ) : active ? (
+        <DiscoveryProgressMessage payload={toDiscoveryProgressPayload(view)} />
       ) : (
         <>
           <div className="run-status">

@@ -45,11 +45,39 @@ export default function App() {
   const [phase, setPhase] = useState<GrillPhase>("idle");
   const [externalCommand, setExternalCommand] = useState<GrillExternalCommand | null>(null);
   const [resultOpenRequest, setResultOpenRequest] = useState<{ jobId: string; token: number } | null>(null);
+  const [restoredDiscoveryJobId, setRestoredDiscoveryJobId] = useState("");
   const searchTermCandidatesForIntent = useMemo(
     () => searchTermCandidates(intent),
     [intent],
   );
   const searchTermCandidateKey = searchTermCandidatesForIntent.join("\u0000");
+
+  useEffect(() => {
+    if (!restoredDiscoveryJobId) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const controller = new AbortController();
+    const poll = async () => {
+      try {
+        const next = await getDiscoveryJob(restoredDiscoveryJobId, false, controller.signal);
+        if (stopped) return;
+        setJob(next);
+        if (terminal(next.status)) {
+          setRestoredDiscoveryJobId("");
+          return;
+        }
+      } catch {
+        if (stopped) return;
+      }
+      timer = setTimeout(poll, 2000);
+    };
+    void poll();
+    return () => {
+      stopped = true;
+      controller.abort();
+      if (timer) clearTimeout(timer);
+    };
+  }, [restoredDiscoveryJobId]);
 
   useEffect(() => {
     setSelectedSearchTerms((current) => {
@@ -122,6 +150,7 @@ export default function App() {
                       <Tile className="agent-surface">
                         <CarbonAgentChat
                           onJob={(next) => {
+                            setRestoredDiscoveryJobId("");
                             setJob(next);
                             if (terminal(next.status)) changed();
                           }}
@@ -185,8 +214,9 @@ export default function App() {
                     onOpenDiscovery={async (item) => {
                       const jobId = String(item.job_id || "");
                       const discoveryId = String(item.discovery_id || item.run_id || "");
+                      const active = !terminal(item.status);
                       const next = jobId
-                        ? await getDiscoveryJob(jobId, true)
+                        ? await getDiscoveryJob(jobId, !active)
                         : {
                             job_id: discoveryId,
                             status: String(item.status || "completed"),
@@ -195,6 +225,7 @@ export default function App() {
                             logs: [],
                           };
                       setJob(next as DiscoveryJob);
+                      setRestoredDiscoveryJobId(active ? jobId : "");
                       setSelectedTab(0);
                       setResultOpenRequest({
                         jobId: String(next.job_id || discoveryId),
