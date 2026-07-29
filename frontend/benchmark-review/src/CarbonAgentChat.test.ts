@@ -175,6 +175,11 @@ describe("dialogue session lifecycle", () => {
         "HLA ligandome、MHC ligandome。把这些词也作为主题词",
       ),
     ).toEqual(["HLA ligandome", "MHC ligandome"]);
+    expect(
+      parseExplicitBulkSearchTermAddition(
+        "HLA ligandome、MHC ligandome，加上这些词",
+      ),
+    ).toEqual(["HLA ligandome", "MHC ligandome"]);
     const chat = await mountChat([
       "immunopeptidomics",
       "immunopeptidome",
@@ -188,7 +193,7 @@ describe("dialogue session lifecycle", () => {
       "eluted HLAligands 、 eluted MHC ligands 、 HLA immunopeptidome 、" +
       "MHC immunopeptidome 、 HLA-Ipeptidome 、 HLA-II peptidome 、 immunopeptide 、" +
       "immunopeptidomic 、 HLA 、 MHC 、 HLAimmunoprecipitation 、 MHC immunoaffinity 、" +
-      "W6/32 、 neoepitope 、 HLA neoantigen。这些关键词也要加";
+      "W6/32 、 neoepitope 、 HLA neoantigen，加上这些关键词，搜全面一些";
 
     await sendMessage(chat.props, chat.instance, prompt, "request-bulk-terms");
 

@@ -103,7 +103,7 @@ const terminal = (job: DiscoveryJob | null) =>
   ["completed", "failed", "blocked", "cancelled"].includes(String(job?.status || "").toLowerCase());
 
 const EXPLICIT_BULK_TERM_SUFFIX =
-  /(?:^|[。.!！；;])\s*(?:把)?这些(?:关键词|检索词|主题词|词)(?:也)?(?:要)?(?:加(?:上|入)?|添加|作为主题词)(?:到主题词)?\s*[。.!！]*$/u;
+  /(?:^|[。.!！；;,，])\s*(?:(?:把)?这些(?:关键词|检索词|主题词|词)(?:也)?(?:要)?(?:加(?:上|入)?|添加|作为主题词)(?:到主题词)?|(?:加(?:上|入)?|添加)这些(?:关键词|检索词|主题词|词))(?:\s*[,，、]\s*(?:搜|搜索|检索)(?:得)?(?:更)?全面(?:一些)?)?\s*[。.!！]*$/u;
 
 export function parseExplicitBulkSearchTermAddition(value: unknown): string[] | null {
   const safe = String(value || "")
