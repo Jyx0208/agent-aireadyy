@@ -36,7 +36,11 @@ vi.mock("./strategy-fingerprint", async (importOriginal) => ({
   canonicalDiscoveryPayloadFingerprint: mocks.executionFingerprint,
 }));
 
-import { CarbonAgentChat, type GrillControls } from "./CarbonAgentChat";
+import {
+  AGENT_TURN_TIMEOUT_MS,
+  CarbonAgentChat,
+  type GrillControls,
+} from "./CarbonAgentChat";
 import { decodeAgentTurnResponse } from "./agent-turn";
 import { startDialogueSessionId } from "./dialogue-session";
 
@@ -141,6 +145,88 @@ afterEach(() => {
 });
 
 describe("dialogue session lifecycle", () => {
+  it("gives a long theme-list update the server-aligned turn deadline", async () => {
+    mocks.grillTurn.mockResolvedValueOnce(decodeAgentTurnResponse({
+      status: "completed",
+      action: "chat",
+      assistant_message: "Theme terms received.",
+      tool_calls: [],
+    }));
+    const chat = await mountChat();
+    const longThemeList = [
+      "MHC peptidome",
+      "HLA class I ligandome",
+      "HLA class II ligandome",
+      "immunopeptides",
+      "HLA ligands",
+      "MHC ligands",
+      "MHC-associated peptides",
+      "HLApeptidomics",
+      "MHC peptidomics",
+      "HLA-bound peptides",
+      "MHC-bound peptides",
+      "HLA-presented peptides",
+      "MHC-presented peptides",
+      "HLA-associated peptides",
+      "eluted HLA ligands",
+      "eluted MHC ligands",
+      "HLA immunopeptidome",
+      "MHC immunopeptidome",
+      "HLA-I peptidome",
+      "HLA-II peptidome",
+      "immunopeptide",
+      "immunopeptidomic",
+      "HLA",
+      "MHC",
+      "HLA immunoprecipitation",
+      "MHC immunoaffinity",
+      "W6/32",
+      "neoepitope",
+      "HLA neoantigen",
+    ].join("、");
+
+    await sendMessage(chat.props, chat.instance, `${longThemeList}。把这些词也作为主题词`);
+
+    const payload = mocks.grillTurn.mock.calls[0][0] as {
+      user_message: string;
+      request_timeout_seconds: number;
+    };
+    expect(payload.user_message).toContain("HLA neoantigen");
+    expect(payload.request_timeout_seconds).toBeGreaterThanOrEqual(170);
+  });
+
+  it("reports a model deadline as a timeout instead of an expired session", async () => {
+    const chat = await mountChat();
+    vi.useFakeTimers();
+    mocks.grillTurn.mockImplementationOnce(
+      (_payload: unknown, signal: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        }),
+    );
+
+    try {
+      const pending = sendMessage(
+        chat.props,
+        chat.instance,
+        "Add the complete immunopeptidomics synonym list.",
+        "request-timeout",
+      );
+      await vi.advanceTimersByTimeAsync(AGENT_TURN_TIMEOUT_MS);
+      await pending;
+
+      const rendered = JSON.stringify(chat.renderedMessages);
+      expect(rendered).toContain("模型响应超过 190 秒");
+      expect(rendered).not.toContain("会话已过期");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("starts a new SDK session when the page strategy state starts fresh", () => {
     window.sessionStorage.setItem(
       "pride-agent-dialogue-session",
@@ -176,7 +262,7 @@ describe("dialogue session lifecycle", () => {
       session_id: string;
       request_timeout_seconds: number;
     };
-    expect(firstPayload.request_timeout_seconds).toBe(60);
+    expect(firstPayload.request_timeout_seconds).toBe(180);
     chat.instance.messaging.upsertMessage.mockClear();
 
     act(() => mocks.restartHandler?.());

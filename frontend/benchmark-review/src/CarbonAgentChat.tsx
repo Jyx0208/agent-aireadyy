@@ -102,9 +102,8 @@ const text = (value: unknown) => String(value || "").trim();
 const terminal = (job: DiscoveryJob | null) =>
   ["completed", "failed", "blocked", "cancelled"].includes(String(job?.status || "").toLowerCase());
 
-/** Slightly above the server's bounded turn deadline; never wait for multi-minute retries. */
-/** Align with server grill budget (~profile timeout 180s); 75s caused false stalls on DeepSeek. */
-export const AGENT_TURN_TIMEOUT_MS = 70_000;
+/** Allow the server's bounded 180s turn, plus a 10s transport/UI margin. */
+export const AGENT_TURN_TIMEOUT_MS = 190_000;
 
 type AgentTurnRequestContext = {
   sessionId: string;
@@ -708,7 +707,11 @@ export function CarbonAgentChat({
       // DeepSeek 冷启动/JSON 补全偶发 >25s；给足余量，避免误报「超时」
       const timeoutMs = opts.timeoutMs ?? AGENT_TURN_TIMEOUT_MS;
       const timer = window.setTimeout(
-        () => controller.abort(),
+        () => {
+          lastGrillErrorRef.current =
+            `模型响应超过 ${Math.round(timeoutMs / 1_000)} 秒，已停止本轮；策略没有被修改。`;
+          controller.abort();
+        },
         timeoutMs,
       );
       lastGrillErrorRef.current = "";
@@ -880,7 +883,9 @@ export function CarbonAgentChat({
               await reply(
                 agentTurn
                   ? `本轮结果已返回，但对话上下文已变化（例如重复发送/重置），未写入策略。请再发一次需求。`
-                  : `本轮被中断或会话已过期。请再发一次；若反复发生请 Ctrl+F5 强制刷新。`,
+                  : lastGrillErrorRef.current
+                    ? `${lastGrillErrorRef.current} 请直接重试，无需刷新页面。`
+                    : `本轮被中断或会话已过期。请再发一次；若反复发生请 Ctrl+F5 强制刷新。`,
                 MessageState.COMPLETE,
               );
             }
