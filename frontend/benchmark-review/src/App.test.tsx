@@ -13,16 +13,28 @@ vi.mock("./CarbonAgentChat", () => ({
 }));
 vi.mock("./HistoryPanel", () => ({
   HistoryPanel: ({ onOpenDiscovery }: { onOpenDiscovery: (item: Record<string, unknown>) => void }) => (
-    <button
-      type="button"
-      onClick={() => onOpenDiscovery({
-        kind: "discovery",
-        job_id: "discovery_job_running",
-        status: "running",
-      })}
-    >
-      Open running discovery
-    </button>
+    <>
+      <button
+        type="button"
+        onClick={() => onOpenDiscovery({
+          kind: "discovery",
+          job_id: "discovery_job_running",
+          status: "running",
+        })}
+      >
+        Open running discovery
+      </button>
+      <button
+        type="button"
+        onClick={() => onOpenDiscovery({
+          kind: "discovery",
+          job_id: "discovery_job_interrupted",
+          status: "interrupted",
+        })}
+      >
+        Open interrupted discovery
+      </button>
+    </>
   ),
 }));
 vi.mock("./workflow-api", async (importOriginal) => {
@@ -95,6 +107,27 @@ describe("proteomics operational workbench", () => {
       false,
       expect.any(AbortSignal),
     );
+  });
+
+  it("loads an interrupted discovery once without polling it as active", async () => {
+    getDiscoveryJobMock.mockResolvedValue({
+      job_id: "discovery_job_interrupted",
+      status: "interrupted",
+      resumable: true,
+      logs: [],
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: "运行历史" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open interrupted discovery" }));
+
+    await waitFor(() => {
+      expect(getDiscoveryJobMock).toHaveBeenCalledWith(
+        "discovery_job_interrupted",
+        true,
+      );
+    });
+    expect(getDiscoveryJobMock).toHaveBeenCalledTimes(1);
   });
 
   it("uses one compact discovery workspace without duplicate progress surfaces", () => {

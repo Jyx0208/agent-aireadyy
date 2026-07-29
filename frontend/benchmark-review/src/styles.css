@@ -38,6 +38,12 @@ body { margin: 0; }
   min-height: 38rem;
   overflow: hidden;
 }
+.agent-layout--run-active {
+  grid-template-areas:
+    "chat rail"
+    "progress progress";
+  grid-template-rows: minmax(15rem, .7fr) minmax(20rem, 1.3fr);
+}
 .agent-column { grid-area: chat; min-width: 0; min-height: 0; }
 .run-rail {
   grid-area: rail;
@@ -50,6 +56,21 @@ body { margin: 0; }
   overscroll-behavior: contain;
 }
 .run-rail .cds--tile { padding: 1rem; }
+.run-progress-workspace {
+  grid-area: progress;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.run-progress-workspace .discovery-run-card { min-height: 100%; padding: 1rem; }
+.run-progress-workspace .discovery-progress {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+}
+.run-progress-workspace .discovery-progress__review-trace > ol { max-height: 34rem; }
 .context-rail-mobile-trigger { display: none; grid-area: context; }
 .workspace-stack { display: grid; gap: 1rem; padding-top: 1rem; }
 .workspace-stack h2, .workspace-stack h3 { margin-top: 0; }
@@ -809,6 +830,7 @@ body { margin: 0; }
     height: calc(100dvh - 11.5rem);
   }
   .run-rail { display: none; }
+  .run-progress-workspace { display: none; }
   .context-rail-mobile-trigger { display: flex; justify-content: flex-end; }
 }
 

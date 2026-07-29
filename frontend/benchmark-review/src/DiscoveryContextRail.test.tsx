@@ -1,5 +1,5 @@
 /* @vitest-environment jsdom */
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DiscoveryContextRail } from "./DiscoveryContextRail";
@@ -78,6 +78,11 @@ describe("DiscoveryContextRail", () => {
     expect(screen.getByLabelText("项目审查过程")).toBeTruthy();
     expect(screen.getByText("已审项目")).toBeTruthy();
     expect(screen.getByText("PXD004233")).toBeTruthy();
+    const progressWorkspace = screen.getByLabelText("运行进度主面板");
+    expect(within(progressWorkspace).getByLabelText("当前任务与流程")).toBeTruthy();
+    expect(
+      within(screen.getByLabelText("策略与运行上下文")).queryByLabelText("数据发现进度"),
+    ).toBeNull();
   });
 
   it("keeps one compact result entry and puts downloads in its result dialog", () => {

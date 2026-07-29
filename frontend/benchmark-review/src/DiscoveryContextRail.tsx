@@ -280,6 +280,7 @@ export function DiscoveryContextRail({
   const [mobileOpen, setMobileOpen] = useState(false);
   const [resultOpen, setResultOpen] = useState(false);
   const view = job ? buildDiscoveryRunView(job) : null;
+  const active = view?.status === "queued" || view?.status === "running";
   const openResult = () => {
     setMobileOpen(false);
     setResultOpen(true);
@@ -294,19 +295,25 @@ export function DiscoveryContextRail({
     setResultOpen(true);
   }, [openResultRequest, job]);
 
-  const content = (
-    <>
-      <IntentSpecPanel
-        spec={spec}
-        phase={phase}
-        busy={phase === "running"}
-        onConfirm={onConfirm}
-        selectedSearchTerms={selectedSearchTerms}
-        onSelectedSearchTermsChange={onSelectedSearchTermsChange}
-        onApplyDefaults={onApplyDefaults}
-      />
-      <RunStatusCard view={view} onOpenResult={openResult} />
-    </>
+  const intentPanel = (
+    <IntentSpecPanel
+      spec={spec}
+      phase={phase}
+      busy={phase === "running"}
+      onConfirm={onConfirm}
+      selectedSearchTerms={selectedSearchTerms}
+      onSelectedSearchTermsChange={onSelectedSearchTermsChange}
+      onApplyDefaults={onApplyDefaults}
+    />
+  );
+  const runStatusCard = (
+    <RunStatusCard view={view} onOpenResult={openResult} />
+  );
+  const modalContent = (
+    <div className="context-modal-stack">
+      {intentPanel}
+      {runStatusCard}
+    </div>
   );
 
   return (
@@ -322,8 +329,14 @@ export function DiscoveryContextRail({
         </Button>
       </div>
       <aside className="run-rail" aria-label="策略与运行上下文">
-        {content}
+        {intentPanel}
+        {!active ? runStatusCard : null}
       </aside>
+      {active ? (
+        <section className="run-progress-workspace" aria-label="运行进度主面板">
+          {runStatusCard}
+        </section>
+      ) : null}
 
       {mobileOpen ? (
         <ComposedModal open onClose={() => setMobileOpen(false)} size="lg">
@@ -334,7 +347,7 @@ export function DiscoveryContextRail({
             closeModal={() => setMobileOpen(false)}
           />
           <ModalBody hasScrollingContent>
-            <div className="context-modal-stack">{content}</div>
+            {modalContent}
           </ModalBody>
         </ComposedModal>
       ) : null}

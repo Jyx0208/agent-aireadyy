@@ -173,8 +173,14 @@ _tasks: dict[str, dict[str, Any]] = {}
 _tasks_lock = threading.Lock()
 _batches: dict[str, dict[str, Any]] = {}
 _batches_lock = threading.Lock()
-_batch_history_cache: dict[str, Any] = {"ts": 0.0, "records": []}
+_batch_history_cache: dict[str, Any] = {
+    "ts": 0.0,
+    "root": "",
+    "generation": 0,
+    "records": [],
+}
 _batch_history_cache_lock = threading.Lock()
+_history_index_lock = threading.RLock()
 _history_delete_confirmations: dict[str, dict[str, Any]] = {}
 _history_delete_confirmations_lock = threading.Lock()
 _discovery_jobs: dict[str, dict[str, Any]] = {}
@@ -9936,6 +9942,86 @@ def _list_discovery_history_records(limit: int = 100) -> list[dict[str, Any]]:
     return records[:limit]
 
 
+def _discovery_job_history_shell(job: Mapping[str, Any]) -> dict[str, Any]:
+    record = job.get("record") if isinstance(job.get("record"), Mapping) else {}
+    body = job.get("body") if isinstance(job.get("body"), Mapping) else {}
+    request = record.get("request") if isinstance(record.get("request"), Mapping) else {}
+    prompt = _clean_text(body.get("prompt"))
+    goal = _clean_text(request.get("goal") or body.get("goal") or prompt)
+    job_id = _clean_text(job.get("job_id"))
+    discovery_id = _clean_text(record.get("discovery_id"))
+    output_dir = _clean_text(record.get("output_dir"))
+    history_time = job.get("finished_at") or job.get("started_at") or job.get("created_at")
+    return _decorate_history_item(
+        {
+            "kind": "discovery",
+            "history_id": (
+                f"discovery-{discovery_id}"
+                if discovery_id
+                else f"discovery-job-{job_id}"
+            ),
+            "job_id": job_id,
+            "discovery_id": discovery_id or None,
+            "run_id": _clean_text(record.get("run_id")) or discovery_id or job_id,
+            "result_id": discovery_id or job_id,
+            "name": discovery_id or job_id,
+            "display_name": goal[:80] if goal else f"Discovery job {job_id}",
+            "input_value": goal or job_id,
+            "status": job.get("status") or "unknown",
+            "repository": _clean_text(request.get("repository")) or "pride",
+            "run_mode": "discovery",
+            "project_count": int(record.get("project_count") or 0),
+            "file_count": int(record.get("file_count") or 0),
+            "size_bytes": int(record.get("size_bytes") or 0),
+            "output_dir": output_dir,
+            "can_download": bool(job.get("status") == "completed" and output_dir),
+            "primary_action": (
+                "open_discovery" if discovery_id else "open_discovery_job"
+            ),
+            "created_at": job.get("created_at"),
+            "updated_at": history_time,
+            "finished_at": job.get("finished_at"),
+            "history_time": history_time,
+            "submitter": "discovery",
+            "error": job.get("error"),
+            "resumable": bool(job.get("resumable")),
+            "goal": goal or None,
+        }
+    )
+
+
+def _list_discovery_history_records_fast(limit: int = 100) -> list[dict[str, Any]]:
+    """Return compact discovery shells without loading large authoritative jobs."""
+    with _discovery_jobs_lock:
+        jobs = [dict(job) for job in _discovery_jobs.values()]
+    records = [_discovery_job_history_shell(job) for job in jobs]
+    seen_job_ids = {_clean_text(record.get("job_id")) for record in records}
+    summaries_dir = _discovery_job_summaries_dir()
+    if summaries_dir.is_dir():
+        for path in summaries_dir.glob("*.json"):
+            summary = _read_json_if_exists(path)
+            job_id = _clean_text((summary or {}).get("job_id"))
+            if not summary or not job_id or job_id in seen_job_ids:
+                continue
+            if str(summary.get("status") or "").lower() in _ACTIVE_STATUSES:
+                summary = dict(summary)
+                summary["status"] = "interrupted"
+                summary["resumable"] = True
+                summary["error"] = (
+                    summary.get("error")
+                    or "discovery_job_interrupted_by_server_reload"
+                )
+            records.append(_decorate_history_item(summary))
+            seen_job_ids.add(job_id)
+    records.sort(
+        key=lambda item: str(
+            item.get("history_time") or item.get("finished_at") or item.get("created_at") or ""
+        ),
+        reverse=True,
+    )
+    return records[:limit]
+
+
 def _upsert_discovery_history_record(record: Mapping[str, Any] | None, output_dir: Path | None = None) -> None:
     """Ensure finished discovery runs appear in project history."""
     try:
@@ -11639,6 +11725,13 @@ def _ensure_batch_audit_zip(batch: dict[str, Any]) -> Path | None:
 def _write_batch_manifest(batch: dict[str, Any]) -> None:
     manifest = {key: value for key, value in batch.items() if key not in {"llm_config"}}
     _json_write(Path(batch["output_dir"]) / _BATCH_MANIFEST_FILE, manifest)
+    with _batch_history_cache_lock:
+        _batch_history_cache["ts"] = 0.0
+        _batch_history_cache["root"] = ""
+        _batch_history_cache["generation"] = int(
+            _batch_history_cache.get("generation") or 0
+        ) + 1
+        _batch_history_cache["records"] = []
 
 
 
@@ -11888,8 +11981,13 @@ def _batch_history_record(batch: dict[str, Any], include_file_stats: bool = True
     public = _public_batch_record(batch)
     batch_id = str(public.get("batch_id") or "").strip()
     output_dir = Path(public.get("output_dir") or "")
-    file_count = 0
-    size_bytes = 0
+    file_count = int(
+        batch.get("file_count")
+        or public.get("file_count")
+        or public.get("item_count")
+        or 0
+    )
+    size_bytes = int(batch.get("size_bytes") or public.get("size_bytes") or 0)
     if include_file_stats and output_dir.exists():
         file_count, size_bytes, _latest_mtime = _path_file_stats(output_dir)
     public.update(
@@ -11907,6 +12005,10 @@ def _batch_history_record(batch: dict[str, Any], include_file_stats: bool = True
             "size_bytes": size_bytes,
         }
     )
+    # History cards only need aggregate batch progress. Returning every item and
+    # event makes the history response grow with all processed files.
+    public.pop("items", None)
+    public.pop("events", None)
     return _decorate_history_item(public)
 
 
@@ -11922,10 +12024,16 @@ def _load_batch_from_disk(batch_id: str) -> dict[str, Any] | None:
 
 
 def _list_parameter_batch_history_records(use_cache: bool = True, include_file_stats: bool = True) -> list[dict[str, Any]]:
+    cache_root = str(_batch_root_dir().resolve())
+    cache_generation = 0
     if use_cache and not include_file_stats:
         with _batch_history_cache_lock:
+            cache_generation = int(_batch_history_cache.get("generation") or 0)
             cached_ts = float(_batch_history_cache.get("ts") or 0.0)
-            if time.time() - cached_ts < 20:
+            if (
+                _batch_history_cache.get("root") == cache_root
+                and time.time() - cached_ts < 20
+            ):
                 return [dict(item) for item in _batch_history_cache.get("records") or []]
     records: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -11957,8 +12065,10 @@ def _list_parameter_batch_history_records(use_cache: bool = True, include_file_s
         records.append(_batch_history_record(batch, include_file_stats=include_file_stats))
     if use_cache and not include_file_stats:
         with _batch_history_cache_lock:
-            _batch_history_cache["ts"] = time.time()
-            _batch_history_cache["records"] = [dict(item) for item in records]
+            if int(_batch_history_cache.get("generation") or 0) == cache_generation:
+                _batch_history_cache["ts"] = time.time()
+                _batch_history_cache["root"] = cache_root
+                _batch_history_cache["records"] = [dict(item) for item in records]
     return records
 
 
@@ -12168,32 +12278,48 @@ def _read_history_index_file(path: Path) -> list[dict[str, Any]]:
 
 
 def _read_history_index() -> list[dict[str, Any]]:
-    records = _read_history_index_file(_history_index_path())
-    if records:
-        return records
-    return _read_history_index_file(_history_index_backup_path())
+    with _history_index_lock:
+        records = _read_history_index_file(_history_index_path())
+        if records:
+            return records
+        return _read_history_index_file(_history_index_backup_path())
 
 
 def _upsert_history_index(record: dict[str, Any]) -> None:
-    indexed_record = with_history_identity(record)
-    if not indexed_record.get("project_key"):
-        return
-    records = merge_project_history_records([*_read_history_index(), indexed_record], limit=200)
-    _write_history_index(records)
+    with _history_index_lock:
+        indexed_record = _compact_history_index_record(record)
+        if not indexed_record.get("project_key"):
+            return
+        records = merge_project_history_records([*_read_history_index(), indexed_record])
+        _write_history_index(records)
+
+
+def _compact_history_index_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    item = with_history_identity(record)
+    # Archived task details still use their concise task log after result cleanup.
+    # Batch item/event arrays are the unbounded payloads and belong in manifests.
+    for key in ("items", "events"):
+        item.pop(key, None)
+    return item
 
 
 def _write_history_index(records: list[dict[str, Any]]) -> None:
-    try:
-        _runs_dir.mkdir(parents=True, exist_ok=True)
-        cleaned = [with_history_identity(record) for record in records if not _is_legacy_batches_history_record(record)]
-        payload = json.dumps(cleaned, indent=2, ensure_ascii=False)
-        path = _history_index_path()
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        tmp_path.write_text(payload, encoding="utf-8")
-        os.replace(tmp_path, path)
-        _history_index_backup_path().write_text(payload, encoding="utf-8")
-    except OSError:
-        return
+    with _history_index_lock:
+        try:
+            _runs_dir.mkdir(parents=True, exist_ok=True)
+            cleaned = [
+                _compact_history_index_record(record)
+                for record in records
+                if not _is_legacy_batches_history_record(record)
+            ]
+            payload = json.dumps(cleaned, indent=2, ensure_ascii=False)
+            path = _history_index_path()
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            tmp_path.write_text(payload, encoding="utf-8")
+            os.replace(tmp_path, path)
+            _history_index_backup_path().write_text(payload, encoding="utf-8")
+        except OSError:
+            return
 
 
 def _write_task_history(task_id: str) -> None:
@@ -12279,18 +12405,19 @@ def _mark_interrupted_history_item(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _repair_interrupted_history_index() -> None:
-    with _tasks_lock:
-        active_task_ids, active_history_ids = _active_history_identity_sets_locked()
-    repaired: list[dict[str, Any]] = []
-    changed = False
-    for record in _read_history_index():
-        item = with_history_identity(record)
-        if item.get("status") in _ACTIVE_STATUSES and not _history_item_is_active(item, active_task_ids, active_history_ids):
-            item = _mark_interrupted_history_item(item)
-            changed = True
-        repaired.append(item)
-    if changed:
-        _write_history_index(merge_project_history_records(repaired, limit=200))
+    with _history_index_lock:
+        with _tasks_lock:
+            active_task_ids, active_history_ids = _active_history_identity_sets_locked()
+        repaired: list[dict[str, Any]] = []
+        changed = False
+        for record in _read_history_index():
+            item = with_history_identity(record)
+            if item.get("status") in _ACTIVE_STATUSES and not _history_item_is_active(item, active_task_ids, active_history_ids):
+                item = _mark_interrupted_history_item(item)
+                changed = True
+            repaired.append(item)
+        if changed:
+            _write_history_index(merge_project_history_records(repaired))
 
 
 def _disk_task_history_records() -> list[dict[str, Any]]:
@@ -12309,14 +12436,15 @@ def _disk_task_history_records() -> list[dict[str, Any]]:
 
 
 def _sync_history_index_from_disk() -> None:
-    records = [*_read_history_index(), *_disk_task_history_records()]
-    for batch in _list_parameter_batch_history_records(use_cache=False):
-        if batch.get("status") in _ACTIVE_STATUSES:
-            continue
-        records.append(batch)
-    if not records:
-        return
-    _write_history_index(merge_project_history_records(records, limit=200))
+    with _history_index_lock:
+        records = [*_read_history_index(), *_disk_task_history_records()]
+        for batch in _list_parameter_batch_history_records(use_cache=False):
+            if batch.get("status") in _ACTIVE_STATUSES:
+                continue
+            records.append(batch)
+        if not records:
+            return
+        _write_history_index(merge_project_history_records(records))
 
 
 def _find_history_record(task_id: str) -> dict[str, Any] | None:
@@ -12562,18 +12690,10 @@ def _list_project_history_records_fast() -> list[dict[str, Any]]:
         item["can_download"] = bool(item.get("can_download"))
         records.append(_decorate_history_item(item))
 
-    for batch in _list_parameter_batch_history_records(include_file_stats=True):
+    for batch in _list_parameter_batch_history_records(include_file_stats=False):
         if batch.get("status") in _ACTIVE_STATUSES:
             continue
         records.append(_decorate_history_item(batch))
-
-    for result in _list_public_results():
-        task_updated_at = result.get("task_updated_at") or result.get("finished_at") or result.get("started_at") or result.get("created_at")
-        if task_updated_at:
-            result["updated_at"] = task_updated_at
-        if result.get("status") in _ACTIVE_STATUSES and not _history_item_is_active(result, active_task_ids, active_history_ids):
-            result = _mark_interrupted_history_item(result)
-        records.append(_decorate_history_item(result))
 
     with _tasks_lock:
         for task_id, task in _tasks.items():
@@ -15073,27 +15193,28 @@ def _remove_history_index_targets(deleted: list[dict[str, Any]]) -> None:
             }
         )
     aliases.discard("")
-    kept = []
-    for record in _read_history_index():
-        item = with_history_identity(record)
-        values = {
-            str(item.get(field) or "")
-            for field in (
-                "history_id",
-                "run_id",
-                "result_id",
-                "name",
-                "task_id",
-                "discovery_id",
-                "batch_id",
-                "job_id",
-            )
-        }
-        values.add(Path(str(item.get("output_dir") or "")).name)
-        if values & aliases:
-            continue
-        kept.append(item)
-    _write_history_index(kept)
+    with _history_index_lock:
+        kept = []
+        for record in _read_history_index():
+            item = with_history_identity(record)
+            values = {
+                str(item.get(field) or "")
+                for field in (
+                    "history_id",
+                    "run_id",
+                    "result_id",
+                    "name",
+                    "task_id",
+                    "discovery_id",
+                    "batch_id",
+                    "job_id",
+                )
+            }
+            values.add(Path(str(item.get("output_dir") or "")).name)
+            if values & aliases:
+                continue
+            kept.append(item)
+        _write_history_index(kept)
 
 
 def _execute_history_delete(
@@ -15150,12 +15271,19 @@ def _execute_history_delete(
                     job_path = _discovery_job_path(job_id)
                     if job_path.exists():
                         job_path.unlink()
+                    summary_path = _discovery_job_summary_path(job_id)
+                    if summary_path.exists():
+                        summary_path.unlink()
             deleted.append({**target, **receipt})
         except Exception as exc:
             failed.append({**target, "error": _redact_secrets(str(exc))})
     _remove_history_index_targets(deleted)
     with _batch_history_cache_lock:
         _batch_history_cache["ts"] = 0.0
+        _batch_history_cache["root"] = ""
+        _batch_history_cache["generation"] = int(
+            _batch_history_cache.get("generation") or 0
+        ) + 1
         _batch_history_cache["records"] = []
     return {
         "status": "completed" if not failed else "partial",
@@ -15171,22 +15299,18 @@ def _execute_history_delete(
 @app.get("/api/history")
 async def list_project_history(fast: bool = True, refresh: bool = False):
     if fast and not refresh:
-        if not _read_history_index():
-            _sync_history_index_from_disk()
         with _tasks_lock:
             active_tasks = [
                 _public_task_record_locked(task_id, task)
                 for task_id, task in _tasks.items()
                 if task.get("status") in _ACTIVE_STATUSES
             ]
-        active_tasks.extend(batch for batch in _list_parameter_batch_history_records(include_file_stats=True) if batch.get("status") in _ACTIVE_STATUSES)
+        active_tasks.extend(batch for batch in _list_parameter_batch_history_records(include_file_stats=False) if batch.get("status") in _ACTIVE_STATUSES)
         # Discovery jobs that are still running should also appear in history.
-        try:
-            for item in _list_discovery_history_records(limit=50):
-                if str(item.get("status") or "").lower() in _ACTIVE_STATUSES:
-                    active_tasks.append(item)
-        except Exception:
-            pass
+        discovery_history = _list_discovery_history_records_fast(limit=100)
+        for item in discovery_history:
+            if str(item.get("status") or "").lower() in _ACTIVE_STATUSES:
+                active_tasks.append(item)
         active_tasks.sort(key=lambda item: str(item.get("created_at") or item.get("history_time") or ""))
         active_task_ids = {str(item.get("task_id") or "") for item in active_tasks}
         active_history_ids = {str(item.get("history_id") or "") for item in active_tasks}
@@ -15197,10 +15321,7 @@ async def list_project_history(fast: bool = True, refresh: bool = False):
         results = []
         # Merge ordinary task history with discovery run history.
         combined = list(_list_project_history_records_fast())
-        try:
-            combined.extend(_list_discovery_history_records(limit=100))
-        except Exception:
-            pass
+        combined.extend(discovery_history)
         # de-dupe by history_id/run_id
         seen: set[str] = set()
         ordered: list[dict[str, Any]] = []
@@ -16451,6 +16572,14 @@ def _discovery_job_path(job_id: str) -> Path:
     return _discovery_jobs_dir() / f"{safe_output_stem(job_id)}.json"
 
 
+def _discovery_job_summaries_dir() -> Path:
+    return _discovery_jobs_dir() / "_history"
+
+
+def _discovery_job_summary_path(job_id: str) -> Path:
+    return _discovery_job_summaries_dir() / f"{safe_output_stem(job_id)}.json"
+
+
 def _discovery_job_persist_payload(job: dict[str, Any]) -> dict[str, Any]:
     """Serialize job for disk with raw English logs/error (API localizes on read).
 
@@ -16525,6 +16654,18 @@ def _persist_discovery_job(job: dict[str, Any], *, required: bool = False) -> No
             _discovery_job_path(job_id),
             _discovery_job_persist_payload(job),
         )
+        try:
+            _write_json_atomic(
+                _discovery_job_summary_path(job_id),
+                _discovery_job_history_shell(job),
+            )
+        except Exception:
+            # Never leave an older running shell beside a newer authoritative job.
+            # The full job remains authoritative if this acceleration sidecar fails.
+            try:
+                _discovery_job_summary_path(job_id).unlink(missing_ok=True)
+            except OSError:
+                pass
         # Also keep a line-oriented log for forensic debugging of long runs.
         try:
             _write_discovery_job_log_file(job)

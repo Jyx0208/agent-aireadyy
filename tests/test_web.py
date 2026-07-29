@@ -2107,6 +2107,165 @@ def test_project_history_lists_parameter_batches_from_memory_and_disk(monkeypatc
     assert history["summary"]["downloadable"] == 1
 
 
+def test_fast_project_history_never_recursively_scans_result_directories(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr(
+        web_app,
+        "_list_discovery_history_records",
+        lambda limit=100: (_ for _ in ()).throw(
+            AssertionError("fast history must not load discovery job files")
+        ),
+    )
+    monkeypatch.setattr(web_app, "_list_discovery_history_records_fast", lambda limit=100: [])
+    monkeypatch.setattr(
+        web_app,
+        "_path_file_stats",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("fast history must not recursively scan result directories")
+        ),
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_list_public_results",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("fast history must not scan unindexed result directories")
+        ),
+    )
+    (tmp_path / "project_history.json").write_text("[]", encoding="utf-8")
+    batch_dir = tmp_path / "_batches" / "donebatch"
+    batch_dir.mkdir(parents=True)
+    web_app._write_batch_manifest(
+        {
+            "batch_id": "donebatch",
+            "status": "completed",
+            "created_at": "2026-05-09T11:00:00+08:00",
+            "finished_at": "2026-05-09T11:10:00+08:00",
+            "output_dir": str(batch_dir),
+            "excel_path": str(batch_dir / "benchmark_results.xlsx"),
+            "items": [{"index": 1, "input": "done.raw", "status": "completed"}],
+            "errors": [],
+        }
+    )
+
+    history = asyncio.run(list_project_history(fast=True, refresh=False))
+
+    assert history["history_mode"] == "fast"
+    assert [item["batch_id"] for item in history["results"]] == ["donebatch"]
+    assert "items" not in history["results"][0]
+    assert "events" not in history["results"][0]
+
+
+def test_fast_discovery_history_survives_memory_reset_via_small_sidecar(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    job = {
+        "job_id": "discovery_job_resume",
+        "status": "running",
+        "created_at": "2026-07-29T10:00:00+08:00",
+        "started_at": "2026-07-29T10:01:00+08:00",
+        "body": {"prompt": "find human immunopeptidomics"},
+        "record": {"project_count": 612, "file_count": 5000},
+        "logs": [{"message": "large details stay in the authoritative job"}],
+    }
+    web_app._persist_discovery_job(job, required=True)
+    with web_app._discovery_jobs_lock:
+        previous_jobs = dict(web_app._discovery_jobs)
+        web_app._discovery_jobs.clear()
+    try:
+        records = web_app._list_discovery_history_records_fast()
+    finally:
+        with web_app._discovery_jobs_lock:
+            web_app._discovery_jobs.clear()
+            web_app._discovery_jobs.update(previous_jobs)
+
+    assert len(records) == 1
+    assert records[0]["job_id"] == "discovery_job_resume"
+    assert records[0]["status"] == "interrupted"
+    assert records[0]["resumable"] is True
+    assert records[0]["project_count"] == 612
+    assert "logs" not in records[0]
+
+
+def test_failed_discovery_sidecar_refresh_removes_stale_running_shell(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    job = {
+        "job_id": "discovery_job_sidecar_failure",
+        "status": "running",
+        "created_at": "2026-07-29T10:00:00+08:00",
+        "body": {"prompt": "find human immunopeptidomics"},
+        "record": {},
+        "logs": [],
+    }
+    web_app._persist_discovery_job(job, required=True)
+    summary_path = web_app._discovery_job_summary_path(job["job_id"])
+    assert summary_path.exists()
+    original_write = web_app._write_json_atomic
+
+    def fail_summary_only(path, payload):
+        if Path(path) == summary_path:
+            raise OSError("summary disk failure")
+        return original_write(path, payload)
+
+    monkeypatch.setattr(web_app, "_write_json_atomic", fail_summary_only)
+    job["status"] = "completed"
+    job["finished_at"] = "2026-07-29T10:30:00+08:00"
+    web_app._persist_discovery_job(job, required=True)
+
+    assert not summary_path.exists()
+
+
+def test_batch_manifest_write_invalidates_fast_history_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    batch = {
+        "batch_id": "changingbatch",
+        "status": "running",
+        "created_at": "2026-07-29T10:00:00+08:00",
+        "output_dir": str(tmp_path / "_batches" / "changingbatch"),
+        "excel_path": str(tmp_path / "_batches" / "changingbatch" / "benchmark_results.xlsx"),
+        "items": [{"index": 1, "input": "one.raw", "status": "running"}],
+        "errors": [],
+    }
+    with web_app._batches_lock:
+        previous_batches = dict(web_app._batches)
+        web_app._batches.clear()
+        web_app._batches[batch["batch_id"]] = batch
+    try:
+        web_app._write_batch_manifest(batch)
+        first = web_app._list_parameter_batch_history_records(include_file_stats=False)
+        batch["status"] = "completed"
+        batch["items"][0]["status"] = "completed"
+        web_app._write_batch_manifest(batch)
+        second = web_app._list_parameter_batch_history_records(include_file_stats=False)
+    finally:
+        with web_app._batches_lock:
+            web_app._batches.clear()
+            web_app._batches.update(previous_batches)
+
+    assert first[0]["status"] == "running"
+    assert second[0]["status"] == "completed"
+
+
+def test_lightweight_history_index_keeps_more_than_two_hundred_records(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    records = [
+        {
+            "task_id": f"task-{index}",
+            "input_value": f"sample-{index}.raw",
+            "output_dir": f"run-{index}",
+            "status": "completed",
+            "created_at": f"2026-07-29T10:{index % 60:02d}:00+08:00",
+            "items": [{"index": 1, "status": "completed"}],
+            "events": [{"message": "must not be copied into the lightweight index"}],
+        }
+        for index in range(205)
+    ]
+
+    web_app._write_history_index(records)
+    indexed = web_app._read_history_index()
+
+    assert len(indexed) == 205
+    assert all("items" not in item and "events" not in item for item in indexed)
+
+
 def test_cleanup_results_does_not_remove_batch_history_root(monkeypatch, tmp_path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setenv("AGENT_RESULT_RETENTION_SECONDS", "1800")
@@ -2143,6 +2302,7 @@ def test_cleanup_results_does_not_remove_batch_history_root(monkeypatch, tmp_pat
 
 def test_project_history_recovers_from_corrupt_index_by_scanning_run_directories(monkeypatch, tmp_path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setenv("AGENT_RESULT_RETENTION_SECONDS", "8640000")
     (tmp_path / "project_history.json").write_text("{not valid json", encoding="utf-8")
     run_dir = tmp_path / "recoverable"
     run_dir.mkdir()
@@ -2161,7 +2321,7 @@ def test_project_history_recovers_from_corrupt_index_by_scanning_run_directories
         encoding="utf-8",
     )
 
-    history = asyncio.run(list_project_history())
+    history = asyncio.run(list_project_history(fast=False, refresh=True))
 
     assert history["results"][0]["task_id"] == "recoverable-task"
     repaired_index = json.loads((tmp_path / "project_history.json").read_text(encoding="utf-8"))
@@ -2898,6 +3058,7 @@ def test_project_history_lists_active_submitters_and_results_without_secrets(mon
         '{"task_id":"finished","input_value":"done.raw","submitter":"Bob","status":"completed"}',
         encoding="utf-8",
     )
+    web_app._sync_history_index_from_disk()
     _tasks["active"] = {
         "task_id": "active",
         "input_value": "active.raw",
@@ -2910,7 +3071,7 @@ def test_project_history_lists_active_submitters_and_results_without_secrets(mon
     }
 
     try:
-        history = asyncio.run(list_project_history())
+        history = asyncio.run(list_project_history(fast=False, refresh=True))
     finally:
         _tasks.pop("active", None)
 
@@ -2960,6 +3121,7 @@ def test_project_history_adds_human_timing_and_actions(monkeypatch, tmp_path):
         ),
         encoding="utf-8",
     )
+    web_app._sync_history_index_from_disk()
 
     history = asyncio.run(list_project_history())
     result = history["results"][0]
@@ -3144,6 +3306,7 @@ def test_history_reflects_failed_status_and_disables_download(monkeypatch, tmp_p
         json.dumps({"task_id": "failed", "input_value": "failed.raw", "submitter": "Alice", "status": "failed"}),
         encoding="utf-8",
     )
+    web_app._sync_history_index_from_disk()
 
     history = asyncio.run(list_project_history())
     result = history["results"][0]
@@ -3201,8 +3364,9 @@ def test_project_history_uses_task_start_time_not_result_file_mtime(monkeypatch,
     os.utime(first_dir, (later_stamp, later_stamp))
     os.utime(second_file, (earlier_stamp, earlier_stamp))
     os.utime(second_dir, (earlier_stamp, earlier_stamp))
+    web_app._sync_history_index_from_disk()
 
-    history = asyncio.run(list_project_history())
+    history = asyncio.run(list_project_history(fast=False, refresh=True))
 
     assert [item["task_id"] for item in history["results"]] == ["bbbb", "aaaa"]
     assert [item["history_time"] for item in history["results"]] == [

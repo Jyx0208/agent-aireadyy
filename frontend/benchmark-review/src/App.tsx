@@ -28,7 +28,9 @@ import { reconcileSearchTermSelection, searchTermCandidates } from "./grill-tree
 import { getDiscoveryJob, getDiscoveryRun, type DiscoveryBatchHandoff, type DiscoveryJob, type WorkflowRecord } from "./workflow-api";
 
 const terminal = (status: unknown) =>
-  ["completed", "failed", "blocked", "cancelled"].includes(String(status || "").toLowerCase());
+  ["completed", "failed", "blocked", "cancelled", "interrupted", "durability_failed"].includes(
+    String(status || "").toLowerCase(),
+  );
 
 export default function App() {
   const [selectedTab, setSelectedTab] = useState(0);
@@ -51,6 +53,7 @@ export default function App() {
     [intent],
   );
   const searchTermCandidateKey = searchTermCandidatesForIntent.join("\u0000");
+  const discoveryActive = job?.status === "queued" || job?.status === "running";
 
   useEffect(() => {
     if (!restoredDiscoveryJobId) return;
@@ -145,7 +148,7 @@ export default function App() {
               </TabList>
               <TabPanels>
                 <TabPanel className="discovery-tab-panel">
-                  <div className="agent-layout agent-layout--grill">
+                  <div className={`agent-layout agent-layout--grill${discoveryActive ? " agent-layout--run-active" : ""}`}>
                     <div className="agent-column">
                       <Tile className="agent-surface">
                         <CarbonAgentChat
