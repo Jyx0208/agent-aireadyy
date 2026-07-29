@@ -102,6 +102,33 @@ const text = (value: unknown) => String(value || "").trim();
 const terminal = (job: DiscoveryJob | null) =>
   ["completed", "failed", "blocked", "cancelled"].includes(String(job?.status || "").toLowerCase());
 
+const EXPLICIT_BULK_TERM_SUFFIX =
+  /(?:^|[。.!！；;])\s*(?:把)?这些(?:关键词|检索词|主题词|词)(?:也)?(?:要)?(?:加(?:上|入)?|添加|作为主题词)(?:到主题词)?\s*[。.!！]*$/u;
+
+export function parseExplicitBulkSearchTermAddition(value: unknown): string[] | null {
+  const safe = String(value || "")
+    .replace(/[\r\n\t]+/g, "、")
+    .replace(
+      /([\p{L}\p{N}])[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]+(?=[\p{L}\p{N}])/gu,
+      "$1-",
+    )
+    .replace(/[\u0000-\u001F\u007F]+/g, " ");
+  const command = EXPLICIT_BULK_TERM_SUFFIX.exec(safe);
+  if (!command || command.index == null) return null;
+  const terms = normalizeSearchTerms(
+    safe
+      .slice(0, command.index)
+      .split(/[、,，;；]+/u)
+      .map((term) =>
+        term.replace(
+          /^[\s:："'“”‘’]+|[\s。.!！:："'“”‘’]+$/gu,
+          "",
+        ),
+      ),
+  );
+  return terms.length >= 2 ? terms : null;
+}
+
 /** Allow the server's bounded 180s turn, plus a 10s transport/UI margin. */
 export const AGENT_TURN_TIMEOUT_MS = 190_000;
 
@@ -829,6 +856,50 @@ export function CarbonAgentChat({
 
           if (phaseRef.current === "running") {
             await reply("当前已有数据发现任务在跑。可点停止取消，或等它完成。");
+            return;
+          }
+
+          const explicitBulkTerms = parseExplicitBulkSearchTermAddition(prompt);
+          if (explicitBulkTerms) {
+            const previousTerms = normalizeSearchTerms(
+              intentRef.current.selectedSearchTerms || [],
+            );
+            const previousKeys = new Set(
+              previousTerms.map((term) => term.toLocaleLowerCase()),
+            );
+            const mergedTerms = normalizeSearchTerms([
+              ...previousTerms,
+              ...explicitBulkTerms,
+            ]).slice(0, 100);
+            const addedTerms = mergedTerms.filter(
+              (term) => !previousKeys.has(term.toLocaleLowerCase()),
+            );
+            const nextSpec: IntentSpec = {
+              ...intentRef.current,
+              selectedSearchTerms: mergedTerms,
+              confirmed: false,
+            };
+            pendingDecisionRef.current = null;
+            setIntent(nextSpec);
+            setPhase(isReadyForConfirm(nextSpec) ? "awaiting_confirm" : "grilling");
+            const responseBody =
+              `已直接解析 ${explicitBulkTerms.length} 个关键词：新增 ${addedTerms.length} 个，` +
+              `忽略重复 ${explicitBulkTerms.length - addedTerms.length} 个。` +
+              `当前共有 ${mergedTerms.length} 个待确认主题词；未调用模型，也未开始 PRIDE 搜索。`;
+            events.push(
+              tl.tool(
+                "update-search-terms",
+                "ok",
+                `deterministic · ${addedTerms.length} added · ${mergedTerms.length} total`,
+                0,
+              ),
+            );
+            dialogueHistoryRef.current = appendAgentDialogue(
+              dialogueHistoryRef.current,
+              prompt,
+              responseBody,
+            );
+            await reply(responseBody, MessageState.COMPLETE);
             return;
           }
 

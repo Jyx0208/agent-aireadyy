@@ -39,6 +39,7 @@ vi.mock("./strategy-fingerprint", async (importOriginal) => ({
 import {
   AGENT_TURN_TIMEOUT_MS,
   CarbonAgentChat,
+  parseExplicitBulkSearchTermAddition,
   type GrillControls,
 } from "./CarbonAgentChat";
 import { decodeAgentTurnResponse } from "./agent-turn";
@@ -145,54 +146,64 @@ afterEach(() => {
 });
 
 describe("dialogue session lifecycle", () => {
-  it("gives a long theme-list update the server-aligned turn deadline", async () => {
+  it("gives a model-routed strategy turn the server-aligned deadline", async () => {
     mocks.grillTurn.mockResolvedValueOnce(decodeAgentTurnResponse({
       status: "completed",
       action: "chat",
-      assistant_message: "Theme terms received.",
+      assistant_message: "I will recommend additional theme terms.",
       tool_calls: [],
     }));
     const chat = await mountChat();
-    const longThemeList = [
-      "MHC peptidome",
-      "HLA class I ligandome",
-      "HLA class II ligandome",
-      "immunopeptides",
-      "HLA ligands",
-      "MHC ligands",
-      "MHC-associated peptides",
-      "HLApeptidomics",
-      "MHC peptidomics",
-      "HLA-bound peptides",
-      "MHC-bound peptides",
-      "HLA-presented peptides",
-      "MHC-presented peptides",
-      "HLA-associated peptides",
-      "eluted HLA ligands",
-      "eluted MHC ligands",
-      "HLA immunopeptidome",
-      "MHC immunopeptidome",
-      "HLA-I peptidome",
-      "HLA-II peptidome",
-      "immunopeptide",
-      "immunopeptidomic",
-      "HLA",
-      "MHC",
-      "HLA immunoprecipitation",
-      "MHC immunoaffinity",
-      "W6/32",
-      "neoepitope",
-      "HLA neoantigen",
-    ].join("、");
 
-    await sendMessage(chat.props, chat.instance, `${longThemeList}。把这些词也作为主题词`);
+    await sendMessage(
+      chat.props,
+      chat.instance,
+      "请根据项目元数据的常见写法，再推荐一批可能遗漏的免疫肽主题词。",
+    );
 
     const payload = mocks.grillTurn.mock.calls[0][0] as {
       user_message: string;
       request_timeout_seconds: number;
     };
-    expect(payload.user_message).toContain("HLA neoantigen");
+    expect(payload.user_message).toContain("再推荐一批");
     expect(payload.request_timeout_seconds).toBeGreaterThanOrEqual(170);
+  });
+
+  it("adds an explicit bulk keyword list locally without calling the model", async () => {
+    expect(
+      parseExplicitBulkSearchTermAddition(
+        "HLA ligandome、MHC ligandome。把这些词也作为主题词",
+      ),
+    ).toEqual(["HLA ligandome", "MHC ligandome"]);
+    const chat = await mountChat([
+      "immunopeptidomics",
+      "immunopeptidome",
+      "HLA ligandome",
+    ]);
+    const prompt =
+      "MHC peptidome 、 HLA class I ligandome 、 HLA class II ligandome 、" +
+      "immunopeptides 、 HLA ligands 、 MHC ligands 、 MHC-associated peptides 、" +
+      "HLApeptidomics 、 MHC peptidomics 、 HLA-bound peptides 、 MHC-bound peptides 、" +
+      "HLA\u0002presented peptides 、 MHC-presented peptides 、 HLA-associated peptides 、" +
+      "eluted HLAligands 、 eluted MHC ligands 、 HLA immunopeptidome 、" +
+      "MHC immunopeptidome 、 HLA-Ipeptidome 、 HLA-II peptidome 、 immunopeptide 、" +
+      "immunopeptidomic 、 HLA 、 MHC 、 HLAimmunoprecipitation 、 MHC immunoaffinity 、" +
+      "W6/32 、 neoepitope 、 HLA neoantigen。这些关键词也要加";
+
+    await sendMessage(chat.props, chat.instance, prompt, "request-bulk-terms");
+
+    expect(mocks.grillTurn).not.toHaveBeenCalled();
+    const updated = chat.onIntentChange.mock.calls.at(-1)?.[0];
+    expect(updated.selectedSearchTerms).toEqual(expect.arrayContaining([
+      "immunopeptidomics",
+      "HLA class I ligandome",
+      "HLA-presented peptides",
+      "W6/32",
+      "HLA neoantigen",
+    ]));
+    expect(new Set(updated.selectedSearchTerms.map((term: string) => term.toLowerCase())).size)
+      .toBe(updated.selectedSearchTerms.length);
+    expect(updated.confirmed).toBe(false);
   });
 
   it("reports a model deadline as a timeout instead of an expired session", async () => {
