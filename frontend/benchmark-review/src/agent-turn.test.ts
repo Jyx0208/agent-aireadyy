@@ -76,6 +76,37 @@ describe("agent-turn response boundary", () => {
     expect(turn.gap_report?.required_missing).toEqual([]);
   });
 
+  it("applies exact ordered repository search terms from the fast path", () => {
+    const turn = decodeAgentTurnResponse({
+      status: "completed",
+      action: "update_strategy",
+      assistant_message: "Search terms appended.",
+      tool_calls: [
+        {
+          name: "update_strategy",
+          arguments: {
+            patch: {
+              selected_search_terms: [
+                "immunopeptidomics",
+                "HLA peptidomics",
+                "HLA",
+              ],
+            },
+          },
+        },
+      ],
+    });
+
+    const reduction = reduceAgentTurn(createEmptyIntent(), turn);
+
+    expect(reduction.spec.selectedSearchTerms).toEqual([
+      "immunopeptidomics",
+      "HLA peptidomics",
+      "HLA",
+    ]);
+    expect(reduction.strategyUpdated).toBe(true);
+  });
+
   it("canonicalizes predeclared option strategy patches at the shared response boundary", () => {
     const turn = decodeAgentTurnResponse({
       action: "clarify",
@@ -882,6 +913,32 @@ describe("D1 semantic confirmation and patch safety", () => {
     expect(turn.strategy_patch).toBeNull();
     expect(reduction.spec).toBe(original);
     expect(reduction.strategyUpdated).toBe(false);
+  });
+
+  it("accepts exhaustive-scale safety thresholds from the Agent", () => {
+    const turn = decodeAgentTurnResponse({
+      status: "completed",
+      action: "update_strategy",
+      assistant_message: "Updated.",
+      tool_calls: [{
+        name: "update_strategy",
+        arguments: {
+          patch: {
+            coverage_mode: "exhaustive",
+            target_project_count: 2000,
+            max_candidate_projects: 20000,
+            quota_flexibility: "open_ended",
+          },
+        },
+      }],
+    });
+
+    expect(turn.strategy_patch).toMatchObject({
+      coverageMode: "exhaustive",
+      targetProjectCount: 2000,
+      maxCandidateProjects: 20000,
+      quotaFlexibility: "open_ended",
+    });
   });
 
   it("accepts an Agent confirmation decision only while awaiting confirmation", () => {

@@ -161,6 +161,7 @@ export type DiscoveryJob = WorkflowRecord & {
   job_id?: string;
   logs?: WorkflowRecord[];
   record?: DiscoveryJobRecord;
+  execution_state?: WorkflowRecord;
   resumable?: boolean;
 };
 

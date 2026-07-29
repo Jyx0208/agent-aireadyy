@@ -20,6 +20,7 @@ from agent.discovery.query_portfolio import (
     classify_atomic_seed_budget_role,
     QueryPortfolio,
     build_query_portfolio_units,
+    expand_query_unit_seeds,
     is_filter_budget_role,
     resolve_budget_role,
 )
@@ -331,6 +332,10 @@ class DiscoverySearchEnvironment(Protocol):
 
     def inspect(self, action: CandidateInspectionAction) -> CandidateInspectionResult: ...
 
+    def is_query_exhausted(self, query: str) -> bool: ...
+
+    def reviewable_accessions(self, *, limit: int | None = None) -> list[str]: ...
+
     def close(self) -> None: ...
 
 
@@ -398,6 +403,38 @@ class PrideDiscoverySearchEnvironment:
             return accessions[: max(0, int(limit))]
         return accessions
 
+    def reviewable_accessions(self, *, limit: int | None = None) -> list[str]:
+        """Return every ranked candidate that did not fail metadata hard filters.
+
+        High-relevance scoring remains useful for ordering, but exhaustive
+        discovery must not silently turn that heuristic into a candidate-pool
+        cap.  Project inspection is the authority for the final conclusion.
+        """
+
+        accessions = [
+            accession
+            for accession, _record, preview in self._ranked_records()
+            if not preview.excluded
+        ]
+        if limit is not None:
+            return accessions[: max(0, int(limit))]
+        return accessions
+
+    def is_query_exhausted(self, query: str) -> bool:
+        """Report whether every repository seed for one confirmed phrase ended."""
+
+        # Use the exact same phrase-preserving planner as repository execution.
+        # The legacy query builder atomizes phrases such as "HLA ligandome",
+        # which would make the exhaustion probe check different seed keys from
+        # the ones persisted by ``build_query_portfolio_units``.
+        prepared = expand_query_unit_seeds(query) or [query]
+        seed_keys = {
+            " ".join(str(seed).casefold().split())
+            for seed in prepared
+            if str(seed).strip()
+        }
+        return bool(seed_keys) and seed_keys.issubset(self._exhausted_seeds)
+
     def search(self, action: CandidateSearchAction) -> CandidateSearchObservation:
         return self._search(action, request_budget=None)
 
@@ -420,11 +457,15 @@ class PrideDiscoverySearchEnvironment:
         continuous_search = bool(self.request.continuous_discovery) or bool(
             self.request.harvest_all_qualified
         )
-        confirmed_theme_order = [
-            " ".join(str(term).casefold().split())
+        confirmed_themes = [
+            (
+                " ".join(str(term).casefold().split()),
+                " ".join(str(term).split()),
+            )
             for term in self.request.query_terms or []
             if str(term).strip()
         ]
+        confirmed_theme_order = [key for key, _display in confirmed_themes]
         active_confirmed_theme = next(
             (
                 term
@@ -449,11 +490,63 @@ class PrideDiscoverySearchEnvironment:
             and not submitted_queries_are_already_exhausted
             and submitted_theme_queries != [active_confirmed_theme]
         ):
-            raise ValueError(
-                "open_ended_theme_order_violation: "
-                f"expected {active_confirmed_theme}; search that confirmed theme alone "
-                "until repository_seed_exhausted before using another synonym"
+            active_theme_display = next(
+                display
+                for key, display in confirmed_themes
+                if key == active_confirmed_theme
             )
+            requested_queries = [item.query for item in action.queries]
+            theme_depth = max(
+                200,
+                *(
+                    item.depth
+                    for item in action.queries
+                    if not _EXACT_PRIDE_ACCESSION_RE.fullmatch(item.query.strip())
+                ),
+            )
+            active_rank = confirmed_theme_order.index(active_confirmed_theme)
+            exact_accessions = [
+                item
+                for item in action.queries
+                if _EXACT_PRIDE_ACCESSION_RE.fullmatch(item.query.strip())
+            ]
+            action = action.model_copy(
+                update={
+                    "queries": [
+                        RepositoryQuery(
+                            query=active_theme_display,
+                            depth=min(MAX_REPOSITORY_QUERY_DEPTH, theme_depth),
+                            intent_dimension="confirmed theme order",
+                            expected_gain=(
+                                "Continue the active confirmed theme from its saved "
+                                "repository offset until exhaustion."
+                            ),
+                            budget_role=(
+                                "primary_theme" if active_rank == 0 else "theme_synonym"
+                            ),
+                        ),
+                        *exact_accessions,
+                    ],
+                    "rationale": (
+                        "Deterministic scheduler corrected an out-of-order Agent "
+                        f"request to the active confirmed theme {active_theme_display}. "
+                        f"{action.rationale}"
+                    )[:2000],
+                }
+            )
+            self._emit_search_event(
+                "repository_theme_order_corrected",
+                requested_queries=requested_queries,
+                executed_query=active_theme_display,
+                requested_depth=theme_depth,
+                reason="active_confirmed_theme_not_exhausted",
+            )
+            if self.report is not None:
+                self.report(
+                    "Corrected out-of-order Agent search "
+                    f"({'; '.join(requested_queries)}) to active confirmed theme "
+                    f"{active_theme_display}."
+                )
         if len(self.intent_terms) <= 1:
             translated_terms = _extract_candidate_terms(
                 " ".join(

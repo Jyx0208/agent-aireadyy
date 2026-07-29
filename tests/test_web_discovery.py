@@ -105,6 +105,141 @@ def test_discovery_job_event_is_structured_and_recursively_sanitized(monkeypatch
             web_app._discovery_jobs.pop(job_id, None)
 
 
+def test_discovery_job_projects_authoritative_term_and_review_queue_state(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    job_id = "execution_projection"
+    with web_app._discovery_jobs_lock:
+        web_app._discovery_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "running",
+            "logs": [],
+        }
+
+    def emit(sequence: int, event_type: str, payload: dict[str, object]) -> None:
+        web_app._append_discovery_job_event(
+            job_id,
+            AgentEvent(
+                sequence=sequence,
+                run_id="run_1",
+                event_type=event_type,
+                created_at=f"2026-07-28T10:00:{sequence:02d}+08:00",
+                payload=payload,
+            ),
+        )
+
+    try:
+        emit(
+            1,
+            "confirmed_theme_pipeline_started",
+            {"terms": ["immunopeptidomics", "HLA ligandome"], "term_count": 2},
+        )
+        emit(
+            2,
+            "repository_term_task_started",
+            {
+                "term": "immunopeptidomics",
+                "term_index": 1,
+                "term_count": 2,
+                "role": "primary_theme",
+            },
+        )
+        emit(
+            3,
+            "repository_term_chunk_completed",
+            {
+                "term": "immunopeptidomics",
+                "term_index": 1,
+                "chunk_index": 1,
+                "raw_result_count": 200,
+                "new_candidate_count": 180,
+                "candidate_count": 180,
+                "exhausted": True,
+            },
+        )
+        assert (
+            web_app._discovery_jobs[job_id]["execution_state"]["terms"][0][
+                "exhausted"
+            ]
+            is True
+        )
+        emit(
+            4,
+            "candidate_review_queue_batch_started",
+            {
+                "term": "immunopeptidomics",
+                "term_index": 1,
+                "term_count": 2,
+                "batch_size": 30,
+                "review_workers": 4,
+            },
+        )
+        emit(
+            5,
+            "candidate_review_queue_batch_completed",
+            {
+                "term": "immunopeptidomics",
+                "term_index": 1,
+                "term_count": 2,
+                "reviewed_project_count": 30,
+            },
+        )
+        emit(
+            6,
+            "repository_term_task_completed",
+            {
+                "term": "immunopeptidomics",
+                "term_index": 1,
+                "term_count": 2,
+                "chunks_completed": 1,
+                "raw_result_count": 200,
+                "new_candidate_count": 180,
+                "reviewed_project_count": 30,
+                "exhausted": True,
+            },
+        )
+
+        public = web_app._discovery_job_public(
+            web_app._discovery_jobs[job_id],
+            detail=True,
+        )
+        state = public["execution_state"]
+        assert state["schema_version"] == "discovery-execution/v1"
+        assert state["candidate_count"] == 180
+        assert state["reviewed_project_count"] == 30
+        assert state["active_term_index"] == 2
+        assert state["terms"][0] == {
+            "term": "immunopeptidomics",
+            "term_index": 1,
+            "term_count": 2,
+            "role": "primary_theme",
+            "status": "completed",
+            "chunks_completed": 1,
+            "raw_result_count": 200,
+            "new_candidate_count": 180,
+            "exhausted": True,
+            "failure_reason": "",
+            "reviewed_project_count": 30,
+        }
+        assert state["terms"][1]["status"] == "pending"
+
+        emit(
+            7,
+            "confirmed_theme_pipeline_started",
+            {"terms": ["immunopeptidomics", "HLA ligandome"], "term_count": 2},
+        )
+        resumed_state = web_app._discovery_jobs[job_id]["execution_state"]
+        assert resumed_state["candidate_count"] == 180
+        assert resumed_state["reviewed_project_count"] == 30
+        assert resumed_state["terms"][0]["raw_result_count"] == 200
+        assert resumed_state["terms"][0]["exhausted"] is True
+    finally:
+        with web_app._discovery_jobs_lock:
+            web_app._discovery_jobs.pop(job_id, None)
+
+
 def test_verified_batch_event_is_public_without_local_manifest_path(
     monkeypatch,
     tmp_path: Path,
@@ -726,6 +861,45 @@ def test_failed_discovery_job_can_resume_from_persisted_state(monkeypatch, tmp_p
 
     assert resumed["status"] == "queued"
     assert resumed["resumable"] is False
+    assert resumed["error"] is None
+    assert started == [job_id, job_id]
+    with web_app._discovery_jobs_lock:
+        assert (
+            web_app._discovery_jobs[job_id]["body"]["_execution_discovery_id"]
+            == execution_id
+        )
+
+
+def test_user_cancelled_discovery_job_can_resume_from_persisted_state(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    started: list[str] = []
+    monkeypatch.setattr(web_app, "_start_discovery_job_thread", started.append)
+    created = asyncio.run(
+        web_app.start_discovery_job(
+            {
+                "prompt": "Find all human immunopeptidomics projects",
+                "grill_confirmed": True,
+            }
+        )
+    )
+    job_id = created["job_id"]
+    with web_app._discovery_jobs_lock:
+        job = web_app._discovery_jobs[job_id]
+        execution_id = job["body"]["_execution_discovery_id"]
+        job["status"] = "cancelled"
+        job["cancel_requested"] = True
+        job["resumable"] = False  # Legacy cancelled jobs persisted this value.
+        job["error"] = "Discovery cancelled by user."
+        web_app._persist_discovery_job(job)
+
+    resumed = asyncio.run(web_app.resume_discovery_job(job_id))
+
+    assert resumed["status"] == "queued"
+    assert resumed["resumable"] is False
+    assert resumed["cancel_requested"] is False
     assert resumed["error"] is None
     assert started == [job_id, job_id]
     with web_app._discovery_jobs_lock:

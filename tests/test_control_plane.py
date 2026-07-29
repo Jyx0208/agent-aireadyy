@@ -20,6 +20,7 @@ from agent.control_plane.models import (
     AgentRunRecord,
     BudgetDecision,
     DynamicBudgetLimits,
+    DynamicBudgetUsage,
     OpenAIAgentsDiscoveryResult,
     SearchProposalInput,
     recommended_inspection_rounds,
@@ -540,6 +541,234 @@ def test_candidate_search_pipeline_inspects_new_ranked_accessions_without_duplic
     assert second["automatic_inspection"] is None
     assert second["pipeline"]["skipped_inspection_reason"] == "no_new_ranked_candidates"
     assert len(environment.inspection_actions) == 1
+
+
+def test_confirmed_term_pipeline_exhausts_each_term_before_review_and_next_term(
+    tmp_path: Path,
+) -> None:
+    class ExhaustivePipelineEnvironment(_FakeSearchEnvironment):
+        def __init__(self, request: DatasetRequest) -> None:
+            super().__init__(request)
+            self.calls: list[str] = []
+            self.term_calls: dict[str, int] = {}
+            self.records: list[str] = []
+            self.exhausted: set[str] = set()
+            self.latest_search_id = ""
+
+        def search(self, action: CandidateSearchAction) -> CandidateSearchObservation:
+            term = action.queries[0].query
+            call_index = self.term_calls.get(term, 0) + 1
+            self.term_calls[term] = call_index
+            self.search_actions.append(action)
+            self.calls.append(f"search:{term}:{call_index}")
+            additions = {
+                ("core theme", 1): ["PXD000001"],
+                ("core theme", 2): ["PXD000002"],
+                ("theme synonym", 1): ["PXD000002", "PXD000003"],
+            }[(term, call_index)]
+            before = set(self.records)
+            self.records.extend(
+                accession for accession in additions if accession not in self.records
+            )
+            if (term, call_index) in {
+                ("core theme", 2),
+                ("theme synonym", 1),
+            }:
+                self.exhausted.add(term.casefold())
+            self.latest_search_id = f"search_{len(self.search_actions):04d}"
+            return CandidateSearchObservation(
+                search_id=self.latest_search_id,
+                query_yields=[
+                    QueryYield(
+                        query=term,
+                        executed_query=term,
+                        intent_dimension="confirmed theme",
+                        requested_depth=action.queries[0].depth,
+                        raw_result_count=len(additions),
+                        new_candidate_count=len(set(additions) - before),
+                        duplicate_count=len(additions) - len(set(additions) - before),
+                    )
+                ],
+                raw_result_count=len(additions),
+                candidate_count=len(self.records),
+                new_candidate_count=len(set(additions) - before),
+                duplicate_count=len(additions) - len(set(additions) - before),
+                duplicate_rate=0.0,
+                high_relevance_candidate_count=len(self.records),
+                rationale=action.rationale,
+            )
+
+        def is_query_exhausted(self, query: str) -> bool:
+            return query.casefold() in self.exhausted
+
+        def reviewable_accessions(self, *, limit: int | None = None) -> list[str]:
+            values = list(self.records)
+            return values if limit is None else values[:limit]
+
+        def inspect(self, action: CandidateInspectionAction) -> CandidateInspectionResult:
+            self.calls.append("inspect:" + ",".join(action.accessions))
+            return super().inspect(action)
+
+    request = DatasetRequest(
+        repository="pride",
+        query_terms=["core theme", "theme synonym"],
+        max_projects=2_000,
+        max_files=10_000,
+        continuous_discovery=True,
+        harvest_all_qualified=True,
+        quota_flexibility="open_ended",
+        inspection_batch_size=30,
+    )
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("confirmed_term_pipeline").model_copy(
+            update={
+                "status": "running",
+                "budget": AgentBudget(
+                    max_turns=8,
+                    max_tool_calls=20,
+                    max_discovery_rounds=10,
+                ),
+                "dynamic_limits": DynamicBudgetLimits(),
+            }
+        )
+    )
+    environment = ExhaustivePipelineEnvironment(request)
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=environment,
+    )
+
+    result = service.run_confirmed_term_pipeline()
+
+    assert result["status"] == "completed"
+    assert result["all_terms_exhausted"] is True
+    assert result["pending_review_count"] == 0
+    assert result["term_count"] == 2
+    assert environment.calls == [
+        "search:core theme:1",
+        "search:core theme:2",
+        "inspect:PXD000001,PXD000002",
+        "search:theme synonym:1",
+        "inspect:PXD000003",
+    ]
+    assert [
+        action.queries[0].query for action in environment.search_actions
+    ] == ["core theme", "core theme", "theme synonym"]
+    assert [
+        accession
+        for action in environment.inspection_actions
+        for accession in action.accessions
+    ] == ["PXD000001", "PXD000002", "PXD000003"]
+    term_events = [
+        event
+        for event in store.list_events(run.run_id)
+        if event.event_type.startswith("repository_term_task_")
+    ]
+    assert [event.event_type for event in term_events] == [
+        "repository_term_task_started",
+        "repository_term_task_completed",
+        "repository_term_task_started",
+        "repository_term_task_completed",
+    ]
+    assert term_events[1].payload["chunks_completed"] == 2
+    assert term_events[3].payload["chunks_completed"] == 1
+
+
+def test_confirmed_term_pipeline_stops_before_next_term_when_review_fails(
+    tmp_path: Path,
+) -> None:
+    class ReviewFailureEnvironment(_FakeSearchEnvironment):
+        def __init__(self, request: DatasetRequest) -> None:
+            super().__init__(request)
+            self.records = ["PXD000001"]
+            self.exhausted: set[str] = set()
+            self.latest_search_id = ""
+
+        @property
+        def candidate_accessions(self) -> list[str]:
+            return list(self.records)
+
+        def search(self, action: CandidateSearchAction) -> CandidateSearchObservation:
+            term = action.queries[0].query
+            self.search_actions.append(action)
+            self.exhausted.add(term.casefold())
+            self.latest_search_id = f"search_{len(self.search_actions):04d}"
+            return CandidateSearchObservation(
+                search_id=self.latest_search_id,
+                query_yields=[
+                    QueryYield(
+                        query=term,
+                        executed_query=term,
+                        intent_dimension="confirmed theme",
+                        requested_depth=action.queries[0].depth,
+                        raw_result_count=1,
+                        new_candidate_count=1,
+                        duplicate_count=0,
+                    )
+                ],
+                raw_result_count=1,
+                candidate_count=1,
+                new_candidate_count=1,
+                duplicate_count=0,
+                duplicate_rate=0.0,
+                high_relevance_candidate_count=1,
+                rationale=action.rationale,
+            )
+
+        def is_query_exhausted(self, query: str) -> bool:
+            return query.casefold() in self.exhausted
+
+        def reviewable_accessions(self, *, limit: int | None = None) -> list[str]:
+            return list(self.records)
+
+        def inspect(self, action: CandidateInspectionAction) -> CandidateInspectionResult:
+            self.inspection_actions.append(action)
+            raise RuntimeError("temporary project metadata failure")
+
+    request = DatasetRequest(
+        repository="pride",
+        query_terms=["core theme", "later synonym"],
+        continuous_discovery=True,
+        harvest_all_qualified=True,
+        quota_flexibility="open_ended",
+    )
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("review_failure_blocks_synonym").model_copy(
+            update={
+                "status": "running",
+                "budget": AgentBudget(max_turns=8, max_tool_calls=5),
+                "dynamic_limits": DynamicBudgetLimits(),
+            }
+        )
+    )
+    environment = ReviewFailureEnvironment(request)
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=environment,
+    )
+
+    result = service.run_confirmed_term_pipeline()
+
+    assert result["status"] == "partial"
+    assert result["failed_terms"] == ["core theme"]
+    assert result["pending_review_count"] == 1
+    assert [item.queries[0].query for item in environment.search_actions] == [
+        "core theme"
+    ]
+    failed = [
+        event
+        for event in store.list_events(run.run_id)
+        if event.event_type == "repository_term_task_failed"
+    ]
+    assert failed[-1].payload["reason"] == "candidate_review_queue_not_drained"
 
 
 def test_out_of_order_open_ended_theme_is_a_safe_skip_not_a_failed_search(
@@ -2356,6 +2585,73 @@ def test_openai_agents_setup_failure_is_persisted(monkeypatch, tmp_path: Path) -
     assert Path(result.files["agents_discovery_summary_json"]).exists()
     assert [event.event_type for event in AgentRunStore(state_db).list_events(result.run_id)] == [
         "run_started",
+        "run_failed",
+    ]
+
+
+def test_openai_agents_explicit_resume_reuses_cancelled_run(monkeypatch, tmp_path: Path) -> None:
+    from agent.control_plane import openai_agents
+    from agent.control_plane.models import AgentRunRecord
+
+    def fail_to_build_tool(_function):
+        raise RuntimeError("resumed setup reached")
+
+    monkeypatch.setattr(
+        openai_agents,
+        "_load_agents_sdk",
+        lambda: {"function_tool": fail_to_build_tool},
+    )
+    state_db = tmp_path / "state.sqlite"
+    request = DatasetRequest(repository="pride", species=["human"])
+    store = AgentRunStore(state_db)
+    store.save_run(
+        AgentRunRecord(
+            run_id="resume_cancelled_001",
+            workflow="discovery",
+            status="cancelled",
+            prompt="Find all human immunopeptidomics data",
+            request=request.model_dump(mode="json"),
+            budget=AgentBudget(max_turns=8, max_tool_calls=20),
+            sdk_turn_count=3,
+            tool_call_count=7,
+            discovery_round_count=2,
+            dynamic_usage=DynamicBudgetUsage(
+                query_units=4,
+                repository_requests=25_000,
+                search_batches=3,
+                budget_reviews=2,
+            ),
+            blockers=["Discovery cancelled."],
+            stop_reason="user_cancelled",
+        )
+    )
+
+    result = openai_agents.run_openai_agents_discovery(
+        prompt="Find all human immunopeptidomics data",
+        request=request,
+        output_dir=tmp_path / "output",
+        state_db=state_db,
+        run_id="resume_cancelled_001",
+        model=object(),
+        resume_existing=True,
+    )
+
+    assert result.status == "failed"
+    assert result.blockers == ["resumed setup reached"]
+    stored = store.load_run(result.run_id)
+    assert stored is not None
+    assert stored.sdk_turn_count == 3
+    assert stored.tool_call_count == 7
+    assert stored.discovery_round_count == 2
+    assert stored.dynamic_usage.repository_requests == 0
+    resumed_event = store.list_events(result.run_id)[0]
+    assert resumed_event.payload["budget_tranche_reset"] is True
+    assert (
+        resumed_event.payload["previous_dynamic_usage"]["repository_requests"]
+        == 25_000
+    )
+    assert [event.event_type for event in store.list_events(result.run_id)] == [
+        "run_resumed",
         "run_failed",
     ]
 

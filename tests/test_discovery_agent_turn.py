@@ -230,6 +230,50 @@ def test_web_critical_agenda_is_a_thin_profile_engine_delegate(monkeypatch):
     }
 
 
+def test_explicit_search_term_extension_bypasses_the_language_model(monkeypatch):
+    monkeypatch.setattr(
+        web_app,
+        "_discovery_llm_client",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Explicit repository search terms must use the deterministic fast path"
+        ),
+    )
+    current = [
+        "immunopeptidomics",
+        "immunopeptidome",
+        "HLA ligandome",
+    ]
+
+    result = web_app._run_discovery_grill_turn(
+        {
+            "user_message": (
+                "请扩充检索主题词。保留当前核心词，并新增："
+                "HLA peptidomics、MHC peptidomics、HLA-bound peptides。"
+                "最后使用 HLA、MHC、W6/32 进行宽泛补漏"
+            ),
+            "intent_snapshot": {
+                "selected_search_terms": current,
+                "run_horizon": "candidates_reviewed",
+            },
+            "resolved_fields": ["selected_search_terms", "run_horizon"],
+        }
+    )
+
+    expected = [
+        *current,
+        "HLA peptidomics",
+        "MHC peptidomics",
+        "HLA-bound peptides",
+        "HLA",
+        "MHC",
+        "W6/32",
+    ]
+    assert result["action"] == "update_strategy"
+    assert result["extra_fields"] == {"selected_search_terms": expected}
+    assert result["llm_used"] is False
+    assert result["parser"] == "deterministic_search_terms"
+
+
 def test_web_browse_only_agenda_does_not_load_training_questions():
     agenda = web_app._discovery_critical_decision_agenda(
         {
@@ -1065,6 +1109,7 @@ def test_d1_canonical_fields_are_strictly_isomorphic_with_frontend_strategy_fiel
         "mixed_acquisition_policy",
         "ptm_types",
         "special_themes",
+        "selected_search_terms",
         "labeling_strategy",
         "labeling_hard",
         "coverage_mode",
@@ -1086,7 +1131,7 @@ def test_d1_canonical_fields_are_strictly_isomorphic_with_frontend_strategy_fiel
 
 @pytest.mark.parametrize(
     ("field", "limit"),
-    [("target_project_count", 300), ("max_candidate_projects", 1000)],
+    [("target_project_count", 5000), ("max_candidate_projects", 20000)],
 )
 def test_numeric_contract_limits_match_frontend_product_ceilings(field: str, limit: int):
     accepted, accepted_errors = web_app._validate_discovery_strategy_patch(
@@ -1759,6 +1804,153 @@ def test_next_decision_derives_scope_from_predeclared_option_patches():
     assert decision["target_fields"] == ["task_type", "objective"]
     assert decision["option_patch_contract"] == "predeclared_v1"
     assert decision["recommendation"]["strategy_patch"]["task_type"] == "denovo"
+
+
+def test_task_decision_cannot_overwrite_resolved_open_ended_search_scale(monkeypatch):
+    """A downstream-task choice must preserve the user's explicit exhaustive scope."""
+
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "assistant_message": "Choose the downstream analysis.",
+            "tool_calls": [],
+            "next_decision": {
+                "focus": "downstream_task",
+                "target_fields": [
+                    "task_type",
+                    "coverage_mode",
+                    "target_project_count",
+                    "quota_flexibility",
+                ],
+                "question": "What will you do with these data?",
+                "recommendation": {
+                    "id": "browse_only",
+                    "label": "Browse first",
+                    "reason": "Explore the public data landscape first.",
+                },
+                "options": [
+                    {
+                        "id": "browse_only",
+                        "label": "Browse first",
+                        "reason": "Explore the public data landscape first.",
+                        "strategy_patch": {
+                            "task_type": "browse_only",
+                            "coverage_mode": "curated",
+                            "target_project_count": 20,
+                            "quota_flexibility": "recommended",
+                        },
+                    },
+                    {
+                        "id": "denovo",
+                        "label": "De novo",
+                        "reason": "Train a de novo sequencing model.",
+                        "strategy_patch": {"task_type": "denovo"},
+                    },
+                ],
+                "revisit_existing": False,
+            },
+        },
+        user_message="Find all human immunopeptidomics data in PRIDE.",
+        intent_snapshot={
+            "task_type": "",
+            "coverage_mode": "exhaustive",
+            "target_project_count": None,
+            "quota_flexibility": "open_ended",
+        },
+        resolved_fields=[
+            "coverage_mode",
+            "target_project_count",
+            "quota_flexibility",
+        ],
+        gap_report={
+            "required_missing": ["task_type"],
+            "optional_missing": [],
+            "ready_for_confirm": False,
+        },
+    )
+
+    decision = result["next_decision"]
+    assert decision["target_fields"] == ["task_type"]
+    assert decision["options"][0]["strategy_patch"] == {
+        "task_type": "browse_only"
+    }
+
+
+def test_numeric_task_choice_preserves_resolved_open_ended_search_scale(monkeypatch):
+    pending = {
+        "focus": "downstream_task",
+        "question": "What will you do with these data?",
+        "recommendation": {
+            "id": "browse_only",
+            "label": "Browse first",
+            "reason": "Explore the public data landscape first.",
+        },
+        "options": [
+            {
+                "id": "browse_only",
+                "label": "Browse first",
+                "reason": "Explore the public data landscape first.",
+                "strategy_patch": {
+                    "task_type": "browse_only",
+                    "coverage_mode": "curated",
+                    "target_project_count": 20,
+                    "quota_flexibility": "recommended",
+                },
+            },
+            {
+                "id": "denovo",
+                "label": "De novo",
+                "reason": "Train a de novo sequencing model.",
+                "strategy_patch": {"task_type": "denovo"},
+            },
+        ],
+    }
+    result, _llm = _run_turn(
+        monkeypatch,
+        {
+            "action": "update_strategy",
+            "assistant_message": "Applied browse-only.",
+            "tool_calls": [
+                {
+                    "name": "update_strategy",
+                    "arguments": {
+                        "patch": {
+                            "task_type": "browse_only",
+                            "coverage_mode": "curated",
+                            "target_project_count": 20,
+                            "quota_flexibility": "recommended",
+                        }
+                    },
+                }
+            ],
+        },
+        user_message="1",
+        pending_decision=pending,
+        intent_snapshot={
+            "task_type": "",
+            "coverage_mode": "exhaustive",
+            "target_project_count": None,
+            "quota_flexibility": "open_ended",
+        },
+        resolved_fields=[
+            "coverage_mode",
+            "target_project_count",
+            "quota_flexibility",
+        ],
+        gap_report={
+            "required_missing": ["task_type"],
+            "optional_missing": [],
+            "ready_for_confirm": False,
+        },
+    )
+
+    assert result["extra_fields"] == {"task_type": "browse_only"}
+    assert result["option_resolution"]["discarded_model_fields"] == [
+        "coverage_mode",
+        "quota_flexibility",
+        "target_project_count",
+    ]
 
 
 def test_numeric_selected_option_cannot_authorize_out_of_scope_fields(monkeypatch):
@@ -5034,6 +5226,14 @@ def test_compound_commitment_hints_extracts_packed_sentence_without_inventing_rt
     assert packed["run_horizon"] == "candidates_reviewed"
     assert packed["special_themes"] == ["immunopeptidomics"]
 
+    all_data = web_app._discovery_compound_commitment_hints(
+        "目标：检索PRIDE数据库中的所有人类免疫肽组学数据"
+    )
+    assert all_data["species"] == ["human"]
+    assert all_data["coverage_mode"] == "exhaustive"
+    assert all_data["quota_flexibility"] == "open_ended"
+    assert all_data["target_project_count"] is None
+
     # Theme-only chat must not invent RT or acquisition/horizon.
     immuno_only = web_app._discovery_compound_commitment_hints("免疫肽数据")
     assert "task_type" not in immuno_only
@@ -6509,6 +6709,43 @@ def test_discovery_job_start_accepts_explicit_confirmation(monkeypatch, tmp_path
                 web_app._discovery_jobs.pop(job_id, None)
 
 
+def test_discovery_job_rejects_confirmed_exhaustive_intent_with_legacy_bounded_payload(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    started: list[str] = []
+    monkeypatch.setattr(web_app, "_start_discovery_job_thread", started.append)
+    before = set(web_app._discovery_jobs)
+
+    try:
+        result = asyncio.run(
+            web_app.start_discovery_job(
+                {
+                    "prompt": "目标：检索PRIDE数据库中的所有人类免疫肽组学数据",
+                    "goal": "immunopeptidomics",
+                    "scale_mode": "curated",
+                    "max_projects": 20,
+                    "max_candidate_projects": 80,
+                    "continuous_discovery": False,
+                    "quota_flexibility": "recommended",
+                    "quantity_scope": "unspecified",
+                    "grill_confirmed": True,
+                }
+            )
+        )
+
+        assert result["status"] == "rejected"
+        assert result["code"] == "exhaustive_intent_downgraded"
+        assert "重新确认" in result["error"]
+        assert started == []
+        assert set(web_app._discovery_jobs) == before
+    finally:
+        with web_app._discovery_jobs_lock:
+            for job_id in set(web_app._discovery_jobs) - before:
+                web_app._discovery_jobs.pop(job_id, None)
+
+
 def test_confirmation_fingerprint_is_bound_to_exact_execution_payload(
     monkeypatch,
     tmp_path,
@@ -6560,7 +6797,11 @@ def test_confirmation_fingerprint_survives_server_internal_execution_id():
 
     assert web_app._discovery_confirmation_rejection(body) is None
     assert web_app._discovery_confirmation_rejection(
-        {**body, "_execution_discovery_id": "agents_job_discovery_job_123"}
+        {
+            **body,
+            "_execution_discovery_id": "agents_job_discovery_job_123",
+            "_resume_existing_discovery_run": True,
+        }
     ) is None
 
 

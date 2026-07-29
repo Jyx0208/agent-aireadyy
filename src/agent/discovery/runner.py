@@ -42,6 +42,7 @@ def run_agents_discovery(
     event_callback: Callable[[Any], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
     stream_events: bool = False,
+    resume_existing: bool = False,
 ) -> OpenAIAgentsDiscoveryResult:
     """Run the production default agents discovery path behind one interface."""
     return run_openai_agents_discovery(
@@ -63,4 +64,5 @@ def run_agents_discovery(
         event_callback=event_callback,
         should_cancel=should_cancel,
         stream_events=stream_events,
+        resume_existing=resume_existing,
     )

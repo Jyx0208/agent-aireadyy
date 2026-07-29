@@ -1426,8 +1426,53 @@ def _clean_discovery_ptm_types(value: Any, *, default: list[str] | None = None) 
 _FIXED_DISCOVERY_RUN_HORIZON = "candidates_reviewed"
 
 
+def _has_explicit_exhaustive_discovery_intent(value: Any) -> bool:
+    """Recognize user language that means portfolio-wide discovery, not a quota."""
+
+    text = _clean_text(value)
+    if not text:
+        return False
+    return bool(
+        re.search(
+            r"("
+            r"越多越好|尽可能多|尽量多|尽量搜全|搜全|覆盖全|不设上限|无上限|全量|"
+            r"(?:所有|全部).{0,24}(?:数据|项目|文件|候选)|"
+            r"(?:数据|项目|文件|候选).{0,16}(?:所有|全部)|"
+            r"as\s+many\s+as\s+possible|all\s+(?:relevant\s+)?(?:data|datasets|projects|files)|"
+            r"no\s+(?:candidate\s+pool\s+)?limit|open[-\s]?ended|exhaustive|comprehensive"
+            r")",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _discovery_exhaustive_payload_conflict(body: Mapping[str, Any]) -> bool:
+    """Fail closed when old clients turn an explicit exhaustive goal into 20/80."""
+
+    prompt = _clean_text(
+        body.get("prompt")
+        or body.get("visible_prompt")
+        or body.get("objective")
+        or body.get("goal")
+        or ""
+    )
+    if not _has_explicit_exhaustive_discovery_intent(prompt):
+        return False
+    if _clean_text(body.get("quota_flexibility")).lower() == "fixed":
+        return False
+    return not (
+        body.get("continuous_discovery") is True
+        and _clean_text(body.get("scale_mode")).lower() == "exhaustive"
+        and _clean_text(body.get("quota_flexibility")).lower() == "open_ended"
+        and _clean_text(body.get("quantity_scope")).lower() == "portfolio"
+        and _clean_text(body.get("portfolio_size_preference")).lower().startswith("maximize")
+    )
+
+
 def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
     prompt_text = _clean_text(body.get("prompt") or body.get("visible_prompt") or body.get("goal") or "")
+    explicit_exhaustive = _has_explicit_exhaustive_discovery_intent(prompt_text)
     incoming_provenance = body.get("constraint_provenance")
     incoming_provenance = (
         {str(key): str(value) for key, value in incoming_provenance.items()}
@@ -1476,6 +1521,8 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
     ).lower()
     if quota_flexibility not in {"fixed", "recommended", "open_ended"}:
         quota_flexibility = "recommended"
+    if explicit_exhaustive and quota_flexibility != "fixed":
+        quota_flexibility = "open_ended"
     time_budget_preference = _clean_text(
         body.get("time_budget_preference") or body.get("time_budget") or "multi_round"
     ).lower()
@@ -1608,10 +1655,13 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
         portfolio_size_preference = (
             portfolio_size_preference or "maximize_qualified_projects"
         )
-    if quantity_scope == "unspecified" and re.search(
-        r"(越多越好|尽可能多|as many as possible|maximize.*(project|dataset|sample)|越多越)",
-        prompt_text,
-        re.IGNORECASE,
+    if quantity_scope == "unspecified" and (
+        explicit_exhaustive
+        or re.search(
+            r"(越多越好|尽可能多|as many as possible|maximize.*(project|dataset|sample)|越多越)",
+            prompt_text,
+            re.IGNORECASE,
+        )
     ):
         quantity_scope = "portfolio"
         portfolio_size_preference = portfolio_size_preference or "maximize_qualified_projects"
@@ -1782,10 +1832,32 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
         exclude_rules=exclude_rules,
         success_criteria=success_criteria,
         scientific_constraints=scientific_constraints,
-        max_projects=_bounded_int(body.get("max_projects"), default=2000, minimum=1, maximum=5000),
+        max_projects=(
+            max(
+                2000,
+                _bounded_int(body.get("max_projects"), default=2000, minimum=1, maximum=5000),
+            )
+            if explicit_exhaustive and quota_flexibility != "fixed"
+            else _bounded_int(body.get("max_projects"), default=2000, minimum=1, maximum=5000)
+        ),
         max_files=_bounded_int(body.get("max_files"), default=100000, minimum=1, maximum=200000),
-        max_candidate_projects=_bounded_int(
-            body.get("max_candidate_projects"), default=5000, minimum=1, maximum=20000
+        max_candidate_projects=(
+            max(
+                20000,
+                _bounded_int(
+                    body.get("max_candidate_projects"),
+                    default=20000,
+                    minimum=1,
+                    maximum=20000,
+                ),
+            )
+            if explicit_exhaustive and quota_flexibility != "fixed"
+            else _bounded_int(
+                body.get("max_candidate_projects"),
+                default=5000,
+                minimum=1,
+                maximum=20000,
+            )
         ),
         max_files_per_project=_bounded_int(
             body.get("max_files_per_project"), default=500, minimum=1, maximum=5000
@@ -1796,8 +1868,10 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
         inspection_batch_size=_bounded_int(
             body.get("inspection_batch_size"), default=30, minimum=1, maximum=100
         ),
-        continuous_discovery=bool(
-            body.get("continuous_discovery", quantity_scope == "portfolio")
+        continuous_discovery=(
+            True
+            if explicit_exhaustive and quota_flexibility != "fixed"
+            else bool(body.get("continuous_discovery", quantity_scope == "portfolio"))
         ),
         quantity_scope=quantity_scope,  # type: ignore[arg-type]
         portfolio_size_preference=portfolio_size_preference,
@@ -1965,10 +2039,10 @@ _POOL_BUILD_SCALE_PRESETS: dict[str, dict[str, int]] = {
         "max_files_per_project": 250,
     },
     "exhaustive": {
-        # Soft ambition only. Portfolio maximize keeps every qualified project
-        # within server safety ceilings; these are not "stop at 300" hard caps.
+        # Soft per-run safety thresholds only. Portfolio maximize keeps every
+        # qualified project across resumable rounds; these are not business caps.
         "max_projects": 2000,
-        "max_candidate_projects": 5000,
+        "max_candidate_projects": 20000,
         "max_files": 100000,
         "max_files_per_project": 500,
     },
@@ -2003,7 +2077,7 @@ def _normalise_pool_build_scale(value: Any, *, prompt: str = "", allow_auto: boo
     if normalized and (normalized != "auto" or allow_auto):
         return normalized
     text = _clean_text(prompt).casefold()
-    if any(marker in text for marker in ("越多越好", "尽可能多", "尽量搜全", "全部相关", "as many as possible", "exhaustive", "comprehensive")):
+    if _has_explicit_exhaustive_discovery_intent(text):
         return "exhaustive"
     if any(marker in text for marker in ("精选", "少量", "先验证", "pilot", "curated", "small set")):
         return "curated"
@@ -2030,8 +2104,8 @@ def _pool_build_scale_warning(scale_mode: str, output_language: str) -> str | No
     if scale_mode != "exhaustive":
         return None
     if output_language == "zh-CN":
-        return "“尽量搜全”将在当前安全上限内检索，首版最多入选约 200 个项目。"
-    return "Exhaustive mode searches up to the current safety ceiling, capped at about 200 selected projects in v1."
+        return "“尽量搜全”不设业务候选池上限；安全上限只用于分轮运行与续跑，不会把结果截断为固定项目数。"
+    return "Exhaustive mode has no business candidate-pool cap; safety thresholds only split resumable rounds and do not truncate the result to a fixed project count."
 
 
 def _localize_prompt_parse_warning(value: Any, output_language: str) -> str:
@@ -2312,6 +2386,7 @@ _DISCOVERY_STRATEGY_FIRST_CLASS_FIELDS = {
     "mixed_acquisition_policy",
     "ptm_types",
     "special_themes",
+    "selected_search_terms",
     "labeling_strategy",
     "labeling_hard",
     "coverage_mode",
@@ -2355,6 +2430,7 @@ _DISCOVERY_LOW_RISK_SINGLE_FIELD_VERIFIER_SKIP = frozenset(
         "instrument_preference",
         "run_horizon",
         "special_themes",
+        "selected_search_terms",
         "notes",
     }
 )
@@ -2398,6 +2474,7 @@ _DISCOVERY_STRATEGY_PATCH_ALIASES = {
     "mixedAcquisitionPolicy": "mixed_acquisition_policy",
     "ptmTypes": "ptm_types",
     "specialThemes": "special_themes",
+    "selectedSearchTerms": "selected_search_terms",
     "labelingStrategy": "labeling_strategy",
     "labelingHard": "labeling_hard",
     "coverageMode": "coverage_mode",
@@ -2429,8 +2506,8 @@ _DISCOVERY_STRATEGY_PATCH_CONTRACT = {
         "notes_chars": 4000,
         "array_items": 100,
         "array_item_chars": 240,
-        "target_project_count": 300,
-        "max_candidate_projects": 1000,
+        "target_project_count": 5000,
+        "max_candidate_projects": 20000,
     },
     "objective": "string",
     "task_type": [
@@ -2451,6 +2528,7 @@ _DISCOVERY_STRATEGY_PATCH_CONTRACT = {
     "mixed_acquisition_policy": ["reject_mixed", "review_mixed", "allow"],
     "ptm_types": "array[string], [] clears",
     "special_themes": "array[string], [] clears",
+    "selected_search_terms": "ordered array[string], [] clears",
     "labeling_strategy": [
         "label_free",
         "tmt",
@@ -2495,6 +2573,10 @@ _DISCOVERY_STRATEGY_FIELD_SEMANTICS = {
     "mixed_acquisition_policy": "How mixed-acquisition projects are handled.",
     "ptm_types": "Post-translational modifications only; immunopeptidomics itself is not a PTM.",
     "special_themes": "研究主题/biological study themes. Never use this field for 标记方式, labeling chemistry, acquisition, or run horizon.",
+    "selected_search_terms": (
+        "Exact ordered PRIDE repository query phrases explicitly selected by the user. "
+        "Preserve their order because discovery searches core terms before broad fallback terms."
+    ),
     "labeling_strategy": "标记方式/chemical or isotope labeling strategy; any means intentionally unrestricted/open. A request that labeling is open belongs here, never in special_themes.",
     "labeling_hard": "Whether the labeling choice is a hard filter.",
     "coverage_mode": "Curation-versus-breadth preference, distinct from the exact project target.",
@@ -2532,6 +2614,7 @@ _DISCOVERY_STRATEGY_FIELD_LABELS_ZH = {
     "mixed_acquisition_policy": "混合采集处理",
     "ptm_types": "PTM",
     "special_themes": "研究主题",
+    "selected_search_terms": "仓库检索主题词",
     "labeling_strategy": "标记方式",
     "labeling_hard": "标记硬限制",
     "coverage_mode": "覆盖模式",
@@ -2769,16 +2852,17 @@ _DISCOVERY_STRATEGY_ARRAY_FIELDS = {
     "species",
     "ptm_types",
     "special_themes",
+    "selected_search_terms",
     "exclude_rules",
     "success_criteria",
     "open_risks",
 }
 _DISCOVERY_STRATEGY_BOOLEAN_FIELDS = {"labeling_hard"}
 _DISCOVERY_STRATEGY_INTEGER_LIMITS = {
-    # D1 card/product ceilings. The execution layer may have broader internal
-    # budgets, but the public strategy contract must match the typed frontend.
-    "target_project_count": 300,
-    "max_candidate_projects": 1000,
+    # Public strategy safety thresholds. Open-ended mode continues across
+    # resumable rounds and therefore never treats these as business caps.
+    "target_project_count": 5000,
+    "max_candidate_projects": 20000,
 }
 # ``null`` has one cross-layer meaning for every first-class IntentSpec field:
 # reset that field to createEmptyIntent's safe default. Query/runtime extension
@@ -3562,7 +3646,11 @@ def _discovery_compound_commitment_hints(user_message: str) -> dict[str, Any]:
 
     # Scale / quota
     if re.search(
-        r"越多越好|尽可能多|尽量多|搜全|exhaustive|as\s*many|open[-\s]?ended|不限(数量|规模)?",
+        r"越多越好|尽可能多|尽量多|搜全|覆盖全|不设上限|无上限|全量|"
+        r"(?:所有|全部).{0,24}(?:数据|项目|文件|候选)|"
+        r"(?:数据|项目|文件|候选).{0,16}(?:所有|全部)|"
+        r"exhaustive|as\s*many|all\s+(?:relevant\s+)?(?:data|datasets|projects|files)|"
+        r"open[-\s]?ended|不限(数量|规模)?",
         text,
         flags=re.IGNORECASE,
     ):
@@ -4408,6 +4496,92 @@ def _normalise_discovery_next_decision(raw: Any) -> dict[str, Any] | None:
     }
 
 
+def _scope_discovery_next_decision_to_unresolved_fields(
+    decision: Mapping[str, Any] | None,
+    resolved_fields: set[str],
+) -> dict[str, Any] | None:
+    """Prevent a new menu from silently reopening settled strategy fields.
+
+    A Manager-authored option is an executable mutation contract.  When the
+    user has already resolved search scale (for example exhaustive/open-ended),
+    a later downstream-task recommendation must not bundle a conflicting
+    curated quota into the same numeric choice.  Explicit reconsideration
+    remains available through ``revisit_existing=true``.
+    """
+
+    if not isinstance(decision, Mapping) or decision.get("revisit_existing") is True:
+        return dict(decision) if isinstance(decision, Mapping) else None
+    if decision.get("option_patch_contract") != "predeclared_v1":
+        # Legacy menus have no executable option patch to narrow. Their
+        # selected value is grounded later by the validated strategy tool call.
+        return dict(decision)
+    protected_fields = {
+        _DISCOVERY_STRATEGY_PATCH_ALIASES.get(field, field)
+        for field in resolved_fields
+        if _clean_text(field)
+    }
+    if not protected_fields:
+        return dict(decision)
+
+    scoped_options: list[dict[str, Any]] = []
+    for raw_option in decision.get("options") or []:
+        if not isinstance(raw_option, Mapping):
+            continue
+        option = dict(raw_option)
+        raw_patch = option.get("strategy_patch")
+        if isinstance(raw_patch, Mapping):
+            scoped_patch = {
+                field: value
+                for field, value in raw_patch.items()
+                if field not in protected_fields
+            }
+            # A numeric choice with no remaining mutation meaning is not an
+            # executable option. Reject the whole menu instead of presenting a
+            # row that appears to change strategy but cannot do so.
+            if not scoped_patch:
+                return None
+            option["strategy_patch"] = scoped_patch
+        scoped_options.append(option)
+    if len(scoped_options) < 2:
+        return None
+
+    scoped = dict(decision)
+    scoped["options"] = scoped_options
+    scoped["target_fields"] = list(
+        dict.fromkeys(
+            field
+            for option in scoped_options
+            for field in (
+                option.get("strategy_patch")
+                if isinstance(option.get("strategy_patch"), Mapping)
+                else {}
+            )
+        )
+    )
+    recommendation = scoped.get("recommendation")
+    recommendation_id = (
+        _clean_text(recommendation.get("id"))
+        if isinstance(recommendation, Mapping)
+        else ""
+    )
+    recommendation_option = next(
+        (
+            option
+            for option in scoped_options
+            if _clean_text(option.get("id")) == recommendation_id
+        ),
+        None,
+    )
+    if recommendation_option is None:
+        return None
+    scoped["recommendation"] = {
+        **recommendation_option,
+        **dict(recommendation),
+        "strategy_patch": dict(recommendation_option.get("strategy_patch") or {}),
+    }
+    return scoped
+
+
 _DISCOVERY_ENUM_OPTION_ORDER: dict[str, list[str]] = {
     "labeling_strategy": [
         "label_free",
@@ -4941,6 +5115,10 @@ _DISCOVERY_EXECUTION_FINGERPRINT_VOLATILE_FIELDS = {
     # persisted. It is server-owned routing state, not part of what the user
     # reviewed, so the execution-boundary recheck must ignore it too.
     "_execution_discovery_id",
+    # Added only by the resume endpoint. It authorizes reuse of the existing
+    # control-plane run and must not invalidate the user's original strategy
+    # confirmation.
+    "_resume_existing_discovery_run",
 }
 
 
@@ -7093,6 +7271,150 @@ def _discovery_grill_turn_system_prompt() -> str:
     )
 
 
+def _deterministic_discovery_search_term_extension(
+    user_message: str,
+    intent_snapshot: Mapping[str, Any],
+) -> list[str] | None:
+    """Parse an explicit ordered repository-term extension without an LLM.
+
+    This intentionally handles only high-confidence additive commands. Other
+    edits (replacement, deletion, or ambiguous scientific prose) continue
+    through the normal Agent boundary.
+    """
+
+    message = _clean_text(user_message)
+    if not message or not re.search(r"(?:检索|搜索).{0,6}词", message):
+        return None
+    if not re.search(r"(?:扩充|新增|追加|添加|加入|补充)", message):
+        return None
+    if re.search(r"(?:替换|改为|只用|删除|移除)", message):
+        return None
+
+    sections: list[str] = []
+    additions = re.search(
+        r"(?:并\s*)?(?:新增|追加|添加|加入|补充)\s*[:：]\s*(.+?)"
+        r"(?=(?:[。；;\n]\s*)?最后(?:再)?(?:使用|加入|添加)|$)",
+        message,
+        flags=re.DOTALL,
+    )
+    if additions:
+        sections.append(additions.group(1))
+    broad = re.search(
+        r"最后(?:再)?(?:使用|加入|添加)\s*[:：]?\s*(.+)$",
+        message,
+        flags=re.DOTALL,
+    )
+    if broad:
+        sections.append(broad.group(1))
+    if not sections:
+        return None
+
+    extracted: list[str] = []
+    for section in sections:
+        for raw_term in re.split(r"[,，、;；\n]+", section):
+            term = raw_term.strip().strip("`'\"“”‘’（）()[]{}。.!！?？")
+            term = re.sub(
+                r"\s*(?:进行|用于|作为)\s*(?:最后一层|宽泛)?(?:补漏|检索|搜索).*$",
+                "",
+                term,
+                flags=re.IGNORECASE,
+            ).strip()
+            if not term or len(term) > _DISCOVERY_STRATEGY_ARRAY_ITEM_MAX_CHARS:
+                continue
+            extracted.append(term)
+    if not extracted:
+        return None
+
+    current = intent_snapshot.get("selected_search_terms")
+    current_terms = current if isinstance(current, list) else []
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw_term in [*current_terms, *extracted]:
+        if not isinstance(raw_term, str):
+            continue
+        term = re.sub(r"\s+", " ", raw_term).strip()
+        key = term.casefold()
+        if not term or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(term)
+    if len(ordered) > _DISCOVERY_STRATEGY_ARRAY_MAX_ITEMS:
+        return None
+    return ordered
+
+
+def _deterministic_discovery_search_term_turn(
+    body: Mapping[str, Any],
+    *,
+    user_message: str,
+) -> dict[str, Any] | None:
+    intent_snapshot = (
+        _json_object(body.get("intent_snapshot"))
+        if isinstance(body.get("intent_snapshot"), Mapping)
+        else {}
+    )
+    terms = _deterministic_discovery_search_term_extension(
+        user_message,
+        intent_snapshot,
+    )
+    if terms is None:
+        return None
+    patch, errors = _validate_discovery_strategy_patch(
+        {"selected_search_terms": terms}
+    )
+    if errors or not patch:
+        return None
+
+    current_terms = intent_snapshot.get("selected_search_terms")
+    current_count = len(current_terms) if isinstance(current_terms, list) else 0
+    added_count = max(0, len(terms) - current_count)
+    assistant_message = (
+        f"已按原顺序保留现有检索词，并追加 {added_count} 个检索词；"
+        f"当前共 {len(terms)} 个。确认前仍可继续调整，尚未访问 PRIDE。"
+    )
+    session_id = _normalise_discovery_session_id(body.get("session_id"))
+    decision_memory = _normalise_discovery_decision_memory(
+        body.get("decision_memory")
+    )
+    result = {
+        "action": "update_strategy",
+        "mode": "update_strategy",
+        "assistant_message": assistant_message,
+        "tool_calls": [
+            {"name": "update_strategy", "arguments": {"patch": patch}}
+        ],
+        "gap_report": _normalise_discovery_gap_report(body.get("gap_report")),
+        "intent": "revise",
+        "advance": True,
+        "answer_text": "",
+        "extra_fields": patch,
+        "understanding": "Explicit ordered repository search terms were appended.",
+        "next_focus": None,
+        "ready_for_confirm": False,
+        "phase": _clean_text(body.get("phase") or "grilling").lower() or "grilling",
+        "pending_question_id": "",
+        "strategy_fingerprint": "",
+        "status": "completed",
+        "parser": "deterministic_search_terms",
+        "agent_runtime": "deterministic",
+        "llm_used": False,
+        "request_budget_seconds": 0.0,
+        "decision_memory": decision_memory,
+        "decision_agenda": [],
+        "session_id": session_id,
+    }
+    _store_discovery_dialogue_session_turn(
+        session_id,
+        user_message=user_message,
+        assistant_message=assistant_message,
+        action="update_strategy",
+        patch=patch,
+        next_decision=None,
+        resolved_decision=None,
+    )
+    return result
+
+
 def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
     """Run one model-owned D1 turn; structural validation is deterministic."""
     turn_started_at = monotonic()
@@ -7108,6 +7430,12 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
     user_message = _clean_text(body.get("user_message") or body.get("prompt"))
     if not user_message:
         raise ValueError("Please enter a message.")
+    deterministic_turn = _deterministic_discovery_search_term_turn(
+        body,
+        user_message=user_message,
+    )
+    if deterministic_turn is not None:
+        return deterministic_turn
 
     llm_config = body.get("llm_config") if isinstance(body.get("llm_config"), dict) else {}
     client = _discovery_llm_client(
@@ -7124,10 +7452,6 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
     pending = body.get("pending_question") if isinstance(body.get("pending_question"), dict) else None
     raw_pending_decision = body.get("pending_decision")
     pending_decision = _normalise_discovery_next_decision(raw_pending_decision)
-    selected_decision = _resolve_discovery_pending_selection(
-        user_message,
-        pending_decision,
-    )
     intent_snapshot = (
         _json_object(body.get("intent_snapshot"))
         if isinstance(body.get("intent_snapshot"), dict)
@@ -7142,6 +7466,14 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         intent_snapshot,
     )
     resolved_fields.add("run_horizon")
+    pending_decision = _scope_discovery_next_decision_to_unresolved_fields(
+        pending_decision,
+        resolved_fields,
+    )
+    selected_decision = _resolve_discovery_pending_selection(
+        user_message,
+        pending_decision,
+    )
     candidate_resolved_decision = _discovery_resolved_decision_record(
         pending_decision,
         selected_decision,
@@ -7351,7 +7683,7 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
         "- If asked to search before confirmation, use refuse_search and explain the one remaining confirmation dependency.\n"
         "- During grilling PRIDE has not been queried. Do not invent availability, project counts, repository composition, or metadata coverage.\n"
         "- There is no repository evidence in this turn. The assistant_message must not claim that a project count, availability statement, or repository composition is known from PRIDE. If asked about one, label it as an unverified expectation and say discovery has not checked it yet.\n"
-        "- Immunopeptidomics is not a PTM task. For open-ended exploration, recommend browse-only, human-prioritized, curated around 20; do not silently apply that recommendation.\n"
+        "- Immunopeptidomics is not a PTM task. Downstream browse-only does not imply a small search scale. Preserve explicit all/exhaustive/no-limit language as exhaustive + open_ended, and never inject curated/20 from the downstream-task choice.\n"
         "- Keep prose consistent with the action and tool patch.\n"
     )
 
@@ -7406,6 +7738,7 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
     requested_action = _clean_text(raw.get("action") or raw.get("mode")).lower()
     raw_next_decision = raw.get("next_decision")
     next_decision = _normalise_discovery_next_decision(raw_next_decision)
+    resolved_scope_removed_next_decision = False
     decision_contract_error = raw_next_decision is not None and next_decision is None
     if requested_action == "chat":
         # A social/casual turn stays conversational. Structured choices are
@@ -8311,14 +8644,22 @@ def _run_discovery_grill_turn(body: dict[str, Any]) -> dict[str, Any]:
     # structured response. Expand from the canonical schema only for an open
     # (not already selected) Agent decision; accepted decisions must move on.
     if selected_decision is None:
+        unscoped_next_decision = next_decision
+        next_decision = _scope_discovery_next_decision_to_unresolved_fields(
+            next_decision,
+            resolved_fields.union(patch),
+        )
+        resolved_scope_removed_next_decision = (
+            unscoped_next_decision is not None and next_decision is None
+        )
         next_decision = _expand_discovery_enum_decision_options(
             next_decision,
             assistant_message,
         )
 
     input_gap = _normalise_discovery_gap_report(input_gap_report)
-    redundant_next_decision = False
-    if not (
+    redundant_next_decision = resolved_scope_removed_next_decision
+    if not redundant_next_decision and not (
         selected_decision is not None
         and resolved_decision is None
         and _same_discovery_decision(pending_decision, next_decision)
@@ -10173,6 +10514,15 @@ def _discovery_confirmation_rejection(
             "code": "grill_confirmation_required",
             "error": "Explicit strategy confirmation is required: grill_confirmed must be true.",
         }
+    if _discovery_exhaustive_payload_conflict(body):
+        return {
+            "status": "rejected",
+            "code": "exhaustive_intent_downgraded",
+            "error": (
+                "检索目标明确要求全部/搜全，但执行载荷仍是旧版有限候选池。"
+                "本次未启动搜索；请刷新策略并重新确认。"
+            ),
+        }
     supplied_fingerprint = _clean_text(body.get("strategy_fingerprint")).lower()
     if supplied_fingerprint:
         supplied_canonical = body.get("strategy_fingerprint_payload")
@@ -10400,6 +10750,7 @@ def _run_web_discovery(
                 # should_cancel is provided; avoid full run_sync blind spots.
                 stream_events=False,
                 should_cancel=should_cancel,
+                resume_existing=body.get("_resume_existing_discovery_run") is True,
             )
         except InterruptedError:
             # A user stop means "stop searching and keep verified work", not
@@ -13081,7 +13432,10 @@ def _prepare_expert_pool_discovery_request(payload: dict[str, Any]) -> dict[str,
         or str(request.get("portfolio_size_preference") or "").startswith("maximize")
         or bool(
             re.search(
-                r"(越多越好|尽可能多|尽量多|as many as possible|maximize)",
+                r"(越多越好|尽可能多|尽量多|搜全|覆盖全|不设上限|无上限|全量|"
+                r"(?:所有|全部).{0,24}(?:数据|项目|文件|候选)|"
+                r"as many as possible|all (?:relevant )?(?:data|datasets|projects|files)|"
+                r"open[-\s]?ended|exhaustive|maximize)",
                 prompt,
                 re.IGNORECASE,
             )
@@ -16024,6 +16378,7 @@ def _discovery_job_public(job: dict[str, Any], *, detail: bool = False) -> dict[
         "output_language": output_language,
         "logs": logs,
         "result_batches": result_batches,
+        "execution_state": job.get("execution_state"),
         "record": record,
         "error": _localize_discovery_message(job.get("error"), output_language) if job.get("error") else None,
         "detail": "full" if detail else "summary",
@@ -16127,6 +16482,7 @@ def _discovery_job_persist_payload(job: dict[str, Any]) -> dict[str, Any]:
         "logs": logs,
         "body": safe_body,
         "record": job.get("record"),
+        "execution_state": job.get("execution_state"),
         # Raw error string for forensics; _discovery_job_public localizes for clients.
         "error": _redact_secrets(job.get("error")) if job.get("error") else None,
         "detail": "full",
@@ -16394,6 +16750,7 @@ def _load_discovery_job(job_id: str) -> dict[str, Any] | None:
     payload.setdefault("logs", [])
     payload.setdefault("cancel_requested", False)
     payload.setdefault("record", None)
+    payload.setdefault("execution_state", None)
     payload.setdefault("error", None)
     payload.setdefault("output_language", "en")
     payload.setdefault("idempotency_key", None)
@@ -16479,6 +16836,12 @@ def _event_actor(event_type: str) -> str:
         return "OpenAI Agents SDK"
     if event_type.startswith("candidate_search_"):
         return "Repository Search"
+    if event_type.startswith("repository_term_") or event_type.startswith(
+        "confirmed_theme_pipeline_"
+    ):
+        return "Repository Scheduler"
+    if event_type.startswith("candidate_review_queue_"):
+        return "Candidate Review Queue"
     if event_type.startswith("candidate_inspection_"):
         return "Candidate Inspector"
     if event_type.startswith("discovery_quality_"):
@@ -16505,6 +16868,23 @@ def _event_message(event: AgentEvent) -> str:
         return _redact_secrets(
             f"Searching repository with {len(queries)} query plan(s): "
             + "; ".join(str(query) for query in queries[:4])
+        )
+    if event.event_type == "repository_term_task_started":
+        return (
+            f"Started confirmed repository term {int(payload.get('term_index') or 0)}/"
+            f"{int(payload.get('term_count') or 0)}: {payload.get('term') or ''}."
+        )
+    if event.event_type == "repository_term_task_completed":
+        return (
+            f"Exhausted confirmed repository term {int(payload.get('term_index') or 0)}/"
+            f"{int(payload.get('term_count') or 0)} after "
+            f"{int(payload.get('chunks_completed') or 0)} internal pagination chunk(s); "
+            f"{int(payload.get('reviewed_project_count') or 0)} project(s) reviewed."
+        )
+    if event.event_type == "repository_term_task_failed":
+        return (
+            f"Confirmed repository term {payload.get('term') or ''} did not reach "
+            f"exhaustion: {payload.get('reason') or 'unknown failure'}."
         )
     if event.event_type == "candidate_search_completed":
         return (
@@ -16584,6 +16964,167 @@ def _sanitize_log_payload(value: Any) -> Any:
     return _json_safe(value)
 
 
+def _project_discovery_execution_state(
+    current: Mapping[str, Any] | None,
+    event: AgentEvent,
+) -> dict[str, Any]:
+    """Project the scheduler's durable state instead of inferring it in React."""
+
+    state = dict(current or {})
+    state.setdefault("schema_version", "discovery-execution/v1")
+    terms = [
+        dict(item)
+        for item in state.get("terms") or []
+        if isinstance(item, Mapping)
+    ]
+    event_type = event.event_type
+    payload = event.payload
+    if event_type == "confirmed_theme_pipeline_started":
+        confirmed = [
+            str(term).strip()
+            for term in payload.get("terms") or []
+            if str(term).strip()
+        ]
+        previous_terms = {
+            (int(item.get("term_index") or 0), str(item.get("term") or "")): item
+            for item in terms
+        }
+        terms = [
+            {
+                **previous_terms.get((index, term), {}),
+                "term": term,
+                "term_index": index,
+                "term_count": len(confirmed),
+                "role": "primary_theme" if index == 1 else "theme_synonym",
+                "status": "pending",
+                "failure_reason": "",
+                "chunks_completed": int(
+                    previous_terms.get((index, term), {}).get("chunks_completed") or 0
+                ),
+                "raw_result_count": int(
+                    previous_terms.get((index, term), {}).get("raw_result_count") or 0
+                ),
+                "new_candidate_count": int(
+                    previous_terms.get((index, term), {}).get("new_candidate_count") or 0
+                ),
+                "exhausted": (
+                    previous_terms.get((index, term), {}).get("exhausted") is True
+                ),
+            }
+            for index, term in enumerate(confirmed, start=1)
+        ]
+        state.update(
+            {
+                "phase": "searching",
+                "active_term_index": 1 if terms else 0,
+                "candidate_count": int(state.get("candidate_count") or 0),
+                "reviewed_project_count": int(
+                    state.get("reviewed_project_count") or 0
+                ),
+                "pending_review_count": int(
+                    state.get("pending_review_count") or 0
+                ),
+                "all_terms_exhausted": False,
+                "completion_ready": False,
+            }
+        )
+    term_index = int(payload.get("term_index") or 0)
+    term_item = next(
+        (
+            item
+            for item in terms
+            if int(item.get("term_index") or 0) == term_index
+        ),
+        None,
+    )
+    if event_type == "repository_term_task_started" and term_item is not None:
+        term_item.update(status="running", failure_reason="")
+        state.update(phase="searching", active_term_index=term_index)
+    elif event_type == "repository_term_chunk_completed" and term_item is not None:
+        term_item["chunks_completed"] = max(
+            int(term_item.get("chunks_completed") or 0),
+            int(payload.get("chunk_index") or 0),
+        )
+        term_item["raw_result_count"] = int(
+            term_item.get("raw_result_count") or 0
+        ) + int(payload.get("raw_result_count") or 0)
+        term_item["new_candidate_count"] = int(
+            term_item.get("new_candidate_count") or 0
+        ) + int(payload.get("new_candidate_count") or 0)
+        state["candidate_count"] = max(
+            int(state.get("candidate_count") or 0),
+            int(payload.get("candidate_count") or 0),
+        )
+        term_item["exhausted"] = payload.get("exhausted") is True
+    elif event_type == "candidate_review_queue_batch_started":
+        state.update(
+            phase="reviewing",
+            active_term_index=term_index,
+            active_review_batch_size=int(payload.get("batch_size") or 0),
+            review_workers=int(payload.get("review_workers") or 0),
+        )
+    elif event_type == "candidate_review_queue_batch_completed":
+        state["reviewed_project_count"] = max(
+            int(state.get("reviewed_project_count") or 0),
+            int(payload.get("reviewed_project_count") or 0),
+        )
+        state["active_review_batch_size"] = 0
+    elif event_type in {
+        "repository_term_task_completed",
+        "repository_term_task_failed",
+    } and term_item is not None:
+        failed = event_type.endswith("_failed")
+        term_item.update(
+            status="failed" if failed else "completed",
+            chunks_completed=max(
+                int(term_item.get("chunks_completed") or 0),
+                int(payload.get("chunks_completed") or 0),
+            ),
+            raw_result_count=max(
+                int(term_item.get("raw_result_count") or 0),
+                int(payload.get("raw_result_count") or 0),
+            ),
+            new_candidate_count=max(
+                int(term_item.get("new_candidate_count") or 0),
+                int(payload.get("new_candidate_count") or 0),
+            ),
+            exhausted=payload.get("exhausted") is True,
+            failure_reason=str(payload.get("reason") or "") if failed else "",
+            reviewed_project_count=int(
+                payload.get("reviewed_project_count") or 0
+            ),
+        )
+        state["phase"] = "failed" if failed else "searching"
+        state["active_term_index"] = (
+            term_index if failed else min(term_index + 1, len(terms))
+        )
+    elif event_type == "confirmed_theme_pipeline_completed":
+        complete = (
+            payload.get("status") == "completed"
+            and payload.get("all_terms_exhausted") is True
+            and int(payload.get("pending_review_count") or 0) == 0
+        )
+        state.update(
+            phase="finalizing" if complete else "failed",
+            active_term_index=0,
+            candidate_count=max(
+                int(state.get("candidate_count") or 0),
+                int(payload.get("candidate_count") or 0),
+            ),
+            reviewed_project_count=max(
+                int(state.get("reviewed_project_count") or 0),
+                int(payload.get("reviewed_project_count") or 0),
+            ),
+            pending_review_count=int(payload.get("pending_review_count") or 0),
+            all_terms_exhausted=payload.get("all_terms_exhausted") is True,
+            completion_ready=complete,
+        )
+    state["terms"] = terms
+    state["last_event_sequence"] = int(event.sequence)
+    state["updated_at"] = event.created_at
+    return state
+
+
 def _append_discovery_job_event(job_id: str, event: AgentEvent) -> None:
     event_metrics: Any = event.payload.get("metrics") or {}
     if event.event_type == "round_value_evaluated":
@@ -16609,6 +17150,12 @@ def _append_discovery_job_event(job_id: str, event: AgentEvent) -> None:
         job = _discovery_jobs.get(job_id)
         if not job:
             return
+        job["execution_state"] = _project_discovery_execution_state(
+            job.get("execution_state")
+            if isinstance(job.get("execution_state"), Mapping)
+            else None,
+            event,
+        )
         if event.event_type == "verified_project_batch_published":
             batches = job.setdefault("result_batches", [])
             batch_index = int(event.payload.get("batch_index") or 0)
@@ -16731,7 +17278,7 @@ def _run_discovery_job(job_id: str) -> None:
                     or "Discovery failed."
                 )
             job["finished_at"] = _now_app_iso()
-            job["resumable"] = terminal_status == "failed"
+            job["resumable"] = terminal_status in {"failed", "cancelled"}
             try:
                 _persist_discovery_job(job, required=True)
             except Exception as persist_exc:
@@ -16790,6 +17337,7 @@ def _run_discovery_job(job_id: str) -> None:
             job = _discovery_jobs.get(job_id)
             if job:
                 job["status"] = "cancelled"
+                job["resumable"] = True
                 job["error"] = str(exc)
                 job["finished_at"] = _now_app_iso()
                 _persist_discovery_job(job)
@@ -16904,13 +17452,19 @@ async def resume_discovery_job(job_id: str):
                 return {"error": "Discovery job not found."}
             job = _mark_interrupted_discovery_job(job)
             _discovery_jobs[job_id] = job
-        if job.get("status") not in {"interrupted", "failed", "durability_failed"}:
+        if job.get("status") not in {
+            "interrupted",
+            "failed",
+            "durability_failed",
+            "cancelled",
+        }:
             return _discovery_job_public(job)
         body = job.get("body") if isinstance(job.get("body"), dict) else {}
         body.setdefault(
             "_execution_discovery_id",
             safe_output_stem(f"agents_job_{job_id}"),
         )
+        body["_resume_existing_discovery_run"] = True
         job["body"] = body
         job["status"] = "queued"
         job["cancel_requested"] = False

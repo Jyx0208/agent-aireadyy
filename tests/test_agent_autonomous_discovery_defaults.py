@@ -200,6 +200,31 @@ def test_legacy_downstream_horizons_are_accepted_then_normalized_at_execution() 
         assert rejection is None
 
 
+def test_all_human_immunopeptidomics_cannot_be_parsed_as_bounded_curated() -> None:
+    request = web_app._clean_dataset_request(
+        {
+            "prompt": "目标：检索PRIDE数据库中的所有人类免疫肽组学数据",
+            "goal": "immunopeptidomics",
+            "species": ["human"],
+            "species_policy": "include_only",
+            "scale_mode": "curated",
+            "max_projects": 20,
+            "max_candidate_projects": 80,
+            "continuous_discovery": False,
+            "quota_flexibility": "recommended",
+            "quantity_scope": "unspecified",
+        }
+    )
+
+    assert request.continuous_discovery is True
+    assert request.harvest_all_qualified is True
+    assert request.quantity_scope == "portfolio"
+    assert request.portfolio_size_preference == "maximize_qualified_projects"
+    assert request.quota_flexibility == "open_ended"
+    assert request.max_projects >= 2_000
+    assert request.max_candidate_projects >= 20_000
+
+
 def test_dialogue_agent_is_told_the_real_execution_boundary() -> None:
     prompt = web_app._discovery_grill_turn_system_prompt()
 

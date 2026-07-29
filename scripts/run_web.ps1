@@ -11,6 +11,8 @@ $ErrorActionPreference = "Stop"
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
+$SourceRoot = Join-Path $RepoRoot "src"
+$env:PYTHONPATH = $SourceRoot
 
 function Ensure-EnvFile {
     $EnvPath = Join-Path $RepoRoot ".env"
@@ -77,4 +79,4 @@ Write-Host "Press Ctrl+C to stop." -ForegroundColor Yellow
 Write-Host ""
 
 Start-Process $Url
-& $Python -m uvicorn agent.web.app:app --host $ListenHost --port $Port
+& $Python -m uvicorn --app-dir $SourceRoot agent.web.app:app --host $ListenHost --port $Port

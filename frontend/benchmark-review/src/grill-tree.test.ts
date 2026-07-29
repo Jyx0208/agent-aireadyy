@@ -348,6 +348,50 @@ describe("grill decision tree", () => {
 
 
 describe("explicit project count / strategy revise", () => {
+  it("treats all-human immunopeptidomics as open-ended exhaustive discovery", () => {
+    const draft = applyLocalParse("目标：检索PRIDE数据库中的所有人类免疫肽组学数据");
+    const payload = toDiscoveryJobPayload({ ...draft, confirmed: true });
+
+    expect(draft.coverageMode).toBe("exhaustive");
+    expect(draft.quotaFlexibility).toBe("open_ended");
+    expect(payload.scale_mode).toBe("exhaustive");
+    expect(payload.continuous_discovery).toBe(true);
+    expect(payload.quantity_scope).toBe("portfolio");
+    expect(payload.portfolio_size_preference).toBe("maximize_qualified_projects");
+    expect(payload.max_candidate_projects).toBe(20_000);
+  });
+
+  it("repairs a legacy bounded card when its objective still says all relevant data", () => {
+    const stale = applyRecommendedDefaults(applyLocalParse("人类免疫肽组学数据"));
+    stale.objective = "检索PRIDE数据库中的所有人类免疫肽组学数据";
+    stale.originalPrompt = "免疫肽/HLA 配体 · 人源 · 先摸清有哪些数据";
+    stale.coverageMode = "curated";
+    stale.targetProjectCount = 20;
+    stale.maxCandidateProjects = 80;
+    stale.quotaFlexibility = "recommended";
+
+    const payload = toDiscoveryJobPayload({ ...stale, confirmed: true });
+
+    expect(payload.scale_mode).toBe("exhaustive");
+    expect(payload.max_projects).toBeGreaterThanOrEqual(2_000);
+    expect(payload.max_candidate_projects).toBe(20_000);
+    expect(payload.continuous_discovery).toBe(true);
+    expect(payload.quota_flexibility).toBe("open_ended");
+    expect(payload.quantity_scope).toBe("portfolio");
+    expect(payload.portfolio_size_preference).toBe("maximize_qualified_projects");
+  });
+
+  it("replaces a legacy bounded scale when the user later says search all", () => {
+    const stale = applyRecommendedDefaults(applyLocalParse("人类免疫肽组学数据"));
+    const repaired = absorbFreeTextSignals(stale, "改为检索所有相关数据，不设候选池上限");
+
+    expect(repaired.coverageMode).toBe("exhaustive");
+    expect(repaired.quotaFlexibility).toBe("open_ended");
+    expect(repaired.targetProjectCount).toBe(2_000);
+    expect(repaired.maxCandidateProjects).toBe(20_000);
+    expect(toDiscoveryJobPayload(repaired).continuous_discovery).toBe(true);
+  });
+
   it("extracts explicit counts from free text", () => {
     expect(extractTargetProjectCount("20个可用项目就行")).toBe(20);
     expect(extractTargetProjectCount("我要20个你为啥写80")).toBe(20);

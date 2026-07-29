@@ -104,7 +104,7 @@ const terminal = (job: DiscoveryJob | null) =>
 
 /** Slightly above the server's bounded turn deadline; never wait for multi-minute retries. */
 /** Align with server grill budget (~profile timeout 180s); 75s caused false stalls on DeepSeek. */
-export const AGENT_TURN_TIMEOUT_MS = 180_000;
+export const AGENT_TURN_TIMEOUT_MS = 70_000;
 
 type AgentTurnRequestContext = {
   sessionId: string;
@@ -492,7 +492,7 @@ export function CarbonAgentChat({
       await pushAssistant("单个检索词不能超过 240 个字符；请缩短后重新确认。本次没有访问仓库。");
       return;
     }
-    const selectedTerms = normalizeSearchTerms(rawSelectedTerms).slice(0, 24);
+    const selectedTerms = normalizeSearchTerms(rawSelectedTerms).slice(0, 100);
     if (!selectedTerms.length) {
       await pushAssistant("请至少选择或补充一个实际检索词；本次没有访问仓库。");
       return;
@@ -856,7 +856,7 @@ export function CarbonAgentChat({
           const progressTimer = window.setInterval(() => {
             const sec = Math.round((performance.now() - onlineStarted) / 1000);
             void reply(
-              `仍在等待模型（已 ${sec}s）。服务端在跑 grill-turn，确认前不会访问 PRIDE。`,
+              `仍在等待模型（已 ${sec}s）。可点击停止按钮取消；确认前不会访问 PRIDE。`,
               MessageState.STREAMING,
             );
           }, 1_000);

@@ -4,6 +4,7 @@ cd /d "%~dp0"
 
 set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
 set "AGENT_MAX_CONCURRENT_TASKS=1"
+set "PYTHONPATH=%~dp0src"
 
 if not exist "%PYTHON_EXE%" (
     echo ERROR: Python virtual environment was not found.
@@ -19,7 +20,7 @@ echo Keep this window open while using the website.
 echo Press Ctrl+C to stop.
 echo.
 
-"%PYTHON_EXE%" -m uvicorn agent.web.app:app --host 127.0.0.1 --port 8000
+"%PYTHON_EXE%" -m uvicorn --app-dir "%~dp0src" agent.web.app:app --host 127.0.0.1 --port 8000
 
 echo.
 echo Web service stopped.

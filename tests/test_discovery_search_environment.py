@@ -1177,30 +1177,76 @@ def test_continuous_search_has_no_pool_ceiling_and_resumes_exact_result_offset(
     assert client.start_pages == [0, 0, 1, 2]
 
 
-def test_continuous_search_rejects_synonym_before_primary_theme_is_exhausted(
+def test_continuous_search_corrects_synonym_to_active_primary_theme(
     tmp_path: Path,
 ) -> None:
+    projects = [
+        _project(f"PXD{index:06d}", f"Human immunopeptidomics project {index}")
+        for index in range(1, 651)
+    ]
+    client = _PagedFakePrideClient(projects)
+    events: list[tuple[str, dict[str, Any]]] = []
     request = DatasetRequest(
         repository="pride",
-        query_terms=["immunopeptidomics", "HLA ligandome"],
+        query_terms=[
+            "immunopeptidomics",
+            "immunopeptidome",
+            "HLA ligandome",
+            "MHC ligandome",
+        ],
         continuous_discovery=True,
         quota_flexibility="open_ended",
     )
     environment = PrideDiscoverySearchEnvironment(
         request=request,
         prompt="Find as many immunopeptidomics projects as possible.",
-        client=_FakePrideClient({}),
+        client=client,
         state_path=tmp_path / "candidate_state.json",
+        search_event=lambda event_type, payload: events.append((event_type, payload)),
     )
 
-    with pytest.raises(ValueError, match="expected immunopeptidomics"):
+    first = environment.search(
+        CandidateSearchAction(
+            queries=[RepositoryQuery(query="immunopeptidomics", depth=200)],
+            candidate_limit=50,
+            rationale="Start the confirmed core theme.",
+        )
+    )
+    wrong_agent_queries = [
+        "immunopeptidome",
+        "HLA ligandome",
+        "MHC ligandome",
+    ]
+    corrected = [
         environment.search(
             CandidateSearchAction(
-                queries=[RepositoryQuery(query="HLA ligandome", depth=200)],
+                queries=[RepositoryQuery(query=query, depth=200)],
                 candidate_limit=50,
-                rationale="Try to advance too early.",
+                rationale="Agent tried to advance too early.",
             )
         )
+        for query in wrong_agent_queries
+    ]
+
+    assert first.raw_result_count == 200
+    assert [item.raw_result_count for item in corrected] == [200, 200, 50]
+    assert all(
+        item.query_yields[0].query == "immunopeptidomics"
+        and item.query_yields[0].skipped_reason is None
+        for item in corrected
+    )
+    corrections = [
+        payload
+        for event_type, payload in events
+        if event_type == "repository_theme_order_corrected"
+    ]
+    assert [item["requested_queries"] for item in corrections] == [
+        [query] for query in wrong_agent_queries
+    ]
+    assert all(
+        item["executed_query"] == "immunopeptidomics"
+        for item in corrections
+    )
 
 
 def test_continuous_search_skips_repeated_exhausted_theme_without_failing(
@@ -1232,3 +1278,41 @@ def test_continuous_search_skips_repeated_exhausted_theme_without_failing(
     assert first.raw_result_count == 1
     assert repeated.query_yields[0].skipped_reason == "repository_seed_exhausted"
     assert repeated.failures == []
+
+
+def test_multi_word_theme_uses_same_phrase_seed_for_search_and_exhaustion(
+    tmp_path: Path,
+) -> None:
+    request = DatasetRequest(
+        repository="pride",
+        query_terms=["HLA ligandome"],
+        continuous_discovery=True,
+        quota_flexibility="open_ended",
+    )
+    client = _FakePrideClient(
+        {"HLA ligandome": [_project("PXD000001", "Human HLA ligandome")]}
+    )
+    environment = PrideDiscoverySearchEnvironment(
+        request=request,
+        prompt="Find all human HLA ligandome projects.",
+        client=client,
+        state_path=tmp_path / "candidate_state.json",
+    )
+
+    result = environment.search(
+        CandidateSearchAction(
+            queries=[
+                RepositoryQuery(
+                    query="HLA ligandome",
+                    depth=200,
+                    budget_role="primary_theme",
+                )
+            ],
+            candidate_limit=50,
+            rationale="Exhaust the confirmed multi-word phrase.",
+        )
+    )
+
+    assert result.raw_result_count == 1
+    assert client.search_calls == [("HLA ligandome", 100)]
+    assert environment.is_query_exhausted("HLA ligandome") is True

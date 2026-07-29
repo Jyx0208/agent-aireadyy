@@ -836,7 +836,7 @@ def test_pool_build_prompt_preparation_uses_english_terms_scale_preset_and_expli
     assert request["query_terms"] == ["immunopeptidomics", "HLA ligandome"]
     assert request["scale_mode"] == "exhaustive"
     assert request["max_projects"] == 2000
-    assert request["max_candidate_projects"] == 5000
+    assert request["max_candidate_projects"] == 20000
     assert request["max_files"] == 100000
     assert request["agentic"] is False
     assert request["output_language"] == "zh-CN"

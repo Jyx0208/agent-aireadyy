@@ -41,6 +41,7 @@ from agent.discovery.project_judgment import (
     summarize_project_judgments,
 )
 from agent.discovery.publication import business_completion_allows_success
+from agent.discovery.query_portfolio import MAX_REPOSITORY_QUERY_DEPTH
 from agent.discovery.repository_discovery import discover_repository_dataset
 from agent.discovery.query_builder import classify_pride_query_strategy
 from agent.discovery.search_environment import (
@@ -116,6 +117,8 @@ class DiscoveryToolService:
         self,
         action: CandidateSearchAction,
         grant_id: str | None = None,
+        *,
+        scheduler_owned: bool = False,
     ) -> CandidateSearchObservation:
         if self.search_environment is None:
             return self._blocked_candidate_search("candidate_search_environment_unavailable")
@@ -128,7 +131,7 @@ class DiscoveryToolService:
         if policy.outcome != "allow":
             return self._blocked_candidate_search(policy.reason)
         bound_action = action
-        if self.dynamic_budget:
+        if self.dynamic_budget and not scheduler_owned:
             if self.budget_governor is None:
                 raise RuntimeError("dynamic_budget_governor_required")
             if not grant_id:
@@ -157,6 +160,7 @@ class DiscoveryToolService:
         arguments = {
             "action": bound_action.model_dump(mode="json"),
             "grant_id": grant_id,
+            "scheduler_owned": scheduler_owned,
             "request": self.request.model_dump(mode="json"),
         }
         tool_call, claimed = self.store.claim_tool_call(
@@ -171,7 +175,7 @@ class DiscoveryToolService:
 
         queries = [item.query for item in bound_action.queries]
         run = self.store.increment_tool_call_count(self.run_id)
-        if not self.dynamic_budget:
+        if not self.dynamic_budget or scheduler_owned:
             run = self.store.increment_dynamic_usage(
                 self.run_id,
                 query_units=len(queries),
@@ -191,6 +195,7 @@ class DiscoveryToolService:
                 "queries": queries,
                 "action": bound_action.model_dump(mode="json"),
                 "grant_id": grant_id,
+                "scheduler_owned": scheduler_owned,
                 "search_repository_request_budget": search_request_budget,
                 "inspection_repository_request_reserve": max(
                     0,
@@ -431,6 +436,8 @@ class DiscoveryToolService:
     def inspect_repository_candidates(
         self,
         action: CandidateInspectionAction,
+        *,
+        scheduler_owned: bool = False,
     ) -> DiscoveryRoundObservation:
         if self.search_environment is None:
             return self._blocked_environment_inspection(
@@ -440,9 +447,10 @@ class DiscoveryToolService:
         run = self._require_run()
         if run.selected_round_index is not None:
             return self._blocked_environment_inspection(action, "manifest_already_selected")
-        policy = evaluate_tool_policy("inspect_repository_candidates", run)
-        if policy.outcome != "allow":
-            return self._blocked_environment_inspection(action, policy.reason)
+        if not scheduler_owned:
+            policy = evaluate_tool_policy("inspect_repository_candidates", run)
+            if policy.outcome != "allow":
+                return self._blocked_environment_inspection(action, policy.reason)
         if action.search_id != run.latest_candidate_search_id:
             return self._blocked_environment_inspection(action, "candidate_search_id_mismatch")
 
@@ -450,6 +458,7 @@ class DiscoveryToolService:
             "action": action.model_dump(mode="json"),
             "request": self.request.model_dump(mode="json"),
             "task_type": self.task_type,
+            "scheduler_owned": scheduler_owned,
         }
         tool_call, claimed = self.store.claim_tool_call(
             run_id=self.run_id,
@@ -645,6 +654,414 @@ class DiscoveryToolService:
             ),
             "pipeline": pipeline,
         }
+
+    def run_confirmed_term_pipeline(self) -> dict[str, Any]:
+        """Exhaust confirmed terms in order and deterministically drain reviews.
+
+        One user-confirmed phrase is one logical repository task. Pagination
+        chunks are an internal transport detail: the Agent does not choose the
+        next offset, repeat an exhausted term, or decide when to advance to a
+        synonym. Newly discovered accessions enter one global deduplicated
+        review queue and are inspected before the next confirmed term starts.
+        """
+
+        if self.search_environment is None:
+            return {
+                "status": "blocked",
+                "reason": "candidate_search_environment_unavailable",
+                "all_terms_exhausted": False,
+                "pending_review_count": 0,
+                "term_count": 0,
+            }
+        terms = [
+            " ".join(str(term).split())
+            for term in self.request.query_terms or []
+            if str(term).strip()
+        ]
+        terms = list(dict.fromkeys(terms))
+        if not terms:
+            return {
+                "status": "blocked",
+                "reason": "confirmed_repository_terms_required",
+                "all_terms_exhausted": False,
+                "pending_review_count": 0,
+                "term_count": 0,
+            }
+
+        is_exhausted = getattr(self.search_environment, "is_query_exhausted", None)
+        reviewable = getattr(self.search_environment, "reviewable_accessions", None)
+        if not callable(is_exhausted):
+            return {
+                "status": "blocked",
+                "reason": "repository_exhaustion_probe_unavailable",
+                "all_terms_exhausted": False,
+                "pending_review_count": 0,
+                "term_count": len(terms),
+            }
+        if not callable(reviewable):
+            return {
+                "status": "blocked",
+                "reason": "candidate_review_queue_unavailable",
+                "all_terms_exhausted": False,
+                "pending_review_count": 0,
+                "term_count": len(terms),
+            }
+
+        self.store.append_event(
+            self.run_id,
+            "confirmed_theme_pipeline_started",
+            {
+                "terms": terms,
+                "term_count": len(terms),
+                "pagination": "internal_until_repository_exhaustion",
+                "review_queue": "global_project_accession_dedupe",
+                "review_workers": 4,
+            },
+        )
+        term_results: list[dict[str, Any]] = []
+        failed_terms: list[str] = []
+        attempted_reviews: set[str] = set()
+        max_chunks_per_term = max(
+            1,
+            int(self._require_run().dynamic_limits.max_repository_requests),
+        )
+
+        for term_index, term in enumerate(terms, start=1):
+            self._check_pipeline_cancel()
+            term_role = "primary_theme" if term_index == 1 else "theme_synonym"
+            self.store.append_event(
+                self.run_id,
+                "repository_term_task_started",
+                {
+                    "term": term,
+                    "term_index": term_index,
+                    "term_count": len(terms),
+                    "role": term_role,
+                    "status": "running",
+                },
+            )
+            chunks_completed = 0
+            raw_result_count = 0
+            new_candidate_count = 0
+            no_progress_chunks = 0
+            terminal_error = ""
+
+            while chunks_completed < max_chunks_per_term:
+                self._check_pipeline_cancel()
+                if bool(is_exhausted(term)):
+                    break
+                search = self.search_repository_candidates(
+                    CandidateSearchAction(
+                        queries=[
+                            RepositoryQuery(
+                                query=term,
+                                depth=MAX_REPOSITORY_QUERY_DEPTH,
+                                intent_dimension="confirmed theme",
+                                expected_gain=(
+                                    "Read the next internal repository pages for this "
+                                    "confirmed phrase until the repository is exhausted."
+                                ),
+                                budget_role=term_role,
+                            )
+                        ],
+                        candidate_limit=1_000,
+                        rationale=(
+                            "Deterministic confirmed-term pagination chunk "
+                            f"{chunks_completed + 1}; offsets and synonym order "
+                            "are scheduler-owned."
+                        ),
+                    ),
+                    scheduler_owned=True,
+                )
+                chunks_completed += 1
+                raw_result_count += int(search.raw_result_count)
+                new_candidate_count += int(search.new_candidate_count)
+                exhausted_after_chunk = bool(is_exhausted(term))
+                self.store.append_event(
+                    self.run_id,
+                    "repository_term_chunk_completed",
+                    {
+                        "term": term,
+                        "term_index": term_index,
+                        "chunk_index": chunks_completed,
+                        "search_id": search.search_id,
+                        "status": search.status,
+                        "raw_result_count": search.raw_result_count,
+                        "new_candidate_count": search.new_candidate_count,
+                        "candidate_count": search.candidate_count,
+                        "exhausted": exhausted_after_chunk,
+                    },
+                )
+                if search.status != "completed":
+                    terminal_error = (
+                        search.stop_reason
+                        or next(iter(search.failures), "")
+                        or "repository_search_not_completed"
+                    )
+                    break
+                if exhausted_after_chunk:
+                    break
+                if search.raw_result_count <= 0:
+                    no_progress_chunks += 1
+                else:
+                    no_progress_chunks = 0
+                if no_progress_chunks >= 2:
+                    terminal_error = "repository_term_pagination_made_no_progress"
+                    break
+
+            exhausted = bool(is_exhausted(term))
+            if not exhausted and not terminal_error:
+                terminal_error = "repository_term_safety_limit_reached"
+            if terminal_error:
+                failed_terms.append(term)
+                self.store.append_event(
+                    self.run_id,
+                    "repository_term_task_failed",
+                    {
+                        "term": term,
+                        "term_index": term_index,
+                        "term_count": len(terms),
+                        "role": term_role,
+                        "status": "failed",
+                        "chunks_completed": chunks_completed,
+                        "raw_result_count": raw_result_count,
+                        "new_candidate_count": new_candidate_count,
+                        "reason": terminal_error,
+                        "exhausted": exhausted,
+                    },
+                )
+                term_results.append(
+                    {
+                        "term": term,
+                        "status": "failed",
+                        "exhausted": exhausted,
+                        "chunks_completed": chunks_completed,
+                        "raw_result_count": raw_result_count,
+                        "new_candidate_count": new_candidate_count,
+                        "reason": terminal_error,
+                    }
+                )
+                break
+
+            review_summary = self._drain_candidate_review_queue(
+                reviewable=reviewable,
+                attempted_reviews=attempted_reviews,
+                term=term,
+                term_index=term_index,
+                term_count=len(terms),
+            )
+            if (
+                int(review_summary.get("failed_review_count") or 0) > 0
+                or int(review_summary.get("pending_review_count") or 0) > 0
+            ):
+                terminal_error = "candidate_review_queue_not_drained"
+                failed_terms.append(term)
+                term_payload = {
+                    "term": term,
+                    "term_index": term_index,
+                    "term_count": len(terms),
+                    "role": term_role,
+                    "status": "failed",
+                    "exhausted": exhausted,
+                    "chunks_completed": chunks_completed,
+                    "raw_result_count": raw_result_count,
+                    "new_candidate_count": new_candidate_count,
+                    "reason": terminal_error,
+                    **review_summary,
+                }
+                self.store.append_event(
+                    self.run_id,
+                    "repository_term_task_failed",
+                    term_payload,
+                )
+                term_results.append(dict(term_payload))
+                break
+            term_payload = {
+                "term": term,
+                "term_index": term_index,
+                "term_count": len(terms),
+                "role": term_role,
+                "status": "completed",
+                "exhausted": exhausted,
+                "chunks_completed": chunks_completed,
+                "raw_result_count": raw_result_count,
+                "new_candidate_count": new_candidate_count,
+                **review_summary,
+            }
+            self.store.append_event(
+                self.run_id,
+                "repository_term_task_completed",
+                term_payload,
+            )
+            term_results.append(dict(term_payload))
+
+        run = self._require_run()
+        reviewed = {
+            str(accession).strip().upper()
+            for accession in run.inspected_candidate_accessions
+        }
+        pending = [
+            str(accession).strip().upper()
+            for accession in reviewable()
+            if str(accession).strip().upper() not in reviewed
+        ]
+        all_terms_exhausted = not failed_terms and all(
+            bool(is_exhausted(term))
+            for term in terms
+        )
+        status = (
+            "completed"
+            if all_terms_exhausted and not pending
+            else "partial"
+        )
+        payload = {
+            "status": status,
+            "term_count": len(terms),
+            "completed_term_count": sum(
+                item.get("status") == "completed" for item in term_results
+            ),
+            "all_terms_exhausted": all_terms_exhausted,
+            "failed_terms": failed_terms,
+            "candidate_count": len(
+                list(getattr(self.search_environment, "candidate_accessions", []) or [])
+            ),
+            "reviewed_project_count": len(reviewed),
+            "pending_review_count": len(pending),
+            "terms": term_results,
+        }
+        self.store.append_event(
+            self.run_id,
+            "confirmed_theme_pipeline_completed",
+            payload,
+        )
+        return payload
+
+    def _drain_candidate_review_queue(
+        self,
+        *,
+        reviewable: Callable[..., list[str]],
+        attempted_reviews: set[str],
+        term: str,
+        term_index: int,
+        term_count: int,
+    ) -> dict[str, Any]:
+        batch_size = min(
+            40,
+            max(1, int(getattr(self.request, "inspection_batch_size", 30) or 30)),
+        )
+        batches_completed = 0
+        queued_count = 0
+        failed_count = 0
+        while True:
+            self._check_pipeline_cancel()
+            run = self._require_run()
+            inspected = {
+                str(accession).strip().upper()
+                for accession in run.inspected_candidate_accessions
+            }
+            pending = []
+            for raw_accession in reviewable():
+                accession = str(raw_accession).strip().upper()
+                if (
+                    not accession
+                    or accession in inspected
+                    or accession in attempted_reviews
+                ):
+                    continue
+                pending.append(accession)
+            if not pending:
+                break
+            batch = pending[:batch_size]
+            attempted_reviews.update(batch)
+            queued_count += len(batch)
+            self.store.append_event(
+                self.run_id,
+                "candidate_review_queue_batch_started",
+                {
+                    "term": term,
+                    "term_index": term_index,
+                    "term_count": term_count,
+                    "batch_index": batches_completed + 1,
+                    "batch_size": len(batch),
+                    "accessions": batch,
+                    "dedupe_key": "project_accession",
+                    "review_workers": min(4, len(batch)),
+                },
+            )
+            latest_search_id = str(
+                getattr(self.search_environment, "latest_search_id", "")
+                or run.latest_candidate_search_id
+                or ""
+            )
+            if not latest_search_id:
+                failed_count += len(batch)
+                break
+            observation = self.inspect_repository_candidates(
+                CandidateInspectionAction(
+                    search_id=latest_search_id,
+                    accessions=batch,
+                    rationale=(
+                        "Deterministic review queue for newly discovered, globally "
+                        "deduplicated repository projects."
+                    ),
+                ),
+                scheduler_owned=True,
+            )
+            batches_completed += 1
+            if observation.status != "completed":
+                failed_count += len(batch)
+            else:
+                failed_count += len(observation.inspection_outcomes) - sum(
+                    item.get("category")
+                    in {"usable_files", "scientific_exclusion", "no_usable_files"}
+                    for item in observation.inspection_outcomes
+                )
+                updated_run = self._backfill_judgments_for_inspected_pool_projects(
+                    self._require_run()
+                )
+                pool_path = str(updated_run.candidate_pool_manifest_path or "")
+                if pool_path and Path(pool_path).exists():
+                    self._maybe_emit_partial_l1_delivery(
+                        run=updated_run,
+                        manifest=_load_manifest(Path(pool_path)),
+                    )
+            self.store.append_event(
+                self.run_id,
+                "candidate_review_queue_batch_completed",
+                {
+                    "term": term,
+                    "term_index": term_index,
+                    "term_count": term_count,
+                    "batch_index": batches_completed,
+                    "batch_size": len(batch),
+                    "status": observation.status,
+                    "reviewed_project_count": len(
+                        self._require_run().inspected_candidate_accessions
+                    ),
+                },
+            )
+        reviewed_accessions = {
+            str(item).strip().upper()
+            for item in self._require_run().inspected_candidate_accessions
+        }
+        pending_review_count = sum(
+            str(accession).strip().upper() not in reviewed_accessions
+            for accession in reviewable()
+        )
+        return {
+            "review_batches_completed": batches_completed,
+            "queued_project_count": queued_count,
+            "failed_review_count": failed_count,
+            "reviewed_project_count": len(
+                self._require_run().inspected_candidate_accessions
+            ),
+            "pending_review_count": pending_review_count,
+        }
+
+    def _check_pipeline_cancel(self) -> None:
+        checker = getattr(self.search_environment, "_check_cancel", None)
+        if callable(checker):
+            checker()
 
     def publish_verified_file_batches(
         self,
@@ -2684,6 +3101,10 @@ class DiscoveryToolService:
                     "Auto-harvest promoted an inspected project with usable files and "
                     "goal-compatible evidence that the agent left unscored."
                 ),
+                evidence_refs=[
+                    "selected_file_examples",
+                    "validity_status_counts",
+                ],
                 target_file_count=len(project_files),
                 evidence_stage="inspection",
             )

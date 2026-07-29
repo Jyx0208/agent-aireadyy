@@ -358,7 +358,18 @@ export function absorbFreeTextSignals(spec: IntentSpec, rawInput: string): Inten
 
   // Explicit count
   const n = extractTargetProjectCount(raw);
-  if (n != null) next = applyTargetProjectCount(next, n);
+  if (n != null) {
+    next = applyTargetProjectCount(next, n);
+  } else if (EXHAUSTIVE_HINT.test(raw)) {
+    const exhaustive = coverageQuota("exhaustive");
+    next.coverageMode = "exhaustive";
+    next.targetProjectCount = exhaustive.projects;
+    next.maxCandidateProjects = exhaustive.pool;
+    next.quotaFlexibility = "open_ended";
+    next.timeBudget = "multi_round";
+    next.onSafetyCeiling = "ask";
+    next = markAnswered(next, "Q7", true);
+  }
 
   // Keep a useful originalPrompt trail
   if (!next.originalPrompt || isGreetingPrompt(next.originalPrompt) || isPollutedObjective(next.originalPrompt)) {
@@ -475,7 +486,7 @@ const DRUG_CELL = /drug[- ]?treat|化合物处理|药物处理|cell line|细胞�
 const PATIENT_VS_LINE =
   /patient|clinical|clinical sample|病人|临床样本|组织样本|immortalized|永生化/i;
 const EXHAUSTIVE_HINT =
-  /尽量搜全|尽量多|搜全|覆盖全|越多越好|尽可能多|多一点|as many as possible|exhaustive|comprehensive/i;
+  /尽量搜全|尽量多|搜全|覆盖全|越多越好|尽可能多|多一点|不设上限|无上限|全量|(?:所有|全部).{0,24}(?:数据|项目|文件|候选)|(?:数据|项目|文件|候选).{0,16}(?:所有|全部)|as many as possible|all (?:relevant )?(?:data|datasets|projects|files)|no (?:candidate pool )?limit|open[- ]?ended|exhaustive|comprehensive/i;
 const LABEL_FREE_HINT = /label[- ]?free|无标记|非标记/i;
 const SILAC_HINT = /\bsilac\b/i;
 const TMT_HINT = /\btmt\b|itraq|标记定量|isobaric/i;
@@ -1603,7 +1614,7 @@ function questionQ6(spec: IntentSpec): GrillQuestion {
 }
 
 function questionQ7(spec: IntentSpec): GrillQuestion {
-  const exhaustive = EXHAUSTIVE_HINT.test(spec.originalPrompt);
+  const exhaustive = EXHAUSTIVE_HINT.test(`${spec.originalPrompt} ${spec.objective}`);
   const immuno = isImmunopeptideContext(spec);
   return {
     id: "Q7",
@@ -2067,6 +2078,7 @@ export function searchTermCandidates(spec: IntentSpec): string[] {
       themes.push(normalized);
     }
   };
+  (spec.selectedSearchTerms || []).forEach(add);
   spec.specialThemes.forEach(add);
   if (
     isImmunopeptideContext(spec) &&
@@ -2108,12 +2120,12 @@ export function searchTermCandidates(spec: IntentSpec): string[] {
       if (pattern.test(objective)) add(term);
     });
   }
-  return themes.slice(0, 12);
+  return themes.slice(0, 100);
 }
 
 export function confirmedSearchThemes(spec: IntentSpec): string[] {
   const selected = normalizeSearchTerms(spec.selectedSearchTerms || []);
-  return selected.length ? selected.slice(0, 24) : searchTermCandidates(spec);
+  return selected.length ? selected.slice(0, 100) : searchTermCandidates(spec);
 }
 
 export function normalizeSearchTerms(values: string[]): string[] {
@@ -2141,20 +2153,37 @@ export function reconcileSearchTermSelection(
 }
 
 export function toDiscoveryJobPayload(spec: IntentSpec): DiscoveryJobPayload {
-  const quota = coverageQuota(spec.coverageMode || "balanced");
+  const intentText = [
+    spec.originalPrompt,
+    spec.objective,
+    spec.notes,
+    ...spec.successCriteria,
+  ].filter(Boolean).join(" ");
+  // Legacy sessions may already contain curated/20/80 from the old browse-only
+  // recommendation. An explicit "all/exhaustive/no limit" commitment is the
+  // stronger user instruction unless the user also fixed an exact count.
+  const repairLegacyExhaustive =
+    spec.quotaFlexibility !== "fixed" && EXHAUSTIVE_HINT.test(intentText);
+  const effectiveCoverage: CoverageMode = repairLegacyExhaustive
+    ? "exhaustive"
+    : (spec.coverageMode || "balanced");
+  const effectiveQuotaFlexibility = repairLegacyExhaustive
+    ? "open_ended"
+    : (spec.quotaFlexibility || "recommended");
+  const quota = coverageQuota(effectiveCoverage);
   const immunopeptideContext = isImmunopeptideContext(spec);
   const openEnded =
-    spec.quotaFlexibility === "open_ended" ||
+    effectiveQuotaFlexibility === "open_ended" ||
     (
-      spec.quotaFlexibility !== "fixed" &&
+      effectiveQuotaFlexibility !== "fixed" &&
       (
-        spec.coverageMode === "exhaustive" ||
-        /越多越好|尽可能多|尽量多|as many as possible|maximize/i.test(String(spec.originalPrompt || ""))
+        effectiveCoverage === "exhaustive" ||
+        EXHAUSTIVE_HINT.test(intentText)
       )
     );
   // Soft ambition for selected projects; open-ended / 越多越好 is not a hard knife.
   const projects = openEnded
-    ? Math.min(5000, Math.max(1, spec.targetProjectCount ?? quota.projects))
+    ? Math.min(5000, Math.max(coverageQuota("exhaustive").projects, spec.targetProjectCount ?? quota.projects))
     : Math.min(5000, Math.max(1, spec.targetProjectCount ?? quota.projects));
   // Business candidate pool: open-ended uses high safety ceiling (not 600/1000 business cap).
   const rawPool = Math.max(projects, spec.maxCandidateProjects ?? quota.pool);
@@ -2198,7 +2227,7 @@ export function toDiscoveryJobPayload(spec: IntentSpec): DiscoveryJobPayload {
 
   const diversity =
     spec.speciesCoverage === "broaden" ||
-    spec.coverageMode === "exhaustive" ||
+    effectiveCoverage === "exhaustive" ||
     spec.instrumentPreference === "newer_with_legacy_floor"
       ? "high"
       : "balanced";
@@ -2219,7 +2248,8 @@ export function toDiscoveryJobPayload(spec: IntentSpec): DiscoveryJobPayload {
           : "";
 
   const promptParts = [
-    spec.objective || spec.originalPrompt,
+    spec.objective,
+    spec.originalPrompt !== spec.objective ? spec.originalPrompt : "",
     taskPromptNote,
     spec.notes,
     spec.excludeRules.length ? `exclude: ${spec.excludeRules.join("; ")}` : "",
@@ -2248,7 +2278,7 @@ export function toDiscoveryJobPayload(spec: IntentSpec): DiscoveryJobPayload {
     species: spec.species,
     species_policy: speciesPolicy,
     diversity_strategy: diversity,
-    scale_mode: spec.coverageMode || "balanced",
+    scale_mode: effectiveCoverage,
     ptm_types: spec.ptmTypes.filter((x) => x !== "immunopeptide"),
     max_projects: projects,
     max_candidate_projects: pool,
@@ -2262,9 +2292,9 @@ export function toDiscoveryJobPayload(spec: IntentSpec): DiscoveryJobPayload {
     idempotency_key: crypto.randomUUID(),
     grill_confirmed: spec.confirmed === true,
     run_horizon: "candidates_reviewed",
-    quota_flexibility: spec.quotaFlexibility || "recommended",
-    quantity_scope: spec.quotaFlexibility === "open_ended" ? "portfolio" : "unspecified",
-    portfolio_size_preference: spec.quotaFlexibility === "open_ended"
+    quota_flexibility: effectiveQuotaFlexibility,
+    quantity_scope: openEnded ? "portfolio" : "unspecified",
+    portfolio_size_preference: openEnded
       ? "maximize_qualified_projects"
       : null,
     instrument_preference: spec.instrumentPreference || "none",

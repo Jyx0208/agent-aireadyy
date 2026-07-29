@@ -176,6 +176,75 @@ describe("discovery run display projection", () => {
     expect(screen.getByText(/0\/2 个查询动作已结束 · 共 1 轮 · 2 个主题词/)).toBeTruthy();
   });
 
+  it("shows the Agent request and deterministic theme-order correction transparently", () => {
+    const view = buildDiscoveryRunView({
+      status: "running",
+      logs: [
+        {
+          type: "candidate_search_started",
+          payload: {
+            action: {
+              queries: [
+                { query: "HLA ligandome", depth: 150, budget_role: "theme_synonym" },
+              ],
+            },
+          },
+        },
+        {
+          type: "repository_theme_order_corrected",
+          payload: {
+            requested_queries: ["HLA ligandome"],
+            executed_query: "immunopeptidomics",
+            reason: "active_confirmed_theme_not_exhausted",
+          },
+        },
+        {
+          type: "repository_query_started",
+          payload: {
+            query: "immunopeptidomics",
+            executed_query: "immunopeptidomics",
+            depth: 200,
+            role: "primary_theme",
+            max_pages: 2,
+            start_offset: 200,
+          },
+        },
+        {
+          type: "candidate_search_completed",
+          payload: {
+            observation: {
+              query_yields: [
+                {
+                  query: "immunopeptidomics",
+                  executed_query: "immunopeptidomics",
+                  raw_result_count: 200,
+                  new_candidate_count: 120,
+                },
+              ],
+            },
+          },
+        },
+      ],
+    });
+
+    expect(view.searchTrace).toHaveLength(1);
+    expect(view.searchTrace[0]).toMatchObject({
+      query: "HLA ligandome",
+      status: "completed",
+      depth: 200,
+      startOffset: 200,
+      role: "primary_theme",
+      executedSeeds: ["immunopeptidomics"],
+      rawResultCount: 200,
+      newCandidateCount: 120,
+    });
+
+    render(<DiscoveryProgressMessage payload={toDiscoveryProgressPayload(view)} />);
+    expect(screen.getByText("HLA ligandome")).toBeTruthy();
+    expect(screen.getByText(/提交给 PRIDE：immunopeptidomics/)).toBeTruthy();
+    expect(screen.getByText(/本轮原始返回 200 · 去重后新增 120/)).toBeTruthy();
+  });
+
   it("groups repository work by round and describes depth as an incremental read", () => {
     const view = buildDiscoveryRunView({
       status: "running",
@@ -243,6 +312,74 @@ describe("discovery run display projection", () => {
     expect(rounds).toHaveLength(2);
     expect(rounds[0].open).toBe(false);
     expect(rounds[1].open).toBe(true);
+  });
+
+  it("uses authoritative term tasks and hides transport pagination rounds", () => {
+    const view = buildDiscoveryRunView({
+      status: "running",
+      execution_state: {
+        schema_version: "discovery-execution/v1",
+        phase: "searching",
+        active_term_index: 2,
+        candidate_count: 305,
+        reviewed_project_count: 200,
+        pending_review_count: 0,
+        review_workers: 4,
+        all_terms_exhausted: false,
+        completion_ready: false,
+        terms: [
+          {
+            term: "immunopeptidomics",
+            term_index: 1,
+            term_count: 2,
+            role: "primary_theme",
+            status: "completed",
+            chunks_completed: 2,
+            raw_result_count: 305,
+            new_candidate_count: 305,
+            exhausted: true,
+            failure_reason: "",
+            reviewed_project_count: 200,
+          },
+          {
+            term: "HLA ligandome",
+            term_index: 2,
+            term_count: 2,
+            role: "theme_synonym",
+            status: "running",
+            chunks_completed: 1,
+            raw_result_count: 21,
+            new_candidate_count: 14,
+            exhausted: false,
+            failure_reason: "",
+            reviewed_project_count: 200,
+          },
+        ],
+      },
+      logs: [
+        {
+          type: "candidate_search_started",
+          payload: {
+            action: {
+              queries: [
+                { query: "HLA ligandome", depth: 2000, budget_role: "theme_synonym" },
+              ],
+            },
+          },
+        },
+      ],
+    });
+
+    expect(view.metrics.projects).toBe(305);
+    expect(view.metrics.inspectedProjects).toBe(200);
+    render(<DiscoveryProgressMessage payload={toDiscoveryProgressPayload(view)} />);
+    expect(screen.getByText(/正在完整检索主题词 2\/2/)).toBeTruthy();
+    expect(screen.getByText(/1\/2 个主题词已结束/)).toBeTruthy();
+    expect(screen.getByText("主题词 1/2")).toBeTruthy();
+    expect(screen.getByText("主题词 2/2")).toBeTruthy();
+    expect(screen.getByText(/内部分页段 2 个 · 原始返回 305/)).toBeTruthy();
+    expect(screen.getByText(/已明确读到末尾/)).toBeTruthy();
+    expect(screen.queryByText("第 1 轮")).toBeNull();
   });
 
   it("explains legacy open-ended order failures in user-facing language", () => {

@@ -34,6 +34,7 @@ export type StrategyPatchKey =
   | "mixedAcquisitionPolicy"
   | "ptmTypes"
   | "specialThemes"
+  | "selectedSearchTerms"
   | "labelingStrategy"
   | "labelingHard"
   | "coverageMode"
@@ -327,6 +328,7 @@ const STRATEGY_FIELDS: readonly StrategyFieldDefinition[] = [
   ] as const) },
   { key: "ptmTypes", aliases: ["ptm_types", "ptmTypes"], decode: stringListDecoder },
   { key: "specialThemes", aliases: ["special_themes", "specialThemes", "themes", "theme"], decode: stringListDecoder },
+  { key: "selectedSearchTerms", aliases: ["selected_search_terms", "selectedSearchTerms"], decode: stringListDecoder },
   { key: "labelingStrategy", aliases: ["labeling_strategy", "labelingStrategy"], decode: enumDecoder([
     "label_free", "tmt", "itraq", "silac", "dimethyl", "unknown", "any",
   ] as const) },
@@ -334,8 +336,8 @@ const STRATEGY_FIELDS: readonly StrategyFieldDefinition[] = [
   { key: "coverageMode", aliases: ["coverage_mode", "coverageMode", "scale_mode", "scaleMode"], decode: enumDecoder([
     "curated", "balanced", "exhaustive",
   ] as const) },
-  { key: "targetProjectCount", aliases: ["target_project_count", "targetProjectCount", "max_projects", "maxProjects"], decode: positiveInteger(300) },
-  { key: "maxCandidateProjects", aliases: ["max_candidate_projects", "maxCandidateProjects"], decode: positiveInteger(1000) },
+  { key: "targetProjectCount", aliases: ["target_project_count", "targetProjectCount", "max_projects", "maxProjects"], decode: positiveInteger(5000) },
+  { key: "maxCandidateProjects", aliases: ["max_candidate_projects", "maxCandidateProjects"], decode: positiveInteger(20000) },
   { key: "quotaFlexibility", aliases: ["quota_flexibility", "quotaFlexibility"], decode: enumDecoder([
     "fixed", "recommended", "open_ended",
   ] as const) },

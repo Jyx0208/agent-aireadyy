@@ -79,6 +79,32 @@ export type SearchQueryTrace = {
   skipReason: string;
 };
 
+export type DiscoveryTermExecution = {
+  term: string;
+  termIndex: number;
+  termCount: number;
+  role: string;
+  status: "pending" | "running" | "completed" | "failed";
+  chunksCompleted: number;
+  rawResultCount: number;
+  newCandidateCount: number;
+  exhausted: boolean;
+  failureReason: string;
+  reviewedProjectCount: number;
+};
+
+export type DiscoveryExecutionState = {
+  phase: string;
+  activeTermIndex: number;
+  candidateCount: number;
+  reviewedProjectCount: number;
+  pendingReviewCount: number;
+  reviewWorkers: number;
+  allTermsExhausted: boolean;
+  completionReady: boolean;
+  terms: DiscoveryTermExecution[];
+};
+
 export type ProjectReviewTrace = {
   projectAccession: string;
   title: string;
@@ -126,6 +152,7 @@ export type DiscoveryRunView = {
   error: string;
   qualityIssues: string[];
   resultBatches: VerifiedProjectBatchLink[];
+  executionState: DiscoveryExecutionState | null;
   searchTrace: SearchQueryTrace[];
   reviewTrace: ProjectReviewTrace[];
   resumable: boolean;
@@ -145,6 +172,7 @@ export type DiscoveryProgressPayload = {
   technicalEvents: TimelineEvent[];
   rawLogCount: number;
   resultBatches?: VerifiedProjectBatchLink[];
+  executionState?: DiscoveryExecutionState;
   searchTrace?: SearchQueryTrace[];
   reviewTrace?: ProjectReviewTrace[];
   resumable?: boolean;
@@ -213,6 +241,42 @@ function readTextList(value: unknown, limit = 30): string[] {
   return Array.isArray(value)
     ? value.map(readOptionalText).filter(Boolean).slice(0, limit)
     : [];
+}
+
+function readExecutionState(value: unknown): DiscoveryExecutionState | null {
+  if (!isRecord(value) || value.schema_version !== "discovery-execution/v1") {
+    return null;
+  }
+  const terms = Array.isArray(value.terms)
+    ? value.terms.filter(isRecord).map((term) => ({
+        term: readOptionalText(term.term),
+        termIndex: readCount(term.term_index),
+        termCount: readCount(term.term_count),
+        role: readOptionalText(term.role),
+        status: (
+          ["pending", "running", "completed", "failed"].includes(String(term.status))
+            ? String(term.status)
+            : "pending"
+        ) as DiscoveryTermExecution["status"],
+        chunksCompleted: readCount(term.chunks_completed),
+        rawResultCount: readCount(term.raw_result_count),
+        newCandidateCount: readCount(term.new_candidate_count),
+        exhausted: term.exhausted === true,
+        failureReason: readOptionalText(term.failure_reason),
+        reviewedProjectCount: readCount(term.reviewed_project_count),
+      })).filter((term) => term.term.length > 0)
+    : [];
+  return {
+    phase: readOptionalText(value.phase),
+    activeTermIndex: readCount(value.active_term_index),
+    candidateCount: readCount(value.candidate_count),
+    reviewedProjectCount: readCount(value.reviewed_project_count),
+    pendingReviewCount: readCount(value.pending_review_count),
+    reviewWorkers: readCount(value.review_workers),
+    allTermsExhausted: value.all_terms_exhausted === true,
+    completionReady: value.completion_ready === true,
+    terms,
+  };
 }
 
 const SEARCH_ROLE_LABELS: Record<string, string> = {
@@ -325,9 +389,21 @@ function buildSearchTrace(job: DiscoveryJob): SearchQueryTrace[] {
       trace.push(...active);
       continue;
     }
+    if (type === "repository_theme_order_corrected") {
+      const requested = readTextList(payload.requested_queries);
+      const executed = readOptionalText(payload.executed_query);
+      const query = active.find((item) => requested.includes(item.query))
+        || [...active].reverse().find((item) => item.status === "planned");
+      if (query && executed && !query.executedSeeds.includes(executed)) {
+        query.executedSeeds.push(executed);
+      }
+      continue;
+    }
     if (type.startsWith("repository_query_")) {
       const parentQuery = readOptionalText(payload.query);
-      const query = active.find((item) => item.query === parentQuery);
+      const query = active.find(
+        (item) => item.query === parentQuery || item.executedSeeds.includes(parentQuery),
+      );
       if (!query) continue;
       const seed = readOptionalText(payload.executed_query);
       if (seed && !query.executedSeeds.includes(seed)) query.executedSeeds.push(seed);
@@ -380,7 +456,10 @@ function buildSearchTrace(job: DiscoveryJob): SearchQueryTrace[] {
         ? observation.query_yields.filter(isRecord)
         : [];
       for (const query of active) {
-        const matches = yields.filter((item) => readOptionalText(item.query) === query.query);
+        const matches = yields.filter((item) => {
+          const yieldedQuery = readOptionalText(item.query);
+          return yieldedQuery === query.query || query.executedSeeds.includes(yieldedQuery);
+        });
         query.rawResultCount = matches.reduce(
           (sum, item) => sum + readCount(item.raw_result_count),
           0,
@@ -746,6 +825,7 @@ export function buildDiscoveryRunView(job: DiscoveryJob): DiscoveryRunView {
     honestDiscoveryStatus(serverStatus, record, attemptFinishedWithoutAudit),
   );
   const auditCounts = isRecord(audit.counts) ? audit.counts : {};
+  const executionState = readExecutionState(job.execution_state);
   const searchTrace = buildSearchTrace(job);
   const latestBatchMatch = searchTrace.at(-1)?.id.match(/^search-(\d+)-/);
   const latestBatchPrefix = latestBatchMatch ? `search-${latestBatchMatch[1]}-` : "";
@@ -768,7 +848,11 @@ export function buildDiscoveryRunView(job: DiscoveryJob): DiscoveryRunView {
   const runIsActive = status === "queued" || status === "running";
   const metrics: DiscoveryRunMetrics = {
     projects: runIsActive
-      ? Math.max(finalProjectCount, liveDeduplicatedCandidates)
+      ? Math.max(
+          finalProjectCount,
+          liveDeduplicatedCandidates,
+          executionState?.candidateCount ?? 0,
+        )
       : finalProjectCount,
     repositoryHits,
     files: firstCount(
@@ -863,6 +947,10 @@ export function buildDiscoveryRunView(job: DiscoveryJob): DiscoveryRunView {
     (item) => item.status === "included",
   ).length;
   metrics.inspectedProjects = Math.max(metrics.inspectedProjects, concludedReviewProjects);
+  metrics.inspectedProjects = Math.max(
+    metrics.inspectedProjects,
+    executionState?.reviewedProjectCount ?? 0,
+  );
   metrics.judgmentQualifiedProjects = Math.max(
     metrics.judgmentQualifiedProjects,
     qualifiedReviewProjects,
@@ -896,6 +984,7 @@ export function buildDiscoveryRunView(job: DiscoveryJob): DiscoveryRunView {
     error: String(job.error || record.error || "").trim(),
     qualityIssues,
     resultBatches,
+    executionState,
     searchTrace,
     reviewTrace,
     resumable: job.resumable === true,
@@ -920,6 +1009,7 @@ export function toDiscoveryProgressPayload(view: DiscoveryRunView): DiscoveryPro
     technicalEvents: view.technicalEvents,
     rawLogCount: view.rawLogCount,
     resultBatches: view.resultBatches,
+    executionState: view.executionState || undefined,
     searchTrace: view.searchTrace,
     reviewTrace: view.reviewTrace,
     resumable: view.resumable,
@@ -995,6 +1085,34 @@ export function isDiscoveryProgressPayload(value: unknown): value is DiscoveryPr
     ))
   ) return false;
   if (
+    value.executionState != null &&
+    (!isRecord(value.executionState) ||
+      typeof value.executionState.phase !== "string" ||
+      !isNonNegativeNumber(value.executionState.activeTermIndex) ||
+      !isNonNegativeNumber(value.executionState.candidateCount) ||
+      !isNonNegativeNumber(value.executionState.reviewedProjectCount) ||
+      !isNonNegativeNumber(value.executionState.pendingReviewCount) ||
+      !isNonNegativeNumber(value.executionState.reviewWorkers) ||
+      typeof value.executionState.allTermsExhausted !== "boolean" ||
+      typeof value.executionState.completionReady !== "boolean" ||
+      !Array.isArray(value.executionState.terms) ||
+      !value.executionState.terms.every(
+        (term) =>
+          isRecord(term) &&
+          typeof term.term === "string" &&
+          isNonNegativeNumber(term.termIndex) &&
+          isNonNegativeNumber(term.termCount) &&
+          typeof term.role === "string" &&
+          ["pending", "running", "completed", "failed"].includes(String(term.status)) &&
+          isNonNegativeNumber(term.chunksCompleted) &&
+          isNonNegativeNumber(term.rawResultCount) &&
+          isNonNegativeNumber(term.newCandidateCount) &&
+          typeof term.exhausted === "boolean" &&
+          typeof term.failureReason === "string" &&
+          isNonNegativeNumber(term.reviewedProjectCount),
+      ))
+  ) return false;
+  if (
     value.searchTrace != null &&
     (!Array.isArray(value.searchTrace) ||
       !value.searchTrace.every(
@@ -1047,6 +1165,7 @@ function tagType(status: DiscoveryRunStatus): "blue" | "green" | "red" | "gray" 
 export function DiscoveryProgressMessage({ payload, onCancel, onResume }: { payload: DiscoveryProgressPayload; onCancel?: (jobId: string) => void; onResume?: (jobId: string) => void }) {
   const active = payload.status === "queued" || payload.status === "running";
   const showProgress = active || payload.progressPercent != null;
+  const executionState = payload.executionState || null;
   const searchTrace = payload.searchTrace || [];
   const reviewTrace = payload.reviewTrace || [];
   const searchRounds = [...new Set(searchTrace.map((item) => item.round))].sort(
@@ -1073,6 +1192,16 @@ export function DiscoveryProgressMessage({ payload, onCancel, onResume }: { payl
         : payload.status === "failed"
           ? "任务已停止，请查看失败与阻塞原因"
           : "本轮检索与项目审查已经结束";
+  const activeTerm = executionState?.terms.find(
+    (term) => term.termIndex === executionState.activeTermIndex,
+  );
+  const authoritativeTask = executionState?.phase === "reviewing" && activeTerm
+    ? `正在审查“${activeTerm.term}”发现的项目：已审 ${executionState.reviewedProjectCount} 个，${executionState.reviewWorkers || 4} 路并行`
+    : executionState?.phase === "searching" && activeTerm
+      ? `正在完整检索主题词 ${activeTerm.termIndex}/${activeTerm.termCount}：“${activeTerm.term}”（内部自动翻页至耗尽）`
+      : executionState?.phase === "finalizing"
+        ? "全部主题词已检索至耗尽，审查队列已清空，正在整理交付结果"
+        : currentTask;
   const filterReasonSummary = reviewTrace.reduce<Record<string, number>>(
     (summary, item) => {
       for (const [reason, count] of Object.entries(item.filterReasonCounts || {})) {
@@ -1124,14 +1253,18 @@ export function DiscoveryProgressMessage({ payload, onCancel, onResume }: { payl
       <section className="discovery-progress__task" aria-label="当前任务与流程">
         <div>
           <strong>当前任务</strong>
-          <span>{currentTask}</span>
+          <span>{authoritativeTask}</span>
         </div>
         <ol>
           <li data-state={searchTrace.length ? "active" : "waiting"}>
             <span>1</span>
             <div>
               <strong>检索候选</strong>
-              <small>{searchRounds.length} 轮 · {payload.metrics.projects} 个去重候选</small>
+              <small>
+                {executionState
+                  ? `${executionState.terms.filter((term) => term.status === "completed").length}/${executionState.terms.length} 个主题词已耗尽 · ${payload.metrics.projects} 个去重候选`
+                  : `${searchRounds.length} 个旧版查询段 · ${payload.metrics.projects} 个去重候选`}
+              </small>
             </div>
           </li>
           <li data-state={reviewTrace.length ? "active" : "waiting"}>
@@ -1201,7 +1334,62 @@ export function DiscoveryProgressMessage({ payload, onCancel, onResume }: { payl
           </ul>
         </section>
       ) : null}
-      {searchTrace.length ? (
+      {executionState?.terms.length ? (
+        <section className="discovery-progress__search-trace" aria-label="仓库检索过程">
+          <div>
+            <strong>仓库检索过程</strong>
+            <span>
+              {executionState.terms.filter((term) =>
+                ["completed", "failed"].includes(term.status)
+              ).length}
+              /{executionState.terms.length} 个主题词已结束 · 每个词内部自动翻页至仓库耗尽
+            </span>
+          </div>
+          <div className="discovery-progress__search-rounds">
+            {executionState.terms.map((term) => (
+              <details
+                className="discovery-progress__search-round"
+                key={`${term.termIndex}-${term.term}`}
+                open={term.termIndex === executionState.activeTermIndex || term.status === "failed"}
+              >
+                <summary>
+                  <span className="discovery-progress__round-label">
+                    主题词 {term.termIndex}/{term.termCount}
+                  </span>
+                  <span className="discovery-progress__round-summary">
+                    {term.status === "pending" ? "等待"
+                      : term.status === "running" ? "检索或审查中"
+                        : term.status === "completed" ? "已耗尽并完成审查"
+                          : "失败，尚未耗尽"}
+                  </span>
+                </summary>
+                <ol>
+                  <li data-status={term.status === "pending" ? "planned" : term.status}>
+                    <div>
+                      <strong>{term.term}</strong>
+                      <span>{searchRoleLabel(term.role)}</span>
+                    </div>
+                    <p>
+                      内部分页段 {term.chunksCompleted} 个 · 原始返回 {term.rawResultCount}
+                      {" · "}全局去重后新增 {term.newCandidateCount}
+                    </p>
+                    <p>
+                      仓库状态：{term.exhausted ? "已明确读到末尾" : "尚未证明耗尽"}
+                      {term.reviewedProjectCount > 0
+                        ? ` · 累计已审 ${term.reviewedProjectCount} 个项目`
+                        : ""}
+                    </p>
+                    {term.failureReason ? (
+                      <p role="alert">失败原因：{term.failureReason}</p>
+                    ) : null}
+                  </li>
+                </ol>
+              </details>
+            ))}
+          </div>
+        </section>
+      ) : null}
+      {!executionState && searchTrace.length ? (
         <section className="discovery-progress__search-trace" aria-label="仓库检索过程">
           <div>
             <strong>仓库检索过程</strong>

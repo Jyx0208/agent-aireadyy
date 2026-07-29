@@ -32,6 +32,7 @@ from agent.control_plane.models import (
     ArtifactReference,
     DiscoveryQualityAudit,
     DynamicBudgetLimits,
+    DynamicBudgetUsage,
     OpenAIAgentsDiscoveryResult,
     RuntimeProvenance,
     SearchProposalInput,
@@ -1771,6 +1772,7 @@ def run_openai_agents_discovery(
     stream_events: bool = False,
     session_db: str | Path | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    resume_existing: bool = False,
 ) -> OpenAIAgentsDiscoveryResult:
     sdk = _load_agents_sdk()
     if model is None:
@@ -1788,35 +1790,93 @@ def run_openai_agents_discovery(
     project_id = str(project_id).strip() if project_id else None
     budget = budget or AgentBudget()
     store = AgentRunStore(state_db, event_listener=event_callback)
-    if store.load_run(run_id) is not None:
+    existing_run = store.load_run(run_id)
+    if existing_run is not None and not resume_existing:
         raise ValueError(f"Agent run already exists: {run_id}")
     runtime_provenance = _runtime_provenance()
-    run = store.save_run(
-        AgentRunRecord(
-            run_id=run_id,
-            project_id=project_id,
-            runtime_provenance=runtime_provenance,
-            workflow="discovery",
-            status="running",
-            prompt=prompt,
-            request=request.model_dump(mode="json"),
-            budget=budget,
-            dynamic_budget_enabled=mode == "multi_agent",
-            dynamic_limits=dynamic_limits or DynamicBudgetLimits(),
+    if existing_run is not None:
+        previous_dynamic_usage = existing_run.dynamic_usage
+        request_payload = request.model_dump(mode="json")
+        if existing_run.workflow != "discovery":
+            raise ValueError(
+                f"Agent run {run_id} cannot resume as discovery: "
+                f"workflow is {existing_run.workflow!r}"
+            )
+        if existing_run.prompt != prompt or existing_run.request != request_payload:
+            raise ValueError(
+                "An existing Agent discovery run can only resume with its "
+                "original prompt and request."
+            )
+        if existing_run.status not in {"running", "cancelled", "failed", "blocked"}:
+            raise ValueError(
+                f"Agent run {run_id} cannot resume from status "
+                f"{existing_run.status!r}."
+            )
+        previous_status = existing_run.status
+        cancellation_blockers = {"Discovery cancelled.", "user_cancelled"}
+        run = store.save_run(
+            existing_run.model_copy(
+                update={
+                    "status": "running",
+                    "stop_reason": None,
+                    "final_output": None,
+                    "pending_approvals": [],
+                    # A resume starts a new bounded execution tranche. The
+                    # previous tranche remains auditable in the run_resumed
+                    # event instead of permanently preventing later pages.
+                    "dynamic_usage": DynamicBudgetUsage(),
+                    "blockers": [
+                        blocker
+                        for blocker in existing_run.blockers
+                        if blocker not in cancellation_blockers
+                    ],
+                }
+            )
         )
-    )
-    store.append_event(
-        run_id,
-        "run_started",
-        {
-            "runtime": "openai_agents",
-            "workflow": "discovery",
-            "project_id": project_id,
-            "task_type": task_type,
-            "budget": budget.model_dump(mode="json"),
-            "mode": mode,
-        },
-    )
+        budget = run.budget
+        store.append_event(
+            run_id,
+            "run_resumed",
+            {
+                "runtime": "openai_agents",
+                "workflow": "discovery",
+                "previous_status": previous_status,
+                "sdk_turn_count": run.sdk_turn_count,
+                "tool_call_count": run.tool_call_count,
+                "discovery_round_count": run.discovery_round_count,
+                "previous_dynamic_usage": previous_dynamic_usage.model_dump(
+                    mode="json"
+                ),
+                "budget_tranche_reset": True,
+            },
+        )
+    else:
+        run = store.save_run(
+            AgentRunRecord(
+                run_id=run_id,
+                project_id=project_id,
+                runtime_provenance=runtime_provenance,
+                workflow="discovery",
+                status="running",
+                prompt=prompt,
+                request=request.model_dump(mode="json"),
+                budget=budget,
+                dynamic_budget_enabled=mode == "multi_agent",
+                dynamic_limits=dynamic_limits or DynamicBudgetLimits(),
+            )
+        )
+        store.append_event(
+            run_id,
+            "run_started",
+            {
+                "runtime": "openai_agents",
+                "workflow": "discovery",
+                "project_id": project_id,
+                "task_type": task_type,
+                "budget": budget.model_dump(mode="json"),
+                "mode": mode,
+            },
+        )
     observed_sdk_turns = run.sdk_turn_count
 
     def _append_public_sdk_event(event_type: str, payload: dict[str, Any]) -> None:
@@ -1865,7 +1925,44 @@ def run_openai_agents_discovery(
             should_cancel=should_cancel,
         )
         context.raise_if_cancelled()
-        if mode == "multi_agent" and quality_first:
+        deterministic_term_pipeline_enabled = bool(
+            quality_first
+            and request.query_terms
+            and (
+                request.quota_flexibility == "open_ended"
+                or request.continuous_discovery
+                or request.harvest_all_qualified
+            )
+        )
+        deterministic_term_pipeline_result: dict[str, Any] | None = None
+        if deterministic_term_pipeline_enabled:
+            deterministic_term_pipeline_result = (
+                service.run_confirmed_term_pipeline()
+            )
+        if deterministic_term_pipeline_enabled and quality_first:
+            tools = [
+                sdk["function_tool"](inspect_project_sdrf),
+                sdk["function_tool"](submit_project_judgments),
+                sdk["function_tool"](get_discovery_state),
+                sdk["function_tool"](audit_discovery_state),
+                sdk["function_tool"](select_discovery_manifest),
+            ]
+            instructions = _quality_first_discovery_instructions(
+                request,
+                task_type=task_type,
+                dynamic_budget=mode == "multi_agent",
+            )
+            instructions += (
+                "\nDETERMINISTIC EXECUTION CONTRACT: the server scheduler has already "
+                "executed every confirmed repository phrase in order, paginated each "
+                "phrase internally until repository exhaustion, globally deduplicated "
+                "project accessions, and drained the project-review queue. Repository "
+                "pagination and synonym advancement are not Agent decisions. Do not "
+                "request another candidate search. Inspect persisted state, repair only "
+                "evidence-level gaps, audit, and select only when the scheduler reports "
+                "all_terms_exhausted=true and pending_review_count=0."
+            )
+        elif mode == "multi_agent" and quality_first:
             tools = [
                 sdk["function_tool"](request_search_budget),
                 sdk["function_tool"](search_repository_candidates_with_grant),
@@ -1944,15 +2041,51 @@ def run_openai_agents_discovery(
                 pre_approval_tool_input_guardrails=True,
             ),
         )
+        runner_input = (
+            (
+                "Continue the existing discovery run from its persisted "
+                "candidate pool, review state, search cursors, and delivered "
+                "batches. Inspect current discovery state before choosing the "
+                "next action. Do not restart completed searches or repeat "
+                "delivered files."
+            )
+            if resume_existing
+            else _quality_first_runner_input(prompt, request, task_type=task_type)
+            if quality_first
+            else _runner_input(prompt, request, task_type=task_type)
+        )
+        if deterministic_term_pipeline_result is not None:
+            runner_input += (
+                "\nThe deterministic confirmed-term pipeline has finished this "
+                "execution pass with state: "
+                + json.dumps(
+                    {
+                        key: deterministic_term_pipeline_result.get(key)
+                        for key in (
+                            "status",
+                            "term_count",
+                            "completed_term_count",
+                            "all_terms_exhausted",
+                            "candidate_count",
+                            "reviewed_project_count",
+                            "pending_review_count",
+                            "failed_terms",
+                        )
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + ". Do not repeat repository pagination."
+            )
         runner_kwargs = {
             "starting_agent": agent,
-            "input": (
-                _quality_first_runner_input(prompt, request, task_type=task_type)
-                if quality_first
-                else _runner_input(prompt, request, task_type=task_type)
-            ),
+            "input": runner_input,
             "context": context,
-            "max_turns": budget.max_turns,
+            "max_turns": (
+                max(1, run.remaining_model_turn_budget())
+                if resume_existing
+                else budget.max_turns
+            ),
             "run_config": run_config,
             "hooks": hooks,
             "session": session,
@@ -2059,10 +2192,27 @@ def run_openai_agents_discovery(
 
     run = _record_result_usage(result, turns_before=initial_turns_before)
     assert service is not None  # A completed Runner call has an initialized service.
-    repair_stop_reason: str | None = None
+    repair_stop_reason: str | None = (
+        "confirmed_theme_pipeline_incomplete"
+        if deterministic_term_pipeline_result is not None
+        and (
+            deterministic_term_pipeline_result.get("status") != "completed"
+            or deterministic_term_pipeline_result.get("all_terms_exhausted") is not True
+            or int(
+                deterministic_term_pipeline_result.get("pending_review_count") or 0
+            )
+            > 0
+        )
+        else None
+    )
 
     initial_interruptions = list(getattr(result, "interruptions", []) or [])
-    if quality_first and not initial_interruptions and run.selected_round_index is None:
+    if (
+        quality_first
+        and not initial_interruptions
+        and run.selected_round_index is None
+        and repair_stop_reason is None
+    ):
         audit = _audit_and_persist(service, meter_tool=False)
         if audit.status == "repair_required":
             store.append_event(

@@ -176,7 +176,7 @@ describe("dialogue session lifecycle", () => {
       session_id: string;
       request_timeout_seconds: number;
     };
-    expect(firstPayload.request_timeout_seconds).toBe(170);
+    expect(firstPayload.request_timeout_seconds).toBe(60);
     chat.instance.messaging.upsertMessage.mockClear();
 
     act(() => mocks.restartHandler?.());
