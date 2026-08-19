@@ -65,7 +65,7 @@ function Invoke-Msconvert {
     )
     New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
     Write-Log "msconvert: $([System.IO.Path]::GetFileName($SourcePath)) -> $OutputName"
-    & $PwizExecutable $SourcePath --mzML --filter "peakPicking true 1-" --outfile $OutputName -o $OutputDir 2>&1 | Tee-Object -FilePath $LogPath -Append
+    & $PwizExecutable $SourcePath --mzML --filter "peakPicking true 1-" --outfile $OutputName -o $OutputDir 2>&1 | Tee-Object -FilePath $LogPath -Append | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "msconvert failed ($LASTEXITCODE): $SourcePath" }
     $result = Join-Path $OutputDir $OutputName
     if (-not (Test-Path -LiteralPath $result -PathType Leaf)) { throw "msconvert did not create $result" }
