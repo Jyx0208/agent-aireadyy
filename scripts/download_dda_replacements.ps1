@@ -12,9 +12,9 @@ if (-not $ManifestPath) { $ManifestPath = Join-Path $DataRoot "dataset_manifest.
 if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { throw "Manifest not found: $ManifestPath" }
 if (-not (Test-Path -LiteralPath $CurlExecutable -PathType Leaf)) { throw "curl not found: $CurlExecutable" }
 
-$rows = @(Import-Csv -LiteralPath $ManifestPath | Where-Object { $_.project_accession -eq "PXD079900" })
-if ($rows.Count -ne 2) { throw "Expected exactly two PXD079900 replacement rows, found $($rows.Count)" }
 $allRows = @(Import-Csv -LiteralPath $ManifestPath)
+$rows = @($allRows | Where-Object { $_.project_accession -eq "PXD079900" })
+if ($rows.Count -ne 2) { throw "Expected exactly two PXD079900 replacement rows, found $($rows.Count)" }
 if ($allRows.Count -ne 16) { throw "Final benchmark manifest must contain 16 files, found $($allRows.Count)" }
 if (@($allRows | Where-Object { $_.acquisition_mode -ieq "dia" }).Count -ne 0) { throw "Final benchmark manifest still contains DIA rows; refuse to download/process it" }
 if (@($allRows.project_accession | Sort-Object -Unique).Count -ne 8) { throw "Final benchmark manifest must contain 8 projects" }

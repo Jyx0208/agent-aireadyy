@@ -1,30 +1,28 @@
-# DDA 替换候选（2026-08-19）
+# DDA Replacement Candidates (2026-08-19)
 
-本清单用于替换当前 benchmark 中不支持的 DIA 项目 PXD080696。候选均来自 PRIDE Archive API；只有项目元数据明确标注 `Data-dependent acquisition` 的项目才进入表格。
+This shortlist replaces PXD080696 because the current processing lane does not support DIA. Only projects whose PRIDE metadata explicitly contains `Data-dependent acquisition` are included.
 
-## 首选替换
+## Selected replacement
 
-| 项目 | 建议文件 | 格式/大小 | 项目元数据证据 | 文件来源 |
+| Project | Files | Format / size | Evidence | Source |
 |---|---|---:|---|---|
-| [PXD079900](https://www.ebi.ac.uk/pride/archive/projects/PXD079900) | `20241218_Exploris_TS25_LouridoLab_DV_Sample_7_DDA.raw` | RAW / 0.65 GiB | Bottom-up proteomics；Data-dependent acquisition；Orbitrap Exploris 480；*Toxoplasma gondii*；PI Sebastian Lourido；COMPLETE；另有 `Glycan_bead.sdrf.tsv` | `ftp://ftp.pride.ebi.ac.uk/pride/data/archive/2026/08/PXD079900/20241218_Exploris_TS25_LouridoLab_DV_Sample_7_DDA.raw` |
-| [PXD079900](https://www.ebi.ac.uk/pride/archive/projects/PXD079900) | `20241218_Exploris_TS25_LouridoLab_DV_Sample_5_DDA.raw` | RAW / 0.60 GiB | 同上 | `ftp://ftp.pride.ebi.ac.uk/pride/data/archive/2026/08/PXD079900/20241218_Exploris_TS25_LouridoLab_DV_Sample_5_DDA.raw` |
+| [PXD079900](https://www.ebi.ac.uk/pride/archive/projects/PXD079900) | `20241218_Exploris_TS25_LouridoLab_DV_Sample_7_DDA.raw` | RAW / 701,006,363 bytes | Bottom-up proteomics; DDA; Orbitrap Exploris 480; *Toxoplasma gondii rh*; COMPLETE; SDRF available | [FTP file](ftp://ftp.pride.ebi.ac.uk/pride/data/archive/2026/08/PXD079900/20241218_Exploris_TS25_LouridoLab_DV_Sample_7_DDA.raw) |
+| [PXD079900](https://www.ebi.ac.uk/pride/archive/projects/PXD079900) | `20241218_Exploris_TS25_LouridoLab_DV_Sample_5_DDA.raw` | RAW / 646,817,627 bytes | Same project-level evidence | [FTP file](ftp://ftp.pride.ebi.ac.uk/pride/data/archive/2026/08/PXD079900/20241218_Exploris_TS25_LouridoLab_DV_Sample_5_DDA.raw) |
 
-这两个文件来自同一项目，适合直接替换 PXD080696 的两份 DIA 文件：仍保持 8 个项目、16 个文件；总新增下载量约 1.25 GiB。
+These two files preserve the benchmark shape: 8 projects and 16 files. They add approximately 1.25 GiB and are both directly supported by the current RAW conversion lane.
 
-## 备用候选
+## Backup candidates
 
-| 项目 | 建议文件 | 格式/大小 | 关键元数据证据 | 备注 |
-|---|---|---:|---|---|
-| [PXD079334](https://www.ebi.ac.uk/pride/archive/projects/PXD079334) | `20240430_AS_LC4_GF_Sante_exp2_400ng_F17.raw`、`..._F13.raw` | RAW / 0.57、0.55 GiB | Bottom-up；DDA；Orbitrap Ascend；人；PI Enzo Tramontano；COMPLETE；有 SDRF | 适合增加仪器/实验室差异 |
-| [PXD081816](https://www.ebi.ac.uk/pride/archive/projects/PXD081816) | `BimczokD_022323_02.raw`、`CherneM_20260415_01_DDA_02.raw` | RAW / 0.80、1.13 GiB | Bottom-up；DDA；Orbitrap Eclipse；人；PI Diane Bimczok；COMPLETE；有 SampleList | 文件较大，但证据完整 |
-| [PXD080314](https://www.ebi.ac.uk/pride/archive/projects/PXD080314) | `241211_S4_Flour-c.raw`、`250324_S8_Crust-c.raw` | RAW / 0.42、0.46 GiB | Bottom-up；DDA；Q Exactive；小麦/黑麦/大麦；PI Katharina Anne Scherf；COMPLETE | 项目级有多物种，文件级物种需再由 SDRF/样本表确认 |
-| [PXD079061](https://www.ebi.ac.uk/pride/archive/projects/PXD079061) | `2024-10-22-204A.raw`、`2024-10-22-116B.raw` | RAW / 0.53、0.53 GiB | Bottom-up；DDA；Orbitrap Fusion Lumos；*Lepidochelys kempii*；COMPLETE | 可增加跨物种泛化，但实验室/样本背景较特殊 |
+| Project | Instrument / organism | File format and approximate size | Evidence notes |
+|---|---|---:|---|
+| [PXD079334](https://www.ebi.ac.uk/pride/archive/projects/PXD079334) | Orbitrap Ascend / human | two RAW files, 0.57 and 0.55 GiB | Bottom-up; DDA; COMPLETE; SDRF available |
+| [PXD081816](https://www.ebi.ac.uk/pride/archive/projects/PXD081816) | Orbitrap Eclipse / human | two RAW files, 0.80 and 1.13 GiB | Bottom-up; DDA; COMPLETE; SampleList available |
+| [PXD080314](https://www.ebi.ac.uk/pride/archive/projects/PXD080314) | Q Exactive / wheat, rye, barley | two RAW files, 0.42 and 0.46 GiB | Bottom-up; DDA; file-level organism mapping still needs confirmation |
+| [PXD079061](https://www.ebi.ac.uk/pride/archive/projects/PXD079061) | Orbitrap Fusion Lumos / *Lepidochelys kempii* | two RAW files, 0.53 GiB each | Bottom-up; DDA; COMPLETE |
 
-## 明确排除
+## Explicit exclusions
 
-- PXD080696 的两份 DIA 文件不进入新的处理计划。
-- PXD061973、PXD064530 虽然明确是 DDA，但主要文件是 WIFF/WIFF.SCAN；当前 Tower3 的批处理链路没有把 WIFF sidecar 作为可处理输入，因此暂不作为本轮替换。
+- The two PXD080696 DIA files are excluded from the active manifest and processing plan. They are retained under `excluded_dia_20260819/PXD080696` for traceability.
+- PXD061973 and PXD064530 have explicit DDA evidence but their primary files are WIFF/WIFF.SCAN, which the current Tower3 preparation lane does not accept as input.
 
-## 建议
-
-已用 PXD079900 的两份 RAW 替换 PXD080696；最终 manifest 已更新为 8 个项目、16 个文件、0 个 DIA 文件。下载任务只处理这两份 DDA RAW，后续才送入 Tower3 批处理。
+The final manifest is now 8 projects, 16 files, and 0 DIA rows. The download task processes only the two PXD079900 RAW files before any Tower3 preparation is started.
