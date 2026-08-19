@@ -16,6 +16,7 @@ $rows = @(Import-Csv -LiteralPath $ManifestPath | Where-Object { $_.project_acce
 if ($rows.Count -ne 2) { throw "Expected exactly two PXD079900 replacement rows, found $($rows.Count)" }
 
 $jobs = New-Object System.Collections.Generic.List[object]
+$completed = New-Object System.Collections.Generic.List[object]
 foreach ($row in $rows) {
     $projectDir = Join-Path $DataRoot ([string]$row.project_accession)
     New-Item -ItemType Directory -Force -Path $projectDir | Out-Null
@@ -25,6 +26,7 @@ foreach ($row in $rows) {
     $expected = [int64]$row.expected_size_bytes
     if ((Test-Path -LiteralPath $target -PathType Leaf) -and ((Get-Item -LiteralPath $target).Length -eq $expected)) {
         Write-Host "already complete: $fileName ($expected bytes)"
+        $completed.Add([ordered]@{ project_accession = $row.project_accession; file_name = $fileName; expected_size_bytes = $expected; actual_size_bytes = $expected; status = "already_complete"; downloaded_at = (Get-Date).ToString("o") })
         continue
     }
     $stdout = "$part.stdout.log"
@@ -59,6 +61,7 @@ while (@($jobs | Where-Object { -not $_.process.HasExited }).Count -gt 0) {
 }
 
 $summary = New-Object System.Collections.Generic.List[object]
+foreach ($item in $completed) { $summary.Add($item) }
 foreach ($job in $jobs) {
     $job.process.WaitForExit()
     $job.process.Refresh()
