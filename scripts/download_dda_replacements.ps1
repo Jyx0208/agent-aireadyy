@@ -14,6 +14,10 @@ if (-not (Test-Path -LiteralPath $CurlExecutable -PathType Leaf)) { throw "curl 
 
 $rows = @(Import-Csv -LiteralPath $ManifestPath | Where-Object { $_.project_accession -eq "PXD079900" })
 if ($rows.Count -ne 2) { throw "Expected exactly two PXD079900 replacement rows, found $($rows.Count)" }
+$allRows = @(Import-Csv -LiteralPath $ManifestPath)
+if ($allRows.Count -ne 16) { throw "Final benchmark manifest must contain 16 files, found $($allRows.Count)" }
+if (@($allRows | Where-Object { $_.acquisition_mode -ieq "dia" }).Count -ne 0) { throw "Final benchmark manifest still contains DIA rows; refuse to download/process it" }
+if (@($allRows.project_accession | Sort-Object -Unique).Count -ne 8) { throw "Final benchmark manifest must contain 8 projects" }
 
 $jobs = New-Object System.Collections.Generic.List[object]
 $completed = New-Object System.Collections.Generic.List[object]
@@ -26,6 +30,10 @@ foreach ($row in $rows) {
     $expected = [int64]$row.expected_size_bytes
     if ((Test-Path -LiteralPath $target -PathType Leaf) -and ((Get-Item -LiteralPath $target).Length -eq $expected)) {
         Write-Host "already complete: $fileName ($expected bytes)"
+        Remove-Item -LiteralPath "$part.stdout.log", "$part.stderr.log" -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $part -PathType Leaf) {
+            if ((Get-Item -LiteralPath $part).Length -eq $expected) { Remove-Item -LiteralPath $part -Force }
+        }
         $completed.Add([ordered]@{ project_accession = $row.project_accession; file_name = $fileName; expected_size_bytes = $expected; actual_size_bytes = $expected; status = "already_complete"; downloaded_at = (Get-Date).ToString("o") })
         continue
     }
