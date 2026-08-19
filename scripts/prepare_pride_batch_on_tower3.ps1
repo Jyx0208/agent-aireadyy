@@ -4,6 +4,7 @@ param(
     [string]$WorkRoot = "E:\pride_processing",
     [string]$PwizExecutable = "E:\pride_processing\tools\pwiz\msconvert.exe",
     [string]$ProjectFilter = "",
+    [string]$FileFilter = "",
     [string]$WorkerId = "main",
     [switch]$Resume
 )
@@ -83,6 +84,11 @@ if ($ProjectFilter.Trim()) {
     $allowedProjects = @($ProjectFilter.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     $rows = @($rows | Where-Object { $allowedProjects -contains [string]$_.project_accession })
     if ($rows.Count -eq 0) { throw "ProjectFilter selected no rows: $ProjectFilter" }
+}
+if ($FileFilter.Trim()) {
+    $allowedFiles = @($FileFilter.Split(",") | ForEach-Object { [System.IO.Path]::GetFileName($_.Trim()) } | Where-Object { $_ })
+    $rows = @($rows | Where-Object { $allowedFiles -contains [System.IO.Path]::GetFileName([string]$_.file_name) })
+    if ($rows.Count -eq 0) { throw "FileFilter selected no rows: $FileFilter" }
 }
 
 $results = New-Object System.Collections.Generic.List[object]
