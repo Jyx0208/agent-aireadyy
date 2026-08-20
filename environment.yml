@@ -1,0 +1,8 @@
+name: pride-ai-ready-agent
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - pip
+  - pip:
+      - -e .[agents-sdk,dev,dataset-construction,dataset-construction-ortools-worker,web]

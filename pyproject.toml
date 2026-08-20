@@ -25,17 +25,35 @@ agents-sdk = [
 dev = [
   "pytest>=8.2,<9",
 ]
+dataset-construction = [
+  "duckdb>=1.4,<2",
+  "pandera[pandas]>=0.26,<1",
+  "psm-utils>=1.5,<2",
+  "prov>=2.1,<3",
+  "rocrate>=0.14,<1",
+  "scikit-learn>=1.7,<2",
+  "scipy>=1.16,<2",
+  "sdrf-pipelines>=0.0.34,<1",
+]
+dataset-construction-ortools-worker = [
+  "ortools>=9.14,<10",
+]
 web = [
+  "alembic>=1.18.5,<2",
   "anthropic>=0.75,<1",
   "fastapi>=0.115,<1",
+  "huey>=3.2.1,<4",
   "openai-agents==0.18.1",
   "openai>=2.45,<3",
-  "uvicorn[standard]>=0.34,<1",
   "python-dotenv>=1.0,<2",
+  "SQLAlchemy>=2.0.51,<2.1",
+  "sse-starlette>=3.4.5,<4",
+  "uvicorn[standard]>=0.34,<1",
 ]
 
 [project.scripts]
 pride-agent = "agent.cli:app"
+pride-dataset = "agent.dataset_construction.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent"]
