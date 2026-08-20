@@ -49,3 +49,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 2: Publish leakage-aware dataset construction
+
+**Date**: 2026-08-20
+**Task**: Publish leakage-aware dataset construction
+**Branch**: `worktree-benchmark-review-planning`
+
+### Summary
+
+Committed and pushed the isolated dataset-construction core, operations persistence/API dependencies, project Conda environment, design documentation, and 47 passing backend tests. Left unrelated dirty work untouched.
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `79e2d7e` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

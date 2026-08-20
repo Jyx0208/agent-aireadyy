@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 1
-- **Last Active**: 2026-07-17
+- **Total Sessions**: 2
+- **Last Active**: 2026-08-20
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~51 | Active |
+| `journal-1.md` | ~84 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 2 | 2026-08-20 | Publish leakage-aware dataset construction | `79e2d7e` | `worktree-benchmark-review-planning` |
 | 1 | 2026-07-17 | Agents SDK 建池与权重校准可视化 | `2ff41f1`, `378db6f` | `worktree-benchmark-review-planning` |
 <!-- @@@/auto:session-history -->
 
