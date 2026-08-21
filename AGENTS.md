@@ -1,5 +1,13 @@
 # Agent Guide
 
+## Canonical development line
+
+- The only supported checkout is `E:\ai-agent-already\github-publish\agent-aireadyy`.
+- The only development branch is `main`, tracking `origin/main`.
+- Before editing, verify that `git rev-parse --show-toplevel` resolves to the path above and that `git branch --show-current` returns `main`.
+- Do not create or use Git worktrees, feature branches, or retired paths under `.claude/worktrees/` unless the user explicitly reverses this policy.
+- Historical plans may mention retired worktrees. Those references describe past execution and are never instructions for current development.
+
 ## Agent skills
 
 ### Issue tracker

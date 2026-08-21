@@ -1,5 +1,9 @@
 # Domain Glossary
 
+## Canonical workspace
+
+All current development happens in `E:\ai-agent-already\github-publish\agent-aireadyy` on `main`. Historical references to `worktree-benchmark-review-planning` or `.claude/worktrees/benchmark-review-planning` are retired and must not be used as working paths.
+
 ## Discovery dialogue
 
 **Dialogue turn** — One user utterance and the Agent's response while shaping a
