@@ -714,7 +714,7 @@ describe("agent-turn strategy reducer", () => {
     expect(result.spec.quotaFlexibility).toBe("open_ended");
     expect(result.spec.targetProjectCount).toBeNull();
     expect(result.spec.maxCandidateProjects).toBeNull();
-    expect(result.spec.coverageMode).toBe("curated");
+    expect(result.spec.coverageMode).toBe("quick");
     expect(result.spec.timeBudget).toBe("fast");
   });
 

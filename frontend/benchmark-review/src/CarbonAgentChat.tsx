@@ -100,7 +100,9 @@ type Props = {
 
 const text = (value: unknown) => String(value || "").trim();
 const terminal = (job: DiscoveryJob | null) =>
-  ["completed", "failed", "blocked", "cancelled"].includes(String(job?.status || "").toLowerCase());
+  ["completed", "failed", "blocked", "cancelled", "interrupted", "durability_failed"].includes(
+    String(job?.status || "").toLowerCase(),
+  );
 
 const EXPLICIT_BULK_TERM_SUFFIX =
   /(?:^|[。.!！；;,，])\s*(?:(?:把)?这些(?:关键词|检索词|主题词|词)(?:也)?(?:要)?(?:加(?:上|入)?|添加|作为主题词)(?:到主题词)?|(?:加(?:上|入)?|添加)这些(?:关键词|检索词|主题词|词))(?:\s*[,，、]\s*(?:搜|搜索|检索)(?:得)?(?:更)?全面(?:一些)?)?\s*[。.!！]*$/u;

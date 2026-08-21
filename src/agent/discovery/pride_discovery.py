@@ -160,6 +160,9 @@ def discover_pride_dataset(
     queries: list[str] | None = None,
     candidate_records: list[dict[str, Any]] | None = None,
     report: Callable[[str], None] | None = None,
+    project_event: (
+        Callable[[str, str, str, dict[str, Any]], None] | None
+    ) = None,
     should_cancel: Callable[[], bool] | None = None,
     early_stop_on_limits: bool = False,
 ) -> DatasetManifest:
@@ -183,6 +186,21 @@ def discover_pride_dataset(
     def _check_cancel() -> None:
         if should_cancel is not None and should_cancel():
             raise InterruptedError("Discovery cancelled.")
+
+    def _project_event(
+        accession: str,
+        step: str,
+        status: str = "running",
+        **payload: Any,
+    ) -> None:
+        if project_event is None:
+            return
+        try:
+            project_event(accession, step, status, payload)
+        except Exception:
+            # Operational telemetry is best-effort; scientific inspection and
+            # its persisted manifest remain authoritative.
+            return
 
     try:
         if candidate_records is None and queries != proposed_queries:
@@ -281,6 +299,7 @@ def discover_pride_dataset(
             _check_cancel()
             accession = _project_accession(candidate)
             _report(f"Inspecting project {accession}.")
+            _project_event(accession, "metadata_read")
             try:
                 project_record = pride.get_project(accession)
             except Exception as exc:  # pragma: no cover - defensive network boundary
@@ -289,6 +308,13 @@ def discover_pride_dataset(
                     accession,
                     "inspection_failure",
                     stage="get_project",
+                    reason="repository_or_network_failure",
+                    error=str(exc),
+                )
+                _project_event(
+                    accession,
+                    "metadata_read",
+                    "failed",
                     reason="repository_or_network_failure",
                     error=str(exc),
                 )
@@ -302,6 +328,7 @@ def discover_pride_dataset(
                 continue
 
             try:
+                _project_event(accession, "metadata_score")
                 project_score = score_project(project_record, request)
             except Exception as exc:  # pragma: no cover - defensive parser boundary
                 failures.append(
@@ -311,6 +338,13 @@ def discover_pride_dataset(
                     accession,
                     "inspection_failure",
                     stage="score_project",
+                    reason="parse_failure",
+                    error=str(exc),
+                )
+                _project_event(
+                    accession,
+                    "metadata_score",
+                    "failed",
                     reason="parse_failure",
                     error=str(exc),
                 )
@@ -331,6 +365,16 @@ def discover_pride_dataset(
                 f"{project_score.acquisition_mode or 'unknown'}, evidence fields "
                 f"{', '.join(evidence_fields[:8]) or 'none'}."
             )
+            _project_event(
+                accession,
+                "metadata_score",
+                "completed",
+                retrieval_score=project_score.project_score,
+                confidence=project_score.confidence,
+                species=project_score.species,
+                acquisition_mode=project_score.acquisition_mode,
+                evidence_fields=evidence_fields,
+            )
             if project_score.excluded:
                 excluded_projects += 1
                 reason = project_score.exclusion_reason or "project excluded by request constraints"
@@ -338,6 +382,13 @@ def discover_pride_dataset(
                     accession,
                     "scientific_exclusion",
                     stage="score_project",
+                    reason=reason,
+                )
+                _project_event(
+                    accession,
+                    "scientific_gate",
+                    "completed",
+                    decision="exclude",
                     reason=reason,
                 )
                 _report(f"Excluded project {accession}: {reason}")
@@ -356,6 +407,11 @@ def discover_pride_dataset(
             else:
                 file_fetch_limit = max(int(request.max_files_per_project), 100)
             try:
+                _project_event(
+                    accession,
+                    "file_inventory",
+                    limit=file_fetch_limit,
+                )
                 if file_fetch_limit is None:
                     _report(f"Listing files for {accession} (all pages, no per-project cap).")
                 else:
@@ -373,12 +429,26 @@ def discover_pride_dataset(
                         else " (complete listing)."
                     )
                 )
+                _project_event(
+                    accession,
+                    "file_inventory",
+                    "completed",
+                    raw_file_count=total_fetched,
+                    truncated=is_truncated,
+                )
             except Exception as exc:  # pragma: no cover - defensive network boundary
                 failures.append({"stage": "list_project_files", "project": accession, "error": str(exc)})
                 _record_inspection_outcome(
                     accession,
                     "inspection_failure",
                     stage="list_project_files",
+                    reason="repository_or_network_failure",
+                    error=str(exc),
+                )
+                _project_event(
+                    accession,
+                    "file_inventory",
+                    "failed",
                     reason="repository_or_network_failure",
                     error=str(exc),
                 )
@@ -398,6 +468,7 @@ def discover_pride_dataset(
             sdrf_status = "not_found"
             sdrf_errors: list[str] = []
             try:
+                _project_event(accession, "sdrf_lookup")
                 _report(f"{accession}: checking SDRF metadata.")
                 sdrf_candidates = pride.list_project_files(accession, keyword="sdrf", max_files=5)
             except Exception as exc:  # pragma: no cover - defensive network boundary
@@ -411,6 +482,7 @@ def discover_pride_dataset(
                 if sdrf_url:
                     try:
                         _report(f"{accession}: downloading SDRF text.")
+                        _project_event(accession, "sdrf_download")
                         sdrf_text = pride.download_text(sdrf_url)
                     except Exception as exc:  # pragma: no cover - defensive network boundary
                         failures.append({"stage": "download_sdrf", "project": accession, "error": str(exc)})
@@ -431,6 +503,14 @@ def discover_pride_dataset(
                 else:
                     sdrf_status = "missing_download_url"
                     sdrf_errors.append("SDRF file record has no public download URL")
+            _project_event(
+                accession,
+                "sdrf_lookup",
+                "completed" if sdrf_status in {"available", "not_found"} else "failed",
+                sdrf_status=sdrf_status,
+                sdrf_row_count=len(sdrf_rows),
+                errors=sdrf_errors,
+            )
 
             project_features = extract_project_features(project_record, sdrf_rows)
             sdrf_file_index = build_sdrf_file_index(sdrf_rows)
@@ -448,6 +528,11 @@ def discover_pride_dataset(
             file_parse_errors: list[str] = []
             file_role_counts: Counter[str] = Counter()
             filter_reason_counts: Counter[str] = Counter()
+            _project_event(
+                accession,
+                "file_filter",
+                raw_file_count=len(raw_files),
+            )
             for raw_file in raw_files:
                 _check_cancel()
                 file_name = str(raw_file.get("fileName") or raw_file.get("name") or "")
@@ -473,6 +558,13 @@ def discover_pride_dataset(
                         raw_file,
                         project_features,
                         matched_sdrf_rows,
+                        inherit_homogeneous_project_instrument=(
+                            isinstance(request.portfolio_spec, dict)
+                            and (
+                                request.portfolio_spec.get("detail_level") == "strict"
+                                or "instruments" in (request.portfolio_spec.get("hard_dimensions") or [])
+                            )
+                        ),
                     )
                     file_features.evidence.extend(
                         _matched_sdrf_immunopeptide_evidence(matched_sdrf_rows)
@@ -556,6 +648,17 @@ def discover_pride_dataset(
                     _report(
                         f"{accession}: no usable acquisition/peaklist file candidates after filtering."
                     )
+                _project_event(
+                    accession,
+                    "file_filter",
+                    "completed",
+                    decision="exclude",
+                    raw_file_count=len(raw_files),
+                    usable_file_count=0,
+                    excluded_file_count=project_excluded_files,
+                    file_role_counts=dict(file_role_counts),
+                    filter_reason_counts=dict(filter_reason_counts),
+                )
                 continue
 
             project = project.model_copy(
@@ -577,6 +680,17 @@ def discover_pride_dataset(
                 accession,
                 "usable_files",
                 stage="score_files",
+                raw_file_count=len(raw_files),
+                usable_file_count=len(scored_files),
+                excluded_file_count=project_excluded_files,
+                file_role_counts=dict(file_role_counts),
+                filter_reason_counts=dict(filter_reason_counts),
+            )
+            _project_event(
+                accession,
+                "file_filter",
+                "completed",
+                decision="include",
                 raw_file_count=len(raw_files),
                 usable_file_count=len(scored_files),
                 excluded_file_count=project_excluded_files,

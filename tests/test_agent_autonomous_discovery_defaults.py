@@ -225,6 +225,29 @@ def test_all_human_immunopeptidomics_cannot_be_parsed_as_bounded_curated() -> No
     assert request.max_candidate_projects >= 20_000
 
 
+def test_legacy_twenty_project_payload_is_normalized_to_fixed_quick_execution() -> None:
+    request = web_app._clean_dataset_request(
+        {
+            "prompt": "Find 20 human immunopeptidomics projects for de novo training",
+            "goal": "immunopeptidomics",
+            "species": ["human"],
+            "query_terms": ["immunopeptidomics", "HLA ligandome"],
+            # This is the exact stale-client combination observed in production:
+            # the numeric target was present, but old mode defaults prevented the
+            # deterministic target-aware scheduler from running.
+            "scale_mode": "curated",
+            "max_projects": 20,
+            "max_candidate_projects": 80,
+            "continuous_discovery": False,
+            "quota_flexibility": "recommended",
+        }
+    )
+
+    assert request.max_projects == 20
+    assert request.quota_flexibility == "fixed"
+    assert request.continuous_discovery is True
+
+
 def test_dialogue_agent_is_told_the_real_execution_boundary() -> None:
     prompt = web_app._discovery_grill_turn_system_prompt()
 

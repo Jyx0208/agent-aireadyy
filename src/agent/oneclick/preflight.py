@@ -9,6 +9,17 @@ from agent.runtime.toolchain import detect_toolchain
 
 RUN_MODES = {"parameters", "prepare", "full"}
 RESOURCE_POLICIES = {"conservative", "balanced", "fast"}
+VENDOR_RAW_SUFFIXES = (
+    ".raw",
+    ".raw.zip",
+    ".raw.gz",
+    ".wiff",
+    ".wiff.scan",
+    ".d",
+    ".d.zip",
+    ".d.tar.gz",
+    ".d.tgz",
+)
 
 
 def normalize_run_mode(value: Any, *, default: str = "full") -> str:
@@ -25,6 +36,14 @@ def normalize_run_mode(value: Any, *, default: str = "full") -> str:
 def normalize_resource_policy(value: Any) -> str:
     policy = str(value or "").strip().lower().replace("-", "_")
     return policy if policy in RESOURCE_POLICIES else "balanced"
+
+
+def _contains_vendor_raw_input(inputs: list[str]) -> bool:
+    for value in inputs:
+        path = str(value or "").split("?", 1)[0].split("#", 1)[0].lower()
+        if path.endswith(VENDOR_RAW_SUFFIXES):
+            return True
+    return False
 
 
 def run_preflight(
@@ -46,6 +65,7 @@ def run_preflight(
     warnings: list[str] = []
 
     toolchain = toolchain_detector()
+    contains_vendor_raw = _contains_vendor_raw_input(inputs)
     if mode == "parameters":
         checks.append({"name": "toolchain", "status": "ok", "message": "Parameter mode does not require Docker or msconvert."})
     else:
@@ -55,12 +75,42 @@ def run_preflight(
             checks.append({"name": "docker", "status": "blocked", "message": issue})
         else:
             checks.append({"name": "docker", "status": "ok", "message": "Docker daemon is reachable."})
+        if (
+            mode == "full"
+            and bool(getattr(toolchain, "docker_daemon_available", False))
+            and not bool(
+                getattr(toolchain, "docker_msdt_image_available", False)
+            )
+        ):
+            issue = (
+                "Required MSDT workflow Docker image is not installed: "
+                "guomics2017/msdt-converter:v1.3."
+            )
+            blocking.append(issue)
+            checks.append(
+                {"name": "msdt_image", "status": "blocked", "message": issue}
+            )
         if not bool(getattr(toolchain, "msconvert_available", False)) and not bool(getattr(toolchain, "docker_daemon_available", False)):
             issue = "msconvert or Docker ProteoWizard fallback is required for vendor RAW conversion."
             blocking.append(issue)
             checks.append({"name": "msconvert", "status": "blocked", "message": issue})
         elif bool(getattr(toolchain, "msconvert_available", False)):
             checks.append({"name": "msconvert", "status": "ok", "message": "Local msconvert is available."})
+        elif (
+            contains_vendor_raw
+            and not bool(
+                getattr(toolchain, "docker_pwiz_image_available", False)
+            )
+        ):
+            issue = (
+                "Vendor RAW input requires local msconvert or the installed "
+                "ProteoWizard Docker image; the Docker daemon is reachable "
+                "but the ProteoWizard Docker image is missing."
+            )
+            blocking.append(issue)
+            checks.append(
+                {"name": "pwiz_image", "status": "blocked", "message": issue}
+            )
         else:
             checks.append({"name": "msconvert", "status": "warning", "message": "Local msconvert is missing; Docker ProteoWizard fallback will be used."})
 

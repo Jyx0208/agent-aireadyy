@@ -1,0 +1,4 @@
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Verify the full Prompt -> TaskSpec -> discovery -> evidence -> pool -> experts -> consensus -> UI/export data flow and ownership."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Check that shared payload normalization, status transitions, and existing job/pool services are reused without divergence."}
+{"file":".trellis/tasks/07-15-expert-review-workbench/design.md","reason":"Regression-check existing expert/developer/test visibility, credential redaction, persistence, and API compatibility."}
+{"file":".trellis/tasks/07-16-benchmark-review-scoring/prd.md","reason":"Primary acceptance criteria for heterogeneous expert independence, evidence-backed judgments, one-prompt pool construction, and provenance semantics."}

@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
-set "AGENT_MAX_CONCURRENT_TASKS=1"
+set "AGENT_MAX_CONCURRENT_TASKS=4"
 set "PYTHONPATH=%~dp0src"
 
 if not exist "%PYTHON_EXE%" (
@@ -15,12 +15,12 @@ if not exist "%PYTHON_EXE%" (
 
 echo Starting PRIDE AI-ready Agent Web...
 echo URL: http://127.0.0.1:8000
-echo Small-server mode: only 1 task runs at a time; extra tasks stay queued.
+echo Operations mode: persistent queue with 4 review workers.
 echo Keep this window open while using the website.
 echo Press Ctrl+C to stop.
 echo.
 
-"%PYTHON_EXE%" -m uvicorn --app-dir "%~dp0src" agent.web.app:app --host 127.0.0.1 --port 8000
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\run_platform.ps1" -ListenHost 127.0.0.1 -Port 8000 -WorkerCount 4
 
 echo.
 echo Web service stopped.

@@ -43,6 +43,36 @@ def _value(value, confidence=0.9, source="test", conflict_flag=False):
     )
 
 
+def test_fixed_project_count_uses_quick_mode_and_the_scale_question_has_two_modes():
+    hints = web_app._discovery_compound_commitment_hints(
+        "检索人类免疫肽数据，只要 37 个可用项目"
+    )
+    assert hints["coverage_mode"] == "quick"
+    assert hints["quota_flexibility"] == "fixed"
+    assert hints["target_project_count"] == 37
+    for prompt in ("搜20个", "找20个", "20个"):
+        parsed = web_app._discovery_compound_commitment_hints(prompt)
+        assert parsed["coverage_mode"] == "quick"
+        assert parsed["quota_flexibility"] == "fixed"
+        assert parsed["target_project_count"] == 20
+    conflict = web_app._discovery_compound_commitment_hints(
+        "检索所有相关数据，但先找够20个项目"
+    )
+    assert conflict["coverage_mode"] == "quick"
+    assert conflict["quota_flexibility"] == "fixed"
+    assert conflict["target_project_count"] == 20
+
+    decision = web_app._synthesize_discovery_next_decision_from_agenda(
+        [{"id": "search_scale", "reason": "需要确认数量"}]
+    )
+    assert decision is not None
+    assert [option["id"] for option in decision["options"]] == [
+        "quick_20",
+        "open_ended",
+    ]
+    assert "精选" not in json.dumps(decision, ensure_ascii=False)
+
+
 def test_primary_project_error_allows_known_project_local_source():
     result = SimpleNamespace(
         resolution=SimpleNamespace(
@@ -1004,6 +1034,84 @@ def test_create_parameter_batch_persists_manifest_without_api_key(monkeypatch, t
             web_app._batches.pop(batch_id, None)
 
 
+def test_create_parameter_batch_rejects_full_mode_when_execution_is_disabled(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr("agent.web.app._run_llm_check", _llm_ok, raising=False)
+    monkeypatch.setattr("agent.web.app._start_parameter_batch_thread", lambda _batch_id: None, raising=False)
+    monkeypatch.setenv("AGENT_WEB_FULL_WORKFLOW_ENABLED", "0")
+
+    result = asyncio.run(
+        web_app.create_parameter_batch(
+            {
+                "inputs": ["sample.raw"],
+                "run_mode": "full",
+                "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
+            }
+        )
+    )
+
+    assert "error" in result
+    assert "full" in result["error"].lower()
+    assert not result.get("batch_id")
+
+
+def test_cancel_parameter_batch_marks_queued_items_cancelled(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    monkeypatch.setattr("agent.web.app._run_llm_check", _llm_ok, raising=False)
+    monkeypatch.setattr("agent.web.app._start_parameter_batch_thread", lambda _batch_id: None, raising=False)
+
+    created = asyncio.run(
+        web_app.create_parameter_batch(
+            {
+                "inputs": ["sample_a.raw", "sample_b.raw"],
+                "run_mode": "parameters",
+                "llm_config": {"api_key": "sk-secret", "base_url": "https://api.example.com", "model": "m1"},
+            }
+        )
+    )
+    batch_id = created["batch_id"]
+    try:
+        cancelled = asyncio.run(web_app.cancel_parameter_batch(batch_id))
+
+        assert cancelled["status"] == "cancelled"
+        assert cancelled["cancel_requested"] is True
+        assert cancelled["cancelled_items"] == 2
+        assert cancelled["queued_items"] == 0
+        manifest = json.loads(
+            (tmp_path / "_batches" / batch_id / "batch_manifest.json").read_text(encoding="utf-8")
+        )
+        assert manifest["status"] == "cancelled"
+        assert all(item["status"] == "cancelled" for item in manifest["items"])
+    finally:
+        web_app._batches.pop(batch_id, None)
+
+
+def test_batch_manifest_is_indexed_in_operations_history(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
+    batch_dir = tmp_path / "_batches" / "historybatch"
+    batch = {
+        "batch_id": "historybatch",
+        "status": "queued",
+        "created_at": "2026-07-31T10:00:00+08:00",
+        "updated_at": "2026-07-31T10:00:00+08:00",
+        "output_dir": str(batch_dir),
+        "excel_path": str(batch_dir / "benchmark_results.xlsx"),
+        "repository": "pride",
+        "run_mode": "full",
+        "items": [{"index": 1, "input": "sample.raw", "status": "queued"}],
+        "errors": [],
+        "events": [],
+    }
+
+    web_app._write_batch_manifest(batch)
+
+    page = web_app.get_operations_repository().list_history(kind="batch")
+    indexed = next(item for item in page.items if item["source_id"] == "historybatch")
+    assert indexed["status"] == "queued"
+    assert indexed["file_count"] == 1
+    assert indexed["metadata"]["run_mode"] == "full"
+
+
 def test_create_parameter_batch_persists_discovery_context(monkeypatch, tmp_path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setattr("agent.web.app._run_llm_check", _llm_ok, raising=False)
@@ -1417,7 +1525,7 @@ def test_create_batch_persists_run_mode_and_resource_policy(monkeypatch, tmp_pat
                 web_app._batches.pop(batch_id, None)
 
 
-def test_create_batch_downgrades_full_workflow_when_disabled(monkeypatch, tmp_path):
+def test_create_batch_never_silently_downgrades_full_workflow_when_disabled(monkeypatch, tmp_path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setattr("agent.web.app._run_llm_check", _llm_ok, raising=False)
     monkeypatch.setattr(web_app, "_start_parameter_batch_thread", lambda _batch_id: None)
@@ -1434,16 +1542,9 @@ def test_create_batch_downgrades_full_workflow_when_disabled(monkeypatch, tmp_pa
         )
     )
 
-    batch_id = result.get("batch_id")
-    try:
-        assert result["run_mode"] == "prepare"
-        with web_app._batches_lock:
-            batch = dict(web_app._batches[batch_id])
-        assert batch["run_mode"] == "prepare"
-    finally:
-        if batch_id:
-            with web_app._batches_lock:
-                web_app._batches.pop(batch_id, None)
+    assert "error" in result
+    assert "not enabled" in result["error"]
+    assert not result.get("batch_id")
 
 
 def test_preflight_endpoint_accepts_single_and_batch_inputs(monkeypatch, tmp_path):
@@ -2094,17 +2195,24 @@ def test_project_history_lists_parameter_batches_from_memory_and_disk(monkeypatc
     active = {item["batch_id"]: item for item in history["active_tasks"] if item.get("kind") == "batch"}
     results = {item["batch_id"]: item for item in history["results"] if item.get("kind") == "batch"}
 
-    assert active["activebatch"]["display_name"] == "Batch Excel report"
+    assert active["activebatch"]["display_name"].startswith("Batch workflow")
+    assert active["activebatch"]["display_name"].endswith("2 files")
     assert active["activebatch"]["task_id"] == "batch-activebatch"
     assert active["activebatch"]["primary_action"] == "watch"
     assert active["activebatch"]["item_count"] == 2
     assert active["activebatch"]["run_mode"] == "parameters"
-    assert results["donebatch"]["display_name"] == "Batch Excel report"
+    assert results["donebatch"]["display_name"].startswith("Batch workflow")
+    assert results["donebatch"]["display_name"].endswith("1 files")
     assert results["donebatch"]["primary_action"] == "download"
     assert results["donebatch"]["can_download"] is True
     assert results["donebatch"]["file_count"] >= 1
     assert history["summary"]["total"] == 2
     assert history["summary"]["downloadable"] == 1
+
+
+def test_web_runtime_uses_the_per_test_run_storage(tmp_path: Path):
+    assert web_app._runs_dir == tmp_path / "runs"
+
 
 
 def test_fast_project_history_never_recursively_scans_result_directories(monkeypatch, tmp_path):
@@ -2183,6 +2291,34 @@ def test_fast_discovery_history_survives_memory_reset_via_small_sidecar(monkeypa
     assert records[0]["resumable"] is True
     assert records[0]["project_count"] == 612
     assert "logs" not in records[0]
+
+
+def test_discovery_memory_is_scoped_to_the_configured_run_storage(monkeypatch, tmp_path):
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    monkeypatch.setattr(web_app, "_runs_dir", first_root)
+    stale_job = {
+        "job_id": "discovery_job_other_storage",
+        "idempotency_key": "same-request",
+        "storage_scope": web_app._discovery_storage_scope(),
+        "status": "running",
+        "created_at": "2026-07-29T10:00:00+08:00",
+        "body": {"prompt": "human immunopeptidomics"},
+        "record": {},
+        "logs": [],
+    }
+    with web_app._discovery_jobs_lock:
+        previous_jobs = dict(web_app._discovery_jobs)
+        web_app._discovery_jobs.clear()
+        web_app._discovery_jobs[stale_job["job_id"]] = stale_job
+    try:
+        monkeypatch.setattr(web_app, "_runs_dir", second_root)
+        assert web_app._list_discovery_history_records_fast() == []
+        assert web_app._find_discovery_job_by_idempotency_key("same-request") is None
+    finally:
+        with web_app._discovery_jobs_lock:
+            web_app._discovery_jobs.clear()
+            web_app._discovery_jobs.update(previous_jobs)
 
 
 def test_failed_discovery_sidecar_refresh_removes_stale_running_shell(monkeypatch, tmp_path):
@@ -2391,7 +2527,7 @@ def test_project_history_marks_disk_only_running_batch_as_interrupted(monkeypatc
 
     assert history["active_tasks"] == []
     assert history["results"][0]["batch_id"] == "orphanbatch"
-    assert history["results"][0]["status"] == "failed"
+    assert history["results"][0]["status"] == "interrupted"
     assert history["results"][0]["interrupted"] is True
 
 
@@ -3485,7 +3621,7 @@ def test_create_task_keeps_output_dir_inside_runs_for_pathlike_input(monkeypatch
     try:
         assert "error" not in result
         output_dir = Path(result["output_dir"])
-        assert output_dir.parts[0] == "runs"
+        assert output_dir.resolve().is_relative_to(web_app._runs_dir.resolve())
         assert output_dir.name == "outside" or output_dir.name.startswith("outside__")
         assert ".." not in output_dir.parts
     finally:

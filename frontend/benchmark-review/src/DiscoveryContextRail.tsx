@@ -18,6 +18,7 @@ import {
   type DiscoveryRunView,
 } from "./DiscoveryProgressMessage";
 import { IntentSpecPanel } from "./IntentSpecPanel";
+import { PortfolioCoveragePanel } from "./PortfolioCoveragePanel";
 import type { GrillPhase, IntentSpec } from "./intent-spec";
 import { getDiscoveryBatchHandoff, type DiscoveryBatchHandoff, type DiscoveryJob } from "./workflow-api";
 
@@ -46,9 +47,11 @@ function tagType(status: DiscoveryRunStatus): "blue" | "green" | "red" | "gray" 
 
 function RunStatusCard({
   view,
+  portfolioState,
   onOpenResult,
 }: {
   view: DiscoveryRunView | null;
+  portfolioState?: unknown;
   onOpenResult: () => void;
 }) {
   const active = view?.status === "queued" || view?.status === "running";
@@ -62,9 +65,12 @@ function RunStatusCard({
         <h2>当前数据发现</h2>
       </div>
       {!view ? (
-        <p className="empty-copy">策略确认后，这里只显示真实运行状态、关键计数和结果入口。</p>
+        <p className="empty-copy">确认检索策略后，将在此显示实时运行状态和关键指标。</p>
       ) : active ? (
-        <DiscoveryProgressMessage payload={toDiscoveryProgressPayload(view)} />
+        <>
+          <DiscoveryProgressMessage payload={toDiscoveryProgressPayload(view)} />
+          <PortfolioCoveragePanel state={portfolioState} />
+        </>
       ) : (
         <>
           <div className="run-status">
@@ -118,6 +124,7 @@ function RunStatusCard({
           {view.status === "cancelled" ? (
             <p className="empty-copy">已取消本轮搜索；可以继续修改策略后重新确认。</p>
           ) : null}
+          <PortfolioCoveragePanel state={portfolioState} />
         </>
       )}
     </Tile>
@@ -307,7 +314,11 @@ export function DiscoveryContextRail({
     />
   );
   const runStatusCard = (
-    <RunStatusCard view={view} onOpenResult={openResult} />
+    <RunStatusCard
+      view={view}
+      portfolioState={job?.record?.portfolio_state}
+      onOpenResult={openResult}
+    />
   );
   const modalContent = (
     <div className="context-modal-stack">

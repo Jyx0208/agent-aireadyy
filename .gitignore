@@ -3,6 +3,8 @@ __pycache__/
 .env
 .agent_python_path
 .venv/
+.conda-env/
+.conda-pkgs/
 .pytest_cache/
 .test_tmp/
 pytest-cache-files-*/
@@ -18,6 +20,23 @@ sample_task/
 .codex_known_hosts
 .check_hela_argc_try/
 .upload_tmp/
+.codex_tmp/
+.continuity/
+.local_data/
+.playwright-cli/
+.run/
+output/
+frontend/benchmark-review/.playwright-cli/
+
+# Agent/session scratch files are local diagnostics, not product source.
+/_*.py
+/_*.txt
+/_tmp*.json
+/findings.md
+/progress.md
+/task_plan.md
+/nul
+/docs/plans/_*
 
 # Local tool archives and unpacked vendor bundles
 FragPipe-*.zip

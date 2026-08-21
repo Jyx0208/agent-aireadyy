@@ -334,7 +334,7 @@ const STRATEGY_FIELDS: readonly StrategyFieldDefinition[] = [
   ] as const) },
   { key: "labelingHard", aliases: ["labeling_hard", "labelingHard"], decode: booleanDecoder },
   { key: "coverageMode", aliases: ["coverage_mode", "coverageMode", "scale_mode", "scaleMode"], decode: enumDecoder([
-    "curated", "balanced", "exhaustive",
+    "quick", "curated", "balanced", "exhaustive",
   ] as const) },
   { key: "targetProjectCount", aliases: ["target_project_count", "targetProjectCount", "max_projects", "maxProjects"], decode: positiveInteger(5000) },
   { key: "maxCandidateProjects", aliases: ["max_candidate_projects", "maxCandidateProjects"], decode: positiveInteger(20000) },

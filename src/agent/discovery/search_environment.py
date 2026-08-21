@@ -7,6 +7,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Protocol
 
 from pydantic import Field, model_validator
@@ -454,8 +455,13 @@ class PrideDiscoverySearchEnvironment:
         request_budget: int | None,
     ) -> CandidateSearchObservation:
         self._check_cancel()
-        continuous_search = bool(self.request.continuous_discovery) or bool(
-            self.request.harvest_all_qualified
+        continuous_search = (
+            bool(self.request.continuous_discovery)
+            or bool(self.request.harvest_all_qualified)
+            or (
+                self.request.quota_flexibility == "fixed"
+                and bool(self.request.query_terms)
+            )
         )
         confirmed_themes = [
             (
@@ -484,7 +490,7 @@ class PrideDiscoverySearchEnvironment:
         )
         if (
             continuous_search
-            and self.request.quota_flexibility == "open_ended"
+            and self.request.quota_flexibility in {"fixed", "open_ended"}
             and active_confirmed_theme is not None
             and bool(submitted_theme_queries)
             and not submitted_queries_are_already_exhausted
@@ -875,6 +881,7 @@ class PrideDiscoverySearchEnvironment:
                         max_results=max_results,
                         start_page=start_page,
                         start_offset=absolute_offset,
+                        page_number=start_page + 1,
                     )
                     last_page_count: int | None = None
                     last_cumulative_count = 0
@@ -896,7 +903,11 @@ class PrideDiscoverySearchEnvironment:
                             depth=query_spec.depth,
                             role=unit_role,
                             page=page,
+                            page_number=page + 1,
+                            page_result_count=page_count,
+                            # Keep the legacy field for old event consumers.
                             page_count=page_count,
+                            pages_completed=actual_pages_requested,
                             cumulative_count=min(
                                 target_per_query,
                                 max(0, cumulative_count - page_prefix_to_skip),
@@ -945,6 +956,8 @@ class PrideDiscoverySearchEnvironment:
                         depth=query_spec.depth,
                         role=unit_role,
                         error=str(exc),
+                        page_number=start_page + actual_pages_requested + 1,
+                        pages_completed=actual_pages_requested,
                     )
                     failure = f"{query_spec.query}: {exc}"
                     failures.append(failure)
@@ -1029,6 +1042,8 @@ class PrideDiscoverySearchEnvironment:
                     raw_result_count=len(rows),
                     new_candidate_count=new_for_query,
                     duplicate_count=duplicate_for_query,
+                    pages_completed=actual_pages_requested,
+                    last_page_result_count=last_page_count or 0,
                 )
             # Portfolio unit audit status.
             if unit_executed:
@@ -1070,8 +1085,13 @@ class PrideDiscoverySearchEnvironment:
             ranked,
             key=lambda item: item[0] not in self._pinned_accessions,
         )
-        unlimited_pool = bool(self.request.continuous_discovery) or bool(
-            self.request.harvest_all_qualified
+        unlimited_pool = (
+            bool(self.request.continuous_discovery)
+            or bool(self.request.harvest_all_qualified)
+            or (
+                self.request.quota_flexibility == "fixed"
+                and bool(self.request.query_terms)
+            )
         )
         retention_limit = max(1, int(self.request.max_candidate_projects))
         if not unlimited_pool and len(ranked) > retention_limit:
@@ -1212,17 +1232,94 @@ class PrideDiscoverySearchEnvironment:
             }
         )
         inspection_workers = min(4, len(records))
-        if inspection_workers <= 1:
-            manifest = discover_pride_dataset(
-                inspection_request,
-                client=self.client,
-                memory=self.memory,
-                queries=[],
-                candidate_records=records,
-                report=self.report,
-                should_cancel=self.should_cancel,
-                early_stop_on_limits=False,
+        def _inspect_one(
+            record: dict[str, Any],
+            worker_slot: int,
+        ) -> DatasetManifest:
+            accession = _project_accession(record)
+            started = perf_counter()
+            self._emit_search_event(
+                "project_review_started",
+                project_accession=accession,
+                worker_slot=worker_slot,
+                step="metadata_read",
+                status="running",
             )
+            single_request = inspection_request.model_copy(
+                update={
+                    "max_projects": 1,
+                    "max_candidate_projects": 1,
+                }
+            )
+
+            def project_event(
+                project_accession: str,
+                step: str,
+                status: str,
+                payload: dict[str, Any],
+            ) -> None:
+                self._emit_search_event(
+                    "project_review_step",
+                    project_accession=project_accession,
+                    worker_slot=worker_slot,
+                    step=step,
+                    status=status,
+                    elapsed_ms=int((perf_counter() - started) * 1_000),
+                    **payload,
+                )
+
+            try:
+                result = discover_pride_dataset(
+                    single_request,
+                    client=self.client,
+                    memory=self.memory,
+                    queries=[],
+                    candidate_records=[record],
+                    report=self.report,
+                    project_event=project_event,
+                    should_cancel=self.should_cancel,
+                    early_stop_on_limits=False,
+                )
+            except Exception as exc:
+                self._emit_search_event(
+                    "project_review_completed",
+                    project_accession=accession,
+                    worker_slot=worker_slot,
+                    status="failed",
+                    step="failed",
+                    elapsed_ms=int((perf_counter() - started) * 1_000),
+                    inspection_outcomes=[
+                        {
+                            "project_accession": accession,
+                            "category": "inspection_failure",
+                            "stage": "inspection",
+                            "reason": "project_review_failed",
+                            "error": str(exc),
+                        }
+                    ],
+                )
+                raise
+            outcomes = [
+                {
+                    **dict(item),
+                    "elapsed_ms": int((perf_counter() - started) * 1_000),
+                }
+                for item in result.summary.get("inspection_outcomes") or []
+                if isinstance(item, dict)
+            ]
+            self._emit_search_event(
+                "project_review_completed",
+                project_accession=accession,
+                worker_slot=worker_slot,
+                status="completed",
+                step="completed",
+                elapsed_ms=int((perf_counter() - started) * 1_000),
+                inspection_outcomes=outcomes,
+            )
+            return result
+
+        if inspection_workers <= 1:
+            manifest = _inspect_one(records[0], 1)
         else:
             self._report(
                 f"Reviewing {len(records)} deduplicated projects with "
@@ -1230,30 +1327,17 @@ class PrideDiscoverySearchEnvironment:
             )
             ordered_manifests: list[DatasetManifest | None] = [None] * len(records)
 
-            def _inspect_one(record: dict[str, Any]) -> DatasetManifest:
-                single_request = inspection_request.model_copy(
-                    update={
-                        "max_projects": 1,
-                        "max_candidate_projects": 1,
-                    }
-                )
-                return discover_pride_dataset(
-                    single_request,
-                    client=self.client,
-                    memory=self.memory,
-                    queries=[],
-                    candidate_records=[record],
-                    report=self.report,
-                    should_cancel=self.should_cancel,
-                    early_stop_on_limits=False,
-                )
-
             with ThreadPoolExecutor(
                 max_workers=inspection_workers,
                 thread_name_prefix="pride-review",
             ) as executor:
                 futures = {
-                    executor.submit(copy_context().run, _inspect_one, record): index
+                    executor.submit(
+                        copy_context().run,
+                        _inspect_one,
+                        record,
+                        (index % inspection_workers) + 1,
+                    ): index
                     for index, record in enumerate(records)
                 }
                 for future in as_completed(futures):

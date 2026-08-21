@@ -56,6 +56,18 @@ def classify_error(exc: BaseException, *, stage: str = "unknown") -> ErrorClassi
         if status_code >= 500:
             return ErrorClassification("remote_service", f"远程服务暂时不可用（HTTP {status_code}）。", "稍后重试；若持续失败，保留 error.json 供排查。", True)
         return ErrorClassification("http_error", f"远程请求失败（HTTP {status_code}）。", "检查请求目标和输入文件名。", False)
+    if "docker" in text and (
+        "failed to resolve reference" in text
+        or "registry-1.docker.io" in text
+        or "pull access denied" in text
+        or "no such image" in text
+    ):
+        return ErrorClassification(
+            "docker_image_unavailable",
+            "ProteoWizard/MSDT Docker 镜像未安装或镜像仓库不可访问。",
+            "预先下载所需镜像，或安装本地 ProteoWizard msconvert；Docker daemon 本身可能仍正常。",
+            True,
+        )
     if isinstance(exc, httpx.TimeoutException) or "timed out" in text or "timeout" in text:
         return ErrorClassification("timeout", "远程请求超时。", "降低并发、稍后重试，或增大超时时间。", True)
     if isinstance(exc, httpx.RequestError):

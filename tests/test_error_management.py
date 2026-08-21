@@ -53,6 +53,23 @@ def test_classify_common_runtime_failures():
     assert classify_error(nonzero).category == "process_failed"
 
 
+def test_classify_docker_registry_pull_failure_separately_from_daemon():
+    error = subprocess.CalledProcessError(
+        125,
+        ["docker", "run"],
+        output=(
+            "docker: Error response from daemon: failed to resolve reference "
+            '"docker.io/chambm/pwiz-skyline-i-agree-to-the-vendor-licenses:latest": '
+            'Head "https://registry-1.docker.io/v2/": connectex timeout'
+        ),
+    )
+
+    result = classify_error(error, stage="batch_item")
+
+    assert result.category == "docker_image_unavailable"
+    assert "ProteoWizard" in result.public_message
+
+
 def test_classify_network_error_uses_readable_public_message():
     request = httpx.Request("GET", "https://ftp.pride.ebi.ac.uk/")
     error = httpx.ConnectError("[SSL: UNEXPECTED_EOF_WHILE_READING]", request=request)

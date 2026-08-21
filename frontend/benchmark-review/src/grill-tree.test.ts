@@ -413,17 +413,39 @@ describe("explicit project count / strategy revise", () => {
     expect(draft.targetProjectCount).toBe(2000);
     expect(payload.max_projects).toBe(2000);
     expect(payload.max_candidate_projects).toBeGreaterThanOrEqual(8000);
-    expect(payload.continuous_discovery).toBe(false);
+    expect(payload.continuous_discovery).toBe(true);
   });
 
   it("applyLocalParse writes target 20 from natural language", () => {
     const draft = applyLocalParse("免疫肽数据，20个可用项目就行");
     expect(draft.targetProjectCount).toBe(20);
-    expect(draft.coverageMode).toBe("curated");
+    expect(draft.coverageMode).toBe("quick");
     expect(draft.maxCandidateProjects).toBeGreaterThanOrEqual(80);
     const card = buildStrategyCard(draft);
     expect(card.summaryLines.join("\n")).toContain("固定数量目标：20 个项目（待搜索核验）");
     expect(card.summaryLines.join("\n")).not.toMatch(/约 80 个可用项目/);
+  });
+
+  it("presents quantity as quick target versus exhaustive coverage without curated wording", () => {
+    const draft = applyRecommendedDefaults(applyLocalParse("人类免疫肽数据"));
+    draft.answered.Q7 = false;
+
+    const question = nextQuestion(draft);
+    expect(question?.id).toBe("Q7");
+    expect(question?.prompt).toContain("快速找够指定数量");
+    expect(question?.options.map((option) => option.id)).toEqual([
+      "quick",
+      "exhaustive",
+    ]);
+    expect(JSON.stringify(question)).not.toContain("精选");
+
+    const quick = applyAnswer(draft, "Q7", "快速找够 20 个可用项目");
+    expect(quick.coverageMode).toBe("quick");
+    expect(quick.quotaFlexibility).toBe("fixed");
+    expect(quick.targetProjectCount).toBe(20);
+    const payload = toDiscoveryJobPayload({ ...quick, confirmed: true });
+    expect(payload.scale_mode).toBe("quick");
+    expect(payload.continuous_discovery).toBe(true);
   });
 
   it("revises balanced 80 down to explicit 20 without wiping other fields", () => {
@@ -442,7 +464,7 @@ describe("explicit project count / strategy revise", () => {
     merged = applyTargetProjectCount(merged, n!);
 
     expect(merged.targetProjectCount).toBe(20);
-    expect(merged.coverageMode).toBe("curated");
+    expect(merged.coverageMode).toBe("quick");
     expect(merged.ptmTypes).toContain("immunopeptide");
     expect(merged.maxCandidateProjects).toBeLessThan(250);
 
@@ -453,12 +475,14 @@ describe("explicit project count / strategy revise", () => {
     expect(formatConfirmMessage(merged)).toContain("固定数量目标：20 个项目（待搜索核验）");
   });
 
-  it("immunopeptide recommended defaults prefer curated ~20 not balanced 80", () => {
+  it("immunopeptide recommended defaults prefer quick ~20 not balanced 80", () => {
     const draft = applyRecommendedDefaults(applyLocalParse("免疫肽数据"));
     expect(draft.ptmTypes).toContain("immunopeptide");
-    expect(draft.coverageMode).toBe("curated");
+    expect(draft.coverageMode).toBe("quick");
     expect(draft.targetProjectCount).toBe(20);
-    expect(buildStrategyCard(draft).summaryLines.join(" ")).toMatch(/目标规模：约 20 个可用项目/);
+    expect(draft.quotaFlexibility).toBe("fixed");
+    expect(toDiscoveryJobPayload(draft).continuous_discovery).toBe(true);
+    expect(buildStrategyCard(draft).summaryLines.join(" ")).toMatch(/快速模式.*找够|快速模式.*达到即停/);
   });
 
   it("mergeLlmFields overrides existing balanced with max_projects 20", () => {
@@ -832,7 +856,8 @@ describe("objective pollution & free-text absorb", () => {
     expect(deriveObjective(draft)).not.toBe("7");
     const card = buildStrategyCard(draft);
     expect(card.summaryLines.join(" | ")).not.toMatch(/目标：\s*7\b/);
-    expect(card.summaryLines).toContain("固定数量目标：20 个项目（待搜索核验）；候选池约 80");
+    expect(card.summaryLines.join(" ")).toContain("固定数量目标：20 个项目（待搜索核验）");
+    expect(card.summaryLines.join(" ")).not.toContain("候选池约 80");
   });
 });
 
@@ -857,11 +882,11 @@ describe("orientation & right-panel goal", () => {
     expect(draft.species).toContain("human");
   });
 
-    it("mergeLlmFields does not lock invented project counts as fixed user counts", () => {
-    // first-pass fill_gaps: LLM scale band fills gaps without inventing a fixed lock
+  it("treats the quick scale itself as a fixed-target execution contract", () => {
     let draft = applyLocalParse("免疫肽");
     draft = mergeLlmFields(draft, { scale_mode: "curated", target_project_count: 50 }, [], "llm guess", "fill_gaps");
-    expect(draft.quotaFlexibility).not.toBe("fixed");
+    expect(draft.coverageMode).toBe("quick");
+    expect(draft.quotaFlexibility).toBe("fixed");
     expect(draft.targetProjectCount).toBe(20);
     // user explicit still wins even under patch
     draft = applyTargetProjectCount(draft, 20);

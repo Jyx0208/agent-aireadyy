@@ -1,0 +1,4 @@
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"One-prompt pool build spans prompt parsing, discovery jobs, storage, APIs, UI, expert execution, and benchmark export; use the shared boundary-contract checklist."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Extend existing discovery, pool registry, pool builder, and judge job implementations instead of creating parallel code paths."}
+{"file":".trellis/tasks/07-15-expert-review-workbench/design.md","reason":"Existing expert-review architecture, API, storage, visibility, job, and compatibility contracts that the new system must migrate rather than overwrite."}
+{"file":".trellis/tasks/07-15-expert-agent-judging/prd.md","reason":"Legacy agent judging requirements and constraints whose provisional semantics must be upgraded to heterogeneous model-expert consensus."}

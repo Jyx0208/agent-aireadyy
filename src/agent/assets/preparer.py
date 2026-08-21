@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import gzip
 import shutil
@@ -21,8 +22,16 @@ class AssetPreparationError(RuntimeError):
 
 
 class RawToMzMLConverter:
-    def __init__(self, executable: str = "msconvert", report: Callable[[str], None] | None = None):
-        self.executable = executable
+    def __init__(
+        self,
+        executable: str | None = None,
+        report: Callable[[str], None] | None = None,
+    ):
+        self.executable = (
+            executable
+            or os.getenv("AGENT_MSCONVERT_EXECUTABLE", "").strip()
+            or "msconvert"
+        )
         self.report = report
 
     def convert_to_mzml(self, source: Path, target: Path) -> Path:

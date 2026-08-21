@@ -678,6 +678,149 @@ def test_confirmed_term_pipeline_exhausts_each_term_before_review_and_next_term(
     assert term_events[3].payload["chunks_completed"] == 1
 
 
+def test_fixed_target_pipeline_reviews_each_core_chunk_and_stops_before_more_search(
+    tmp_path: Path,
+) -> None:
+    class FixedTargetPipelineEnvironment(_FakeSearchEnvironment):
+        def __init__(self, request: DatasetRequest) -> None:
+            super().__init__(request)
+            self.calls: list[str] = []
+            self.records: list[str] = []
+            self.latest_search_id = ""
+
+        @property
+        def candidate_accessions(self) -> list[str]:
+            return list(self.records)
+
+        def search(self, action: CandidateSearchAction) -> CandidateSearchObservation:
+            term = action.queries[0].query
+            self.search_actions.append(action)
+            self.calls.append(f"search:{term}")
+            additions = (
+                ["PXD000001"]
+                if len(self.search_actions) == 1
+                else ["PXD000001", "PXD000002", "PXD000003"]
+            )
+            before = set(self.records)
+            new_accessions = set(additions) - before
+            self.records.extend(
+                accession for accession in additions if accession not in self.records
+            )
+            self.latest_search_id = f"search_{len(self.search_actions):04d}"
+            return CandidateSearchObservation(
+                search_id=self.latest_search_id,
+                query_yields=[
+                    QueryYield(
+                        query=term,
+                        executed_query=term,
+                        intent_dimension="confirmed theme",
+                        requested_depth=action.queries[0].depth,
+                        raw_result_count=len(additions),
+                        new_candidate_count=len(new_accessions),
+                        duplicate_count=len(additions) - len(new_accessions),
+                    )
+                ],
+                raw_result_count=len(additions),
+                candidate_count=len(self.records),
+                new_candidate_count=len(new_accessions),
+                duplicate_count=len(additions) - len(new_accessions),
+                duplicate_rate=0.0,
+                high_relevance_candidate_count=len(self.records),
+                rationale=action.rationale,
+            )
+
+        def is_query_exhausted(self, query: str) -> bool:
+            return False
+
+        def reviewable_accessions(self, *, limit: int | None = None) -> list[str]:
+            values = list(self.records)
+            return values if limit is None else values[:limit]
+
+        def inspect(self, action: CandidateInspectionAction) -> CandidateInspectionResult:
+            self.calls.append("inspect:" + ",".join(action.accessions))
+            return super().inspect(action)
+
+    request = DatasetRequest(
+        repository="pride",
+        query_terms=["core theme", "later synonym"],
+        max_projects=2,
+        max_files=100,
+        continuous_discovery=True,
+        quota_flexibility="fixed",
+        inspection_batch_size=30,
+    )
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(
+        _run("fixed_target_pipeline").model_copy(
+            update={
+                "status": "running",
+                "budget": AgentBudget(
+                    max_turns=8,
+                    max_tool_calls=20,
+                    max_discovery_rounds=10,
+                ),
+                "dynamic_limits": DynamicBudgetLimits(),
+            }
+        )
+    )
+    environment = FixedTargetPipelineEnvironment(request)
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+        search_environment=environment,
+    )
+
+    result = service.run_confirmed_term_pipeline()
+
+    assert result["status"] == "completed"
+    assert result["target_reached"] is True
+    assert result["qualified_project_count"] == 2
+    assert result["all_terms_exhausted"] is False
+    assert result["pending_review_count"] == 0
+    assert result["deferred_candidate_count"] == 1
+    assert environment.calls == [
+        "search:core theme",
+        "inspect:PXD000001",
+        "search:core theme",
+        "inspect:PXD000002",
+    ]
+    assert [item.queries[0].query for item in environment.search_actions] == [
+        "core theme",
+        "core theme"
+    ]
+    reached = [
+        event
+        for event in store.list_events(run.run_id)
+        if event.event_type == "fixed_project_target_reached"
+    ]
+    assert reached[-1].payload["qualified_project_count"] == 2
+
+
+def test_fixed_target_quality_gate_does_not_require_double_the_requested_projects(
+    tmp_path: Path,
+) -> None:
+    request = DatasetRequest(
+        repository="pride",
+        query_terms=["immunopeptidomics"],
+        max_projects=20,
+        max_files=1000,
+        quota_flexibility="fixed",
+    )
+    store = AgentRunStore(tmp_path / "state.sqlite")
+    run = store.save_run(_run("fixed_target_quality_gate"))
+    service = DiscoveryToolService(
+        run_id=run.run_id,
+        request=request,
+        output_dir=tmp_path / "output",
+        store=store,
+    )
+
+    assert service._required_high_relevance_inspections(89) == 20
+    assert service._required_high_relevance_inspections(12) == 12
+
+
 def test_confirmed_term_pipeline_stops_before_next_term_when_review_fails(
     tmp_path: Path,
 ) -> None:

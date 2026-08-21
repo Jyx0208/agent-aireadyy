@@ -33,6 +33,12 @@ services:
       - AGENT_PRIDE_CACHE_DIR=${AGENT_PRIDE_CACHE_DIR:-/app/.agent_cache/pride}
       - AGENT_IPROX_INDEX_XLSX=${AGENT_IPROX_INDEX_XLSX:-/app/data/iprox.xlsx}
       - AGENT_ZIP_COMPRESS_LEVEL=${AGENT_ZIP_COMPRESS_LEVEL:-6}
+      - AGENT_RUNS_DIR=/app/runs
+      - AGENT_OPERATIONS_DIR=/app/runs/_operations
+      - AGENT_OPERATIONS_DB=/app/runs/_operations/operations.sqlite
+      - AGENT_QUEUE_DB=/app/runs/_operations/queue.sqlite
+      - AGENT_OPERATIONS_ARTIFACTS=/app/runs/_operations/artifacts
+      - AGENT_DISCOVERY_WORKERS=4
       - AGENT_CONTAINER_APP_DIR=/app
       - AGENT_DOCKER_VOLUMES_FROM=${AGENT_DOCKER_VOLUMES_FROM:-}
       - AGENT_HOST_APP_DIR=${AGENT_HOST_APP_DIR:-/opt/pride-agent}
@@ -41,6 +47,45 @@ services:
       - AGENT_MSDT_DOCKER_TIMEOUT_SECONDS=${AGENT_MSDT_DOCKER_TIMEOUT_SECONDS:-7200}
       - AGENT_MSDT_DOCKER_IDLE_TIMEOUT_SECONDS=${AGENT_MSDT_DOCKER_IDLE_TIMEOUT_SECONDS:-900}
       - AGENT_MSDT_ABORT_ON_LOW_PSM=${AGENT_MSDT_ABORT_ON_LOW_PSM:-1}
+    volumes:
+      - .:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/ops/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  operations-worker:
+    build:
+      context: .
+    image: pride-agent-all-in-one-local:latest
+    container_name: pride-agent-operations-worker
+    working_dir: /app
+    command:
+      - python
+      - -m
+      - huey.bin.huey_consumer
+      - agent.operations.queue.huey
+      - -k
+      - thread
+      - -w
+      - "4"
+    env_file:
+      - .env
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - AGENT_OPERATIONS_DB=/app/runs/_operations/operations.sqlite
+      - AGENT_QUEUE_DB=/app/runs/_operations/queue.sqlite
+      - AGENT_OPERATIONS_ARTIFACTS=/app/runs/_operations/artifacts
+      - AGENT_DISCOVERY_WORKERS=4
+      - AGENT_CONTAINER_APP_DIR=/app
+      - AGENT_CONTAINER_RUNS_DIR=/app/runs
+      - AGENT_HOST_RUNS_DIR=${AGENT_HOST_RUNS_DIR:-/opt/pride-agent/runs}
+      - AGENT_PRIDE_CACHE_DIR=${AGENT_PRIDE_CACHE_DIR:-/app/.agent_cache/pride}
     volumes:
       - .:/app
       - /var/run/docker.sock:/var/run/docker.sock

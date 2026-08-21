@@ -644,9 +644,16 @@ def build_discovered_project(
     )
     observed_ptm = score.ptm_type if ptm_goal else None
     observed_modification_scope = score.modification_scope if ptm_goal else None
+    project_accession = _project_accession(project)
+    project_source_url = (
+        f"https://www.ebi.ac.uk/pride/archive/projects/{project_accession}"
+        if request.repository == "pride" and project_accession
+        else None
+    )
     project_model = DiscoveredProject(
         repository=request.repository,
-        project_accession=_project_accession(project),
+        project_accession=project_accession,
+        project_source_url=project_source_url,
         native_accession=str(project.get("accession") or project.get("projectAccession") or "") or None,
         px_accession=str(project.get("projectAccession") or project.get("accession") or "") or None,
         project_title=_project_title(project),
@@ -680,6 +687,7 @@ def build_discovered_project(
         evidence=_dedupe_evidence(score.evidence + feature_summary.evidence),
         instrument_names=feature_summary.instrument_names,
         instrument_families=feature_summary.instrument_families,
+        laboratory_names=feature_summary.laboratory_names,
         instrument_generation_score=feature_summary.instrument_generation_score,
         instrument_generation_label=feature_summary.instrument_generation_label,
         project_publication_date=str(project.get("publicationDate") or "") or None,
@@ -984,6 +992,7 @@ def score_file(
     file_model = DiscoveredFile(
         repository=request.repository,
         project_accession=project.project_accession,
+        project_source_url=project.project_source_url,
         native_accession=project.native_accession,
         px_accession=project.px_accession,
         file_accession_or_path=str(
@@ -1036,6 +1045,7 @@ def score_file(
         evidence=_dedupe_evidence(project_evidence + file_context_evidence),
         instrument_names=inherited_instrument_names,
         instrument_families=inherited_instrument_families,
+        laboratory_names=list(feature_summary.laboratory_names or project.laboratory_names),
         instrument_generation_score=inherited_generation_score,
         instrument_generation_label=inherited_generation_label,
         fragmentation_methods=inherited_fragmentation,

@@ -154,6 +154,25 @@ def test_run_command_streaming_aborts_on_low_psm_marker_quickly():
         raise AssertionError("Expected watchdog abort")
 
 
+def test_run_command_streaming_polls_for_user_cancellation_without_output():
+    started = time.monotonic()
+    command = [sys.executable, "-c", "import time; time.sleep(30)"]
+
+    try:
+        run_command_streaming(
+            command,
+            poll_abort_predicate=lambda: "user_cancelled"
+            if time.monotonic() - started > 0.2
+            else None,
+        )
+    except subprocess.CalledProcessError as exc:
+        elapsed = time.monotonic() - started
+        assert elapsed < 5
+        assert "agent_watchdog_abort:user_cancelled" in exc.output
+    else:
+        raise AssertionError("Expected user cancellation abort")
+
+
 def test_docker_runner_low_psm_abort_can_be_disabled(monkeypatch):
     monkeypatch.setenv("AGENT_MSDT_ABORT_ON_LOW_PSM", "0")
     runner = DockerMSDTConverterRunner()

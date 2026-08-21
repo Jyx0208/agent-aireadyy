@@ -93,6 +93,10 @@ class DatasetRequest(JsonModel):
     # Discovery Agent can explore instead of being locked into parser defaults.
     hard_constraint_fields: list[str] = Field(default_factory=lambda: ["repository"])
     constraint_provenance: dict[str, str] = Field(default_factory=dict)
+    # Optional portfolio contract.  It remains a plain JSON object here to keep
+    # DatasetRequest independent from the portfolio evaluator and backwards
+    # compatible with stored requests from older runs.
+    portfolio_spec: dict[str, Any] = Field(default_factory=dict)
 
     def is_hard_constraint(self, field_name: str) -> bool:
         return str(field_name) in set(self.hard_constraint_fields)
@@ -101,6 +105,10 @@ class DatasetRequest(JsonModel):
 class DiscoveredProject(JsonModel):
     repository: DiscoveryRepository = "pride"
     project_accession: str
+    # Canonical public project page used as the provenance anchor for every
+    # selected file.  Kept explicit so a manifest never requires the caller
+    # to reconstruct a source page from an accession.
+    project_source_url: str | None = None
     native_accession: str | None = None
     px_accession: str | None = None
     project_title: str | None = None
@@ -139,6 +147,7 @@ class DiscoveredProject(JsonModel):
     evidence: list[DiscoveryEvidence] = Field(default_factory=list)
     instrument_names: list[str] = Field(default_factory=list)
     instrument_families: list[str] = Field(default_factory=list)
+    laboratory_names: list[str] = Field(default_factory=list)
     instrument_generation_score: float | None = Field(default=None, ge=0.0, le=1.0)
     instrument_generation_label: str | None = None
     project_publication_date: str | None = None
@@ -156,6 +165,7 @@ class DiscoveredProject(JsonModel):
 class DiscoveredFile(JsonModel):
     repository: DiscoveryRepository = "pride"
     project_accession: str
+    project_source_url: str | None = None
     native_accession: str | None = None
     px_accession: str | None = None
     file_accession_or_path: str | None = None
@@ -226,6 +236,7 @@ class DiscoveredFile(JsonModel):
     evidence: list[DiscoveryEvidence] = Field(default_factory=list)
     instrument_names: list[str] = Field(default_factory=list)
     instrument_families: list[str] = Field(default_factory=list)
+    laboratory_names: list[str] = Field(default_factory=list)
     instrument_generation_score: float | None = Field(default=None, ge=0.0, le=1.0)
     instrument_generation_label: str | None = None
     fragmentation_methods: list[str] = Field(default_factory=list)

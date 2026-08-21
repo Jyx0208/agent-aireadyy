@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,28 @@ from agent.control_plane.models import AgentEvent, OpenAIAgentsDiscoveryResult
 from agent.discovery.agentic import AgenticDiscoveryPlanner
 from agent.discovery.memory import DiscoveryMemory
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
+
+
+def test_reviewed_candidate_batches_complete_fixed_run_horizon() -> None:
+    body = {
+        "run_horizon": "candidates_reviewed",
+        "max_projects": 20,
+        "quota_flexibility": "fixed",
+        "coverage_mode": "quick",
+    }
+
+    assert web_app._candidate_delivery_satisfies_run_horizon(
+        body,
+        {"qualified_count": 20, "batch_count": 2},
+    )
+    assert not web_app._candidate_delivery_satisfies_run_horizon(
+        {**body, "quota_flexibility": "open_ended"},
+        {"qualified_count": 20, "batch_count": 2},
+    )
+    assert not web_app._candidate_delivery_satisfies_run_horizon(
+        body,
+        {"qualified_count": 20, "batch_count": 0},
+    )
 
 
 def _manifest(request: DatasetRequest) -> DatasetManifest:
@@ -235,6 +258,22 @@ def test_discovery_job_projects_authoritative_term_and_review_queue_state(
         assert resumed_state["reviewed_project_count"] == 30
         assert resumed_state["terms"][0]["raw_result_count"] == 200
         assert resumed_state["terms"][0]["exhausted"] is True
+
+        emit(
+            8,
+            "confirmed_theme_pipeline_completed",
+            {
+                "status": "completed",
+                "target_reached": True,
+                "all_terms_exhausted": False,
+                "pending_review_count": 0,
+                "candidate_count": 180,
+                "reviewed_project_count": 30,
+            },
+        )
+        completed_state = web_app._discovery_jobs[job_id]["execution_state"]
+        assert completed_state["phase"] == "finalizing"
+        assert completed_state["completion_ready"] is True
     finally:
         with web_app._discovery_jobs_lock:
             web_app._discovery_jobs.pop(job_id, None)
@@ -726,6 +765,11 @@ def test_discovery_job_runs_in_background_and_exposes_logs(monkeypatch, tmp_path
 def test_discovery_job_recovers_completed_state_after_memory_loss(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setattr(web_app, "discover_pride_dataset", lambda request, memory=None, **_kwargs: _manifest(request))
+    monkeypatch.setattr(
+        web_app,
+        "_start_discovery_job_thread",
+        web_app._run_discovery_job,
+    )
 
     created = asyncio.run(
         web_app.start_discovery_job(
@@ -747,11 +791,164 @@ def test_discovery_job_recovers_completed_state_after_memory_loss(monkeypatch, t
     assert "Discovery job stopped at the quality gate; candidate evidence and audits were retained." in messages
 
 
+def test_completed_operations_snapshot_clears_legacy_failure():
+    merged = web_app._merge_operations_snapshot_into_discovery_job(
+        {
+            "job_id": "resumed-job",
+            "status": "failed",
+            "error": "Agent run already exists",
+            "execution_state": {"phase": "failed"},
+        },
+        {
+            "status": "completed",
+            "phase": "completed",
+            "cancel_requested": False,
+            "resumable": False,
+            "error": None,
+            "progress": {},
+            "last_event_sequence": 12,
+        },
+    )
+
+    assert merged["status"] == "completed"
+    assert merged["error"] is None
+    assert merged["execution_state"]["phase"] == "completed"
+
+
+def test_batch_handoff_uses_operations_database_after_web_restart(
+    monkeypatch,
+):
+    job_id = "discovery_job_durable_batch"
+
+    class FakeOperationsRepository:
+        @staticmethod
+        def get_batch_delivery(requested_job_id, batch_index):
+            assert requested_job_id == job_id
+            assert batch_index == 1
+            return {
+                "batch_index": 1,
+                "file_count": 1,
+                "project_count": 1,
+                "terminal": True,
+                "missing_file_identifiers": [],
+                "files": [
+                    {
+                        "repository": "pride",
+                        "project_accession": "PXD000001",
+                        "native_id": "file-a",
+                        "file_name": "a.raw",
+                        "download_url": "https://example.test/a.raw",
+                        "file_format": "raw",
+                        "file_role": "acquisition",
+                        "acquisition_mode": "dda",
+                        "file_identifier": "pride:PXD000001:file-a",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        web_app,
+        "get_operations_repository",
+        lambda: FakeOperationsRepository(),
+    )
+    monkeypatch.setattr(web_app, "_load_discovery_job", lambda _job_id: None)
+    with web_app._discovery_jobs_lock:
+        web_app._discovery_jobs.pop(job_id, None)
+
+    handoff = asyncio.run(
+        web_app.handoff_discovery_verified_batch(job_id, 1)
+    )
+
+    assert handoff["job_id"] == job_id
+    assert handoff["file_count"] == 1
+    assert handoff["inputs"] == ["https://example.test/a.raw"]
+    assert handoff["input_records"][0]["source_file_identifier"] == (
+        "pride:PXD000001:file-a"
+    )
+
+
+def test_run_bundle_is_recovered_from_operations_database(
+    monkeypatch,
+    tmp_path: Path,
+):
+    job_id = "discovery_job_durable_bundle"
+
+    class FakeOperationsRepository:
+        settings = SimpleNamespace(artifact_root=tmp_path)
+
+        @staticmethod
+        def get_job(requested_job_id):
+            assert requested_job_id == job_id
+            return {
+                "job_id": job_id,
+                "status": "completed",
+                "phase": "completed",
+            }
+
+        @staticmethod
+        def list_batches(requested_job_id):
+            assert requested_job_id == job_id
+            return [{"batch_index": 1}]
+
+        @staticmethod
+        def get_batch_delivery(requested_job_id, batch_index):
+            assert requested_job_id == job_id
+            assert batch_index == 1
+            return {
+                "batch_index": 1,
+                "file_count": 1,
+                "project_count": 1,
+                "terminal": True,
+                "missing_file_identifiers": [],
+                "files": [
+                    {
+                        "repository": "pride",
+                        "project_accession": "PXD000001",
+                        "native_id": "file-a",
+                        "file_name": "a.raw",
+                        "download_url": "https://example.test/a.raw",
+                        "file_format": "raw",
+                        "file_role": "acquisition",
+                        "acquisition_mode": "dda",
+                        "file_identifier": "pride:PXD000001:file-a",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        web_app,
+        "get_operations_repository",
+        lambda: FakeOperationsRepository(),
+    )
+    discovery_id = f"agents_job_{job_id}"
+    bundle = web_app._operations_discovery_run_bundle(discovery_id)
+
+    assert bundle is not None
+    with zipfile.ZipFile(bundle) as archive:
+        assert set(archive.namelist()) == {
+            "README.md",
+            "all_input_records.json",
+            "batch_inputs/batch_001.txt",
+            "job_snapshot.json",
+            "verified_batches/batch_001.json",
+        }
+        recovered = json.loads(
+            archive.read("verified_batches/batch_001.json")
+        )
+    assert recovered["file_count"] == 1
+    assert recovered["inputs"] == ["https://example.test/a.raw"]
+
+
 
 
 def test_discovery_job_can_defer_worker_until_response(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     monkeypatch.setattr(web_app, "discover_pride_dataset", lambda request, memory=None, **_kwargs: _manifest(request))
+    monkeypatch.setattr(
+        web_app,
+        "_start_discovery_job_thread",
+        web_app._run_discovery_job,
+    )
 
     background_tasks = BackgroundTasks()
     created = asyncio.run(
@@ -774,7 +971,7 @@ def test_discovery_job_can_defer_worker_until_response(monkeypatch, tmp_path: Pa
     assert final["record"]["file_count"] == 1
 
 
-def test_discovery_job_reports_interrupted_state_after_memory_loss(monkeypatch, tmp_path: Path):
+def test_discovery_job_preserves_external_worker_state_after_web_memory_loss(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(web_app, "_runs_dir", tmp_path)
     job_id = "discovery_job_test_interrupted"
     web_app._persist_discovery_job(
@@ -788,16 +985,17 @@ def test_discovery_job_reports_interrupted_state_after_memory_loss(monkeypatch, 
             "logs": [{"ts": web_app._now_app_iso(), "level": "info", "message": "Discovery job started."}],
             "record": None,
             "error": None,
-        }
+        },
+        required=True,
     )
     with web_app._discovery_jobs_lock:
         web_app._discovery_jobs.pop(job_id, None)
 
     recovered = asyncio.run(web_app.get_discovery_job(job_id))
-    # WP-D: durable recovery marks interrupted (resumable), not hard-failed.
-    assert recovered["status"] in {"interrupted", "failed"}
-    assert "interrupt" in str(recovered.get("error") or "").casefold() or recovered["status"] == "interrupted"
-    assert any("interrupted by a server reload" in item["message"] for item in recovered["logs"])
+    # The durable worker is a separate process. Losing Web memory must not
+    # falsely mark an externally running task interrupted.
+    assert recovered["status"] == "running"
+    assert recovered["execution_state"]["phase"] == "searching"
 
 
 
@@ -830,7 +1028,8 @@ def test_discovery_job_can_be_cancelled(monkeypatch, tmp_path: Path):
         assert final["cancel_requested"] is True
         messages = [item["message"] for item in final["logs"]]
         assert any("Cancel requested" in message for message in messages)
-        assert any("Discovery cancelled" in message for message in messages)
+        # A queued task is cancelled transactionally before a worker claims it.
+        assert not any("Discovery job started" in message for message in messages)
     finally:
         with web_app._discovery_jobs_lock:
             web_app._discovery_jobs.pop(job_id, None)
@@ -1640,7 +1839,7 @@ def test_discovery_error_localization_preserves_detail_and_raw_persist(monkeypat
     assert "数据发现进度已更新" not in str(public["error"])
     assert raw_error in str(public["error"]) or "失败" in str(public["error"])
 
-    web_app._persist_discovery_job(job)
+    web_app._persist_discovery_job(job, required=True)
     disk = web_app._load_discovery_job(job["job_id"])
     assert disk is not None
     assert disk["error"] == raw_error  # raw English on disk
@@ -1686,3 +1885,74 @@ def test_discovery_job_get_defaults_to_slim_record(monkeypatch, tmp_path: Path):
     assert full["detail"] == "full"
     assert len(full["record"]["projects"]) == 1
     assert len(full["record"]["files"]) == 1
+
+
+def test_discovery_poll_and_persist_payloads_bound_heavy_progress_logs():
+    heavy_excerpt = "metadata-" + ("x" * 5_000)
+    logs = [
+        {
+            "sequence": index,
+            "ts": f"2026-07-29T10:00:{index % 60:02d}+08:00",
+            "level": "info",
+            "actor": "Candidate Inspector",
+            "type": "candidate_inspection_completed",
+            "message": f"Inspected PXD{index:06d}",
+            "payload": {
+                "observation": {
+                    "project_assessments": [
+                        {
+                            "project_accession": f"PXD{index:06d}",
+                            "project_title": f"Project {index}",
+                            "project_description_excerpt": heavy_excerpt,
+                            "sample_processing_excerpt": heavy_excerpt,
+                            "data_processing_excerpt": heavy_excerpt,
+                            "selected_file_examples": [f"file-{value}.raw" for value in range(40)],
+                        }
+                    ]
+                }
+            },
+        }
+        for index in range(500)
+    ]
+    logs.insert(
+        0,
+        {
+            "sequence": 0,
+            "ts": "2026-07-29T09:59:59+08:00",
+            "level": "info",
+            "actor": "Repository Scheduler",
+            "type": "confirmed_theme_pipeline_started",
+            "message": "",
+            "payload": {"terms": ["immunopeptidomics", "HLA ligandome"]},
+        },
+    )
+    job = {
+        "job_id": "bounded-progress",
+        "status": "running",
+        "logs": logs,
+        "body": {"prompt": "human immunopeptidomics"},
+        "record": None,
+        "execution_state": {
+            "phase": "reviewing",
+            "candidate_count": 765,
+            "reviewed_project_count": 544,
+            "pending_review_count": 83,
+            "terms": [],
+        },
+    }
+
+    public = web_app._discovery_job_public(job)
+    persisted = web_app._discovery_job_persist_payload(job)
+    public_bytes = len(json.dumps(public, ensure_ascii=False).encode("utf-8"))
+    persisted_bytes = len(json.dumps(persisted, ensure_ascii=False).encode("utf-8"))
+
+    assert public["log_count"] == 501
+    assert public["logs_truncated"] is True
+    assert any(
+        item.get("type") == "confirmed_theme_pipeline_started"
+        for item in public["logs"]
+    )
+    assert public["logs"][-1]["message"] == "Inspected PXD000499"
+    assert public_bytes < 500_000
+    assert persisted_bytes < 1_500_000
+    assert heavy_excerpt not in json.dumps(persisted, ensure_ascii=False)

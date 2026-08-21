@@ -473,7 +473,8 @@ const COVERAGE_QUOTAS: Record<
   Exclude<CoverageMode, "">,
   { projects: number; pool: number; label: string }
 > = {
-  curated: { projects: 20, pool: 80, label: "精选" },
+  quick: { projects: 20, pool: 80, label: "快速" },
+  curated: { projects: 20, pool: 80, label: "快速" },
   balanced: { projects: 80, pool: 250, label: "均衡" },
   exhaustive: { projects: 2000, pool: 20000, label: "尽量搜全（无业务池顶，仅安全顶）" },
 };
@@ -498,7 +499,7 @@ const IP_MS = /\bip[- ]?ms\b|免疫沉淀|pull[- ]?down|affinity purification|ap
 const CROSSLINK = /cross[- ]?link|交联|xl[- ]?ms|dss|bs3/i;
 
 export function coverageQuota(mode: CoverageMode) {
-  if (mode === "curated" || mode === "balanced" || mode === "exhaustive") {
+  if (mode === "quick" || mode === "curated" || mode === "balanced" || mode === "exhaustive") {
     return COVERAGE_QUOTAS[mode];
   }
   return COVERAGE_QUOTAS.balanced;
@@ -540,10 +541,7 @@ export function applyTargetProjectCount(
   const count = Math.min(5000, Math.max(1, Math.round(Number(n) || 0)));
   if (!Number.isFinite(count) || count < 1) return spec;
 
-  let mode: CoverageMode = "balanced";
-  if (count <= 30) mode = "curated";
-  else if (count <= 120) mode = "balanced";
-  else mode = "exhaustive";
+  const mode: CoverageMode = "quick";
 
   const q = coverageQuota(mode);
   const pool = Math.min(
@@ -566,7 +564,7 @@ export function applyTargetProjectCount(
   next.maxCandidateProjects = pool;
   next.coverageMode = mode;
   next.quotaFlexibility = flex;
-  next.timeBudget = mode === "curated" ? "fast" : "multi_round";
+  next.timeBudget = "fast";
   next.onSafetyCeiling = next.onSafetyCeiling || "ask";
   if (next.successCriteria.some((c) => /可用项目数/.test(c))) {
     next.successCriteria = next.successCriteria.map((c) =>
@@ -866,11 +864,12 @@ export function applyLocalParse(prompt: string): IntentSpec {
     spec.timeBudget = "multi_round";
     spec.onSafetyCeiling = "ask";
     spec = markAnswered(spec, "Q7", true);
-  } else if (/精选|少量|先验证|curated|small set/.test(blob)) {
-    spec.coverageMode = "curated";
-    const q = coverageQuota("curated");
+  } else if (/快速|精选|少量|先验证|quick|curated|small set/.test(blob)) {
+    spec.coverageMode = "quick";
+    const q = coverageQuota("quick");
     spec.targetProjectCount = q.projects;
     spec.maxCandidateProjects = q.pool;
+    spec.quotaFlexibility = "fixed";
     spec.timeBudget = "fast";
     spec = markAnswered(spec, "Q7", true);
   }
@@ -976,7 +975,7 @@ export function mergeLlmFields(
     // Drop non-organism tokens the model sometimes puts in species (e.g. "DIA").
     const NON_SPECIES = new Set([
       "dda", "dia", "tmt", "itraq", "silac", "label-free", "label_free", "label",
-      "rt", "psm", "denovo", "curated", "balanced", "exhaustive",
+      "rt", "psm", "denovo", "quick", "curated", "balanced", "exhaustive",
     ]);
     const cleanSpecies = species
       ? species.filter((s) => s && !NON_SPECIES.has(s.toLowerCase()))
@@ -1041,10 +1040,10 @@ export function mergeLlmFields(
 
   if (canMutateQuotaBand) {
     let modeCov: CoverageMode | "" = "";
-    if (scale === "curated" || scale === "balanced" || scale === "exhaustive") {
-      modeCov = scale as CoverageMode;
+    if (scale === "quick" || scale === "curated" || scale === "balanced" || scale === "exhaustive") {
+      modeCov = scale === "curated" ? "quick" : scale as CoverageMode;
     } else if (isImmunopeptideContext(next) && !next.coverageMode) {
-      modeCov = "curated";
+      modeCov = "quick";
     }
 
     if (mode === "patch" && hasExplicitCount) {
@@ -1060,8 +1059,9 @@ export function mergeLlmFields(
         Number(fields.max_candidate_projects) > 0
           ? Number(fields.max_candidate_projects)
           : q.pool;
-      next.quotaFlexibility = modeCov === "exhaustive" ? "open_ended" : "recommended";
-      next.timeBudget = modeCov === "exhaustive" ? "multi_round" : modeCov === "curated" ? "fast" : "multi_round";
+      next.quotaFlexibility =
+        modeCov === "exhaustive" ? "open_ended" : modeCov === "quick" ? "fixed" : "recommended";
+      next.timeBudget = modeCov === "exhaustive" ? "multi_round" : modeCov === "quick" ? "fast" : "multi_round";
       next = markAnswered(next, "Q7", true);
     } else if (mode === "patch" && modeCov && allowCountOverwrite) {
       // User asserted a new scale this turn — reband even if previously fixed.
@@ -1072,8 +1072,9 @@ export function mergeLlmFields(
         Number(fields.max_candidate_projects) > 0
           ? Number(fields.max_candidate_projects)
           : q.pool;
-      next.quotaFlexibility = modeCov === "exhaustive" ? "open_ended" : "recommended";
-      next.timeBudget = modeCov === "exhaustive" ? "multi_round" : modeCov === "curated" ? "fast" : "multi_round";
+      next.quotaFlexibility =
+        modeCov === "exhaustive" ? "open_ended" : modeCov === "quick" ? "fixed" : "recommended";
+      next.timeBudget = modeCov === "exhaustive" ? "multi_round" : modeCov === "quick" ? "fast" : "multi_round";
       next = markAnswered(next, "Q7", true);
     }
   }
@@ -1142,15 +1143,15 @@ export function applyRecommendedDefaults(spec: IntentSpec): IntentSpec {
     next = markAnswered(next, "Q6", true);
   }
   if (!next.coverageMode) {
-    // Immunopeptide: curated ~20 matches expert rec; generic stays balanced.
+    // Immunopeptide: start with a concrete quick target; generic stays balanced.
     const immuno = isImmunopeptideContext(next);
-    const mode: CoverageMode = immuno ? "curated" : "balanced";
+    const mode: CoverageMode = immuno ? "quick" : "balanced";
     const q = coverageQuota(mode);
     next.coverageMode = mode;
     next.targetProjectCount = q.projects;
     next.maxCandidateProjects = q.pool;
-    next.quotaFlexibility = "recommended";
-    next.timeBudget = mode === "curated" ? "fast" : "multi_round";
+    next.quotaFlexibility = mode === "quick" ? "fixed" : "recommended";
+    next.timeBudget = mode === "quick" ? "fast" : "multi_round";
     next.onSafetyCeiling = "ask";
     next = markAnswered(next, "Q7", true);
   }
@@ -1615,29 +1616,20 @@ function questionQ6(spec: IntentSpec): GrillQuestion {
 
 function questionQ7(spec: IntentSpec): GrillQuestion {
   const exhaustive = EXHAUSTIVE_HINT.test(`${spec.originalPrompt} ${spec.objective}`);
-  const immuno = isImmunopeptideContext(spec);
   return {
     id: "Q7",
-    prompt: immuno
-      ? "这轮免疫肽想找多少个可用项目？精选快跑，还是铺开搜？"
-      : "这轮希望找多少个可用项目？精选 / 均衡 / 尽量搜全？",
-    why: "你也可以直接说具体数字（例如「只要 20 个」）；数字会写进策略卡，不是口头参考。",
+    prompt: "选择数量模式：快速找够指定数量，还是尽可能搜全？",
+    why: "快速模式会从核心词开始分页检索、去重并审查，达到指定的可用项目数立即停止；数量不够才继续下一页或下一个词。",
     options: [
       {
-        id: "curated",
-        label: "精选（约 10–30，较快）",
-        recommended: immuno && !exhaustive,
-        reason: immuno ? "免疫肽先精选验证检索口径更划算" : undefined,
-      },
-      {
-        id: "balanced",
-        label: "均衡（约 50–100）",
-        recommended: !immuno && !exhaustive,
-        reason: "质量与覆盖兼顾",
+        id: "quick",
+        label: "快速找够 20 个可用项目",
+        recommended: !exhaustive,
+        reason: "达到目标后立即停止，不必拉完所有检索词",
       },
       {
         id: "exhaustive",
-        label: "尽量搜全（约 150–300+，可多轮）",
+        label: "尽可能搜全（不设候选池上限）",
         recommended: exhaustive,
         reason: "你提到了搜全/越多越好",
       },
@@ -1893,16 +1885,19 @@ export function applyAnswer(spec: IntentSpec, questionId: QuestionId, rawAnswer:
         next = applyTargetProjectCount(next, exact);
         break;
       }
-      let mode: CoverageMode = "balanced";
-      if (key === "1" || key === "curated" || /精选/.test(answer)) mode = "curated";
-      else if (key === "3" || key === "exhaustive" || /搜全|尽量/.test(answer)) mode = "exhaustive";
-      else mode = "balanced";
+      let mode: CoverageMode = "quick";
+      if (key === "2" || key === "exhaustive" || /搜全|尽量/.test(answer)) mode = "exhaustive";
+      else if (key === "1" || key === "quick" || key === "curated" || /快速|精选/.test(answer)) mode = "quick";
+      if (mode === "quick") {
+        next = applyTargetProjectCount(next, 20);
+        break;
+      }
       next.coverageMode = mode;
       const q = coverageQuota(mode);
       next.targetProjectCount = q.projects;
       next.maxCandidateProjects = q.pool;
       next.quotaFlexibility = mode === "exhaustive" ? "open_ended" : "recommended";
-      next.timeBudget = mode === "curated" ? "fast" : "multi_round";
+      next.timeBudget = "multi_round";
       next.onSafetyCeiling = "ask";
       next = markAnswered(next, "Q7");
       break;
@@ -2046,7 +2041,7 @@ export function buildStrategyCard(spec: IntentSpec): StrategyCard {
       openEnded
         ? "目标规模：尽可能多（以质量收敛与服务器安全上限为边界）"
         : hasFixedCount
-          ? `固定数量目标：${projects} 个项目（待搜索核验）；候选池约 ${pool}`
+          ? `快速模式 · 固定数量目标：${projects} 个项目（待搜索核验）；达到即停`
           : fixedQuota
             ? "固定数量目标：待补齐（尚未搜索）"
             : `目标规模：约 ${projects} 个可用项目；候选池约 ${pool}`,
@@ -2058,7 +2053,7 @@ export function buildStrategyCard(spec: IntentSpec): StrategyCard {
     targetQuota: openEnded
       ? "不设固定数量目标；持续补搜高质量项目，直到质量收敛或触达服务器安全上限。"
       : hasFixedCount
-        ? `固定数量目标 ${projects} 个；这是执行约束，搜索后才核验实际可用项目数。候选池约 ${pool}（不可突破服务器安全上限）。`
+        ? `固定数量目标 ${projects} 个；搜索后才核验实际可用项目数。从核心词开始分页检索并逐批审查，达到目标立即停止，不足才继续下一页或下一个词。`
         : fixedQuota
           ? "固定数量目标尚未补齐；当前预览不表示已经找到或入选任何项目。"
           : `目标入选约 ${projects}；候选池约 ${pool}（可随搜全抬高，不可突破服务器安全上限）`,
@@ -2282,7 +2277,7 @@ export function toDiscoveryJobPayload(spec: IntentSpec): DiscoveryJobPayload {
     ptm_types: spec.ptmTypes.filter((x) => x !== "immunopeptide"),
     max_projects: projects,
     max_candidate_projects: pool,
-    continuous_discovery: openEnded,
+    continuous_discovery: openEnded || effectiveQuotaFlexibility === "fixed",
     partial_delivery_batch_size: 500,
     inspection_batch_size: 30,
     use_memory: true,

@@ -60,6 +60,37 @@ def test_preflight_full_run_blocks_without_docker_daemon_or_converter(tmp_path: 
     assert any("msconvert" in issue for issue in report["blocking_issues"])
 
 
+def test_preflight_blocks_vendor_raw_when_pwiz_fallback_image_is_missing(
+    tmp_path: Path,
+):
+    toolchain = SimpleNamespace(
+        docker_daemon_available=True,
+        docker_pwiz_image_available=False,
+        msconvert_available=False,
+        notes=[],
+    )
+
+    report = run_preflight(
+        inputs=["https://example.test/sample.raw"],
+        run_mode="full",
+        repository="pride",
+        output_root=tmp_path,
+        toolchain_detector=lambda: toolchain,
+        disk_usage=lambda _path: Usage(
+            total=100 * 1024**3,
+            used=1,
+            free=90 * 1024**3,
+        ),
+        env={},
+    )
+
+    assert report["status"] == "blocked"
+    assert any(
+        "ProteoWizard Docker image" in issue
+        for issue in report["blocking_issues"]
+    )
+
+
 def test_preflight_does_not_run_iprox_specific_checks(tmp_path: Path):
     report = run_preflight(
         inputs=["IPX000001"],

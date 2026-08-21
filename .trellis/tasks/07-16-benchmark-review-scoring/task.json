@@ -1,0 +1,31 @@
+{
+  "id": "benchmark-review-scoring",
+  "name": "benchmark-review-scoring",
+  "title": "多模型专家评审与一键评审池构建",
+  "description": "从单一 Prompt 构建证据驱动评审池，并由异构模型专家独立评分、聚合和仲裁。",
+  "status": "in_progress",
+  "dev_type": "backend",
+  "scope": "fullstack",
+  "package": null,
+  "priority": "P1",
+  "creator": "Jyx0208",
+  "assignee": "Jyx0208",
+  "createdAt": "2026-07-16",
+  "completedAt": null,
+  "branch": "worktree-benchmark-review-planning",
+  "base_branch": "main",
+  "worktree_path": ".claude/worktrees/benchmark-review-planning",
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "src/agent/web/expert_review/",
+    "src/agent/discovery/blind_judging.py",
+    "src/agent/web/app.py",
+    "src/agent/web/templates/benchmark_review.html"
+  ],
+  "notes": "Implementation approved by user on 2026-07-16. Existing expert-review-q4-continue changes were copied into this isolated worktree as the protected implementation baseline.",
+  "meta": {}
+}

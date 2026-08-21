@@ -1,49 +1,68 @@
 /* @vitest-environment jsdom */
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 
-const { getDiscoveryJobMock } = vi.hoisted(() => ({
-  getDiscoveryJobMock: vi.fn(),
+const { chatEffectCleanupMock, chatHarness } = vi.hoisted(() => ({
+  chatEffectCleanupMock: vi.fn(),
+  chatHarness: {
+    onJob: null as null | ((job: { job_id: string }) => void),
+    initialOnJob: null as null | ((job: { job_id: string }) => void),
+  },
 }));
 
-vi.mock("./CarbonAgentChat", () => ({
-  CarbonAgentChat: () => <div>Agent chat</div>,
-}));
-vi.mock("./HistoryPanel", () => ({
-  HistoryPanel: ({ onOpenDiscovery }: { onOpenDiscovery: (item: Record<string, unknown>) => void }) => (
-    <>
-      <button
-        type="button"
-        onClick={() => onOpenDiscovery({
-          kind: "discovery",
-          job_id: "discovery_job_running",
-          status: "running",
-        })}
-      >
-        Open running discovery
-      </button>
-      <button
-        type="button"
-        onClick={() => onOpenDiscovery({
-          kind: "discovery",
-          job_id: "discovery_job_interrupted",
-          status: "interrupted",
-        })}
-      >
-        Open interrupted discovery
-      </button>
-    </>
-  ),
-}));
-vi.mock("./workflow-api", async (importOriginal) => {
-  const original = await importOriginal<typeof import("./workflow-api")>();
+vi.mock("./CarbonAgentChat", async () => {
+  const { useEffect } = await import("react");
   return {
-    ...original,
-    getDiscoveryJob: getDiscoveryJobMock,
+    CarbonAgentChat: ({
+      onJob,
+    }: {
+      onJob: (job: { job_id: string }) => void;
+    }) => {
+      chatHarness.onJob = onJob;
+      chatHarness.initialOnJob ||= onJob;
+      useEffect(() => () => chatEffectCleanupMock(), []);
+      return <div>Agent chat</div>;
+    },
   };
 });
+
+vi.mock("./OperationsConsole", () => ({
+  OperationsConsole: ({
+    jobId,
+    activeTab,
+    onTabChange,
+  }: {
+    jobId: string;
+    activeTab: string;
+    onTabChange: (tab: "events") => void;
+  }) => (
+    <section aria-label="运行进度主面板">
+      Operations job {jobId} · tab {activeTab}
+      <button type="button" onClick={() => onTabChange("events")}>
+        查看运行事件
+      </button>
+    </section>
+  ),
+}));
+
+vi.mock("./OperationsHistory", () => ({
+  OperationsHistory: ({
+    onOpenJob,
+  }: {
+    onOpenJob: (jobId: string) => void;
+  }) => (
+    <section aria-label="历史任务">
+      <h1>历史任务与磁盘空间</h1>
+      <button type="button" onClick={() => onOpenJob("history-job")}>
+        打开历史发现任务
+      </button>
+    </section>
+  ),
+}));
+
 vi.stubGlobal(
   "ResizeObserver",
   class {
@@ -52,6 +71,7 @@ vi.stubGlobal(
     disconnect() {}
   },
 );
+
 Object.defineProperty(window, "matchMedia", {
   configurable: true,
   value: vi.fn().mockReturnValue({
@@ -60,97 +80,131 @@ Object.defineProperty(window, "matchMedia", {
     removeEventListener: vi.fn(),
   }),
 });
-vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({}))));
+
+const renderApp = () => {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  });
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <App />
+    </QueryClientProvider>,
+  );
+};
 
 afterEach(() => {
   cleanup();
-  getDiscoveryJobMock.mockReset();
+  chatEffectCleanupMock.mockReset();
+  chatHarness.onJob = null;
+  chatHarness.initialOnJob = null;
+  window.localStorage.clear();
+  window.history.replaceState(null, "", "#current");
 });
 
-describe("proteomics operational workbench", () => {
-  it("keeps polling a running discovery restored from history", async () => {
-    getDiscoveryJobMock.mockResolvedValue({
-      job_id: "discovery_job_running",
-      status: "running",
-      execution_state: {
-        schema_version: "discovery-execution/v1",
-        phase: "reviewing",
-        active_term_index: 1,
-        candidate_count: 612,
-        reviewed_project_count: 466,
-        pending_review_count: 83,
-        review_workers: 4,
-        terms: [{
-          term: "immunopeptidomics",
-          term_index: 1,
-          term_count: 34,
-          status: "running",
-          exhausted: true,
-        }],
-      },
-      logs: [{
-        type: "candidate_inspection_started",
-        payload: { action: { accessions: ["PXD004233"] } },
-      }],
-    });
+describe("industrial operations shell", () => {
+  it("shows the task-first Carbon product navigation and strategy workspace", async () => {
+    renderApp();
 
-    render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "运行历史" }));
-    fireEvent.click(screen.getByRole("button", { name: "Open running discovery" }));
-
-    await waitFor(() => {
-      expect(screen.getAllByLabelText("当前任务与流程").length).toBeGreaterThan(0);
-      expect(getDiscoveryJobMock.mock.calls.length).toBeGreaterThan(1);
-    }, { timeout: 3000 });
-    expect(getDiscoveryJobMock).toHaveBeenCalledWith(
-      "discovery_job_running",
-      false,
-      expect.any(AbortSignal),
-    );
-  });
-
-  it("loads an interrupted discovery once without polling it as active", async () => {
-    getDiscoveryJobMock.mockResolvedValue({
-      job_id: "discovery_job_interrupted",
-      status: "interrupted",
-      resumable: true,
-      logs: [],
-    });
-
-    render(<App />);
-    fireEvent.click(screen.getByRole("tab", { name: "运行历史" }));
-    fireEvent.click(screen.getByRole("button", { name: "Open interrupted discovery" }));
-
-    await waitFor(() => {
-      expect(getDiscoveryJobMock).toHaveBeenCalledWith(
-        "discovery_job_interrupted",
-        true,
-      );
-    });
-    expect(getDiscoveryJobMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("uses one compact discovery workspace without duplicate progress surfaces", () => {
-    render(<App />);
-
-    expect(screen.getByRole("heading", { name: "蛋白质组学数据搜集与处理 Agent" })).toBeTruthy();
-    const buildStamp = screen.getByLabelText("构建身份");
-    expect(buildStamp.textContent?.trim()).toMatch(/^Build v\S+/);
-    expect(buildStamp.getAttribute("title")).toMatch(/构建版本 .+；修订 .+；构建时间 .+/);
-    for (const name of ["数据发现", "单文件处理", "批量处理", "AI-ready 构建", "运行历史", "设置"]) {
-      expect(screen.getAllByText(name).length).toBeGreaterThan(0);
+    expect(
+      screen.getByRole("banner", {
+        name: "PRIDE 蛋白质组学数据运行平台",
+      }),
+    ).toBeTruthy();
+    for (const name of [
+      "当前任务",
+      "历史任务",
+      "批量处理",
+      "单文件处理",
+      "AI-ready 构建",
+      "系统设置",
+    ]) {
+      expect(screen.getByRole("link", { name })).toBeTruthy();
     }
-    expect(screen.getByText("自然语言对齐科学需求，确认策略后再检索、审查并交付可追溯结果。")).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "定义数据发现目标" }),
+    ).toBeTruthy();
     expect(screen.getByText("策略预览")).toBeTruthy();
-    expect(screen.getByText("确认主题词，开始搜")).toBeTruthy();
-    expect(screen.getByText("补齐稳妥默认")).toBeTruthy();
-    expect(screen.getByText("查看完整策略")).toBeTruthy();
-    expect(screen.getByText(/这里只显示真实运行状态、关键计数和结果入口/)).toBeTruthy();
-    expect(screen.queryByText(/原始运行日志/)).toBeNull();
-    expect(screen.queryByText("正在做什么")).toBeNull();
-    expect(screen.queryByRole("heading", { name: "发现结果" })).toBeNull();
-    expect(screen.queryByText("Evidence & Grading")).toBeNull();
-    expect(screen.queryByText("Review API Token")).toBeNull();
-    expect(screen.queryByText("把 Agent 的判断过程变成可检查的工作流")).toBeNull();
+    expect(await screen.findByText("Agent chat")).toBeTruthy();
+  });
+
+  it("opens database-backed history without mounting the heavy chat workspace", async () => {
+    window.history.replaceState(null, "", "#history");
+    renderApp();
+
+    expect(
+      await screen.findByRole("heading", { name: "历史任务与磁盘空间" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("Agent chat")).toBeNull();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "打开历史发现任务" }),
+    );
+
+    expect(
+      await screen.findByText(/Operations job history-job/),
+    ).toBeTruthy();
+    expect(
+      window.localStorage.getItem("pride.discovery.activeJobId"),
+    ).toBe("history-job");
+  });
+
+  it("keeps the live chat instance mounted while navigating between product sections", async () => {
+    renderApp();
+    expect(await screen.findByText("Agent chat")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("link", { name: "历史任务" }));
+    fireEvent.click(screen.getByRole("link", { name: "历史任务" }));
+    fireEvent.click(screen.getByRole("link", { name: "批量处理" }));
+    fireEvent.click(screen.getByRole("link", { name: "当前任务" }));
+
+    expect(await screen.findByText("Agent chat")).toBeTruthy();
+    expect(chatEffectCleanupMock).not.toHaveBeenCalled();
+  });
+
+  it("does not reset the selected operations tab when the same job publishes another snapshot", async () => {
+    window.localStorage.setItem("pride.discovery.activeJobId", "job-live");
+    renderApp();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "查看运行事件" }),
+    );
+    expect(screen.getByText(/tab events/)).toBeTruthy();
+
+    act(() => chatHarness.onJob?.({ job_id: "job-live" }));
+
+    expect(screen.getByText(/tab events/)).toBeTruthy();
+  });
+
+  it("does not let a stale chat callback reset the selected operations tab", async () => {
+    renderApp();
+    expect(await screen.findByText("Agent chat")).toBeTruthy();
+    const staleOnJob = chatHarness.initialOnJob;
+    expect(staleOnJob).toBeTruthy();
+
+    act(() => staleOnJob?.({ job_id: "job-live" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "查看运行事件" }),
+    );
+    expect(screen.getByText(/tab events/)).toBeTruthy();
+
+    act(() => staleOnJob?.({ job_id: "job-live" }));
+
+    expect(screen.getByText(/tab events/)).toBeTruthy();
+  });
+
+  it("restores the durable current job directly after refresh", async () => {
+    window.localStorage.setItem(
+      "pride.discovery.activeJobId",
+      "durable-job",
+    );
+    renderApp();
+
+    expect(
+      await screen.findByText(/Operations job durable-job/),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "新建发现任务" })).toBeTruthy();
   });
 });

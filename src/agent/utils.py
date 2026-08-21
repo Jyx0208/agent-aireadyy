@@ -42,6 +42,7 @@ def run_command_streaming(
     timeout_seconds: float | None = None,
     idle_timeout_seconds: float | None = None,
     abort_predicate: Callable[[str, list[str]], str | None] | None = None,
+    poll_abort_predicate: Callable[[], str | None] | None = None,
     on_abort: Callable[[str], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     emit(report, f"Running command: {' '.join(command)}")
@@ -71,6 +72,12 @@ def run_command_streaming(
     aborted_reason: str | None = None
     reader_done = False
     while not reader_done:
+        if poll_abort_predicate is not None:
+            aborted_reason = poll_abort_predicate()
+            if aborted_reason:
+                _abort_process(process, aborted_reason, report=report, on_abort=on_abort)
+                reader_done = True
+                continue
         try:
             line = output_queue.get(timeout=0.2)
         except queue.Empty:

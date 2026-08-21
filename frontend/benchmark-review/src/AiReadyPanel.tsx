@@ -3,6 +3,7 @@ import { Button, InlineNotification, Select, SelectItem, TextArea, TextInput, Ti
 import { DataBase, Play } from "@carbon/icons-react";
 
 import { runAiReady, type AiReadyAction, type WorkflowRecord } from "./workflow-api";
+import { DatasetConstructionPanel } from "./DatasetConstructionPanel";
 
 const lines = (value: string) => value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
 
@@ -45,5 +46,6 @@ export function AiReadyPanel({ onChanged }: { onChanged?: () => void }) {
       <div className="button-row"><Button renderIcon={DataBase} disabled={busy || (!searchDir.trim() && !searchResults.trim())} onClick={() => void run("profile-inputs")}>分析输入</Button><Button kind="secondary" renderIcon={Play} disabled={busy || !agentRunDir.trim()} onClick={() => void run("build-from-agent-run")}>从 Agent Run 构建</Button><Button kind="tertiary" disabled={busy || !agentRunDir.trim()} onClick={() => void run("mini-e2e")}>Mini E2E 验证</Button><Button kind="tertiary" disabled={busy || !buildDir.trim()} onClick={() => void run("validate-build")}>验证现有 Build</Button></div>
     </Tile>
     {result && <Tile><div className="panel-heading"><div><p className="eyebrow">BUILD RESULT</p><h2>{String(result.status || result.ai_ready_outcome || "AI-ready 结果")}</h2></div></div><div className="button-row">{Object.entries(downloads).map(([name, url]) => typeof url === "string" && <Button key={name} kind="secondary" href={url}>{name}</Button>)}</div><details open><summary>构建摘要</summary><pre className="json-view">{JSON.stringify(result, null, 2)}</pre></details></Tile>}
+    <DatasetConstructionPanel batchOutputDir={buildDir.trim()} taskType={taskType} />
   </div>;
 }

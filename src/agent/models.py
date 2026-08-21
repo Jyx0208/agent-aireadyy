@@ -182,6 +182,8 @@ class ToolchainReport(JsonModel):
     docker_daemon_available: bool
     docker_client_version: str | None = None
     docker_server_version: str | None = None
+    docker_pwiz_image_available: bool = False
+    docker_msdt_image_available: bool = False
     git_available: bool
     java_available: bool
     msconvert_available: bool = False

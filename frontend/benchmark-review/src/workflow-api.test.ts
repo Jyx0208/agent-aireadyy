@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   businessCompletionAllowsSuccess,
+  cancelBatch,
   getDiscoveryJob,
   honestDiscoveryStatus,
   normalizeDiscoveryJobForUi,
@@ -44,8 +45,22 @@ describe("operational workflow API", () => {
     expect(fetchMock.mock.calls[1][0]).toBe("/api/batches/parameters");
   });
 
+  it("requests cooperative cancellation for a running batch", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ batch_id: "batch-1", status: "running", cancel_requested: true })),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await cancelBatch("batch-1");
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/batches/batch-1/cancel");
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: "POST" });
+  });
+
   it("recognizes every terminal workflow state", () => {
-    expect(["completed", "failed", "blocked", "cancelled"].every(terminalWorkflowStatus)).toBe(true);
+    expect(["completed", "failed", "blocked", "cancelled", "interrupted"].every(terminalWorkflowStatus)).toBe(true);
     expect(terminalWorkflowStatus("running")).toBe(false);
   });
 

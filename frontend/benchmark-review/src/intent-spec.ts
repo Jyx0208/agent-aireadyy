@@ -24,7 +24,7 @@ export type RunHorizon =
 
 export type SpeciesPolicy = "open" | "include_only" | "prefer" | "exclude";
 export type AcquisitionMode = "dda" | "dia" | "unknown" | "";
-export type CoverageMode = "curated" | "balanced" | "exhaustive" | "";
+export type CoverageMode = "quick" | "curated" | "balanced" | "exhaustive" | "";
 export type LabelingStrategy =
   | "label_free"
   | "tmt"
@@ -192,7 +192,8 @@ export const RUN_HORIZON_LABELS: Record<string, string> = {
 };
 
 export const COVERAGE_LABELS: Record<string, string> = {
-  curated: "精选",
+  quick: "快速找够指定数量",
+  curated: "快速找够指定数量",
   balanced: "均衡",
   exhaustive: "尽量搜全",
 };

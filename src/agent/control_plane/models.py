@@ -373,6 +373,9 @@ class AgentRunRecord(JsonModel):
     search_stop_reason: str | None = None
     latest_metrics: RoundMetrics | None = None
     latest_discovery_audit: DiscoveryQualityAudit | None = None
+    # Compact, replayable portfolio planner state.  The manifest itself remains
+    # on disk; this field contains only the contract, coverage, gaps, and actions.
+    portfolio_state: dict[str, Any] | None = None
     business_completion: BusinessCompletionDecision | None = None
     builder_dry_run_result: BuilderDryRunResult | None = None
     build_ready_package_material: BuildReadyPackage | None = None
@@ -451,6 +454,7 @@ class OpenAIAgentsDiscoveryResult(JsonModel):
     discovery_round_count: int = 0
     final_output: str = ""
     latest_discovery_audit: DiscoveryQualityAudit | None = None
+    portfolio_state: dict[str, Any] | None = None
     pending_approvals: list[dict[str, Any]] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)

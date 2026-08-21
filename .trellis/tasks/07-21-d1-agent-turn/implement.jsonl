@@ -1,0 +1,3 @@
+{"file":".trellis/spec/backend/index.md","reason":"Backend API conventions and quality entry point"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Defines a single owner for typed API payload decoding across backend/frontend"}
+{"file":".trellis/tasks/07-21-d1-agent-turn/design.md","reason":"Approved D1 ownership inversion and cross-layer contract"}

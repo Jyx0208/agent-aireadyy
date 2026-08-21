@@ -24,6 +24,7 @@ LC_MINUTES_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:min|mins|minute|minutes
 class DiscoveryFeatureSummary:
     instrument_names: list[str] = field(default_factory=list)
     instrument_families: list[str] = field(default_factory=list)
+    laboratory_names: list[str] = field(default_factory=list)
     instrument_generation_score: float | None = None
     instrument_generation_label: str | None = None
     fragmentation_methods: list[str] = field(default_factory=list)
@@ -76,6 +77,8 @@ def _project_text_fields(project: dict[str, Any]) -> list[tuple[str, str]]:
         ("keywords", _entry_text(project.get("keywords"))),
         ("experimentTypes", _entry_text(project.get("experimentTypes"))),
         ("instruments", _entry_text(project.get("instruments"))),
+        ("laboratory", _entry_text(project.get("laboratory") or project.get("laboratoryName"))),
+        ("institution", _entry_text(project.get("institution") or project.get("institutionName"))),
     ]
 
 
@@ -94,9 +97,97 @@ def _sdrf_text_fields(rows: list[dict[str, Any]], *, limit: int = 500) -> list[t
             if not text:
                 continue
             normalized = column.casefold()
-            if any(token in normalized for token in ("instrument", "fragment", "dissociation", "collision", "gradient", "chromatography", "acquisition")):
+            if any(token in normalized for token in ("instrument", "fragment", "dissociation", "collision", "gradient", "chromatography", "acquisition", "laborator", "institution", "institute", "organization", "organisation", "center", "centre")):
                 fields.append((f"sdrf:{column}", text))
     return fields
+
+
+_LABORATORY_KEYS: tuple[str, ...] = (
+    "laboratory",
+    "laboratoryName",
+    "laboratory_name",
+    "laboratories",
+    "lab",
+    "labName",
+    "lab_name",
+    "institution",
+    "institutionName",
+    "institution_name",
+    "institute",
+    "center",
+    "centre",
+    "organization",
+    "organisation",
+)
+
+
+def _laboratory_names_from_project(project: dict[str, Any]) -> tuple[list[str], list[DiscoveryEvidence]]:
+    """Extract only explicitly named submitting laboratories/institutions.
+
+    Publication authors and free-text descriptions are intentionally excluded:
+    they are not reliable ownership evidence for a file-level split.
+    """
+
+    values: list[str] = []
+    evidence: list[DiscoveryEvidence] = []
+    for key in _LABORATORY_KEYS:
+        value = project.get(key)
+        if value is None:
+            continue
+        if isinstance(value, list):
+            entries = value
+        else:
+            entries = [value]
+        for entry in entries:
+            text = _entry_text(entry).strip()
+            if not text:
+                continue
+            values.append(text)
+            evidence.append(
+                DiscoveryEvidence(field=key, source="laboratory", text=text, weight=8)
+            )
+    # PRIDE commonly stores the submitting institution on submitter / lab-PI
+    # objects rather than on a top-level laboratory field.  Affiliation is an
+    # explicit repository field; person names and free-text author lists are
+    # intentionally not promoted to laboratories.
+    for parent_key in ("labPIs", "submitters"):
+        entries = project.get(parent_key) or []
+        if not isinstance(entries, list):
+            entries = [entries]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            affiliation = _entry_text(entry.get("affiliation")).strip()
+            if not affiliation:
+                continue
+            values.append(affiliation)
+            evidence.append(
+                DiscoveryEvidence(
+                    field=f"{parent_key}.affiliation",
+                    source="laboratory",
+                    text=affiliation,
+                    weight=8,
+                )
+            )
+    return _dedupe(values), evidence
+
+
+def _laboratory_names_from_fields(fields: list[tuple[str, str]]) -> tuple[list[str], list[DiscoveryEvidence]]:
+    values: list[str] = []
+    evidence: list[DiscoveryEvidence] = []
+    tokens = ("laborator", "institution", "institute", "organization", "organisation", "center", "centre", "lab")
+    for field_name, text in fields:
+        if not any(token in field_name.casefold() for token in tokens):
+            continue
+        for value in re.split(r"[;|,]\s*", text):
+            cleaned = value.strip()
+            if not cleaned:
+                continue
+            values.append(cleaned)
+            evidence.append(
+                DiscoveryEvidence(field=field_name, source="laboratory", text=cleaned, weight=8)
+            )
+    return _dedupe(values), evidence
 
 
 def _instrument_names_from_project(project: dict[str, Any]) -> tuple[list[str], list[DiscoveryEvidence]]:
@@ -227,6 +318,7 @@ def _lc_gradient_from_fields(fields: list[tuple[str, str]]) -> tuple[str | None,
 def merge_feature_summaries(*summaries: DiscoveryFeatureSummary) -> DiscoveryFeatureSummary:
     names = _dedupe(name for summary in summaries for name in summary.instrument_names)
     families = _known(family for summary in summaries for family in summary.instrument_families)
+    laboratories = _dedupe(name for summary in summaries for name in summary.laboratory_names)
     fragmentations = _dedupe(method for summary in summaries for method in summary.fragmentation_methods)
     lc_summary = next((summary for summary in summaries if summary.lc_gradient), None)
     evidence = [item for summary in summaries for item in summary.evidence]
@@ -243,6 +335,7 @@ def merge_feature_summaries(*summaries: DiscoveryFeatureSummary) -> DiscoveryFea
     return DiscoveryFeatureSummary(
         instrument_names=names,
         instrument_families=families,
+        laboratory_names=laboratories,
         instrument_generation_score=generation_score,
         instrument_generation_label=generation_label,
         fragmentation_methods=fragmentations,
@@ -258,7 +351,9 @@ def extract_project_features(project: dict[str, Any], sdrf_rows: list[dict[str, 
         fields.extend(_sdrf_text_fields(sdrf_rows))
 
     project_names, project_name_evidence = _instrument_names_from_project(project)
+    project_laboratories, project_laboratory_evidence = _laboratory_names_from_project(project)
     sdrf_names, sdrf_name_evidence = _instrument_names_from_fields(fields)
+    sdrf_laboratories, sdrf_laboratory_evidence = _laboratory_names_from_fields(fields)
     protocol_names, protocol_name_evidence = _instrument_names_from_protocols(fields)
     names = _dedupe([*project_names, *sdrf_names, *protocol_names])
     families = _instrument_families(names)
@@ -269,6 +364,7 @@ def extract_project_features(project: dict[str, Any], sdrf_rows: list[dict[str, 
     return DiscoveryFeatureSummary(
         instrument_names=names,
         instrument_families=families,
+        laboratory_names=_dedupe([*project_laboratories, *sdrf_laboratories]),
         instrument_generation_score=generation_score,
         instrument_generation_label=generation_label,
         fragmentation_methods=fragmentation,
@@ -278,6 +374,8 @@ def extract_project_features(project: dict[str, Any], sdrf_rows: list[dict[str, 
             project_name_evidence
             + sdrf_name_evidence
             + protocol_name_evidence
+            + project_laboratory_evidence
+            + sdrf_laboratory_evidence
             + fragmentation_evidence
             + lc_evidence
         ),
@@ -288,16 +386,39 @@ def extract_file_features(
     file_record: dict[str, Any],
     project_features: DiscoveryFeatureSummary,
     matched_sdrf_rows: list[dict[str, Any]] | None = None,
+    *,
+    inherit_homogeneous_project_instrument: bool = False,
 ) -> DiscoveryFeatureSummary:
     fields = _file_text_fields(file_record)
     if matched_sdrf_rows:
         fields.extend(_sdrf_text_fields(matched_sdrf_rows))
 
-    # Instruments are file-owned (SDRF / file fields). Project-level models are
-    # never broadcast onto individual files — that would invent per-file evidence.
+    # Instruments are file-owned when SDRF/file fields identify them. If a
+    # project has exactly one instrument family, inheriting its model is safe:
+    # every raw file belongs to that homogeneous acquisition context. A
+    # multi-family project remains unknown until file-level evidence resolves it.
     sdrf_names, sdrf_name_evidence = _instrument_names_from_fields(fields)
+    sdrf_laboratories, sdrf_laboratory_evidence = _laboratory_names_from_fields(fields)
     names = _dedupe(sdrf_names)
     families = _instrument_families(names) if names else []
+    inherited_instrument_evidence: list[DiscoveryEvidence] = []
+    if (
+        inherit_homogeneous_project_instrument
+        and not names
+        and len(project_features.instrument_families) == 1
+        and project_features.instrument_names
+    ):
+        names = list(project_features.instrument_names)
+        families = list(project_features.instrument_families)
+        inherited_instrument_evidence = [
+            DiscoveryEvidence(
+                field="instruments",
+                source="project_instrument_inherited",
+                text=name,
+                weight=6,
+            )
+            for name in names
+        ]
     generation_score, generation_label = instrument_generation(names)
     fragmentation, fragmentation_evidence = _fragmentation_from_fields(fields)
     if not fragmentation:
@@ -310,12 +431,19 @@ def extract_file_features(
     return DiscoveryFeatureSummary(
         instrument_names=names,
         instrument_families=families,
+        laboratory_names=_dedupe([*sdrf_laboratories, *project_features.laboratory_names]),
         instrument_generation_score=generation_score,
         instrument_generation_label=generation_label,
         fragmentation_methods=fragmentation,
         lc_gradient=lc_gradient,
         lc_gradient_minutes=lc_minutes,
-        evidence=sdrf_name_evidence + fragmentation_evidence + lc_evidence,
+        evidence=(
+            sdrf_name_evidence
+            + sdrf_laboratory_evidence
+            + inherited_instrument_evidence
+            + fragmentation_evidence
+            + lc_evidence
+        ),
     )
 
 

@@ -84,6 +84,49 @@ def test_detect_toolchain_reports_missing_java_and_docker_server(monkeypatch):
     assert report.msconvert_available is True
 
 
+def test_detect_toolchain_reports_missing_pwiz_image(monkeypatch):
+    monkeypatch.setattr(
+        "agent.runtime.toolchain.shutil.which",
+        lambda cmd: {
+            "docker": "docker.exe",
+            "git": "git.exe",
+        }.get(cmd),
+    )
+
+    def fake_run(command, **_kwargs):
+        class Result:
+            returncode = 0
+            stdout = "28.5.1|28.5.1"
+            stderr = ""
+
+        if command[1:3] == ["image", "inspect"]:
+            Result.returncode = 1
+            Result.stdout = ""
+            Result.stderr = "No such image"
+        return Result()
+
+    monkeypatch.setattr("agent.runtime.toolchain.subprocess.run", fake_run)
+
+    report = detect_toolchain()
+
+    assert report.docker_daemon_available is True
+    assert report.docker_pwiz_image_available is False
+
+
+def test_detect_toolchain_uses_configured_msconvert(monkeypatch, tmp_path):
+    executable = tmp_path / "msconvert.exe"
+    executable.write_bytes(b"test")
+    monkeypatch.setenv("AGENT_MSCONVERT_EXECUTABLE", str(executable))
+    monkeypatch.setattr(
+        "agent.runtime.toolchain.shutil.which",
+        lambda cmd: {"git": "git.exe"}.get(cmd),
+    )
+
+    report = detect_toolchain()
+
+    assert report.msconvert_available is True
+
+
 def test_bootstrap_msdt_converter_from_zip_extracts_repo(tmp_path: Path):
     zip_path = tmp_path / "msdt.zip"
     with zipfile.ZipFile(zip_path, "w") as zf:

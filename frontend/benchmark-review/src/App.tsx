@@ -1,249 +1,445 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  Column,
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  Button,
   Content,
-  Grid,
   Header,
+  HeaderMenuButton,
   HeaderName,
+  InlineLoading,
+  SideNav,
+  SideNavDivider,
+  SideNavItems,
+  SideNavLink,
+  SkipToContent,
   Tag,
-  Tab,
-  TabList,
-  TabPanel,
-  TabPanels,
-  Tabs,
   Tile,
 } from "@carbon/react";
-import { IbmWatsonDiscovery } from "@carbon/icons-react";
 
-import { AiReadyPanel } from "./AiReadyPanel";
-import { BatchPanel } from "./BatchPanel";
 import { buildInfoLabel, buildInfoTitle } from "./build-info";
-import { CarbonAgentChat, type GrillExternalCommand } from "./CarbonAgentChat";
+import type { GrillExternalCommand } from "./CarbonAgentChat";
 import { DiscoveryContextRail } from "./DiscoveryContextRail";
-import { HistoryPanel } from "./HistoryPanel";
-import { SettingsPanel } from "./SettingsPanel";
-import { SingleTaskPanel } from "./SingleTaskPanel";
+import { OperationsConsole, type OperationsTab } from "./OperationsConsole";
 import { createEmptyIntent, type GrillPhase, type IntentSpec } from "./intent-spec";
 import { reconcileSearchTermSelection, searchTermCandidates } from "./grill-tree";
-import { getDiscoveryJob, getDiscoveryRun, type DiscoveryBatchHandoff, type DiscoveryJob, type WorkflowRecord } from "./workflow-api";
+import type {
+  DiscoveryBatchHandoff,
+  DiscoveryJob,
+  WorkflowRecord,
+} from "./workflow-api";
 
-const terminal = (status: unknown) =>
-  ["completed", "failed", "blocked", "cancelled", "interrupted", "durability_failed"].includes(
-    String(status || "").toLowerCase(),
-  );
+const CarbonAgentChat = lazy(() =>
+  import("./CarbonAgentChat").then((module) => ({
+    default: module.CarbonAgentChat,
+  })),
+);
+const AiReadyPanel = lazy(() =>
+  import("./AiReadyPanel").then((module) => ({
+    default: module.AiReadyPanel,
+  })),
+);
+const BatchPanel = lazy(() =>
+  import("./BatchPanel").then((module) => ({
+    default: module.BatchPanel,
+  })),
+);
+const OperationsHistory = lazy(() =>
+  import("./OperationsHistory").then((module) => ({
+    default: module.OperationsHistory,
+  })),
+);
+const SettingsPanel = lazy(() =>
+  import("./SettingsPanel").then((module) => ({
+    default: module.SettingsPanel,
+  })),
+);
+const SingleTaskPanel = lazy(() =>
+  import("./SingleTaskPanel").then((module) => ({
+    default: module.SingleTaskPanel,
+  })),
+);
+
+type ProductSection =
+  | "current"
+  | "history"
+  | "batch"
+  | "single"
+  | "ai-ready"
+  | "settings";
+
+const CURRENT_DISCOVERY_STORAGE_KEY = "pride.discovery.activeJobId";
+const productSections = new Set<ProductSection>([
+  "current",
+  "history",
+  "batch",
+  "single",
+  "ai-ready",
+  "settings",
+]);
+
+const sectionFromLocation = (): ProductSection => {
+  const candidate = window.location.hash.replace(/^#/, "") as ProductSection;
+  return productSections.has(candidate) ? candidate : "current";
+};
+
+const navItems: Array<{ id: ProductSection; label: string }> = [
+  { id: "current", label: "当前任务" },
+  { id: "history", label: "历史任务" },
+  { id: "batch", label: "批量处理" },
+  { id: "single", label: "单文件处理" },
+  { id: "ai-ready", label: "AI-ready 构建" },
+  { id: "settings", label: "系统设置" },
+];
+
+const sectionFromLegacyIndex = (index: number): ProductSection => {
+  const sections: Record<number, ProductSection> = {
+    0: "current",
+    1: "single",
+    2: "batch",
+    3: "ai-ready",
+    4: "history",
+    5: "settings",
+  };
+  return sections[index] || "current";
+};
 
 export default function App() {
-  const [selectedTab, setSelectedTab] = useState(0);
-  const [job, setJob] = useState<DiscoveryJob | null>(null);
+  const [section, setSection] = useState<ProductSection>(sectionFromLocation);
+  const [currentWorkspaceMounted, setCurrentWorkspaceMounted] = useState(
+    () => sectionFromLocation() === "current",
+  );
+  const [navExpanded, setNavExpanded] = useState(false);
+  const [currentJobId, setCurrentJobId] = useState(
+    () => window.localStorage.getItem(CURRENT_DISCOVERY_STORAGE_KEY) || "",
+  );
+  const currentJobIdRef = useRef(currentJobId);
+  const [operationsTab, setOperationsTab] =
+    useState<OperationsTab>("overview");
+  const [legacyJob, setLegacyJob] = useState<DiscoveryJob | null>(null);
   const [taskId, setTaskId] = useState("");
   const [batchId, setBatchId] = useState("");
   const [batchSeedInputs, setBatchSeedInputs] = useState("");
   const [batchSeedRecords, setBatchSeedRecords] = useState<WorkflowRecord[]>([]);
-  const [batchSeedSource, setBatchSeedSource] = useState<{ jobId?: string; discoveryId?: string; batchIndex?: number }>({});
+  const [batchSeedSource, setBatchSeedSource] = useState<{
+    jobId?: string;
+    discoveryId?: string;
+    batchIndex?: number;
+  }>({});
   const [batchSeedToken, setBatchSeedToken] = useState(0);
-  const [historyKey, setHistoryKey] = useState(0);
   const [intent, setIntent] = useState<IntentSpec>(() => createEmptyIntent());
   const [selectedSearchTerms, setSelectedSearchTerms] = useState<string[]>([]);
   const [phase, setPhase] = useState<GrillPhase>("idle");
-  const [externalCommand, setExternalCommand] = useState<GrillExternalCommand | null>(null);
-  const [resultOpenRequest, setResultOpenRequest] = useState<{ jobId: string; token: number } | null>(null);
-  const [restoredDiscoveryJobId, setRestoredDiscoveryJobId] = useState("");
+  const [externalCommand, setExternalCommand] =
+    useState<GrillExternalCommand | null>(null);
+  const [resultOpenRequest, setResultOpenRequest] = useState<{
+    jobId: string;
+    token: number;
+  } | null>(null);
   const searchTermCandidatesForIntent = useMemo(
     () => searchTermCandidates(intent),
     [intent],
   );
   const searchTermCandidateKey = searchTermCandidatesForIntent.join("\u0000");
-  const discoveryActive = job?.status === "queued" || job?.status === "running";
 
   useEffect(() => {
-    if (!restoredDiscoveryJobId) return;
-    let stopped = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const controller = new AbortController();
-    const poll = async () => {
-      try {
-        const next = await getDiscoveryJob(restoredDiscoveryJobId, false, controller.signal);
-        if (stopped) return;
-        setJob(next);
-        if (terminal(next.status)) {
-          setRestoredDiscoveryJobId("");
-          return;
-        }
-      } catch {
-        if (stopped) return;
-      }
-      timer = setTimeout(poll, 2000);
-    };
-    void poll();
-    return () => {
-      stopped = true;
-      controller.abort();
-      if (timer) clearTimeout(timer);
-    };
-  }, [restoredDiscoveryJobId]);
-
-  useEffect(() => {
-    setSelectedSearchTerms((current) => {
-      return reconcileSearchTermSelection(current, intent);
-    });
-    // A scientific-theme change deliberately resets stale selections.
+    setSelectedSearchTerms((current) =>
+      reconcileSearchTermSelection(current, intent),
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchTermCandidateKey]);
 
-  const changed = () => setHistoryKey((value) => value + 1);
-  const onNavigate = useCallback((tabIndex: number) => setSelectedTab(tabIndex), []);
-  const onSeedBatchInputs = useCallback((handoff: Pick<DiscoveryBatchHandoff, "inputs" | "input_records" | "job_id" | "discovery_id" | "batch_index">) => {
-    const next = (handoff.inputs || []).join("\n").trim();
-    if (!next) return;
-    setBatchSeedInputs(next);
-    setBatchSeedRecords(handoff.input_records || []);
-    setBatchSeedSource({
-      jobId: handoff.job_id,
-      discoveryId: handoff.discovery_id,
-      batchIndex: handoff.batch_index,
-    });
-    setBatchSeedToken((token) => token + 1);
-    setSelectedTab(2);
+  useEffect(() => {
+    const synchronize = () => setSection(sectionFromLocation());
+    window.addEventListener("hashchange", synchronize);
+    window.addEventListener("popstate", synchronize);
+    return () => {
+      window.removeEventListener("hashchange", synchronize);
+      window.removeEventListener("popstate", synchronize);
+    };
   }, []);
+
+  useEffect(() => {
+    if (section === "current") {
+      setCurrentWorkspaceMounted(true);
+    }
+  }, [section]);
+
+  const selectSection = (next: ProductSection) => {
+    setSection(next);
+    setNavExpanded(false);
+    if (window.location.hash !== `#${next}`) {
+      window.history.pushState(null, "", `#${next}`);
+    }
+  };
+
+  const setCurrentJob = useCallback((jobId: string) => {
+    currentJobIdRef.current = jobId;
+    setCurrentJobId(jobId);
+    if (jobId) {
+      window.localStorage.setItem(CURRENT_DISCOVERY_STORAGE_KEY, jobId);
+    } else {
+      window.localStorage.removeItem(CURRENT_DISCOVERY_STORAGE_KEY);
+    }
+  }, []);
+
+  const onSeedBatchInputs = useCallback(
+    (
+      handoff: Pick<
+        DiscoveryBatchHandoff,
+        "inputs" | "input_records" | "job_id" | "discovery_id" | "batch_index"
+      >,
+    ) => {
+      const next = (handoff.inputs || []).join("\n").trim();
+      if (!next) return;
+      setBatchSeedInputs(next);
+      setBatchSeedRecords(handoff.input_records || []);
+      setBatchSeedSource({
+        jobId: handoff.job_id,
+        discoveryId: handoff.discovery_id,
+        batchIndex: handoff.batch_index,
+      });
+      setBatchSeedToken((token) => token + 1);
+      selectSection("batch");
+    },
+    [],
+  );
+
+  const chatVisible = !currentJobId || operationsTab === "chat";
 
   return (
     <>
-      <Header aria-label="PRIDE 蛋白质组学数据工作台">
-        <HeaderName prefix="PRIDE">蛋白质组学数据 Agent</HeaderName>
+      <Header aria-label="PRIDE 蛋白质组学数据运行平台">
+        <SkipToContent />
+        <HeaderMenuButton
+          aria-label={navExpanded ? "关闭产品导航" : "打开产品导航"}
+          isActive={navExpanded}
+          onClick={() => setNavExpanded((value) => !value)}
+          isCollapsible
+        />
+        <HeaderName
+          href="#current"
+          prefix="PRIDE"
+          onClick={(event) => {
+            event.preventDefault();
+            selectSection("current");
+          }}
+        >
+          蛋白质组学数据运行平台
+        </HeaderName>
+        <div className="product-build">
+          <Tag type="cool-gray" title={buildInfoTitle()}>
+            Build {buildInfoLabel()}
+          </Tag>
+        </div>
       </Header>
-      <Content className={`workbench${selectedTab === 0 ? " workbench--discovery" : ""}`}>
-        <Grid fullWidth className="workbench-grid">
-          <Column sm={4} md={8} lg={16} xlg={16}>
-            <div className="workspace-heading">
-              <div>
-                <p className="eyebrow">PROTEOMICS DATA OPERATIONS</p>
-                <h1>蛋白质组学数据搜集与处理 Agent</h1>
-                <p>自然语言对齐科学需求，确认策略后再检索、审查并交付可追溯结果。</p>
-              </div>
-              <div className="workspace-heading__meta">
-                <Tag type="purple" renderIcon={IbmWatsonDiscovery}>OpenAI Agents SDK</Tag>
-                <span
-                  className="build-stamp"
-                  aria-label="构建身份"
-                  title={buildInfoTitle()}
-                >
-                  Build {buildInfoLabel()}
-                </span>
-              </div>
-            </div>
-          </Column>
-
-          <Column sm={4} md={8} lg={16} xlg={16} className="workbench-tabs-column">
-            <Tabs
-              selectedIndex={selectedTab}
-              onChange={({ selectedIndex }) => setSelectedTab(selectedIndex)}
+      <SideNav
+        aria-label="产品导航"
+        expanded={navExpanded}
+        isPersistent
+        onOverlayClick={() => setNavExpanded(false)}
+      >
+        <SideNavItems>
+          {navItems.slice(0, 2).map((item) => (
+            <SideNavLink
+              key={item.id}
+              href={`#${item.id}`}
+              isActive={section === item.id}
+              onClick={(event) => {
+                event.preventDefault();
+                selectSection(item.id);
+              }}
             >
-              <TabList aria-label="蛋白质组学数据工作流">
-                <Tab>数据发现</Tab>
-                <Tab>单文件处理</Tab>
-                <Tab>批量处理</Tab>
-                <Tab>AI-ready 构建</Tab>
-                <Tab>运行历史</Tab>
-                <Tab>设置</Tab>
-              </TabList>
-              <TabPanels>
-                <TabPanel className="discovery-tab-panel">
-                  <div className={`agent-layout agent-layout--grill${discoveryActive ? " agent-layout--run-active" : ""}`}>
-                    <div className="agent-column">
-                      <Tile className="agent-surface">
-                        <CarbonAgentChat
-                          onJob={(next) => {
-                            setRestoredDiscoveryJobId("");
-                            setJob(next);
-                            if (terminal(next.status)) changed();
-                          }}
-                          onIntentChange={setIntent}
-                          onPhaseChange={setPhase}
-                          externalSelectedSearchTerms={selectedSearchTerms}
-                          onNavigate={onNavigate}
-                          onOpenResults={(jobId) => {
-                            setResultOpenRequest((prev) => ({
-                              jobId,
-                              token: (prev?.token || 0) + 1,
-                            }));
-                          }}
-                          externalCommand={externalCommand}
-                          onExternalCommandConsumed={() => setExternalCommand(null)}
-                        />
-                      </Tile>
-                    </div>
-                    <DiscoveryContextRail
-                      spec={intent}
-                      phase={phase}
-                      job={job}
-                      onConfirm={(queryTerms) => setExternalCommand({ type: "confirm", queryTerms })}
-                      selectedSearchTerms={selectedSearchTerms}
-                      onSelectedSearchTermsChange={setSelectedSearchTerms}
-                      onApplyDefaults={() => setExternalCommand({ type: "defaults" })}
-                      onNavigate={onNavigate}
-                      onSeedBatchInputs={onSeedBatchInputs}
-                      openResultRequest={resultOpenRequest}
+              {item.label}
+            </SideNavLink>
+          ))}
+          <SideNavDivider />
+          {navItems.slice(2).map((item) => (
+            <SideNavLink
+              key={item.id}
+              href={`#${item.id}`}
+              isActive={section === item.id}
+              onClick={(event) => {
+                event.preventDefault();
+                selectSection(item.id);
+              }}
+            >
+              {item.label}
+            </SideNavLink>
+          ))}
+        </SideNavItems>
+      </SideNav>
+
+      <Content id="main-content" className="product-content" tabIndex={-1}>
+        {currentWorkspaceMounted ? (
+          <section
+            className="current-task-page"
+            aria-label="当前任务"
+            hidden={section !== "current"}
+          >
+          {currentJobId ? (
+            <div className="new-task-row">
+              <Button
+                kind="ghost"
+                size="sm"
+                onClick={() => {
+                  setCurrentJob("");
+                  setOperationsTab("overview");
+                  setLegacyJob(null);
+                  setPhase("idle");
+                }}
+              >
+                新建发现任务
+              </Button>
+            </div>
+          ) : (
+            <header className="page-title page-title--discovery">
+              <div>
+                <p className="ops-eyebrow">DISCOVERY WORKBENCH</p>
+                <h1>定义数据发现目标</h1>
+                <p>
+                  用自然语言描述您的检索目标，系统将自动生成检索词并执行发现任务。
+                  确认检索词之前不会访问 PRIDE 数据库。
+                </p>
+              </div>
+            </header>
+          )}
+
+          <div
+            className={`current-task-workspace${
+              currentJobId ? " current-task-workspace--running" : ""
+            }`}
+          >
+              <div
+                className="persistent-chat"
+                aria-hidden={!chatVisible}
+                hidden={!chatVisible}
+              >
+                <Tile className="agent-surface">
+                  <Suspense
+                    fallback={
+                      <div className="route-loading">
+                        <InlineLoading description="正在加载任务对话…" />
+                      </div>
+                    }
+                  >
+                    <CarbonAgentChat
+                      onJob={(next) => {
+                        setLegacyJob(next);
+                        const jobId = String(next.job_id || "");
+                        // Legacy progress snapshots may arrive many times for
+                        // the same durable job. They must not reset the tab the
+                        // operator is currently inspecting.
+                        if (jobId && jobId !== currentJobIdRef.current) {
+                          setCurrentJob(jobId);
+                          setOperationsTab("overview");
+                        }
+                      }}
+                      onIntentChange={setIntent}
+                      onPhaseChange={setPhase}
+                      externalSelectedSearchTerms={selectedSearchTerms}
+                      onNavigate={(index) =>
+                        selectSection(sectionFromLegacyIndex(index))
+                      }
+                      onOpenResults={(jobId) => {
+                        setCurrentJob(jobId);
+                        setOperationsTab("batches");
+                        setResultOpenRequest({
+                          jobId,
+                          token: Date.now(),
+                        });
+                      }}
+                      externalCommand={externalCommand}
+                      onExternalCommandConsumed={() => setExternalCommand(null)}
                     />
-                  </div>
-                </TabPanel>
-                <TabPanel>
-                  <SingleTaskPanel taskId={taskId} onTaskId={setTaskId} onChanged={changed} />
-                </TabPanel>
-                <TabPanel>
-                  <BatchPanel
-                    batchId={batchId}
-                    onBatchId={setBatchId}
-                    onChanged={changed}
-                    initialInputs={batchSeedInputs}
-                    initialInputsToken={batchSeedToken}
-                    initialInputRecords={batchSeedRecords}
-                    initialSource={batchSeedSource}
-                  />
-                </TabPanel>
-                <TabPanel>
-                  <AiReadyPanel onChanged={changed} />
-                </TabPanel>
-                <TabPanel>
-                  <HistoryPanel
-                    refreshKey={historyKey}
-                    onOpenTask={(id) => {
-                      setTaskId(id);
-                      setSelectedTab(1);
-                    }}
-                    onOpenBatch={(id) => {
-                      setBatchId(id);
-                      setSelectedTab(2);
-                    }}
-                    onOpenDiscovery={async (item) => {
-                      const jobId = String(item.job_id || "");
-                      const discoveryId = String(item.discovery_id || item.run_id || "");
-                      const active = !terminal(item.status);
-                      const next = jobId
-                        ? await getDiscoveryJob(jobId, !active)
-                        : {
-                            job_id: discoveryId,
-                            status: String(item.status || "completed"),
-                            record: await getDiscoveryRun(discoveryId),
-                            result_batches: [],
-                            logs: [],
-                          };
-                      setJob(next as DiscoveryJob);
-                      setRestoredDiscoveryJobId(active ? jobId : "");
-                      setSelectedTab(0);
-                      setResultOpenRequest({
-                        jobId: String(next.job_id || discoveryId),
-                        token: Date.now(),
-                      });
-                    }}
-                  />
-                </TabPanel>
-                <TabPanel>
-                  <SettingsPanel />
-                </TabPanel>
-              </TabPanels>
-            </Tabs>
-          </Column>
-        </Grid>
+                  </Suspense>
+                </Tile>
+              </div>
+
+            {!currentJobId ? (
+              <DiscoveryContextRail
+                spec={intent}
+                phase={phase}
+                job={legacyJob}
+                onConfirm={(queryTerms) =>
+                  setExternalCommand({ type: "confirm", queryTerms })
+                }
+                selectedSearchTerms={selectedSearchTerms}
+                onSelectedSearchTermsChange={setSelectedSearchTerms}
+                onApplyDefaults={() =>
+                  setExternalCommand({ type: "defaults" })
+                }
+                onNavigate={(index) =>
+                  selectSection(sectionFromLegacyIndex(index))
+                }
+                onSeedBatchInputs={onSeedBatchInputs}
+                openResultRequest={resultOpenRequest}
+              />
+            ) : (
+              <OperationsConsole
+                jobId={currentJobId}
+                activeTab={operationsTab}
+                onTabChange={setOperationsTab}
+                onSeedBatchInputs={onSeedBatchInputs}
+              />
+            )}
+          </div>
+          </section>
+        ) : null}
+
+        <Suspense
+          fallback={
+            <div className="route-loading">
+              <InlineLoading description="正在加载工作区…" />
+            </div>
+          }
+        >
+          {section === "history" ? (
+            <OperationsHistory
+              onOpenJob={(jobId) => {
+                setCurrentJob(jobId);
+                setOperationsTab("overview");
+                selectSection("current");
+              }}
+              onOpenTask={(id) => {
+                setTaskId(id);
+                selectSection("single");
+              }}
+              onOpenBatch={(id) => {
+                setBatchId(id);
+                selectSection("batch");
+              }}
+            />
+          ) : null}
+          {section === "single" ? (
+            <SingleTaskPanel
+              taskId={taskId}
+              onTaskId={setTaskId}
+              onChanged={() => undefined}
+            />
+          ) : null}
+          {section === "batch" ? (
+            <BatchPanel
+              batchId={batchId}
+              onBatchId={setBatchId}
+              onChanged={() => undefined}
+              initialInputs={batchSeedInputs}
+              initialInputsToken={batchSeedToken}
+              initialInputRecords={batchSeedRecords}
+              initialSource={batchSeedSource}
+            />
+          ) : null}
+          {section === "ai-ready" ? (
+            <AiReadyPanel onChanged={() => undefined} />
+          ) : null}
+          {section === "settings" ? <SettingsPanel /> : null}
+        </Suspense>
       </Content>
     </>
   );

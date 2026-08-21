@@ -12,9 +12,9 @@ import {
   TextInput,
   Tile,
 } from "@carbon/react";
-import { Download, Play, Renew } from "@carbon/icons-react";
+import { Download, Play, Renew, StopFilled } from "@carbon/icons-react";
 
-import { getBatch, preflight, startBatch, terminalWorkflowStatus, type WorkflowRecord } from "./workflow-api";
+import { cancelBatch, getBatch, preflight, startBatch, terminalWorkflowStatus, type WorkflowRecord } from "./workflow-api";
 
 type Props = {
   batchId: string;
@@ -82,6 +82,7 @@ function statusTagType(status: string): "red" | "green" | "blue" | "gray" | "pur
   if (status === "failed") return "red";
   if (status === "completed") return "green";
   if (status === "running") return "blue";
+  if (status === "interrupted") return "purple";
   if (status === "needs_review" || status === "blocked") return "magenta";
   return "gray";
 }
@@ -111,13 +112,14 @@ export function BatchPanel({
   const [inputs, setInputs] = useState("");
   const [submitter, setSubmitter] = useState("local-user");
   const [repository, setRepository] = useState("pride");
-  const [runMode, setRunMode] = useState("parameters");
+  const [runMode, setRunMode] = useState("full");
   const [jobs, setJobs] = useState(3);
   const [record, setRecord] = useState<WorkflowRecord | null>(null);
   const [busy, setBusy] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [error, setError] = useState("");
   const [seedNotice, setSeedNotice] = useState("");
-  const [filter, setFilter] = useState<"all" | "running" | "failed" | "completed" | "queued">("all");
+  const [filter, setFilter] = useState<"all" | "running" | "failed" | "completed" | "queued" | "cancelled">("all");
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [inputRecords, setInputRecords] = useState<WorkflowRecord[]>([]);
   const [deleteSourcesAfterSuccess, setDeleteSourcesAfterSuccess] = useState(false);
@@ -128,7 +130,7 @@ export function BatchPanel({
     setInputs(text);
     setInputRecords(Array.isArray(initialInputRecords) ? initialInputRecords : []);
     const lines = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
-    setSeedNotice(`已从发现结果预填 ${lines.length} 条可用输入（L1），可直接启动参数推断或继续编辑。`);
+    setSeedNotice(`已从发现结果预填 ${lines.length} 条可用输入（L1），默认执行完整工作流，也可继续编辑。`);
   }, [initialInputs, initialInputsToken, initialInputRecords]);
 
   useEffect(() => {
@@ -185,7 +187,13 @@ export function BatchPanel({
     try {
       const check = await preflight(payload);
       if (check.status === "blocked") throw new Error((check.blocking_issues || ["Preflight blocked"]).join("；"));
+      if (String(check.run_mode || runMode) !== runMode) {
+        throw new Error(`服务器将运行模式从 ${runMode} 改成了 ${String(check.run_mode)}；任务未启动。`);
+      }
       const next = await startBatch(payload);
+      if (String(next.run_mode || "") !== runMode) {
+        throw new Error(`服务器没有按所选模式 ${runMode} 创建任务；任务未接受为成功。`);
+      }
       onBatchId(next.batch_id);
       setRecord(next);
       onChanged?.();
@@ -196,6 +204,21 @@ export function BatchPanel({
     }
   };
 
+  const stop = async () => {
+    if (!batchId || !record || terminalWorkflowStatus(record.status)) return;
+    setStopping(true);
+    setError("");
+    try {
+      const next = await cancelBatch(batchId);
+      setRecord(next);
+      onChanged?.();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setStopping(false);
+    }
+  };
+
   const items = Array.isArray(record?.items) ? (record?.items as WorkflowRecord[]) : [];
   const summary = (record?.summary as WorkflowRecord | undefined) || {};
   const completed = Number(record?.completed_items ?? summary.completed ?? items.filter((i) => i.status === "completed").length);
@@ -203,8 +226,9 @@ export function BatchPanel({
   const running = Number(record?.running_items ?? summary.running ?? items.filter((i) => i.status === "running").length);
   const queued = Number(record?.queued_items ?? summary.queued ?? items.filter((i) => i.status === "queued" || !i.status).length);
   const needsReview = Number(record?.needs_review_items ?? summary.needs_review ?? 0);
+  const cancelled = Number(record?.cancelled_items ?? summary.cancelled ?? 0);
   const total = Number(record?.item_count ?? items.length) || 0;
-  const percent = Number(summary.percent ?? (total ? ((completed + failed + needsReview) * 100) / total : 0));
+  const percent = Number(summary.percent ?? (total ? ((completed + failed + needsReview + cancelled) * 100) / total : 0));
   const focusMessage = String(summary.focus_message || "");
   const cleanupReleased = Number(summary.source_cleanup_released_bytes || 0);
   const cleanupCompleted = Number(summary.source_cleanup_completed || 0);
@@ -226,7 +250,7 @@ export function BatchPanel({
         <InlineNotification
           kind="success"
           lowContrast
-          title="已送入批量参数规划"
+          title="已送入批量处理"
           subtitle={seedNotice}
           onCloseButtonClick={() => setSeedNotice("")}
         />
@@ -256,9 +280,9 @@ export function BatchPanel({
             <SelectItem value="iprox" text="iProX" />
           </Select>
           <Select id="batch-run-mode" labelText="运行模式" value={runMode} onChange={(event) => setRunMode(event.target.value)}>
-            <SelectItem value="parameters" text="只推断参数" />
-            <SelectItem value="prepare" text="准备输入包" />
-            <SelectItem value="full" text="完整工作流" />
+            <SelectItem value="full" text="完整工作流（下载 → 转换 → 执行 → 打包）" />
+            <SelectItem value="prepare" text="只准备输入包（不执行转换流程）" />
+            <SelectItem value="parameters" text="只推断参数（不下载、不执行）" />
           </Select>
           <NumberInput id="batch-jobs" label="并行数" min={1} max={16} value={jobs} onChange={(_event, state) => setJobs(Number(state.value || 1))} />
         </div>
@@ -292,7 +316,7 @@ export function BatchPanel({
           <div className="batch-status-bar" style={{ display: "grid", gap: "0.75rem", marginBottom: "1rem" }}>
             <ProgressBar
               label="整批进度"
-              helperText={`${completed + failed + needsReview}/${total || 0} 已结束 · 运行 ${running} · 排队 ${queued} · 失败 ${failed}`}
+              helperText={`${completed + failed + needsReview + cancelled}/${total || 0} 已结束 · 运行 ${running} · 排队 ${queued} · 失败 ${failed} · 已停止 ${cancelled}`}
               value={Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0}
               max={100}
               size="big"
@@ -318,7 +342,19 @@ export function BatchPanel({
                   需复核<strong>{String(needsReview)}</strong>
                 </span>
               )}
+              {cancelled > 0 && (
+                <span>
+                  已停止<strong>{String(cancelled)}</strong>
+                </span>
+              )}
             </div>
+            <p className="empty-copy" style={{ margin: 0 }}>
+              <strong>执行模式：</strong>
+              {String(record.run_mode || "unknown")}
+              {Boolean(record.cancel_requested) && !terminalWorkflowStatus(record.status)
+                ? " · 正在安全停止，已完成结果会保留"
+                : ""}
+            </p>
             {focusMessage && (
               <p className="empty-copy" style={{ margin: 0 }}>
                 <strong>当前焦点：</strong>
@@ -338,6 +374,16 @@ export function BatchPanel({
             <Button kind="tertiary" renderIcon={Renew} onClick={() => void getBatch(batchId).then(setRecord).catch((reason) => setError(String(reason)))}>
               刷新
             </Button>
+            {!terminalWorkflowStatus(record.status) && (
+              <Button
+                kind="danger"
+                renderIcon={StopFilled}
+                disabled={stopping || Boolean(record.cancel_requested)}
+                onClick={() => void stop()}
+              >
+                {Boolean(record.cancel_requested) ? "正在停止" : "停止批次"}
+              </Button>
+            )}
             {Boolean(record.can_download) && (
               <Button kind="secondary" renderIcon={Download} href={`/api/batches/${encodeURIComponent(batchId)}/download`}>
                 下载 Excel
@@ -353,6 +399,7 @@ export function BatchPanel({
               <SelectItem value="running" text="运行中" />
               <SelectItem value="queued" text="排队" />
               <SelectItem value="failed" text="失败" />
+              <SelectItem value="cancelled" text="已停止" />
               <SelectItem value="completed" text="已完成" />
             </Select>
           </div>

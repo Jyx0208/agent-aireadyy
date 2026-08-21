@@ -5,6 +5,7 @@ from typing import Any
 
 from agent.discovery.features import UNKNOWN, lc_gradient_bucket
 from agent.discovery.models import DatasetRequest, DiscoveredFile, DiscoveredProject
+from agent.discovery.portfolio import PortfolioSpec, select_portfolio_files
 
 
 SelectedItems = list[tuple[DiscoveredProject, list[DiscoveredFile]]]
@@ -71,6 +72,37 @@ def select_diverse_items(
     items: list[tuple[DiscoveredProject, list[DiscoveredFile]]],
     request: DatasetRequest,
 ) -> SelectedItems:
+    # A declared portfolio contract is authoritative. The legacy diversity
+    # selector is intentionally broad and can admit a disallowed extension or
+    # exceed the per-project cap; route strict benchmark requests through the
+    # contract-aware selector before applying the historical fallback.
+    if isinstance(request.portfolio_spec, dict) and request.portfolio_spec:
+        spec = PortfolioSpec.from_request(request)
+        if spec.target_files or spec.target_projects or spec.detail_level == "strict":
+            all_files = [
+                file
+                for _project, files in items
+                for file in files
+                if file.validity_status != "exclude"
+            ]
+            selected_files = select_portfolio_files(all_files, spec)
+            project_by_accession = {
+                project.project_accession: project for project, _files in items
+            }
+            grouped: dict[str, list[DiscoveredFile]] = {}
+            for file in selected_files:
+                grouped.setdefault(file.project_accession, []).append(file)
+            return [
+                (
+                    project_by_accession[accession].model_copy(
+                        update={"selected_file_count": len(files)}
+                    ),
+                    files,
+                )
+                for accession, files in grouped.items()
+                if accession in project_by_accession and files
+            ]
+
     candidates: list[tuple[DiscoveredProject, DiscoveredFile]] = []
     for project, files in items:
         for file in files:

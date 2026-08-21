@@ -34,6 +34,15 @@ from agent.discovery.constraints import (
 from agent.discovery.manifest import write_dataset_manifest
 from agent.discovery.memory import DiscoveryMemory
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
+from agent.discovery.portfolio import (
+    RecoveryAction,
+    RecoveryAttempt,
+    PortfolioState,
+    assess_portfolio_coverage,
+    initialize_portfolio_state,
+    select_portfolio_files,
+    update_portfolio_state,
+)
 from agent.discovery.ontology import normalize_labeling_strategy
 from agent.discovery.project_judgment import (
     ProjectJudgmentInput,
@@ -112,6 +121,20 @@ class DiscoveryToolService:
         self.budget_governor = budget_governor
         self.search_environment = search_environment
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _required_high_relevance_inspections(
+        self,
+        high_relevance_candidate_count: int,
+    ) -> int:
+        """Return the inspection gate appropriate for the requested quantity mode."""
+
+        available = max(0, int(high_relevance_candidate_count or 0))
+        target = max(1, int(self.request.max_projects or 1))
+        if str(self.request.quota_flexibility or "") == "fixed":
+            # A fixed target means "stop after N qualified projects", not
+            # "find N and then inspect 2N before allowing delivery".
+            return min(available, target)
+        return minimum_high_relevance_inspections(available, target)
 
     def search_repository_candidates(
         self,
@@ -656,13 +679,14 @@ class DiscoveryToolService:
         }
 
     def run_confirmed_term_pipeline(self) -> dict[str, Any]:
-        """Exhaust confirmed terms in order and deterministically drain reviews.
+        """Run confirmed terms in order with scheduler-owned pagination and review.
 
         One user-confirmed phrase is one logical repository task. Pagination
         chunks are an internal transport detail: the Agent does not choose the
-        next offset, repeat an exhausted term, or decide when to advance to a
-        synonym. Newly discovered accessions enter one global deduplicated
-        review queue and are inspected before the next confirmed term starts.
+        next offset, repeat an exhausted term, or decide when to advance. In
+        fixed-target mode each search chunk is reviewed immediately and no new
+        work is scheduled after enough qualified projects exist. Open-ended
+        mode still exhausts one phrase before draining its review queue.
         """
 
         if self.search_environment is None:
@@ -707,6 +731,19 @@ class DiscoveryToolService:
                 "term_count": len(terms),
             }
 
+        fixed_target = self.request.quota_flexibility == "fixed"
+        target_project_count = max(1, int(self.request.max_projects))
+
+        def qualified_project_count() -> int:
+            return sum(
+                is_qualified_project_judgment(judgment)
+                for judgment in self._require_run().project_judgments.values()
+            )
+
+        target_reached = (
+            fixed_target
+            and qualified_project_count() >= target_project_count
+        )
         self.store.append_event(
             self.run_id,
             "confirmed_theme_pipeline_started",
@@ -716,6 +753,10 @@ class DiscoveryToolService:
                 "pagination": "internal_until_repository_exhaustion",
                 "review_queue": "global_project_accession_dedupe",
                 "review_workers": 4,
+                "execution_mode": "fixed_target" if fixed_target else "exhaustive",
+                "target_project_count": (
+                    target_project_count if fixed_target else None
+                ),
             },
         )
         term_results: list[dict[str, Any]] = []
@@ -725,8 +766,13 @@ class DiscoveryToolService:
             1,
             int(self._require_run().dynamic_limits.max_repository_requests),
         )
+        repository_chunk_size = (
+            100 if fixed_target else MAX_REPOSITORY_QUERY_DEPTH
+        )
 
         for term_index, term in enumerate(terms, start=1):
+            if target_reached:
+                break
             self._check_pipeline_cancel()
             term_role = "primary_theme" if term_index == 1 else "theme_synonym"
             self.store.append_event(
@@ -745,9 +791,25 @@ class DiscoveryToolService:
             new_candidate_count = 0
             no_progress_chunks = 0
             terminal_error = ""
+            review_totals = {
+                "review_batches_completed": 0,
+                "queued_project_count": 0,
+                "failed_review_count": 0,
+                "reviewed_project_count": len(
+                    self._require_run().inspected_candidate_accessions
+                ),
+                "pending_review_count": 0,
+                "deferred_candidate_count": 0,
+            }
 
             while chunks_completed < max_chunks_per_term:
                 self._check_pipeline_cancel()
+                if (
+                    fixed_target
+                    and qualified_project_count() >= target_project_count
+                ):
+                    target_reached = True
+                    break
                 if bool(is_exhausted(term)):
                     break
                 search = self.search_repository_candidates(
@@ -755,7 +817,7 @@ class DiscoveryToolService:
                         queries=[
                             RepositoryQuery(
                                 query=term,
-                                depth=MAX_REPOSITORY_QUERY_DEPTH,
+                                depth=repository_chunk_size,
                                 intent_dimension="confirmed theme",
                                 expected_gain=(
                                     "Read the next internal repository pages for this "
@@ -790,6 +852,7 @@ class DiscoveryToolService:
                         "new_candidate_count": search.new_candidate_count,
                         "candidate_count": search.candidate_count,
                         "exhausted": exhausted_after_chunk,
+                        "chunk_size": repository_chunk_size,
                     },
                 )
                 if search.status != "completed":
@@ -799,6 +862,50 @@ class DiscoveryToolService:
                         or "repository_search_not_completed"
                     )
                     break
+                if fixed_target:
+                    review_summary = self._drain_candidate_review_queue(
+                        reviewable=reviewable,
+                        attempted_reviews=attempted_reviews,
+                        term=term,
+                        term_index=term_index,
+                        term_count=len(terms),
+                        stop_when_qualified=target_project_count,
+                    )
+                    for key in (
+                        "review_batches_completed",
+                        "queued_project_count",
+                        "failed_review_count",
+                    ):
+                        review_totals[key] += int(review_summary.get(key) or 0)
+                    for key in (
+                        "reviewed_project_count",
+                        "pending_review_count",
+                        "deferred_candidate_count",
+                    ):
+                        review_totals[key] = int(review_summary.get(key) or 0)
+                    if int(review_summary.get("failed_review_count") or 0) > 0:
+                        terminal_error = "candidate_review_queue_not_drained"
+                        break
+                    target_reached = bool(review_summary.get("target_reached"))
+                    if target_reached:
+                        self.store.append_event(
+                            self.run_id,
+                            "fixed_project_target_reached",
+                            {
+                                "term": term,
+                                "term_index": term_index,
+                                "target_project_count": target_project_count,
+                                "qualified_project_count": qualified_project_count(),
+                                "reviewed_project_count": len(
+                                    self._require_run().inspected_candidate_accessions
+                                ),
+                                "search_chunks_completed": chunks_completed,
+                                "deferred_candidate_count": int(
+                                    review_summary.get("deferred_candidate_count") or 0
+                                ),
+                            },
+                        )
+                        break
                 if exhausted_after_chunk:
                     break
                 if search.raw_result_count <= 0:
@@ -810,6 +917,27 @@ class DiscoveryToolService:
                     break
 
             exhausted = bool(is_exhausted(term))
+            if target_reached:
+                term_payload = {
+                    "term": term,
+                    "term_index": term_index,
+                    "term_count": len(terms),
+                    "role": term_role,
+                    "status": "completed",
+                    "completion_reason": "fixed_project_target_reached",
+                    "exhausted": exhausted,
+                    "chunks_completed": chunks_completed,
+                    "raw_result_count": raw_result_count,
+                    "new_candidate_count": new_candidate_count,
+                    **review_totals,
+                }
+                self.store.append_event(
+                    self.run_id,
+                    "repository_term_task_completed",
+                    term_payload,
+                )
+                term_results.append(dict(term_payload))
+                break
             if not exhausted and not terminal_error:
                 terminal_error = "repository_term_safety_limit_reached"
             if terminal_error:
@@ -843,12 +971,16 @@ class DiscoveryToolService:
                 )
                 break
 
-            review_summary = self._drain_candidate_review_queue(
-                reviewable=reviewable,
-                attempted_reviews=attempted_reviews,
-                term=term,
-                term_index=term_index,
-                term_count=len(terms),
+            review_summary = (
+                review_totals
+                if fixed_target
+                else self._drain_candidate_review_queue(
+                    reviewable=reviewable,
+                    attempted_reviews=attempted_reviews,
+                    term=term,
+                    term_index=term_index,
+                    term_count=len(terms),
+                )
             )
             if (
                 int(review_summary.get("failed_review_count") or 0) > 0
@@ -905,13 +1037,18 @@ class DiscoveryToolService:
             for accession in reviewable()
             if str(accession).strip().upper() not in reviewed
         ]
+        qualified_count = qualified_project_count()
+        target_reached = (
+            fixed_target and qualified_count >= target_project_count
+        )
+        deferred_candidate_count = len(pending) if target_reached else 0
         all_terms_exhausted = not failed_terms and all(
             bool(is_exhausted(term))
             for term in terms
         )
         status = (
             "completed"
-            if all_terms_exhausted and not pending
+            if target_reached or (all_terms_exhausted and not pending)
             else "partial"
         )
         payload = {
@@ -921,12 +1058,18 @@ class DiscoveryToolService:
                 item.get("status") == "completed" for item in term_results
             ),
             "all_terms_exhausted": all_terms_exhausted,
+            "target_project_count": (
+                target_project_count if fixed_target else None
+            ),
+            "qualified_project_count": qualified_count,
+            "target_reached": target_reached,
             "failed_terms": failed_terms,
             "candidate_count": len(
                 list(getattr(self.search_environment, "candidate_accessions", []) or [])
             ),
             "reviewed_project_count": len(reviewed),
-            "pending_review_count": len(pending),
+            "pending_review_count": 0 if target_reached else len(pending),
+            "deferred_candidate_count": deferred_candidate_count,
             "terms": term_results,
         }
         self.store.append_event(
@@ -944,6 +1087,7 @@ class DiscoveryToolService:
         term: str,
         term_index: int,
         term_count: int,
+        stop_when_qualified: int | None = None,
     ) -> dict[str, Any]:
         batch_size = min(
             40,
@@ -955,6 +1099,15 @@ class DiscoveryToolService:
         while True:
             self._check_pipeline_cancel()
             run = self._require_run()
+            qualified_count = sum(
+                is_qualified_project_judgment(judgment)
+                for judgment in run.project_judgments.values()
+            )
+            if (
+                stop_when_qualified is not None
+                and qualified_count >= stop_when_qualified
+            ):
+                break
             inspected = {
                 str(accession).strip().upper()
                 for accession in run.inspected_candidate_accessions
@@ -971,7 +1124,12 @@ class DiscoveryToolService:
                 pending.append(accession)
             if not pending:
                 break
-            batch = pending[:batch_size]
+            remaining_target = (
+                max(1, stop_when_qualified - qualified_count)
+                if stop_when_qualified is not None
+                else batch_size
+            )
+            batch = pending[: min(batch_size, remaining_target)]
             attempted_reviews.update(batch)
             queued_count += len(batch)
             self.store.append_event(
@@ -1044,7 +1202,15 @@ class DiscoveryToolService:
             str(item).strip().upper()
             for item in self._require_run().inspected_candidate_accessions
         }
-        pending_review_count = sum(
+        qualified_count = sum(
+            is_qualified_project_judgment(judgment)
+            for judgment in self._require_run().project_judgments.values()
+        )
+        target_reached = (
+            stop_when_qualified is not None
+            and qualified_count >= stop_when_qualified
+        )
+        remaining_candidate_count = sum(
             str(accession).strip().upper() not in reviewed_accessions
             for accession in reviewable()
         )
@@ -1055,7 +1221,14 @@ class DiscoveryToolService:
             "reviewed_project_count": len(
                 self._require_run().inspected_candidate_accessions
             ),
-            "pending_review_count": pending_review_count,
+            "qualified_project_count": qualified_count,
+            "target_reached": target_reached,
+            "pending_review_count": (
+                0 if target_reached else remaining_candidate_count
+            ),
+            "deferred_candidate_count": (
+                remaining_candidate_count if target_reached else 0
+            ),
         }
 
     def _check_pipeline_cancel(self) -> None:
@@ -1355,9 +1528,8 @@ class DiscoveryToolService:
             inspected_accessions = _normalize_accessions(
                 [*metered_run.inspected_candidate_accessions, *successful_accessions]
             )
-            minimum_inspections = minimum_high_relevance_inspections(
+            minimum_inspections = self._required_high_relevance_inspections(
                 metered_run.latest_high_relevance_candidate_count,
-                self.request.max_projects,
             )
             harvest_all = bool(getattr(self.request, "harvest_all_qualified", False)) or (
                 str(getattr(self.request, "quantity_scope", "") or "") == "portfolio"
@@ -2289,6 +2461,7 @@ class DiscoveryToolService:
         round_index: int,
         rationale: str,
         project_accessions: list[str] | None = None,
+        file_identifiers: list[str] | None = None,
     ) -> dict[str, Any]:
         run = self._require_run()
         policy = evaluate_tool_policy("select_discovery_manifest", run)
@@ -2313,9 +2486,8 @@ class DiscoveryToolService:
         selected_accessions = _normalize_accessions(project_accessions or [])
         selection_audit: DiscoveryQualityAudit | None = None
 
-        required_inspections = minimum_high_relevance_inspections(
+        required_inspections = self._required_high_relevance_inspections(
             run.latest_high_relevance_candidate_count,
-            self.request.max_projects,
         )
         inspected_count = len(run.inspected_candidate_accessions)
         inspection_budget_remaining = (
@@ -2339,6 +2511,27 @@ class DiscoveryToolService:
             return self._selection_rejected(round_index, "manifest_round_not_found")
 
         manifest = _load_manifest(manifest_path)
+        portfolio_state: PortfolioState | None = None
+        frozen_file_identifiers: set[str] = set()
+        if self.request.portfolio_spec:
+            portfolio_state = self._load_portfolio_state()
+            if portfolio_state.status != "frozen":
+                return self._selection_rejected(round_index, "portfolio_must_be_frozen_before_publication")
+            frozen_file_identifiers = {
+                value.casefold() for value in portfolio_state.selected_file_identifiers
+            }
+            requested_file_identifiers = {
+                str(value).strip().casefold()
+                for value in (file_identifiers or portfolio_state.selected_file_identifiers)
+                if str(value).strip()
+            }
+            if requested_file_identifiers != frozen_file_identifiers:
+                return self._selection_rejected(round_index, "selection_file_ids_do_not_match_frozen_portfolio")
+            file_identifiers = list(requested_file_identifiers)
+            frozen_projects = set(portfolio_state.selected_project_accessions)
+            if selected_accessions and set(selected_accessions) != {value.upper() for value in frozen_projects}:
+                return self._selection_rejected(round_index, "selection_projects_do_not_match_frozen_portfolio")
+            selected_accessions = sorted(frozen_projects)
         judgment_gate_enabled = self._quality_audit_required(run)
         eligible_accessions = {
             accession
@@ -2475,6 +2668,7 @@ class DiscoveryToolService:
         arguments = {
             "round_index": round_index,
             "project_accessions": selected_accessions,
+            "file_identifiers": file_identifiers or [],
             "rationale": rationale,
         }
         tool_call, claimed = self.store.claim_tool_call(
@@ -2492,9 +2686,29 @@ class DiscoveryToolService:
         deliverable = _delivery_manifest_subset(
             manifest,
             selected_accessions=selected_set,
+            selected_file_identifiers={
+                str(value).casefold() for value in (file_identifiers or []) if str(value).strip()
+            } or None,
             project_judgments=run.project_judgments,
             scientific_constraints=self.request.scientific_constraints,
         )
+        if portfolio_state is not None:
+            portfolio_coverage = assess_portfolio_coverage(
+                deliverable.files,
+                portfolio_state.spec,
+            )
+            if not portfolio_coverage.ready:
+                payload = {
+                    "status": "blocked",
+                    "round_index": round_index,
+                    "manifest_path": str(manifest_path),
+                    "selected_files": len(deliverable.files),
+                    "blockers": ["frozen_portfolio_final_audit_failed"],
+                    "portfolio_coverage": portfolio_coverage.model_dump(mode="json"),
+                }
+                self.store.complete_tool_call(tool_call.idempotency_key, payload)
+                self.store.append_event(self.run_id, "manifest_selection_rejected", payload)
+                return payload
         manifest = _merge_discovery_manifests(
             [deliverable],
             request=self.request,
@@ -2640,9 +2854,8 @@ class DiscoveryToolService:
             rejection_reasons.append("auto_selection_requires_project_judgments")
         if not eligible_accessions:
             rejection_reasons.append("auto_selection_requires_eligible_projects")
-        required_inspections = minimum_high_relevance_inspections(
+        required_inspections = self._required_high_relevance_inspections(
             run.latest_high_relevance_candidate_count,
-            self.request.max_projects,
         )
         can_continue = (
             not run.search_stopped
@@ -2916,9 +3129,8 @@ class DiscoveryToolService:
         if not callable(high_relevance_fn):
             return run
 
-        target_inspections = minimum_high_relevance_inspections(
+        target_inspections = self._required_high_relevance_inspections(
             max(int(run.latest_high_relevance_candidate_count or 0), 1),
-            int(self.request.max_projects or 1),
         )
         # Practical upper bound so we do not try to inspect thousands in one post-pass.
         target_inspections = max(target_inspections, 100)
@@ -3251,6 +3463,253 @@ class DiscoveryToolService:
         )
         return payload
 
+    def _load_portfolio_state(self) -> PortfolioState:
+        run = self._require_run()
+        if isinstance(run.portfolio_state, dict):
+            try:
+                return PortfolioState.model_validate(run.portfolio_state)
+            except Exception:
+                # Stored state is advisory; the manifest and request remain the
+                # authoritative sources and can deterministically rebuild it.
+                pass
+        return initialize_portfolio_state(self.request)
+
+    def _portfolio_manifest(self) -> DatasetManifest | None:
+        run = self._require_run()
+        path = Path(run.candidate_pool_manifest_path or run.current_manifest_path or "")
+        if not str(path) or not path.exists() or not path.is_file():
+            return None
+        try:
+            return _load_manifest(path)
+        except Exception:
+            return None
+
+    def _persist_portfolio_state(
+        self,
+        state: PortfolioState,
+        *,
+        event_type: str = "portfolio_state_updated",
+    ) -> PortfolioState:
+        self.store.save_run(
+            self._require_run().model_copy(
+                update={"portfolio_state": state.model_dump(mode="json")}
+            )
+        )
+        self.store.append_event(
+            self.run_id,
+            event_type,
+            {
+                "status": state.status,
+                "gaps": [gap.model_dump(mode="json") for gap in state.gaps],
+                "recovery_actions": [
+                    action.model_dump(mode="json") for action in state.recovery_actions
+                ],
+                "selected_project_accessions": state.selected_project_accessions,
+            },
+        )
+        return state
+
+    def get_portfolio_state(self) -> dict[str, Any]:
+        """Return compact portfolio contract/coverage state for the Agent and UI."""
+
+        state = self._load_portfolio_state()
+        manifest = self._portfolio_manifest()
+        if manifest is not None:
+            state = update_portfolio_state(state, manifest.files)
+        state = self._persist_portfolio_state(state, event_type="portfolio_state_observed")
+        return state.model_dump(mode="json")
+
+    def assess_portfolio_coverage(
+        self,
+        file_identifiers: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Recompute coverage from persisted manifest evidence, never Agent claims."""
+
+        state = self._load_portfolio_state()
+        manifest = self._portfolio_manifest()
+        if manifest is None:
+            state = self._persist_portfolio_state(
+                state.model_copy(update={"status": "blocked", "gaps": []}),
+                event_type="portfolio_coverage_blocked",
+            )
+            return {
+                "status": "blocked",
+                "reason": "candidate_manifest_unavailable",
+                "state": state.model_dump(mode="json"),
+            }
+        state = update_portfolio_state(
+            state,
+            manifest.files,
+            selected_file_identifiers=file_identifiers,
+        )
+        state = self._persist_portfolio_state(state)
+        return {
+            "status": "completed",
+            "coverage": state.coverage.model_dump(mode="json") if state.coverage else None,
+            "gaps": [gap.model_dump(mode="json") for gap in state.gaps],
+            "state": state.model_dump(mode="json"),
+        }
+
+    def plan_portfolio_recovery(self) -> dict[str, Any]:
+        state = self._load_portfolio_state()
+        if state.coverage is None:
+            result = self.assess_portfolio_coverage()
+            return result
+        completed_attempts = sum(
+            1 for attempt in state.recovery_attempts if attempt.status == "completed"
+        )
+        if state.gaps and completed_attempts >= state.spec.max_recovery_rounds:
+            state = state.model_copy(
+                update={
+                    "status": "blocked",
+                    "recovery_actions": [
+                        *state.recovery_actions,
+                        RecoveryAction(
+                            id="recovery-budget-exhausted",
+                            kind="stop_with_limitations",
+                            priority=100,
+                            rationale="The bounded portfolio recovery budget is exhausted.",
+                            expected_gain="Report the remaining evidence gaps without relaxing hard conditions.",
+                        ),
+                    ],
+                }
+            )
+        state = self._persist_portfolio_state(state, event_type="portfolio_recovery_planned")
+        return {
+            "status": "needs_recovery" if state.gaps and state.status != "blocked" else state.status,
+            "actions": [action.model_dump(mode="json") for action in state.recovery_actions],
+            "attempts": [attempt.model_dump(mode="json") for attempt in state.recovery_attempts],
+            "gaps": [gap.model_dump(mode="json") for gap in state.gaps],
+            "state": state.model_dump(mode="json"),
+        }
+
+    def record_portfolio_recovery(
+        self,
+        action_id: str,
+        status: str,
+        observation: str = "",
+        gain: dict[str, int] | None = None,
+        approval_granted: bool = False,
+    ) -> dict[str, Any]:
+        """Persist the bounded recovery loop around an Agent search/inspection."""
+
+        state = self._load_portfolio_state()
+        action = next((item for item in state.recovery_actions if item.id == action_id), None)
+        if action is None:
+            return {"status": "blocked", "reason": "portfolio_recovery_action_unknown"}
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in {"running", "completed", "failed", "stopped"}:
+            return {"status": "blocked", "reason": "portfolio_recovery_status_invalid"}
+        if (
+            action.requires_approval
+            and normalized_status in {"running", "completed"}
+            and not approval_granted
+        ):
+            return {"status": "blocked", "reason": "portfolio_recovery_approval_required"}
+        completed_attempts = sum(
+            1 for attempt in state.recovery_attempts if attempt.status == "completed"
+        )
+        if normalized_status == "running" and completed_attempts >= state.spec.max_recovery_rounds:
+            return {"status": "blocked", "reason": "portfolio_recovery_budget_exhausted"}
+        existing_attempt = next(
+            (
+                item
+                for item in reversed(state.recovery_attempts)
+                if item.action_id == action_id and item.status == "running"
+            ),
+            None,
+        )
+        attempt = (
+            existing_attempt.model_copy(
+                update={
+                    "status": normalized_status,
+                    "observation": str(observation or "").strip()[:2000],
+                    "gain": {str(key): int(value) for key, value in (gain or {}).items()},
+                }
+            )
+            if existing_attempt is not None
+            else RecoveryAttempt(
+                attempt_id=f"recovery-attempt-{len(state.recovery_attempts) + 1}",
+                action_id=action_id,
+                status=normalized_status,
+                observation=str(observation or "").strip()[:2000],
+                gain={str(key): int(value) for key, value in (gain or {}).items()},
+            )
+        )
+        action_status = "accepted" if normalized_status == "running" else (
+            "executed" if normalized_status == "completed" else "skipped"
+        )
+        updated_actions = [
+            item.model_copy(update={"status": action_status}) if item.id == action_id else item
+            for item in state.recovery_actions
+        ]
+        state = state.model_copy(
+            update={
+                "recovery_actions": updated_actions,
+                "recovery_attempts": [
+                    attempt
+                    if item.attempt_id == attempt.attempt_id
+                    else item
+                    for item in state.recovery_attempts
+                ]
+                if existing_attempt is not None
+                else [*state.recovery_attempts, attempt],
+            }
+        )
+        state = self._persist_portfolio_state(state, event_type="portfolio_recovery_recorded")
+        return {
+            "status": "completed",
+            "attempt": attempt.model_dump(mode="json"),
+            "state": state.model_dump(mode="json"),
+        }
+
+    def freeze_portfolio(
+        self,
+        file_identifiers: list[str],
+        rationale: str,
+    ) -> dict[str, Any]:
+        state = self._load_portfolio_state()
+        manifest = self._portfolio_manifest()
+        if manifest is None:
+            return {"status": "blocked", "reason": "candidate_manifest_unavailable"}
+        selected = list(file_identifiers)
+        if not selected:
+            selected = [
+                f"{row.repository}:{row.project_accession}:{row.file_accession_or_path or row.file_name}"
+                for row in select_portfolio_files(manifest.files, state.spec)
+            ]
+        state = update_portfolio_state(
+            state,
+            manifest.files,
+            selected_file_identifiers=selected,
+        )
+        if state.coverage is None or not state.coverage.ready:
+            state = self._persist_portfolio_state(
+                state.model_copy(update={"status": "blocked"}),
+                event_type="portfolio_freeze_blocked",
+            )
+            return {
+                "status": "blocked",
+                "reason": "hard_portfolio_gaps",
+                "state": state.model_dump(mode="json"),
+            }
+        state = state.model_copy(
+            update={
+                "status": "frozen",
+                "frozen_rationale": str(rationale or "").strip()[:2000]
+                or "Evidence-backed portfolio frozen.",
+            }
+        )
+        state = self._persist_portfolio_state(state, event_type="portfolio_frozen")
+        return {
+            "status": "frozen",
+            "selected_file_identifiers": state.selected_file_identifiers,
+            "selected_project_accessions": state.selected_project_accessions,
+            "coverage": state.coverage.model_dump(mode="json") if state.coverage else None,
+            "state": state.model_dump(mode="json"),
+            "next_step": "Call select_discovery_manifest with matching project_accessions; the service will publish the exact frozen selected_file_identifiers.",
+        }
+
     def audit_discovery_state(
         self,
         *,
@@ -3418,9 +3877,8 @@ class DiscoveryToolService:
         open_ended = str(getattr(self.request, "quota_flexibility", "") or "") == "open_ended"
         fixed_target = str(getattr(self.request, "quota_flexibility", "") or "") == "fixed"
         open_ended_search = harvest_all or open_ended
-        required_inspections = minimum_high_relevance_inspections(
+        required_inspections = self._required_high_relevance_inspections(
             run.latest_high_relevance_candidate_count,
-            target,
         )
         can_continue = (
             not search_repair_limitations
@@ -4521,9 +4979,8 @@ class DiscoveryToolService:
             "candidate_search_count": run.candidate_search_count,
             "candidate_inspection_count": run.candidate_inspection_count,
             "inspected_candidate_accessions": run.inspected_candidate_accessions,
-            "minimum_high_relevance_inspections": minimum_high_relevance_inspections(
+            "minimum_high_relevance_inspections": self._required_high_relevance_inspections(
                 run.latest_high_relevance_candidate_count,
-                int((run.request or {}).get("max_projects") or 1),
             ),
             "no_gain_action_count": run.no_gain_action_count,
             "latest_candidate_search_id": run.latest_candidate_search_id,
@@ -4586,6 +5043,7 @@ class DiscoveryToolService:
             "search_recovery_required": run.search_recovery_required,
             "search_recovery_attempts": run.search_recovery_attempts,
             "last_search_strategy": run.last_search_strategy,
+            "portfolio": run.portfolio_state,
         }
 
     def _bind_candidate_search_to_grant(
@@ -5055,6 +5513,7 @@ def _delivery_manifest_subset(
     manifest: DatasetManifest,
     *,
     selected_accessions: set[str] | None = None,
+    selected_file_identifiers: set[str] | None = None,
     project_judgments: dict[str, ProjectJudgmentInput] | None = None,
     scientific_constraints: list[ScientificConstraint] | None = None,
 ) -> DatasetManifest:
@@ -5072,6 +5531,14 @@ def _delivery_manifest_subset(
         accession = file.project_accession.upper()
         if selected_accessions is not None and accession not in selected_accessions:
             continue
+        if selected_file_identifiers is not None:
+            identifier = (
+                f"{file.repository}:{file.project_accession}:"
+                f"{file.file_accession_or_path or file.file_name}"
+            ).casefold()
+            short_identifier = str(file.file_accession_or_path or file.file_name).casefold()
+            if identifier not in selected_file_identifiers and short_identifier not in selected_file_identifiers:
+                continue
         if not _is_delivery_eligible(projects_by_accession.get(accession), file):
             continue
         if scoped_hard_constraints:

@@ -60,6 +60,11 @@ def infer_instrument_family_from_name(name: str) -> str:
         return "orbitrap"
     if "tims" in lowered:
         return "tims"
+    # Bruker Impact HD/II and Waters-style QTOF instruments are a distinct
+    # time-of-flight family even when the repository omits the literal
+    # ``QTOF`` token from the CV name.
+    if any(token in lowered for token in ("qtof", "q-tof", "impact hd", "impact ii", "synapt")):
+        return "qtof"
     if "tof" in lowered:
         return "tof"
     return "unknown"

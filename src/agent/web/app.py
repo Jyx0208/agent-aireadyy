@@ -27,7 +27,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from pydantic import BaseModel, ConfigDict
 from fastapi import BackgroundTasks, FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse
+from starlette.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from agent.agent_core.harness import run_agent_harness
 from agent.ai_ready.agent_run_bridge import build_ai_ready_from_agent_run
@@ -80,6 +81,7 @@ from agent.discovery.memory import (
     now_utc_iso,
 )
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject, DiscoveryEvidence
+from agent.discovery.portfolio import infer_portfolio_spec
 from agent.discovery.ontology import (
     SPECIES_TERMS,
     general_query_terms_from_text,
@@ -113,6 +115,17 @@ from agent.repositories.pride_adapter import PrideAdapter
 from agent.repositories.registry import RepositoryRegistry
 from agent.runtime.system_metrics import collect_system_metrics
 from agent.utils import write_json
+from agent.operations.api import router as operations_router
+from agent.operations.legacy import (
+    import_legacy_discovery_summaries,
+    import_legacy_history_index,
+    is_material_legacy_history_record,
+)
+from agent.operations.queue import enqueue_discovery_job, revoke_discovery_job
+from agent.operations.runtime import (
+    close_operations_repository,
+    get_operations_repository,
+)
 from agent.web.history import history_timestamp, merge_project_history_records, with_history_identity
 from agent.web.storage_lifecycle import (
     clean_item_source_assets,
@@ -149,13 +162,29 @@ from agent.web.llm_config_store import LLMConfigStore
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _runs_dir.mkdir(exist_ok=True)
+    operations = get_operations_repository()
+    await asyncio.to_thread(
+        import_legacy_discovery_summaries,
+        operations,
+        _runs_dir,
+    )
     _sync_history_index_from_disk()
+    await asyncio.to_thread(
+        import_legacy_history_index,
+        operations,
+        _runs_dir,
+    )
     _repair_interrupted_history_index()
     _start_result_cleanup_worker()
-    yield
+    try:
+        yield
+    finally:
+        close_operations_repository()
 
 
 app = FastAPI(title="PRIDE AI-ready Agent", version="0.3.1", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+app.include_router(operations_router)
 
 _benchmark_review_next_dir = Path(__file__).parent / "static" / "benchmark-review-next"
 app.mount(
@@ -185,10 +214,10 @@ _history_delete_confirmations: dict[str, dict[str, Any]] = {}
 _history_delete_confirmations_lock = threading.Lock()
 _discovery_jobs: dict[str, dict[str, Any]] = {}
 _discovery_jobs_lock = threading.RLock()
-_runs_dir = Path("runs")
+_runs_dir = Path(os.getenv("AGENT_RUNS_DIR", "runs")).resolve()
 _templates_dir = Path(__file__).parent / "templates"
 _ACTIVE_STATUSES = {"queued", "running"}
-_TERMINAL_STATUSES = {"completed", "failed", "blocked"}
+_TERMINAL_STATUSES = {"completed", "failed", "blocked", "cancelled", "interrupted"}
 _cleanup_thread_started = False
 _PUBLIC_HISTORY_FILE = "task_history.json"
 _HISTORY_INDEX_FILE = "project_history.json"
@@ -356,6 +385,8 @@ _AI_READY_DOWNLOAD_FILES = {
     "data_scientist_agent_loop_report_md": ("data_scientist_agent_loop_report.md", "text/markdown"),
 }
 _MAX_PERSISTED_LOGS = 2000
+_DISCOVERY_SUMMARY_RECENT_LOGS = 240
+_DISCOVERY_LOG_STRING_LIMIT = 240
 _INTERRUPTED_HISTORY_MESSAGE = "服务重启或任务被手动停止，任务已中断。"
 _RUN_MODE_FULL = "full"
 _RUN_MODE_PREPARE = "prepare"
@@ -430,10 +461,7 @@ def _clean_run_mode(value: Any) -> str:
 
 
 def _clean_batch_run_mode(value: Any) -> str:
-    mode = normalize_run_mode(value, default=_RUN_MODE_PARAMETERS)
-    if mode == _RUN_MODE_FULL and not _full_workflow_enabled():
-        return _RUN_MODE_PREPARE
-    return mode
+    return normalize_run_mode(value, default=_RUN_MODE_PARAMETERS)
 
 
 def _clean_resource_policy(value: Any) -> str:
@@ -1432,6 +1460,52 @@ def _clean_discovery_ptm_types(value: Any, *, default: list[str] | None = None) 
 _FIXED_DISCOVERY_RUN_HORIZON = "candidates_reviewed"
 
 
+def _candidate_delivery_satisfies_run_horizon(
+    body: Mapping[str, Any],
+    progress: Mapping[str, Any],
+) -> bool:
+    """Separate reviewed-candidate delivery from stricter modeling readiness."""
+
+    requested_project_target = _bounded_int(
+        body.get("max_projects"),
+        default=20,
+        minimum=1,
+        maximum=1_000_000,
+    )
+    portfolio_spec = body.get("portfolio_spec") if isinstance(body.get("portfolio_spec"), Mapping) else {}
+    portfolio_project_target = _bounded_int(
+        portfolio_spec.get("target_projects"),
+        default=requested_project_target,
+        minimum=1,
+        maximum=1_000_000,
+    )
+    portfolio_file_target = _bounded_int(
+        portfolio_spec.get("target_files"),
+        default=0,
+        minimum=0,
+        maximum=1_000_000,
+    )
+    requested_quota = _clean_text(body.get("quota_flexibility")).lower()
+    common = (
+        _clean_text(body.get("run_horizon")) == _FIXED_DISCOVERY_RUN_HORIZON
+        and requested_quota != "open_ended"
+        and _clean_text(body.get("coverage_mode")).lower()
+        not in {"exhaustive", "maximize", "all"}
+    )
+    if not common or int(progress.get("qualified_count") or 0) < portfolio_project_target:
+        return False
+    if int(progress.get("batch_count") or 0) > 0:
+        return True
+    # A strict portfolio request can finish with an audited candidate manifest
+    # before the incremental publisher emits a batch. Treat the requested
+    # portfolio itself as the delivery unit; legacy non-portfolio runs retain
+    # the historical batch requirement.
+    return bool(
+        portfolio_file_target > 0
+        and int(progress.get("usable_file_count") or 0) >= portfolio_file_target
+    )
+
+
 def _has_explicit_exhaustive_discovery_intent(value: Any) -> bool:
     """Recognize user language that means portfolio-wide discovery, not a quota."""
 
@@ -1529,6 +1603,22 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
         quota_flexibility = "recommended"
     if explicit_exhaustive and quota_flexibility != "fixed":
         quota_flexibility = "open_ended"
+    raw_project_target = body.get("max_projects")
+    has_positive_project_target = (
+        raw_project_target is not None
+        and _bounded_int(raw_project_target, default=0, minimum=0, maximum=5000) > 0
+    )
+    if (
+        has_positive_project_target
+        and not explicit_exhaustive
+        and quota_flexibility == "recommended"
+    ):
+        # Product semantics now have only two execution modes. Older browser
+        # sessions can still submit the retired curated/recommended fields
+        # together with an exact numeric target. Treat that combination as the
+        # user's fixed target so it cannot fall back to the autonomous SDK path
+        # and continue reviewing after the requested count has been reached.
+        quota_flexibility = "fixed"
     time_budget_preference = _clean_text(
         body.get("time_budget_preference") or body.get("time_budget") or "multi_round"
     ).lower()
@@ -1715,6 +1805,44 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
             f"{details}"
         )
     scientific_constraints = list(constraint_normalize.accepted)
+    portfolio_spec = infer_portfolio_spec(
+        prompt_text,
+        body.get("portfolio_spec"),
+    )
+    # Direct Discovery-job callers do not necessarily pass through the pool
+    # builder. Keep the numeric portfolio contract authoritative there too:
+    # otherwise “8 projects, 16 files” silently falls back to broad defaults.
+    portfolio_target_projects = _bounded_int(
+        portfolio_spec.get("target_projects"), default=0, minimum=0, maximum=5000
+    )
+    portfolio_target_files = _bounded_int(
+        portfolio_spec.get("target_files"), default=0, minimum=0, maximum=200000
+    )
+    portfolio_min_files = _bounded_int(
+        portfolio_spec.get("min_files_per_project"), default=0, minimum=0, maximum=5000
+    )
+    portfolio_max_files = _bounded_int(
+        portfolio_spec.get("max_files_per_project"), default=0, minimum=0, maximum=5000
+    )
+    requested_max_projects = (
+        _bounded_int(body.get("max_projects"), default=2000, minimum=1, maximum=5000)
+        if body.get("max_projects") not in (None, "")
+        else (portfolio_target_projects or 2000)
+    )
+    requested_max_files = (
+        _bounded_int(body.get("max_files"), default=100000, minimum=1, maximum=200000)
+        if body.get("max_files") not in (None, "")
+        else (portfolio_target_files or 100000)
+    )
+    requested_max_files_per_project = (
+        _bounded_int(body.get("max_files_per_project"), default=500, minimum=1, maximum=5000)
+        if body.get("max_files_per_project") not in (None, "")
+        else (portfolio_max_files or 500)
+    )
+    if portfolio_min_files and "files_per_project" in set(
+        portfolio_spec.get("hard_dimensions") or []
+    ):
+        hard_constraint_fields.append("per_project_min_files")
     existing_constraint_ids = {item.id.casefold() for item in scientific_constraints}
     if instrument_preference != "none" and "builtin.instrument-era" not in existing_constraint_ids:
         scientific_constraints.append(
@@ -1841,12 +1969,16 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
         max_projects=(
             max(
                 2000,
-                _bounded_int(body.get("max_projects"), default=2000, minimum=1, maximum=5000),
+                requested_max_projects,
             )
             if explicit_exhaustive and quota_flexibility != "fixed"
-            else _bounded_int(body.get("max_projects"), default=2000, minimum=1, maximum=5000)
+            else requested_max_projects
         ),
-        max_files=_bounded_int(body.get("max_files"), default=100000, minimum=1, maximum=200000),
+        max_files=(
+            max(100000, requested_max_files)
+            if explicit_exhaustive and quota_flexibility != "fixed"
+            else requested_max_files
+        ),
         max_candidate_projects=(
             max(
                 20000,
@@ -1865,9 +1997,7 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
                 maximum=20000,
             )
         ),
-        max_files_per_project=_bounded_int(
-            body.get("max_files_per_project"), default=500, minimum=1, maximum=5000
-        ),
+        max_files_per_project=requested_max_files_per_project,
         partial_delivery_batch_size=_bounded_int(
             body.get("partial_delivery_batch_size"), default=500, minimum=1, maximum=5000
         ),
@@ -1876,7 +2006,7 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
         ),
         continuous_discovery=(
             True
-            if explicit_exhaustive and quota_flexibility != "fixed"
+            if quota_flexibility in {"fixed", "open_ended"}
             else bool(body.get("continuous_discovery", quantity_scope == "portfolio"))
         ),
         quantity_scope=quantity_scope,  # type: ignore[arg-type]
@@ -1888,6 +2018,8 @@ def _clean_dataset_request(body: dict[str, Any]) -> DatasetRequest:
         harvest_all_qualified=quantity_scope == "portfolio" and bool(portfolio_size_preference),
         hard_constraint_fields=list(dict.fromkeys(hard_constraint_fields)),
         constraint_provenance=constraint_provenance,
+        portfolio_spec=portfolio_spec,
+        per_project_min_files=portfolio_min_files or None,
     )
 
 
@@ -2032,6 +2164,12 @@ _DISCOVERY_DIVERSITY_STRATEGIES = {"balanced", "high", "off"}
 _DISCOVERY_REPOSITORIES = {"pride", "massive", "iprox", "auto"}
 _DISCOVERY_GOALS = {"general", "ptm", "immunopeptidomics"}
 _POOL_BUILD_SCALE_PRESETS: dict[str, dict[str, int]] = {
+    "quick": {
+        "max_projects": 20,
+        "max_candidate_projects": 80,
+        "max_files": 2000,
+        "max_files_per_project": 150,
+    },
     "curated": {
         "max_projects": 50,
         "max_candidate_projects": 250,
@@ -2062,6 +2200,9 @@ def _normalise_pool_build_language(value: Any) -> str:
 def _normalise_pool_build_scale(value: Any, *, prompt: str = "", allow_auto: bool = True) -> str:
     raw = _clean_text(value).casefold().replace("-", "_")
     aliases = {
+        "quick": "quick",
+        "fast": "quick",
+        "快速": "quick",
         "selected": "curated",
         "select": "curated",
         "curated": "curated",
@@ -2085,6 +2226,8 @@ def _normalise_pool_build_scale(value: Any, *, prompt: str = "", allow_auto: boo
     text = _clean_text(prompt).casefold()
     if _has_explicit_exhaustive_discovery_intent(text):
         return "exhaustive"
+    if any(marker in text for marker in ("快速", "quick", "find enough", "达到即停")):
+        return "quick"
     if any(marker in text for marker in ("精选", "少量", "先验证", "pilot", "curated", "small set")):
         return "curated"
     if any(marker in text for marker in ("均衡", "balanced")):
@@ -2302,7 +2445,8 @@ def _discovery_goal_parse_system_prompt() -> str:
         "Supported task_type values: rt_prediction, fragment_intensity_prediction, psm_scoring, "
         "denovo, ptm_denovo, chimeric_interpretation, or empty string. "
         "Supported diversity_strategy values: balanced, high, off. "
-        "Supported scale_mode values: curated, balanced, exhaustive. Infer exhaustive when the user asks for as many relevant projects as possible / 越多越好 / 尽可能多. "
+        "Supported scale_mode values: quick, balanced, exhaustive (curated is a legacy alias). "
+        "Use quick with quota_flexibility=fixed when the user asks for a concrete number of usable projects; infer exhaustive when the user asks for as many relevant projects as possible / 越多越好 / 尽可能多. "
         "All query_terms must be concise English phrases suitable for repository search even when the request is written in another language. For broad human proteomics, include terms such as human proteomics, shotgun proteomics, label free quantitation, TMT, DIA, phosphoproteomics, affinity purification mass spectrometry, plasma proteomics. "
         "Warnings and reasoning must use the requested output language. "
         "Do not enable agentic discovery; agentic execution is controlled only by explicit advanced settings. "
@@ -2369,7 +2513,7 @@ _DISCOVERY_AGENT_GUIDANCE_PATH = (
 _DISCOVERY_AGENT_GUIDANCE_FALLBACK = """Scientific discovery guidance:
 - Choose the highest-value next decision from the current science context; do not follow a fixed questionnaire.
 - Treat gap reports and legacy pending questions as guidance, not a command.
-- For exploratory immunopeptide/HLA-ligandome discovery, do not default to PTM de novo. Recommend a human-prioritized, browse-only, curated set around 20 projects first.
+- For exploratory immunopeptide/HLA-ligandome discovery, do not default to PTM de novo. Keep it human-prioritized and offer either quick fixed-target discovery (20 usable projects by default) or exhaustive open-ended coverage.
 - De novo sequencing, PSM scoring, and RT prediction are optional later tasks after the exploratory corpus is understood.
 """
 _DISCOVERY_TURN_ACTIONS = {
@@ -2545,7 +2689,7 @@ _DISCOVERY_STRATEGY_PATCH_CONTRACT = {
         "any",
     ],
     "labeling_hard": "boolean or null",
-    "coverage_mode (scale_mode accepted as input alias)": ["curated", "balanced", "exhaustive"],
+    "coverage_mode (scale_mode accepted as input alias)": ["quick", "curated", "balanced", "exhaustive"],
     "target_project_count (max_projects accepted as input alias)": "positive integer or null",
     "max_candidate_projects": "positive integer or null",
     "quota_flexibility": ["fixed", "recommended", "open_ended"],
@@ -2585,15 +2729,15 @@ _DISCOVERY_STRATEGY_FIELD_SEMANTICS = {
     ),
     "labeling_strategy": "标记方式/chemical or isotope labeling strategy; any means intentionally unrestricted/open. A request that labeling is open belongs here, never in special_themes.",
     "labeling_hard": "Whether the labeling choice is a hard filter.",
-    "coverage_mode": "Curation-versus-breadth preference, distinct from the exact project target.",
+    "coverage_mode": "Quick fixed-target versus exhaustive-coverage execution mode, distinct from the exact project target.",
     "target_project_count": "Desired selected-project count, not the candidate-pool size.",
     "max_candidate_projects": (
         "Bounded-mode retention limit. Compatibility hint only in continuous/maximize mode, "
         "where candidate count is not capped."
     ),
     "quota_flexibility": (
-        "Whether the project target is fixed, recommended, or open-ended. A numeric target alone "
-        "does not mean fixed; fixed requires explicit hard/exact language."
+        "Whether the project target is fixed, recommended, or open-ended. A user-stated numeric "
+        "project target is fixed and must stop new search/review scheduling once reached."
     ),
     "time_budget": "Fast single-pass preference versus a multi-round search.",
     "on_safety_ceiling": "What to do at server safety limits; it cannot remove those limits.",
@@ -2689,6 +2833,7 @@ _DISCOVERY_EXPLICIT_ENUM_HINTS: dict[str, dict[str, tuple[str, ...]]] = {
         "any": ("标记开放", "不限标记", "任何标记"),
     },
     "coverage_mode": {
+        "quick": ("quick", "快速", "达到即停", "找够"),
         "curated": ("curated", "精选", "少量高质量"),
         "balanced": ("balanced", "均衡", "平衡"),
         "exhaustive": ("exhaustive", "尽量搜全", "搜全", "最大覆盖"),
@@ -2841,7 +2986,7 @@ _DISCOVERY_STRATEGY_ENUM_FIELDS: dict[str, set[str]] = {
         "unknown",
         "any",
     },
-    "coverage_mode": {"curated", "balanced", "exhaustive"},
+    "coverage_mode": {"quick", "curated", "balanced", "exhaustive"},
     "quota_flexibility": {"fixed", "recommended", "open_ended"},
     "time_budget": {"fast", "multi_round"},
     "on_safety_ceiling": {"ask", "auto_continue_within_safety", "stop"},
@@ -3651,7 +3796,22 @@ def _discovery_compound_commitment_hints(user_message: str) -> dict[str, Any]:
         hints["task_type"] = "browse_only"
 
     # Scale / quota
-    if re.search(
+    fixed_count_match = re.search(
+        r"(?:只要|需要|目标|找够|达到|搜|找)\s*(\d{1,5})\s*个"
+        r"(?:\s*(?:可用)?项目)?"
+        r"|(\d{1,5})\s*个\s*(?:可用)?项目"
+        r"|^\s*(\d{1,5})\s*个\s*$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if fixed_count_match:
+        count_text = next(
+            group for group in fixed_count_match.groups() if group is not None
+        )
+        hints["coverage_mode"] = "quick"
+        hints["quota_flexibility"] = "fixed"
+        hints["target_project_count"] = min(5000, max(1, int(count_text)))
+    elif re.search(
         r"越多越好|尽可能多|尽量多|搜全|覆盖全|不设上限|无上限|全量|"
         r"(?:所有|全部).{0,24}(?:数据|项目|文件|候选)|"
         r"(?:数据|项目|文件|候选).{0,16}(?:所有|全部)|"
@@ -3663,11 +3823,10 @@ def _discovery_compound_commitment_hints(user_message: str) -> dict[str, Any]:
         hints["quota_flexibility"] = "open_ended"
         hints["coverage_mode"] = "exhaustive"
         hints["target_project_count"] = None
-    elif re.search(r"约\s*20|20\s*个|精选|curated", text, flags=re.IGNORECASE):
-        hints["coverage_mode"] = "curated"
-        hints["quota_flexibility"] = "recommended"
-        if re.search(r"\b20\b|20\s*个", text):
-            hints["target_project_count"] = 20
+    elif re.search(r"快速|quick|精选|curated", text, flags=re.IGNORECASE):
+        hints["coverage_mode"] = "quick"
+        hints["quota_flexibility"] = "fixed"
+        hints["target_project_count"] = 20
 
     # Acquisition
     if re.search(r"\bdda\b|data[-\s]?dependent|仅\s*dda|只要\s*dda", text, flags=re.IGNORECASE):
@@ -4213,36 +4372,26 @@ def _synthesize_discovery_next_decision_from_agenda(
         },
         "search_scale": {
             "focus": "搜索规模",
-            "question": "这次希望覆盖多大规模？",
+            "question": "选择数量模式：快速找够指定数量，还是尽可能搜全？",
             "options": [
                 {
-                    "id": "curated_20",
-                    "label": "精选约 20 个项目",
-                    "reason": "质量可控，适合严肃 benchmark 起步",
+                    "id": "quick_20",
+                    "label": "快速找够 20 个可用项目",
+                    "reason": "核心词优先分页检索并审查，达到 20 个立即停止",
                     "strategy_patch": {
-                        "coverage_mode": "curated",
+                        "coverage_mode": "quick",
                         "target_project_count": 20,
-                        "quota_flexibility": "recommended",
+                        "quota_flexibility": "fixed",
                     },
                 },
                 {
                     "id": "open_ended",
-                    "label": "尽可能多（开放配额）",
-                    "reason": "最大化候选池，审查时再筛",
+                    "label": "尽可能搜全（不设候选池上限）",
+                    "reason": "按顺序拉完全部确认检索词并审查",
                     "strategy_patch": {
                         "coverage_mode": "exhaustive",
                         "target_project_count": None,
                         "quota_flexibility": "open_ended",
-                    },
-                },
-                {
-                    "id": "balanced_50",
-                    "label": "平衡约 50 个项目",
-                    "reason": "质量与广度折中",
-                    "strategy_patch": {
-                        "coverage_mode": "balanced",
-                        "target_project_count": 50,
-                        "quota_flexibility": "recommended",
                     },
                 },
             ],
@@ -5758,20 +5907,46 @@ def _run_discovery_dialogue_agents_sdk(
         {"role": "user", "content": user_message},
     ]
     async def _execute() -> Any:
+        run_config = sdk["RunConfig"](
+            workflow_name="proteomics_discovery_dialogue_v1",
+            group_id=session_id or None,
+            trace_metadata={"workflow": "discovery_dialogue"},
+            tracing_disabled=True,
+            trace_include_sensitive_data=False,
+        )
         try:
-            return await sdk["Runner"].run(
-                starting_agent=agent,
-                input=runner_input,
-                context=context,
-                max_turns=2,
-                run_config=sdk["RunConfig"](
-                    workflow_name="proteomics_discovery_dialogue_v1",
-                    group_id=session_id or None,
-                    trace_metadata={"workflow": "discovery_dialogue"},
-                    tracing_disabled=True,
-                    trace_include_sensitive_data=False,
-                ),
-            )
+            # OpenAI-compatible gateways occasionally close a streamed response
+            # before the final chunk arrives.  The SDK's own retry is not enough
+            # for this failure because it can happen after a tool round starts.
+            # Retry the whole bounded dialogue once, without persisting anything
+            # between attempts; strategy persistence happens only after this
+            # function returns and passes the server-side gates.
+            for attempt in range(2):
+                try:
+                    return await sdk["Runner"].run(
+                        starting_agent=agent,
+                        input=runner_input,
+                        context=context,
+                        max_turns=2,
+                        run_config=run_config,
+                    )
+                except Exception as exc:
+                    message = _clean_text(str(exc)).casefold()
+                    transient_markers = (
+                        "incomplete chunked read",
+                        "peer closed connection",
+                        "server disconnected",
+                        "connection reset",
+                        "readtimeout",
+                        "remoteprotocolerror",
+                    )
+                    if attempt != 0 or not any(
+                        marker in message for marker in transient_markers
+                    ):
+                        raise
+                    context.tool_calls.clear()
+                    context.advisor_calls.clear()
+                    await asyncio.sleep(0.8)
         finally:
             if owned_async_client is not None:
                 await owned_async_client.close()
@@ -9993,7 +10168,11 @@ def _discovery_job_history_shell(job: Mapping[str, Any]) -> dict[str, Any]:
 def _list_discovery_history_records_fast(limit: int = 100) -> list[dict[str, Any]]:
     """Return compact discovery shells without loading large authoritative jobs."""
     with _discovery_jobs_lock:
-        jobs = [dict(job) for job in _discovery_jobs.values()]
+        jobs = [
+            dict(job)
+            for job in _discovery_jobs.values()
+            if _discovery_job_is_in_current_storage_scope(job)
+        ]
     records = [_discovery_job_history_shell(job) for job in jobs]
     seen_job_ids = {_clean_text(record.get("job_id")) for record in records}
     summaries_dir = _discovery_job_summaries_dir()
@@ -10781,6 +10960,20 @@ def _run_web_discovery(
         output_dir = _discovery_root_dir() / discovery_id
         normalized_task_type = task_type
         discovery_mode, budget, dynamic_limits = _agent_discovery_configuration(body)
+        resume_existing_run = body.get("_resume_existing_discovery_run") is True
+        if (
+            not resume_existing_run
+            and fixed_execution_id
+            and (output_dir / "agent_control.sqlite").is_file()
+        ):
+            # The operations console resumes through the persistent queue and
+            # may not share the web process's in-memory legacy body. The stable
+            # execution id and existing control DB are sufficient authority to
+            # resume this exact run instead of attempting to create it again.
+            from agent.control_plane.store import AgentRunStore
+
+            existing_store = AgentRunStore(output_dir / "agent_control.sqlite")
+            resume_existing_run = existing_store.load_run(discovery_id) is not None
 
         def _agent_discovery_func(
             discovery_request: DatasetRequest,
@@ -10836,7 +11029,7 @@ def _run_web_discovery(
                 # should_cancel is provided; avoid full run_sync blind spots.
                 stream_events=False,
                 should_cancel=should_cancel,
-                resume_existing=body.get("_resume_existing_discovery_run") is True,
+                resume_existing=resume_existing_run,
             )
         except InterruptedError:
             # A user stop means "stop searching and keep verified work", not
@@ -11724,7 +11917,7 @@ def _ensure_batch_audit_zip(batch: dict[str, Any]) -> Path | None:
 
 def _write_batch_manifest(batch: dict[str, Any]) -> None:
     manifest = {key: value for key, value in batch.items() if key not in {"llm_config"}}
-    _json_write(Path(batch["output_dir"]) / _BATCH_MANIFEST_FILE, manifest)
+    _write_json_atomic(Path(batch["output_dir"]) / _BATCH_MANIFEST_FILE, manifest)
     with _batch_history_cache_lock:
         _batch_history_cache["ts"] = 0.0
         _batch_history_cache["root"] = ""
@@ -11732,6 +11925,24 @@ def _write_batch_manifest(batch: dict[str, Any]) -> None:
             _batch_history_cache.get("generation") or 0
         ) + 1
         _batch_history_cache["records"] = []
+    try:
+        batch_id = str(batch.get("batch_id") or "").strip()
+        if batch_id:
+            history_record = _batch_history_record(
+                batch,
+                include_file_stats=False,
+            )
+            get_operations_repository().upsert_history_record(
+                history_record,
+                kind="batch",
+                source_id=batch_id,
+                history_id=f"batch:{batch_id}",
+                size_bytes=int(history_record.get("size_bytes") or 0),
+            )
+    except Exception:
+        # The durable batch manifest remains the recovery authority if the
+        # operations index is temporarily unavailable.
+        pass
 
 
 
@@ -11878,6 +12089,8 @@ def _public_batch_record(batch: dict[str, Any]) -> dict[str, Any]:
     completed_items = sum(1 for item in items if item.get("status") == "completed")
     failed_items = sum(1 for item in items if item.get("status") == "failed")
     needs_review_items = sum(1 for item in items if item.get("status") in {"needs_review", "blocked"})
+    cancelled_items = sum(1 for item in items if item.get("status") == "cancelled")
+    interrupted_items = sum(1 for item in items if item.get("status") == "interrupted")
     running_items = sum(1 for item in items if item.get("status") == "running")
     queued_items = sum(1 for item in items if item.get("status") in {"queued", "pending", ""})
     cleanup_requested = bool(batch.get("delete_source_files_after_success"))
@@ -11896,7 +12109,13 @@ def _public_batch_record(batch: dict[str, Any]) -> dict[str, Any]:
         for item in items
         if str((item.get("source_cleanup") or {}).get("status") or "") == "failed"
     )
-    terminal_items = completed_items + failed_items + needs_review_items
+    terminal_items = (
+        completed_items
+        + failed_items
+        + needs_review_items
+        + cancelled_items
+        + interrupted_items
+    )
     total_items = len(items) or 1
     focus = next((item for item in items if item.get("status") == "running"), None)
     if focus is None:
@@ -11907,6 +12126,8 @@ def _public_batch_record(batch: dict[str, Any]) -> dict[str, Any]:
         "completed": completed_items,
         "failed": failed_items,
         "needs_review": needs_review_items,
+        "cancelled": cancelled_items,
+        "interrupted": interrupted_items,
         "source_cleanup_requested": cleanup_requested,
         "source_cleanup_completed": cleanup_completed_items,
         "source_cleanup_failed": cleanup_failed_items,
@@ -11931,6 +12152,8 @@ def _public_batch_record(batch: dict[str, Any]) -> dict[str, Any]:
         "completed_items": completed_items,
         "failed_items": failed_items,
         "needs_review_items": needs_review_items,
+        "cancelled_items": cancelled_items,
+        "interrupted_items": interrupted_items,
         "running_items": running_items,
         "queued_items": queued_items,
         "completed_count": completed_items,
@@ -11938,12 +12161,16 @@ def _public_batch_record(batch: dict[str, Any]) -> dict[str, Any]:
         "running_count": running_items,
         "queued_count": queued_items,
         "needs_review_count": needs_review_items,
+        "cancelled_count": cancelled_items,
         "progress_percent": summary["percent"],
         "summary": summary,
         "jobs": batch.get("jobs", 1),
         "ui_language": ui_language,
         "repository": _clean_repository(batch.get("repository")),
         "run_mode": _clean_batch_run_mode(batch.get("run_mode")),
+        "requested_run_mode": _clean_batch_run_mode(
+            batch.get("requested_run_mode") or batch.get("run_mode")
+        ),
         "resource_policy": _clean_resource_policy(batch.get("resource_policy")),
         "fasta_preference": "project" if batch.get("prefer_project_fasta") else "llm",
         "delete_source_files_after_success": cleanup_requested,
@@ -11952,13 +12179,15 @@ def _public_batch_record(batch: dict[str, Any]) -> dict[str, Any]:
         "source_batch_index": batch.get("source_batch_index"),
         "output_dir": str(output_dir),
         "excel_path": str(excel_path),
-        "can_download": batch.get("status") == "completed" and excel_path.exists(),
+        "can_download": batch.get("status") in _TERMINAL_STATUSES and excel_path.exists(),
         "audit_zip_path": str(output_dir / _BATCH_AUDIT_ZIP_NAME),
         "can_download_audit": batch.get("status") in _TERMINAL_STATUSES and output_dir.exists(),
         "items": items,
         "events": events,
         "errors": [_localize_public_message(error, ui_language, level="error") for error in list(batch.get("errors") or [])],
         "interrupted": bool(batch.get("interrupted")),
+        "cancel_requested": bool(batch.get("cancel_requested")),
+        "cancel_requested_at": batch.get("cancel_requested_at"),
     }
 
 
@@ -11966,7 +12195,7 @@ def _mark_interrupted_batch(batch: dict[str, Any]) -> dict[str, Any]:
     if batch.get("status") not in _ACTIVE_STATUSES:
         return batch
     repaired = dict(batch)
-    repaired["status"] = "failed"
+    repaired["status"] = "interrupted"
     repaired["interrupted"] = True
     repaired["finished_at"] = repaired.get("finished_at") or repaired.get("updated_at") or repaired.get("started_at") or repaired.get("created_at")
     repaired["updated_at"] = repaired.get("updated_at") or repaired.get("finished_at")
@@ -11990,6 +12219,8 @@ def _batch_history_record(batch: dict[str, Any], include_file_stats: bool = True
     size_bytes = int(batch.get("size_bytes") or public.get("size_bytes") or 0)
     if include_file_stats and output_dir.exists():
         file_count, size_bytes, _latest_mtime = _path_file_stats(output_dir)
+    run_mode = _clean_batch_run_mode(batch.get("run_mode"))
+    display_name = f"Batch workflow · {run_mode} · {int(public.get('item_count') or 0)} files"
     public.update(
         {
             "kind": "batch",
@@ -11998,9 +12229,11 @@ def _batch_history_record(batch: dict[str, Any], include_file_stats: bool = True
             "history_id": f"batch-{batch_id}" if batch_id else "",
             "run_id": output_dir.name if output_dir.name else batch_id,
             "result_id": batch_id,
-            "name": "Batch Excel report",
-            "input_value": "Batch Excel report",
-            "run_mode": _clean_batch_run_mode(batch.get("run_mode")),
+            "name": display_name,
+            "display_name": display_name,
+            "input_value": display_name,
+            "objective": display_name,
+            "run_mode": run_mode,
             "file_count": file_count,
             "size_bytes": size_bytes,
         }
@@ -12286,12 +12519,54 @@ def _read_history_index() -> list[dict[str, Any]]:
 
 
 def _upsert_history_index(record: dict[str, Any]) -> None:
+    indexed_record: dict[str, Any]
     with _history_index_lock:
         indexed_record = _compact_history_index_record(record)
         if not indexed_record.get("project_key"):
             return
         records = merge_project_history_records([*_read_history_index(), indexed_record])
         _write_history_index(records)
+    try:
+        kind = _clean_text(indexed_record.get("kind")).lower()
+        if not kind:
+            kind = (
+                "batch"
+                if indexed_record.get("batch_id")
+                else "discovery"
+                if indexed_record.get("discovery_id")
+                or indexed_record.get("job_id")
+                else "task"
+            )
+        source_id = _clean_text(
+            indexed_record.get("job_id")
+            if kind == "discovery"
+            else indexed_record.get("batch_id")
+            if kind == "batch"
+            else indexed_record.get("task_id")
+            or indexed_record.get("result_id")
+        )
+        if source_id:
+            if not is_material_legacy_history_record(
+                indexed_record,
+                source_id=source_id,
+            ):
+                return
+            try:
+                size_bytes = int(indexed_record.get("size_bytes") or 0)
+            except (TypeError, ValueError):
+                size_bytes = 0
+            get_operations_repository().upsert_history_record(
+                indexed_record,
+                kind=kind,
+                source_id=source_id,
+                history_id=f"{kind}:{source_id}",
+                size_bytes=max(0, size_bytes),
+            )
+    except Exception:
+        # The compatibility JSON history remains available if the operations
+        # index is temporarily unavailable. Startup reconciliation is
+        # idempotent and will repair the row later.
+        pass
 
 
 def _compact_history_index_record(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -15217,6 +15492,36 @@ def _remove_history_index_targets(deleted: list[dict[str, Any]]) -> None:
         _write_history_index(kept)
 
 
+def _mark_operations_history_targets_deleted(
+    deleted: list[dict[str, Any]],
+) -> None:
+    """Keep the SQL history index consistent with filesystem deletion."""
+    try:
+        repository = get_operations_repository()
+    except Exception:
+        return
+    for target in deleted:
+        kind = _clean_text(target.get("kind")).lower()
+        source_id = _clean_text(
+            target.get("job_id") if kind == "discovery" else target.get("id")
+        )
+        if not kind or not source_id:
+            continue
+        try:
+            repository.mark_history_deleted(
+                f"{kind}:{source_id}",
+                released_bytes=int(target.get("released_bytes") or 0),
+            )
+        except (KeyError, ValueError):
+            # Compatibility history remains authoritative for legacy rows that
+            # were never imported into the SQL operations index.
+            continue
+        except Exception:
+            # Filesystem deletion has already completed. Startup/history
+            # reconciliation can retry SQL repair without resurrecting files.
+            continue
+
+
 def _execute_history_delete(
     kind: str,
     identifier: str,
@@ -15278,6 +15583,7 @@ def _execute_history_delete(
         except Exception as exc:
             failed.append({**target, "error": _redact_secrets(str(exc))})
     _remove_history_index_targets(deleted)
+    _mark_operations_history_targets_deleted(deleted)
     with _batch_history_cache_lock:
         _batch_history_cache["ts"] = 0.0
         _batch_history_cache["root"] = ""
@@ -16365,6 +16671,93 @@ def _slim_discovery_record(record: Any) -> Any:
     return slim
 
 
+def _bounded_discovery_log_value(
+    value: Any,
+    *,
+    field: str = "",
+    depth: int = 0,
+) -> Any:
+    """Keep progress semantics while bounding repeated metadata/file evidence."""
+    if depth >= 7:
+        return "[nested detail omitted]"
+    if isinstance(value, str):
+        text = _redact_secrets(value)
+        if len(text) <= _DISCOVERY_LOG_STRING_LIMIT:
+            return text
+        return f"{text[:_DISCOVERY_LOG_STRING_LIMIT]}…"
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 60:
+                result["_truncated_fields"] = len(value) - 60
+                break
+            name = str(key)
+            result[name] = _bounded_discovery_log_value(
+                item,
+                field=name,
+                depth=depth + 1,
+            )
+        return result
+    if isinstance(value, (list, tuple)):
+        limits = {
+            "accessions": 100,
+            "queries": 40,
+            "query_yields": 40,
+            "previews": 25,
+            "project_assessments": 40,
+            "inspection_outcomes": 40,
+            "judgments": 40,
+            "selected_file_examples": 8,
+            "evidence_refs": 20,
+            "available_evidence_refs": 20,
+            "missing_information": 20,
+            "limitations": 20,
+        }
+        limit = limits.get(field, 30)
+        compact = [
+            _bounded_discovery_log_value(item, field=field, depth=depth + 1)
+            for item in value[:limit]
+        ]
+        if len(value) > limit:
+            compact.append({"_truncated_items": len(value) - limit})
+        return compact
+    return _json_safe(value)
+
+
+def _compact_discovery_log_entry(raw: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: _bounded_discovery_log_value(value, field=str(key))
+        for key, value in raw.items()
+        if str(key).casefold() not in {"api_key", "authorization", "sdk_state_json"}
+    }
+
+
+def _discovery_summary_logs(logs: list[Any]) -> list[dict[str, Any]]:
+    entries = [item for item in logs if isinstance(item, Mapping)]
+    recent = entries[-_DISCOVERY_SUMMARY_RECENT_LOGS:]
+    recent_ids = {id(item) for item in recent}
+
+    def structural(item: Mapping[str, Any]) -> bool:
+        event_type = str(item.get("type") or "")
+        return (
+            event_type.startswith("confirmed_theme_pipeline_")
+            or event_type.startswith("repository_term_")
+            or event_type in {
+                "candidate_search_started",
+                "candidate_search_completed",
+                "candidate_search_failed",
+                "verified_project_batch_published",
+            }
+        )
+
+    selected = [
+        item
+        for item in entries
+        if id(item) in recent_ids or structural(item)
+    ]
+    return [_compact_discovery_log_entry(item) for item in selected]
+
+
 def _rebuild_discovery_result_batches(job: Mapping[str, Any]) -> list[dict[str, Any]]:
     body = job.get("body") if isinstance(job.get("body"), Mapping) else {}
     record = job.get("record") if isinstance(job.get("record"), Mapping) else {}
@@ -16464,11 +16857,13 @@ def _discovery_job_public(job: dict[str, Any], *, detail: bool = False) -> dict[
         record.pop("published_verified_project_batches", None)
     body = job.get("body") if isinstance(job.get("body"), dict) else {}
     output_language = _normalise_pool_build_language(job.get("output_language") or body.get("output_language"))
+    raw_logs = list(job.get("logs") or [])
+    selected_logs = raw_logs if detail else _discovery_summary_logs(raw_logs)
     logs = []
-    for raw in job.get("logs") or []:
+    for raw in selected_logs:
         if not isinstance(raw, dict):
             continue
-        entry = dict(raw)
+        entry = dict(raw) if detail else _compact_discovery_log_entry(raw)
         entry["message"] = _localize_discovery_message(entry.get("message"), output_language)
         logs.append(entry)
     result_batches = []
@@ -16478,7 +16873,16 @@ def _discovery_job_public(job: dict[str, Any], *, detail: bool = False) -> dict[
         batch = {
             key: value
             for key, value in raw.items()
-            if key not in {"manifest_path", "files"}
+            if key not in (
+                {"manifest_path", "files"}
+                if detail
+                else {
+                    "manifest_path",
+                    "files",
+                    "file_identifiers",
+                    "project_accessions",
+                }
+            )
         }
         batch_index = int(batch.get("batch_index") or 0)
         if batch_index > 0:
@@ -16498,6 +16902,10 @@ def _discovery_job_public(job: dict[str, Any], *, detail: bool = False) -> dict[
         "resumable": bool(job.get("resumable")),
         "output_language": output_language,
         "logs": logs,
+        "log_count": len([item for item in raw_logs if isinstance(item, Mapping)]),
+        "logs_truncated": len(logs) < len(
+            [item for item in raw_logs if isinstance(item, Mapping)]
+        ),
         "result_batches": result_batches,
         "execution_state": job.get("execution_state"),
         "record": record,
@@ -16580,6 +16988,18 @@ def _discovery_job_summary_path(job_id: str) -> Path:
     return _discovery_job_summaries_dir() / f"{safe_output_stem(job_id)}.json"
 
 
+def _discovery_storage_scope() -> str:
+    """Stable, non-path identifier for the configured run storage root."""
+    normalized = os.path.normcase(str(Path(_runs_dir).resolve()))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+
+
+def _discovery_job_is_in_current_storage_scope(job: Mapping[str, Any]) -> bool:
+    scope = _clean_text(job.get("storage_scope"))
+    # Jobs written before storage scoping remain visible for compatibility.
+    return not scope or secrets.compare_digest(scope, _discovery_storage_scope())
+
+
 def _discovery_job_persist_payload(job: dict[str, Any]) -> dict[str, Any]:
     """Serialize job for disk with raw English logs/error (API localizes on read).
 
@@ -16596,11 +17016,12 @@ def _discovery_job_persist_payload(job: dict[str, Any]) -> dict[str, Any]:
     logs: list[Any] = []
     for raw in job.get("logs") or []:
         if isinstance(raw, dict):
-            logs.append(_sanitize_log_payload(dict(raw)))
+            logs.append(_compact_discovery_log_entry(raw))
         else:
-            logs.append(raw)
+            logs.append(_bounded_discovery_log_value(raw))
     return {
         "job_id": job.get("job_id"),
+        "storage_scope": job.get("storage_scope") or _discovery_storage_scope(),
         "idempotency_key": job.get("idempotency_key"),
         "status": job.get("status"),
         "created_at": job.get("created_at"),
@@ -16642,13 +17063,27 @@ def _write_json_atomic(path: Path, payload: Any) -> None:
 
 
 def _persist_discovery_job(job: dict[str, Any], *, required: bool = False) -> None:
-    """Persist discovery job. Disk is authoritative (WP-D3).
+    """Persist discovery state without rewriting giant JSON on every event.
 
-    When ``required`` is True (status transitions / terminal states), failure raises
-    and must not leave memory as a success authority without durable state.
-    Log-only appends keep best-effort behavior so UI streaming is not blocked.
+    The operations database is the live authority. Legacy JSON is retained as
+    a compatibility/checkpoint artifact and is only rewritten for durable
+    lifecycle checkpoints.
     """
     job_id = str(job.get("job_id") or "")
+    job.setdefault("storage_scope", _discovery_storage_scope())
+    try:
+        get_operations_repository().sync_legacy_job(
+            job,
+            legacy_path=str(_discovery_job_path(job_id)),
+        )
+    except Exception as exc:
+        if required:
+            raise RuntimeError(
+                f"operations_job_persist_failed:{job_id}:{exc}"
+            ) from exc
+        return
+    if not required:
+        return
     try:
         _write_json_atomic(
             _discovery_job_path(job_id),
@@ -16666,7 +17101,7 @@ def _persist_discovery_job(job: dict[str, Any], *, required: bool = False) -> No
                 _discovery_job_summary_path(job_id).unlink(missing_ok=True)
             except OSError:
                 pass
-        # Also keep a line-oriented log for forensic debugging of long runs.
+        # Flush compatibility forensic files only at durable checkpoints.
         try:
             _write_discovery_job_log_file(job)
         except Exception:
@@ -16707,14 +17142,15 @@ def _write_discovery_job_log_file(job: Mapping[str, Any]) -> None:
     for item in job.get("logs") or []:
         if not isinstance(item, Mapping):
             continue
+        compact_item = _compact_discovery_log_entry(item)
         payload = {
-            "ts": item.get("ts"),
-            "level": item.get("level") or "info",
-            "actor": item.get("actor") or "Discovery Agent",
-            "type": item.get("type") or "job_message",
-            "message": item.get("message") or "",
-            "metrics": item.get("metrics") or {},
-            "payload": item.get("payload") or {},
+            "ts": compact_item.get("ts"),
+            "level": compact_item.get("level") or "info",
+            "actor": compact_item.get("actor") or "Discovery Agent",
+            "type": compact_item.get("type") or "job_message",
+            "message": compact_item.get("message") or "",
+            "metrics": compact_item.get("metrics") or {},
+            "payload": compact_item.get("payload") or {},
             "job_id": job.get("job_id"),
             "status": job.get("status"),
         }
@@ -16895,14 +17331,78 @@ def _load_discovery_job(job_id: str) -> dict[str, Any] | None:
     payload.setdefault("error", None)
     payload.setdefault("output_language", "en")
     payload.setdefault("idempotency_key", None)
+    payload.setdefault("storage_scope", _discovery_storage_scope())
     return payload
+
+
+def _merge_operations_snapshot_into_discovery_job(
+    job: Mapping[str, Any],
+    snapshot: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Project the authoritative operations snapshot onto the legacy API shape.
+
+    The compatibility endpoint remains available while the new UI reads the
+    operations API directly. It must never mark an externally running Huey job
+    interrupted merely because this web process has stale in-memory state.
+    """
+
+    merged = dict(job)
+    if not isinstance(snapshot, Mapping):
+        return merged
+    operations_status = _clean_text(snapshot.get("status")).lower()
+    merged["status"] = (
+        "running"
+        if operations_status in {"searching", "reviewing", "finalizing"}
+        else operations_status or merged.get("status")
+    )
+    merged["cancel_requested"] = bool(snapshot.get("cancel_requested"))
+    merged["resumable"] = bool(snapshot.get("resumable"))
+    for field in ("started_at", "finished_at", "updated_at"):
+        if snapshot.get(field):
+            merged[field] = snapshot.get(field)
+    error = snapshot.get("error")
+    if isinstance(error, Mapping):
+        merged["error"] = error.get("message") or error.get("code")
+    else:
+        # The operations database is authoritative.  In particular, a
+        # successful terminal transition clears errors from an earlier failed
+        # attempt; retaining the legacy value makes a completed job look
+        # failed after resume.
+        merged["error"] = None
+    progress = snapshot.get("progress")
+    progress = progress if isinstance(progress, Mapping) else {}
+    execution = merged.get("execution_state")
+    execution = dict(execution) if isinstance(execution, Mapping) else {}
+    execution.update(
+        {
+            "phase": snapshot.get("phase") or execution.get("phase"),
+            "current_term": progress.get("current_term"),
+            "candidate_count": progress.get("candidate_count", 0),
+            "raw_hit_count": progress.get("raw_hit_count", 0),
+            "reviewed_project_count": progress.get("reviewed_count", 0),
+            "pending_review_count": progress.get("pending_review_count", 0),
+            "qualified_project_count": progress.get("qualified_count", 0),
+            "candidate_file_count": progress.get("file_clue_count", 0),
+            "usable_file_count": progress.get("usable_file_count", 0),
+            "published_batch_count": progress.get("batch_count", 0),
+            "review_worker_count": progress.get("worker_count", 0),
+            "last_event_sequence": snapshot.get("last_event_sequence", 0),
+            "heartbeat_at": snapshot.get("heartbeat_at"),
+            "updated_at": snapshot.get("updated_at"),
+        }
+    )
+    merged["execution_state"] = execution
+    return merged
 
 
 def _find_discovery_job_by_idempotency_key(key: str) -> dict[str, Any] | None:
     if not key:
         return None
     for job in _discovery_jobs.values():
-        if str(job.get("idempotency_key") or "") == key:
+        if (
+            _discovery_job_is_in_current_storage_scope(job)
+            and str(job.get("idempotency_key") or "") == key
+        ):
             return job
     jobs_dir = _discovery_jobs_dir()
     if not jobs_dir.is_dir():
@@ -16914,7 +17414,13 @@ def _find_discovery_job_by_idempotency_key(key: str) -> dict[str, Any] | None:
         job_id = _clean_text(payload.get("job_id"))
         if not job_id:
             continue
-        payload = _mark_interrupted_discovery_job(dict(payload))
+        operations_snapshot = get_operations_repository().get_job(job_id)
+        payload = _merge_operations_snapshot_into_discovery_job(
+            payload,
+            operations_snapshot,
+        )
+        if operations_snapshot is None:
+            payload = _mark_interrupted_discovery_job(dict(payload))
         _discovery_jobs[job_id] = payload
         _persist_discovery_job(payload)
         return payload
@@ -16943,29 +17449,43 @@ def _mark_interrupted_discovery_job(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def _append_discovery_job_log(job_id: str, level: str, message: str) -> None:
+    entry: dict[str, Any] | None = None
     with _discovery_jobs_lock:
         job = _discovery_jobs.get(job_id)
         if not job:
             return
         logs = job.setdefault("logs", [])
         sequence = max((int(item.get("sequence") or 0) for item in logs if isinstance(item, dict)), default=0) + 1
-        logs.append(
-            {
-                "sequence": sequence,
-                "ts": _now_app_iso(),
-                "level": level,
-                "actor": "Discovery Agent",
-                "type": "job_message",
-                "message": _redact_secrets(str(message)),
-                "reasoning_summary": "",
-                "evidence_refs": [],
-                "metrics": {},
-                "payload": {},
-            }
-        )
+        entry = {
+            "sequence": sequence,
+            "ts": _now_app_iso(),
+            "level": level,
+            "actor": "Discovery Agent",
+            "type": "job_message",
+            "message": _redact_secrets(str(message)),
+            "reasoning_summary": "",
+            "evidence_refs": [],
+            "metrics": {},
+            "payload": {},
+        }
+        logs.append(entry)
         if len(logs) > _MAX_PERSISTED_LOGS:
             del logs[: len(logs) - _MAX_PERSISTED_LOGS]
-        _persist_discovery_job(job)
+    if entry is not None:
+        try:
+            get_operations_repository().append_event(
+                job_id,
+                event_type="job_message",
+                level=level,
+                actor="Discovery Agent",
+                message=str(entry["message"]),
+                payload={},
+                created_at=str(entry["ts"]),
+            )
+        except Exception:
+            # Scientific execution must not fail because the status stream is
+            # temporarily contended; the next lifecycle checkpoint will sync.
+            pass
 
 
 def _event_actor(event_type: str) -> str:
@@ -17242,7 +17762,10 @@ def _project_discovery_execution_state(
     elif event_type == "confirmed_theme_pipeline_completed":
         complete = (
             payload.get("status") == "completed"
-            and payload.get("all_terms_exhausted") is True
+            and (
+                payload.get("target_reached") is True
+                or payload.get("all_terms_exhausted") is True
+            )
             and int(payload.get("pending_review_count") or 0) == 0
         )
         state.update(
@@ -17287,6 +17810,7 @@ def _append_discovery_job_event(job_id: str, event: AgentEvent) -> None:
         "metrics": _sanitize_log_payload(event_metrics),
         "payload": _sanitize_log_payload(public_event_payload),
     }
+    phase = ""
     with _discovery_jobs_lock:
         job = _discovery_jobs.get(job_id)
         if not job:
@@ -17322,7 +17846,25 @@ def _append_discovery_job_event(job_id: str, event: AgentEvent) -> None:
         logs.append(entry)
         if len(logs) > _MAX_PERSISTED_LOGS:
             del logs[: len(logs) - _MAX_PERSISTED_LOGS]
-        _persist_discovery_job(job)
+        execution = job.get("execution_state")
+        if isinstance(execution, Mapping):
+            phase = _clean_text(execution.get("phase"))
+    try:
+        get_operations_repository().append_event(
+            job_id,
+            event_type=event.event_type,
+            level=str(entry["level"]),
+            actor=str(entry["actor"]),
+            phase=phase,
+            message=str(entry["message"]),
+            payload={
+                **dict(entry.get("payload") or {}),
+                "metrics": entry.get("metrics") or {},
+            },
+            created_at=event.created_at,
+        )
+    except Exception:
+        pass
 
 
 def _append_discovery_search_event(
@@ -17353,10 +17895,27 @@ def _append_discovery_search_event(
         logs.append(entry)
         if len(logs) > _MAX_PERSISTED_LOGS:
             del logs[: len(logs) - _MAX_PERSISTED_LOGS]
-        _persist_discovery_job(job)
+    try:
+        get_operations_repository().append_event(
+            job_id,
+            event_type=event_type,
+            level=str(entry["level"]),
+            actor="Repository Search",
+            phase="searching",
+            message=_clean_text(payload.get("message") or payload.get("reason")),
+            payload=entry["payload"],
+            created_at=str(entry["ts"]),
+        )
+    except Exception:
+        pass
 
 
 def _discovery_cancel_requested(job_id: str) -> bool:
+    try:
+        if get_operations_repository().cancel_requested(job_id):
+            return True
+    except Exception:
+        pass
     with _discovery_jobs_lock:
         job = _discovery_jobs.get(job_id)
         return bool(job and job.get("cancel_requested"))
@@ -17364,8 +17923,32 @@ def _discovery_cancel_requested(job_id: str) -> bool:
 
 def _run_discovery_job(job_id: str) -> None:
     with _discovery_jobs_lock:
-        job = _discovery_jobs.get(job_id)
+        job = _discovery_jobs.get(job_id) or _load_discovery_job(job_id)
         if not job:
+            return
+        _discovery_jobs[job_id] = job
+        repository = get_operations_repository()
+        snapshot = repository.get_job(job_id)
+        if snapshot is None:
+            persisted = _discovery_job_persist_payload(job)
+            safe_body = (
+                persisted.get("body")
+                if isinstance(persisted.get("body"), Mapping)
+                else {}
+            )
+            snapshot = repository.create_job(
+                job_id=job_id,
+                payload=safe_body,
+                terms=_discovery_terms_from_body(safe_body),
+                idempotency_key=_clean_text(job.get("idempotency_key")) or None,
+                job_type="discovery",
+                created_at=_clean_text(job.get("created_at")) or None,
+                legacy_path=str(_discovery_job_path(job_id)),
+            )
+        if (
+            snapshot.get("status") == "cancelled"
+            and snapshot.get("cancel_requested")
+        ):
             return
         job["status"] = "running"
         job["resumable"] = False
@@ -17373,7 +17956,16 @@ def _run_discovery_job(job_id: str) -> None:
         body = dict(job.get("body") or {})
         # Keep the request credential only in this worker's local copy.
         job["body"].pop("llm_config", None)
-        _persist_discovery_job(job, required=True)
+    repository.transition_job(
+        job_id,
+        "searching",
+        phase="searching",
+        reason="持久 worker 已认领任务并开始检索。",
+        event_type="job_started",
+        actor="Huey worker",
+    )
+    with _discovery_jobs_lock:
+        _persist_discovery_job(_discovery_jobs[job_id], required=True)
     _append_discovery_job_log(job_id, "info", "Discovery job started.")
 
     def report(message: str) -> None:
@@ -17398,14 +17990,61 @@ def _run_discovery_job(job_id: str) -> None:
         )
         cancelled = should_cancel()
         record_status = _clean_text((record or {}).get("status")).lower() if isinstance(record, dict) else ""
+        operations_progress = (
+            get_operations_repository().get_job(job_id) or {}
+        ).get("progress") or {}
+        fixed_candidate_delivery_complete = (
+            _candidate_delivery_satisfies_run_horizon(
+                body,
+                operations_progress,
+            )
+        )
         if cancelled or record_status == "cancelled":
             terminal_status = "cancelled"
         elif record_status == "failed":
             terminal_status = "failed"
+        elif record_status == "blocked" and fixed_candidate_delivery_complete:
+            # This product's discovery horizon is candidates_reviewed. A
+            # verified terminal file batch satisfies that contract even when a
+            # stricter downstream modeling/build-ready publication audit is
+            # intentionally unavailable for browse-only work.
+            terminal_status = "completed"
         elif record_status == "blocked":
             terminal_status = "blocked"
         else:
             terminal_status = "completed"
+        get_operations_repository().transition_job(
+            job_id,
+            "finalizing",
+            phase="finalizing",
+            reason="检索与项目审查已结束，正在冻结结果和批次。",
+            event_type="job_finalization_started",
+            actor="Discovery Agent",
+        )
+        terminal_error = ""
+        if terminal_status == "failed" and isinstance(record, Mapping):
+            terminal_error = _redact_secrets(
+                _clean_text((record.get("agent") or {}).get("error"))
+                or _clean_text((record.get("summary") or {}).get("error"))
+                or "Discovery failed."
+            )
+        get_operations_repository().transition_job(
+            job_id,
+            terminal_status,
+            phase=terminal_status,
+            reason={
+                "completed": "任务完成，所有权威结果与批次已冻结。",
+                "failed": "任务失败；已完成证据和断点均已保留。",
+                "blocked": "任务停在质量闸门；已有证据和进度均已保留。",
+                "cancelled": "任务已按用户请求安全停止。",
+            }[terminal_status],
+            event_type=f"job_{terminal_status}",
+            level="info" if terminal_status == "completed" else "warning",
+            actor="Discovery Agent",
+            error_code=terminal_status if terminal_status in {"failed", "blocked"} else None,
+            error_message=terminal_error or None,
+            resumable=terminal_status in {"failed", "cancelled"},
+        )
         with _discovery_jobs_lock:
             job = _discovery_jobs.get(job_id)
             if not job:
@@ -17418,6 +18057,8 @@ def _run_discovery_job(job_id: str) -> None:
                     or _clean_text((record.get("summary") or {}).get("error"))
                     or "Discovery failed."
                 )
+            else:
+                job["error"] = None
             job["finished_at"] = _now_app_iso()
             job["resumable"] = terminal_status in {"failed", "cancelled"}
             try:
@@ -17445,6 +18086,10 @@ def _run_discovery_job(job_id: str) -> None:
             else "warning"
         )
         _append_discovery_job_log(job_id, finish_level, finish_message)
+        with _discovery_jobs_lock:
+            finished_checkpoint = _discovery_jobs.get(job_id)
+            if finished_checkpoint is not None:
+                _persist_discovery_job(finished_checkpoint, required=True)
         # Ensure finished discovery runs appear in the main history panel.
         try:
             with _discovery_jobs_lock:
@@ -17474,6 +18119,19 @@ def _run_discovery_job(job_id: str) -> None:
                 f"Discovery run packaging skipped: {_redact_secrets(str(archive_exc))}",
             )
     except InterruptedError as exc:
+        try:
+            get_operations_repository().transition_job(
+                job_id,
+                "cancelled",
+                phase="cancelled",
+                reason=str(exc),
+                event_type="job_cancelled",
+                level="warning",
+                actor="Discovery Agent",
+                resumable=True,
+            )
+        except Exception:
+            pass
         with _discovery_jobs_lock:
             job = _discovery_jobs.get(job_id)
             if job:
@@ -17481,13 +18139,28 @@ def _run_discovery_job(job_id: str) -> None:
                 job["resumable"] = True
                 job["error"] = str(exc)
                 job["finished_at"] = _now_app_iso()
-                _persist_discovery_job(job)
+                _persist_discovery_job(job, required=True)
         _append_discovery_job_log(job_id, "warning", str(exc))
         try:
             _archive_discovery_job_artifacts(job_id)
         except Exception:
             pass
     except Exception as exc:  # pragma: no cover - defensive job boundary
+        try:
+            get_operations_repository().transition_job(
+                job_id,
+                "failed",
+                phase="failed",
+                reason="发现任务执行失败；可从持久断点恢复。",
+                event_type="job_failed",
+                level="error",
+                actor="Discovery Agent",
+                error_code="discovery_execution_failed",
+                error_message=_redact_secrets(str(exc)),
+                resumable=True,
+            )
+        except Exception:
+            pass
         with _discovery_jobs_lock:
             job = _discovery_jobs.get(job_id)
             if job:
@@ -17495,7 +18168,7 @@ def _run_discovery_job(job_id: str) -> None:
                 job["resumable"] = True
                 job["error"] = _redact_secrets(str(exc))
                 job["finished_at"] = _now_app_iso()
-                _persist_discovery_job(job)
+                _persist_discovery_job(job, required=True)
         _append_discovery_job_log(job_id, "error", f"Discovery failed: {exc}")
         try:
             _archive_discovery_job_artifacts(job_id)
@@ -17504,8 +18177,44 @@ def _run_discovery_job(job_id: str) -> None:
 
 
 def _start_discovery_job_thread(job_id: str) -> None:
-    thread = threading.Thread(target=_run_discovery_job, args=(job_id,), daemon=True)
-    thread.start()
+    queue_task_id = enqueue_discovery_job(job_id)
+    try:
+        get_operations_repository().append_event(
+            job_id,
+            event_type="job_enqueued",
+            actor="Huey queue",
+            phase="queued",
+            message="任务已提交到持久队列，等待 worker 认领。",
+            payload={"queue_task_id": queue_task_id},
+        )
+    except Exception:
+        pass
+
+
+def _discovery_terms_from_body(body: Mapping[str, Any]) -> list[dict[str, str]]:
+    for key in (
+        "confirmed_theme_terms",
+        "selected_search_terms",
+        "search_terms",
+        "query_terms",
+    ):
+        values = body.get(key)
+        if not isinstance(values, list):
+            continue
+        terms = [
+            _clean_text(item)
+            for item in values
+            if _clean_text(item)
+        ]
+        if terms:
+            return [
+                {
+                    "term": term,
+                    "role": "primary_theme" if index == 1 else "theme_synonym",
+                }
+                for index, term in enumerate(terms, start=1)
+            ]
+    return []
 
 
 @app.post("/api/discovery/jobs")
@@ -17539,6 +18248,15 @@ async def start_discovery_job(body: dict[str, Any], background_tasks: Background
             "error": None,
         }
         _discovery_jobs[job_id] = job
+        get_operations_repository().create_job(
+            job_id=job_id,
+            payload=persisted_body,
+            terms=_discovery_terms_from_body(persisted_body),
+            idempotency_key=request_key or None,
+            job_type="discovery",
+            created_at=str(job["created_at"]),
+            legacy_path=str(_discovery_job_path(job_id)),
+        )
         _persist_discovery_job(job, required=True)
     if background_tasks is None:
         _start_discovery_job_thread(job_id)
@@ -17556,9 +18274,21 @@ async def get_discovery_job(job_id: str, detail: int = 0):
             job = _load_discovery_job(job_id)
             if not job:
                 return {"error": "Discovery job not found."}
-            job = _mark_interrupted_discovery_job(job)
+            operations_snapshot = get_operations_repository().get_job(job_id)
+            job = _merge_operations_snapshot_into_discovery_job(
+                job,
+                operations_snapshot,
+            )
+            if operations_snapshot is None:
+                job = _mark_interrupted_discovery_job(job)
             _discovery_jobs[job_id] = job
             _persist_discovery_job(job)
+        else:
+            job = _merge_operations_snapshot_into_discovery_job(
+                job,
+                get_operations_repository().get_job(job_id),
+            )
+            _discovery_jobs[job_id] = job
         return _discovery_job_public(job, detail=include_detail)
 
 
@@ -17576,11 +18306,31 @@ async def cancel_discovery_job(job_id: str):
             return _discovery_job_public(job)
         if job.get("status") in {"completed", "failed", "blocked", "cancelled"}:
             return _discovery_job_public(job)
+        operations_before_cancel = get_operations_repository().get_job(job_id)
         job["cancel_requested"] = True
-        _persist_discovery_job(job)
+        operations_snapshot = get_operations_repository().request_cancel(job_id)
+        if (
+            operations_before_cancel
+            and operations_before_cancel.get("status") == "queued"
+        ):
+            revoke_discovery_job(
+                str(operations_before_cancel.get("queue_task_id") or "")
+            )
+        if operations_snapshot.get("status") == "cancelled":
+            job["status"] = "cancelled"
+            job["finished_at"] = (
+                operations_snapshot.get("finished_at") or _now_app_iso()
+            )
+            job["resumable"] = True
+        _persist_discovery_job(job, required=True)
     _append_discovery_job_log(job_id, "warning", "Cancel requested. The current network call may finish before the job stops.")
     with _discovery_jobs_lock:
-        return _discovery_job_public(_discovery_jobs[job_id])
+        job = _merge_operations_snapshot_into_discovery_job(
+            _discovery_jobs[job_id],
+            get_operations_repository().get_job(job_id),
+        )
+        _discovery_jobs[job_id] = job
+        return _discovery_job_public(job)
 
 
 @app.post("/api/discovery/jobs/{job_id}/resume")
@@ -17613,6 +18363,15 @@ async def resume_discovery_job(job_id: str):
         job["error"] = None
         job["finished_at"] = None
         job["record"] = None
+        get_operations_repository().transition_job(
+            job_id,
+            "queued",
+            phase="queued",
+            reason="用户请求从持久断点继续任务。",
+            event_type="job_resume_requested",
+            actor="user",
+            resumable=False,
+        )
         _persist_discovery_job(job, required=True)
     _append_discovery_job_log(
         job_id,
@@ -17628,26 +18387,44 @@ async def resume_discovery_job(job_id: str):
 async def download_discovery_verified_batch(job_id: str, batch_index: int):
     with _discovery_jobs_lock:
         job = _discovery_jobs.get(job_id) or _load_discovery_job(job_id)
-    if not job:
-        return {"error": "Discovery job not found."}
-    batch = next(
-        (
-            item
-            for item in _discovery_result_batches(job)
-            if isinstance(item, dict)
-            and int(item.get("batch_index") or 0) == batch_index
-        ),
-        None,
-    )
-    if batch is None:
-        return {"error": "Verified project batch not found."}
-    path = Path(str(batch.get("manifest_path") or "")).resolve()
-    if not path.is_file() or not _path_within(path, _runs_dir.resolve()):
-        return {"error": "Verified project batch artifact is unavailable."}
-    return FileResponse(
-        path=str(path),
-        filename=f"{job_id}_verified_batch_{batch_index:03d}.json",
-        media_type="application/json",
+    if job:
+        batch = next(
+            (
+                item
+                for item in _discovery_result_batches(job)
+                if isinstance(item, dict)
+                and int(item.get("batch_index") or 0) == batch_index
+            ),
+            None,
+        )
+        if batch is not None:
+            path = Path(str(batch.get("manifest_path") or "")).resolve()
+            if path.is_file() and _path_within(path, _runs_dir.resolve()):
+                return FileResponse(
+                    path=str(path),
+                    filename=(
+                        f"{job_id}_verified_batch_{batch_index:03d}.json"
+                    ),
+                    media_type="application/json",
+                )
+    try:
+        handoff = _operations_discovery_batch_handoff(job_id, batch_index)
+    except Exception as exc:
+        return JSONResponse(
+            {"error": _redact_secrets(str(exc))},
+            status_code=404,
+        )
+    return JSONResponse(
+        {
+            "schema": "pride-agent-verified-file-batch/v1",
+            **handoff,
+        },
+        headers={
+            "Content-Disposition": (
+                "attachment; filename="
+                f'"{job_id}_verified_batch_{batch_index:03d}.json"'
+            )
+        },
     )
 
 
@@ -17722,14 +18499,185 @@ def _discovery_batch_handoff(job: Mapping[str, Any], batch_index: int) -> dict[s
     }
 
 
+def _operations_discovery_batch_handoff(
+    job_id: str,
+    batch_index: int,
+) -> dict[str, Any]:
+    delivery = get_operations_repository().get_batch_delivery(
+        job_id,
+        batch_index,
+    )
+    if delivery is None:
+        raise ValueError("Verified file batch not found.")
+    files = delivery.get("files")
+    files = files if isinstance(files, list) else []
+    missing = delivery.get("missing_file_identifiers")
+    missing = missing if isinstance(missing, list) else []
+    expected_count = int(delivery.get("file_count") or 0)
+    if missing or expected_count <= 0 or len(files) != expected_count:
+        raise ValueError(
+            "Verified file batch is incomplete in the operations database."
+        )
+    inputs: list[str] = []
+    input_records: list[dict[str, Any]] = []
+    for file in files:
+        native = _clean_text(
+            file.get("native_id")
+            or file.get("logical_path")
+            or file.get("file_name")
+        )
+        accession = _clean_text(file.get("project_accession")).upper()
+        repository = _clean_repository(file.get("repository") or "pride")
+        download_url = _clean_text(file.get("download_url"))
+        input_value = download_url or (
+            f"{accession}/{native}" if accession else native
+        )
+        if not input_value:
+            raise ValueError(
+                "Verified file batch contains a file without an input value."
+            )
+        inputs.append(input_value)
+        input_records.append(
+            {
+                "input": input_value,
+                "repository": repository,
+                "project_accession": accession,
+                "project_title": "",
+                "file_name": _clean_text(file.get("file_name")) or native,
+                "download_url": download_url,
+                "file_type": _clean_text(file.get("file_format")),
+                "file_role": _clean_text(file.get("file_role")),
+                "acquisition_mode": _clean_text(file.get("acquisition_mode")),
+                "source_discovery_job_id": job_id,
+                "source_discovery_id": safe_output_stem(
+                    f"agents_job_{job_id}"
+                ),
+                "source_batch_index": batch_index,
+                "source_file_identifier": _clean_text(
+                    file.get("file_identifier")
+                ),
+            }
+        )
+    return {
+        "job_id": job_id,
+        "discovery_id": safe_output_stem(f"agents_job_{job_id}"),
+        "batch_index": batch_index,
+        "file_count": len(inputs),
+        "project_count": len(
+            {item["project_accession"] for item in input_records}
+        ),
+        "terminal": bool(delivery.get("terminal")),
+        "inputs": inputs,
+        "input_records": input_records,
+    }
+
+
+def _operations_discovery_run_bundle(discovery_id: str) -> Path | None:
+    prefix = "agents_job_"
+    if not discovery_id.startswith(prefix):
+        return None
+    job_id = discovery_id[len(prefix):]
+    repository = get_operations_repository()
+    snapshot = repository.get_job(job_id)
+    if snapshot is None:
+        return None
+    batches = repository.list_batches(job_id)
+    if not batches:
+        return None
+    bundle_root = (
+        Path(repository.settings.artifact_root)
+        / "recovered_discovery_bundles"
+    )
+    bundle_root.mkdir(parents=True, exist_ok=True)
+    bundle_path = bundle_root / f"{safe_output_stem(discovery_id)}.zip"
+    temporary_path = bundle_path.with_suffix(".zip.tmp")
+    handoffs: list[dict[str, Any]] = []
+    try:
+        for batch in batches:
+            handoffs.append(
+                _operations_discovery_batch_handoff(
+                    job_id,
+                    int(batch.get("batch_index") or 0),
+                )
+            )
+        with zipfile.ZipFile(
+            temporary_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            archive.writestr(
+                "job_snapshot.json",
+                json.dumps(
+                    snapshot,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+            )
+            archive.writestr(
+                "README.md",
+                (
+                    "# PRIDE discovery recovery bundle\n\n"
+                    "This package was rebuilt from the durable operations "
+                    "database after the legacy run directory was unavailable."
+                    " Batch order and file identities are frozen by the SQL "
+                    "batch index.\n"
+                ),
+            )
+            all_records: list[dict[str, Any]] = []
+            for handoff in handoffs:
+                batch_index = int(handoff["batch_index"])
+                archive.writestr(
+                    f"verified_batches/batch_{batch_index:03d}.json",
+                    json.dumps(
+                        {
+                            "schema": (
+                                "pride-agent-verified-file-batch/v1"
+                            ),
+                            **handoff,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    ),
+                )
+                archive.writestr(
+                    f"batch_inputs/batch_{batch_index:03d}.txt",
+                    "\n".join(handoff["inputs"]) + "\n",
+                )
+                all_records.extend(handoff["input_records"])
+            archive.writestr(
+                "all_input_records.json",
+                json.dumps(
+                    all_records,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+            )
+        os.replace(temporary_path, bundle_path)
+        return bundle_path
+    except Exception:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+
 @app.get("/api/discovery/jobs/{job_id}/batches/{batch_index}/handoff")
 async def handoff_discovery_verified_batch(job_id: str, batch_index: int):
     with _discovery_jobs_lock:
         job = _discovery_jobs.get(job_id) or _load_discovery_job(job_id)
-    if not job:
-        return {"error": "Discovery job not found."}
+    if job:
+        try:
+            return _discovery_batch_handoff(job, batch_index)
+        except Exception:
+            # SQL is the durable authority and remains usable even when a
+            # compatibility manifest path was relative to an older process.
+            pass
     try:
-        return _discovery_batch_handoff(job, batch_index)
+        return _operations_discovery_batch_handoff(job_id, batch_index)
     except Exception as exc:
         return {"error": _redact_secrets(str(exc))}
 
@@ -17803,10 +18751,21 @@ async def review_discovery_run(discovery_id: str, body: dict[str, Any]):
 
 @app.get("/api/discovery/{discovery_id}/download")
 async def download_discovery_file(discovery_id: str, file: str = "dataset_manifest_csv"):
+    file_key = _clean_text(file)
     output_dir = _safe_discovery_dir(discovery_id)
     if output_dir is None or not output_dir.exists():
-        return {"error": "Discovery run not found."}
-    file_key = _clean_text(file)
+        if file_key == "discovery_run_bundle_zip":
+            recovered_bundle = _operations_discovery_run_bundle(discovery_id)
+            if recovered_bundle is not None:
+                return FileResponse(
+                    path=str(recovered_bundle),
+                    filename=f"{discovery_id}_discovery_run_bundle.zip",
+                    media_type="application/zip",
+                )
+        return JSONResponse(
+            {"error": "Discovery run not found."},
+            status_code=404,
+        )
     entry = _DISCOVERY_DOWNLOAD_FILES.get(file_key)
     if entry is None:
         return {"error": "Discovery file not available."}
@@ -18008,6 +18967,8 @@ class BatchFileReporter:
         self._progress_last_emit: dict[str, float] = {}
 
     def __call__(self, message: Any) -> None:
+        if self.batch_id is not None and _batch_cancel_requested(self.batch_id):
+            raise BatchCancelledError("Batch stop requested by user.")
         line_for_log: str
         if isinstance(message, dict):
             kind = str(message.get("kind") or "")
@@ -18148,6 +19109,56 @@ def _update_batch_item(batch_id: str, index: int, **fields: Any) -> None:
         batch["updated_at"] = _now_iso()
         if write_manifest:
             _write_batch_manifest(batch)
+
+
+class BatchCancelledError(RuntimeError):
+    """Cooperative cancellation signal for batch items."""
+
+
+def _batch_cancel_requested(batch_id: str) -> bool:
+    with _batches_lock:
+        batch = _batches.get(batch_id)
+        return bool(batch and batch.get("cancel_requested"))
+
+
+def _raise_if_batch_cancelled(batch_id: str) -> None:
+    if _batch_cancel_requested(batch_id):
+        raise BatchCancelledError("Batch stop requested by user.")
+
+
+def _cancel_batch_item(batch_id: str, index: int, *, message: str = "Stopped by user.") -> dict[str, Any]:
+    with _batches_lock:
+        batch = _batches.get(batch_id)
+        if batch is None:
+            return {"status": "cancelled", "error": message}
+        items = batch.get("items") or []
+        if index < 0 or index >= len(items):
+            return {"status": "cancelled", "error": message}
+        item = items[index]
+        if item.get("status") in {"completed", "failed", "needs_review", "blocked", "cancelled"}:
+            return {"status": str(item.get("status")), "error": str(item.get("error") or "")}
+        item.update(
+            {
+                "status": "cancelled",
+                "finished_at": _now_iso(),
+                "error": message,
+                "progress": {
+                    "stage": "cancelled",
+                    "stage_label": "已停止",
+                    "percent": 100.0,
+                    "message": message,
+                    "updated_at": _now_iso(),
+                },
+                "source_cleanup": _batch_item_source_cleanup(
+                    requested=bool(batch.get("delete_source_files_after_success")),
+                    output_dir=Path(item.get("output_dir", "")),
+                    terminal_status="cancelled",
+                ),
+            }
+        )
+        batch["updated_at"] = _now_iso()
+        _write_batch_manifest(batch)
+    return {"status": "cancelled", "error": message}
 
 
 def _write_batch_item_error(output_dir: Path, input_value: str, exc: BaseException) -> str:
@@ -18326,6 +19337,7 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
     with _batches_lock:
         batch = _batches[batch_id]
         item = dict(batch["items"][index])
+        cancelled_before_start = bool(batch.get("cancel_requested")) or item.get("status") == "cancelled"
         llm_config = dict(batch["llm_config"])
         prefer_project_fasta = bool(batch.get("prefer_project_fasta"))
         ui_language = _clean_ui_language(batch.get("ui_language"))
@@ -18334,6 +19346,8 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
         delete_source_files_after_success = bool(
             batch.get("delete_source_files_after_success")
         )
+    if cancelled_before_start:
+        return _cancel_batch_item(batch_id, index)
 
     input_value = str(item["input"])
     discovery_context = dict(item.get("discovery_context") or {})
@@ -18342,6 +19356,7 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
     _append_batch_event(batch_id, "info", f"Started {input_value}", item_index=index)
     service = None
     try:
+        _raise_if_batch_cancelled(batch_id)
         from agent.input.normalizer import normalize_input
         from agent.orchestrator.pipeline import AgentService
 
@@ -18350,6 +19365,7 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
         task = normalize_input(input_value)
         local_source = _known_local_source_from_input(input_value)
         if run_mode in {_RUN_MODE_PREPARE, _RUN_MODE_FULL}:
+            _raise_if_batch_cancelled(batch_id)
             if local_source:
                 _append_batch_event(
                     batch_id,
@@ -18374,6 +19390,7 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
                     repository=repository,
                     prefer_project_fasta=prefer_project_fasta,
                 )
+            _raise_if_batch_cancelled(batch_id)
             _write_agent_audit_package(output_dir, result, plan=bundle.plan, report=reporter)
             _write_parameter_audit_files(output_dir, batch_id, index, input_value, result)
             project_error = _primary_project_error(result)
@@ -18385,8 +19402,13 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
                 from agent.msdt_converter.docker_runner import DockerMSDTConverterRunner
 
                 _append_batch_event(batch_id, "info", f"{input_value} running MSDT-Converter Docker.", item_index=index)
-                docker_runner = DockerMSDTConverterRunner(image="guomics2017/msdt-converter:v1.3", report=reporter)
+                docker_runner = DockerMSDTConverterRunner(
+                    image="guomics2017/msdt-converter:v1.3",
+                    report=reporter,
+                    cancel_requested=lambda: _batch_cancel_requested(batch_id),
+                )
                 docker_result = docker_runner.run(bundle)
+                _raise_if_batch_cancelled(batch_id)
                 failure_reasons = execution_failure_reasons(
                     bundle.plan,
                     docker_result.returncode,
@@ -18461,6 +19483,7 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
             return {"status": "completed", "error": ""}
 
         discovery_project = _clean_text(discovery_context.get("project_accession"))
+        _raise_if_batch_cancelled(batch_id)
         if local_source:
             _append_batch_event(
                 batch_id,
@@ -18537,6 +19560,7 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
                 )
             finally:
                 _cleanup_batch_instrument_probe_files(output_dir, result, prepared_path)
+        _raise_if_batch_cancelled(batch_id)
         service.write_task_bundle(output_dir, result.resolution, result.context, result.attributes, result.plan, asset=result.asset)
         _write_agent_audit_package(output_dir, result, report=reporter)
         _write_parameter_audit_files(output_dir, batch_id, index, input_value, result)
@@ -18561,6 +19585,11 @@ def _run_parameter_batch_item(batch_id: str, index: int) -> dict[str, Any]:
         level = "warning" if status == "needs_review" else "info"
         _append_batch_event(batch_id, level, f"{input_value} {status}", item_index=index)
         return {"status": status, "error": error}
+    except BatchCancelledError as exc:
+        message = str(exc) or "Stopped by user."
+        result = _cancel_batch_item(batch_id, index, message=message)
+        _append_batch_event(batch_id, "warning", f"{input_value} stopped by user", item_index=index)
+        return result
     except Exception as exc:
         from agent.errors import build_error_record, public_error_summary
 
@@ -18619,6 +19648,13 @@ def _run_parameter_batch(batch_id: str) -> None:
         batch = _batches.get(batch_id)
         if batch is None:
             return
+        if batch.get("cancel_requested"):
+            batch["status"] = "cancelled"
+            batch["finished_at"] = _now_iso()
+            batch["updated_at"] = batch["finished_at"]
+            _append_batch_event_unlocked(batch, "warning", "Batch stopped before execution started")
+            _write_batch_manifest(batch)
+            return
         batch["status"] = "running"
         batch["started_at"] = _now_iso()
         batch["updated_at"] = batch["started_at"]
@@ -18676,11 +19712,17 @@ def _run_parameter_batch(batch_id: str) -> None:
 
         with _batches_lock:
             batch = _batches[batch_id]
-            batch["status"] = "completed"
+            batch["status"] = "cancelled" if batch.get("cancel_requested") else "completed"
             batch["finished_at"] = _now_iso()
             batch["updated_at"] = batch["finished_at"]
             batch["excel_path"] = str(Path(batch["output_dir"]) / _BATCH_EXCEL_FILE)
-            _append_batch_event_unlocked(batch, "info", "Batch completed")
+            _append_batch_event_unlocked(
+                batch,
+                "warning" if batch["status"] == "cancelled" else "info",
+                "Batch stopped; partial Excel report preserved"
+                if batch["status"] == "cancelled"
+                else "Batch completed",
+            )
             _write_batch_manifest(batch)
     except Exception as exc:
         with _batches_lock:
@@ -18712,6 +19754,14 @@ async def create_parameter_batch(body: dict[str, Any]):
     ui_language = _clean_ui_language(body.get("ui_language"))
     repository = _clean_repository(body.get("repository"))
     run_mode = _clean_batch_run_mode(body.get("run_mode"))
+    if run_mode == _RUN_MODE_FULL and not _full_workflow_enabled():
+        return {
+            "error": (
+                "Full batch workflow is not enabled on this server. "
+                "Set AGENT_WEB_FULL_WORKFLOW_ENABLED=true and restart the service; "
+                "the request was not downgraded or started."
+            )
+        }
     resource_policy = _clean_resource_policy(body.get("resource_policy"))
     fasta_preference = _clean_text(body.get("fasta_preference")).lower()
     prefer_project_fasta = fasta_preference == "project" or body.get("prefer_project_fasta") is True
@@ -18787,6 +19837,7 @@ async def create_parameter_batch(body: dict[str, Any]):
         "ui_language": ui_language,
         "repository": repository,
         "run_mode": run_mode,
+        "requested_run_mode": run_mode,
         "resource_policy": resource_policy,
         "prefer_project_fasta": prefer_project_fasta,
         "delete_source_files_after_success": delete_source_files_after_success,
@@ -18812,6 +19863,71 @@ async def create_parameter_batch(body: dict[str, Any]):
         _write_batch_manifest(batch)
     _start_parameter_batch_thread(batch_id)
     return _public_batch_record(batch)
+
+
+@app.post("/api/batches/{batch_id}/cancel")
+async def cancel_parameter_batch(batch_id: str):
+    safe_id = safe_output_stem(batch_id)
+    if safe_id != batch_id:
+        return {"error": "Batch not found."}
+    with _batches_lock:
+        batch = _batches.get(batch_id)
+        if batch is None:
+            loaded = _load_batch_from_disk(batch_id)
+            if loaded is None:
+                return {"error": "Batch not found."}
+            batch = loaded
+            _batches[batch_id] = batch
+        if batch.get("status") in _TERMINAL_STATUSES:
+            return _public_batch_record(batch)
+        now = _now_iso()
+        batch["cancel_requested"] = True
+        batch["cancel_requested_at"] = batch.get("cancel_requested_at") or now
+        for item in batch.get("items") or []:
+            if item.get("status") not in {"queued", "pending", ""}:
+                continue
+            item.update(
+                {
+                    "status": "cancelled",
+                    "finished_at": now,
+                    "error": "Stopped by user before processing started.",
+                    "progress": {
+                        "stage": "cancelled",
+                        "stage_label": "已停止",
+                        "percent": 100.0,
+                        "message": "Stopped by user before processing started.",
+                        "updated_at": now,
+                    },
+                    "source_cleanup": {
+                        "requested": bool(batch.get("delete_source_files_after_success")),
+                        "status": "retained",
+                        "reason": "Source files retained because the batch was stopped.",
+                        "released_bytes": 0,
+                        "removed_paths": [],
+                        "errors": [],
+                        "finished_at": now,
+                    },
+                }
+            )
+        running_items = sum(
+            1 for item in batch.get("items") or [] if item.get("status") == "running"
+        )
+        if running_items == 0:
+            batch["status"] = "cancelled"
+            batch["finished_at"] = now
+        batch["updated_at"] = now
+        _append_batch_event_unlocked(
+            batch,
+            "warning",
+            (
+                f"Stop requested by user; waiting for {running_items} running item(s) "
+                "to reach a safe cancellation point."
+                if running_items
+                else "Batch stopped by user before any remaining item started."
+            ),
+        )
+        _write_batch_manifest(batch)
+        return _public_batch_record(batch)
 
 
 @app.get("/api/batches/{batch_id}")
@@ -18874,19 +19990,33 @@ async def download_parameter_batch_audit(batch_id: str):
 @app.post("/api/preflight")
 async def preflight(body: dict[str, Any]):
     inputs = _clean_batch_inputs(body)
+    is_batch_request = bool(inputs)
     if not inputs:
         single = _clean_text(body.get("input_value"))
         if single:
             inputs = [single]
     if not inputs:
         return {"status": "blocked", "blocking_issues": ["No input files were provided."], "checks": []}
-    return run_preflight(
+    run_mode = (
+        _clean_batch_run_mode(body.get("run_mode"))
+        if is_batch_request
+        else _clean_run_mode(body.get("run_mode"))
+    )
+    result = run_preflight(
         inputs=inputs,
-        run_mode=_clean_run_mode(body.get("run_mode")),
+        run_mode=run_mode,
         repository=_clean_repository(body.get("repository"), default="auto"),
         output_root=_runs_dir,
         resource_policy=_clean_resource_policy(body.get("resource_policy")),
     )
+    if is_batch_request and run_mode == _RUN_MODE_FULL and not _full_workflow_enabled():
+        issue = "Full batch workflow is disabled on this server."
+        result["status"] = "blocked"
+        result.setdefault("blocking_issues", []).append(issue)
+        result.setdefault("checks", []).append(
+            {"name": "full_workflow", "status": "blocked", "message": issue}
+        )
+    return result
 
 
 @app.post("/api/tasks")

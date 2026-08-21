@@ -18,6 +18,7 @@ MANIFEST_COLUMNS = [
     "ms_run_id",
     "repository",
     "project_accession",
+    "project_source_url",
     "native_accession",
     "px_accession",
     "file_accession_or_path",
@@ -96,6 +97,7 @@ MANIFEST_COLUMNS = [
     "ai_ready_target_schema",
     "instrument_names",
     "instrument_families",
+    "laboratory_names",
     "instrument_generation_score",
     "instrument_generation_label",
     "fragmentation_methods",
@@ -154,6 +156,7 @@ def _csv_row(
         "ms_run_id": _ms_run_id(file),
         "repository": file.repository,
         "project_accession": file.project_accession,
+        "project_source_url": file.project_source_url or "",
         "native_accession": file.native_accession or "",
         "px_accession": file.px_accession or "",
         "file_accession_or_path": file.file_accession_or_path or file.raw_record.get("file_accession_or_path") or file.raw_record.get("accession") or "",
@@ -236,6 +239,7 @@ def _csv_row(
         "ai_ready_target_schema": file.ai_ready_target_schema or "",
         "instrument_names": _join_values(file.instrument_names),
         "instrument_families": _join_values(file.instrument_families),
+        "laboratory_names": _join_values(file.laboratory_names),
         "instrument_generation_score": (
             file.instrument_generation_score
             if file.instrument_generation_score is not None
@@ -373,6 +377,7 @@ def build_quality_report(manifest: DatasetManifest) -> dict[str, Any]:
         "ptm_enrichment_method_distribution": _count_values(manifest.files, "ptm_enrichment_methods"),
         "semantic_metadata_confidence_mean": _mean_semantic_confidence(manifest.files),
         "instrument_family_distribution": _count_values(manifest.files, "instrument_families"),
+        "laboratory_distribution": _count_values(manifest.files, "laboratory_names"),
         "instrument_generation_distribution": _count_values(
             manifest.files, "instrument_generation_label"
         ),

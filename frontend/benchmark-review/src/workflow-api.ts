@@ -83,6 +83,11 @@ export const startBatch = (payload: WorkflowRecord) =>
 export const getBatch = (batchId: string, signal?: AbortSignal) =>
   workflowJson<WorkflowRecord>(`/api/batches/${encodeURIComponent(batchId)}`, { signal });
 
+export const cancelBatch = (batchId: string) =>
+  workflowJson<WorkflowRecord>(`/api/batches/${encodeURIComponent(batchId)}/cancel`, {
+    method: "POST",
+  });
+
 export type DiscoveryBatchHandoff = WorkflowRecord & {
   job_id: string;
   discovery_id: string;
@@ -155,6 +160,7 @@ export type BusinessCompletionDecision = WorkflowRecord & {
 
 export type DiscoveryJobRecord = WorkflowRecord & {
   business_completion?: BusinessCompletionDecision;
+  portfolio_state?: WorkflowRecord | null;
 };
 
 export type DiscoveryJob = WorkflowRecord & {
@@ -332,7 +338,7 @@ export const runAiReady = (action: AiReadyAction, payload: WorkflowRecord) =>
   });
 
 export const terminalWorkflowStatus = (status: unknown) =>
-  ["completed", "failed", "blocked", "cancelled"].includes(String(status || "").toLowerCase());
+  ["completed", "failed", "blocked", "cancelled", "interrupted"].includes(String(status || "").toLowerCase());
 
 export const delay = (milliseconds: number, signal?: AbortSignal) =>
   new Promise<void>((resolve, reject) => {

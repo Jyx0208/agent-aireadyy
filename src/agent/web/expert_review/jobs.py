@@ -313,7 +313,7 @@ class ExpertJudgeJobManager:
             [panel.third_profile_id] if panel.third_profile_id else []
         )
         normalized_scale = str(scale_mode or "auto").strip().casefold()
-        if normalized_scale not in {"auto", "curated", "balanced", "exhaustive"}:
+        if normalized_scale not in {"auto", "quick", "curated", "balanced", "exhaustive"}:
             normalized_scale = "auto"
         job = {
             "job_id": job_id,

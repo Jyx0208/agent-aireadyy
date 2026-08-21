@@ -17,9 +17,11 @@ class DockerMSDTConverterRunner:
         self,
         image: str = "guomics2017/msdt-converter:v1.3",
         report: Callable[[str], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ):
         self.image = image
         self.report = report
+        self.cancel_requested = cancel_requested
 
     @staticmethod
     def _path_posix(path: Path) -> str:
@@ -208,10 +210,19 @@ class DockerMSDTConverterRunner:
             timeout_seconds=self._float_env("AGENT_MSDT_DOCKER_TIMEOUT_SECONDS"),
             idle_timeout_seconds=self._float_env("AGENT_MSDT_DOCKER_IDLE_TIMEOUT_SECONDS"),
             abort_predicate=self._abort_reason_from_output,
+            poll_abort_predicate=self._poll_abort_reason,
             on_abort=lambda reason: self._stop_child_container(bundle, reason),
         )
 
+    def _poll_abort_reason(self) -> str | None:
+        if self.cancel_requested is not None and self.cancel_requested():
+            return "user_cancelled"
+        return None
+
     def _abort_reason_from_output(self, line: str, _lines: list[str]) -> str | None:
+        cancelled = self._poll_abort_reason()
+        if cancelled:
+            return cancelled
         abort_mode = self._low_psm_abort_mode()
         if abort_mode == "off":
             return None
