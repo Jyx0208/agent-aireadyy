@@ -1,10 +1,9 @@
 # Parent implementation map
 
-- [ ] Complete and archive `08-24-pride-pagination`.
-- [ ] Create, review, start, and complete the file-model child task.
-- [ ] Create, review, start, and complete the file-family/SDRF child task.
-- [ ] Create, review, start, and complete the file-review/selection child task.
-- [ ] Create, review, start, and complete the Web/export child task.
-- [ ] Run final cross-child scientific and performance validation.
-- [ ] Retire legacy project-level authorization only after dual-read comparison passes.
-
+- [x] Complete and archive `08-24-pride-pagination`.
+- [x] Add file identity, judgment, evidence, and reason models.
+- [x] Add deterministic SDRF/file-family closure.
+- [x] Make frozen file IDs the final selection authority.
+- [x] Add live Web status filters, cursor paging, lazy reason detail, and scalable exports.
+- [x] Run focused scientific, persistence, performance, and production-build validation.
+- [x] Keep project judgment as an explicitly labeled legacy read fallback, never file authorization.

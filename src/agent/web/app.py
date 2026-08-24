@@ -245,6 +245,20 @@ _DISCOVERY_DOWNLOAD_FILES = {
     "dataset_manifest_valid_csv": ("dataset_manifest_valid.csv", "text/csv"),
     "dataset_manifest_usable_csv": ("dataset_manifest_usable.csv", "text/csv"),
     "dataset_manifest_task_ready_csv": ("dataset_manifest_task_ready.csv", "text/csv"),
+    "file_judgments_jsonl": ("file_judgments.jsonl", "application/x-ndjson"),
+    "selected_files_xlsx": (
+        "selected_files.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
+    "files_parquet": ("files.parquet", "application/vnd.apache.parquet"),
+    "file_judgments_parquet": (
+        "file_judgments.parquet",
+        "application/vnd.apache.parquet",
+    ),
+    "file_evidence_parquet": (
+        "file_evidence.parquet",
+        "application/vnd.apache.parquet",
+    ),
     "batch_inputs": ("batch_inputs.txt", "text/plain"),
     "batch_inputs_valid": ("batch_inputs_valid.txt", "text/plain"),
     "batch_inputs_usable": ("batch_inputs_usable.txt", "text/plain"),
@@ -17895,7 +17909,13 @@ def _append_discovery_job_event(job_id: str, event: AgentEvent) -> None:
         if isinstance(execution, Mapping):
             phase = _clean_text(execution.get("phase"))
     try:
-        get_operations_repository().append_event(
+        operations_repository = get_operations_repository()
+        operations_repository.project_file_review_event(
+            job_id,
+            event.event_type,
+            event.payload,
+        )
+        operations_repository.append_event(
             job_id,
             event_type=event.event_type,
             level=str(entry["level"]),

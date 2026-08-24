@@ -8,6 +8,11 @@ import re
 from typing import Any, Callable, Literal
 
 from agent.discovery.diversity import diversity_summary, select_diverse_items, validity_summary
+from agent.discovery.file_family import (
+    FileFamily,
+    FileRelation,
+    stable_family_id,
+)
 from agent.discovery.features import extract_file_features, extract_project_features
 from agent.discovery.memory import (
     DiscoveryMemory,
@@ -147,6 +152,44 @@ def _sort_files(files: list[DiscoveredFile]) -> list[DiscoveredFile]:
     return sorted(files, key=lambda file: (-file.trust_score, -file.file_score, file.needs_review, file.file_name.casefold()))
 
 
+def _sdrf_companion_file(
+    raw_file: dict[str, Any],
+    project: DiscoveredProject,
+    download_url: str | None,
+) -> DiscoveredFile:
+    file_name = str(raw_file.get("fileName") or raw_file.get("name") or "metadata.sdrf.tsv")
+    native_id = str(
+        raw_file.get("accession")
+        or raw_file.get("fileAccession")
+        or raw_file.get("id")
+        or file_name
+    )
+    return DiscoveredFile(
+        repository="pride",
+        project_accession=project.project_accession,
+        project_source_url=project.project_source_url,
+        file_accession_or_path=native_id,
+        project_title=project.project_title,
+        file_name=file_name,
+        download_url=download_url,
+        file_type=".tsv",
+        file_role="metadata",
+        selection_role="required_companion",
+        validity_status="valid",
+        evidence_level="file",
+        file_level_evidence_count=1,
+        evidence=[
+            DiscoveryEvidence(
+                field="sdrf_file",
+                source="pride_file_inventory",
+                text=file_name,
+                weight=9,
+            )
+        ],
+        raw_record=raw_file,
+    )
+
+
 def _file_context_summary(files: list[DiscoveredFile]) -> dict[str, Any]:
     warning_counts: Counter[str] = Counter()
     for file in files:
@@ -173,6 +216,8 @@ def discover_pride_dataset(
 ) -> DatasetManifest:
     owns_client = client is None
     pride = client or PrideClient()
+    file_families: list[FileFamily] = []
+    companion_files: dict[str, DiscoveredFile] = {}
     if candidate_records is None:
         proposed_queries = queries or build_pride_queries(request)
         queries = prepare_pride_search_queries(proposed_queries) or proposed_queries
@@ -619,6 +664,7 @@ def discover_pride_dataset(
             )
 
             scored_files: list[DiscoveredFile] = []
+            sdrf_matched_primary_ids: set[str] = set()
             project_excluded_files = 0
             file_parse_errors: list[str] = []
             file_role_counts: Counter[str] = Counter()
@@ -700,6 +746,8 @@ def discover_pride_dataset(
                             filter_reason_counts[str(reason)] += 1
                     else:
                         scored_files.append(scored_file)
+                        if matched_sdrf_rows:
+                            sdrf_matched_primary_ids.add(scored_file.file_id)
                 else:
                     project_excluded_files += 1
                     if role.role in {"raw_acquisition", "converted_peaklist"}:
@@ -760,6 +808,42 @@ def discover_pride_dataset(
                 )
                 continue
 
+            if sdrf_file is not None and sdrf_url and sdrf_matched_primary_ids:
+                companion = _sdrf_companion_file(sdrf_file, project, sdrf_url)
+                companion_files[companion.file_id] = companion
+                enriched_files: list[DiscoveredFile] = []
+                for scored_file in scored_files:
+                    if scored_file.file_id not in sdrf_matched_primary_ids:
+                        enriched_files.append(scored_file)
+                        continue
+                    family_id = stable_family_id(accession, [scored_file.file_id])
+                    enriched_files.append(
+                        scored_file.model_copy(
+                            update={
+                                "family_id": family_id,
+                                "companion_file_ids": [companion.file_id],
+                            }
+                        )
+                    )
+                    file_families.append(
+                        FileFamily(
+                            family_id=family_id,
+                            project_accession=accession,
+                            primary_file_ids=[scored_file.file_id],
+                            companion_file_ids=[companion.file_id],
+                            relations=[
+                                FileRelation(
+                                    primary_file_id=scored_file.file_id,
+                                    companion_file_id=companion.file_id,
+                                    relation_kind="sdrf_explicit",
+                                    confidence=1.0,
+                                    evidence_refs=[f"{scored_file.file_id}:evidence:0"],
+                                )
+                            ],
+                        )
+                    )
+                scored_files = enriched_files
+
             project = project.model_copy(
                 update={
                     "file_count": len(scored_files),
@@ -815,6 +899,22 @@ def discover_pride_dataset(
         selected_items = select_diverse_items(_sort_projects(scored_items), request)
         selected_projects = [project for project, _files in selected_items]
         selected_files = [file for _project, files in selected_items for file in files]
+        selected_primary_ids = {file.file_id for file in selected_files}
+        selected_families = [
+            family
+            for family in file_families
+            if any(file_id in selected_primary_ids for file_id in family.primary_file_ids)
+        ]
+        selected_companion_ids = {
+            file_id
+            for family in selected_families
+            for file_id in family.companion_file_ids
+        }
+        selected_files.extend(
+            companion_files[file_id]
+            for file_id in sorted(selected_companion_ids)
+            if file_id in companion_files
+        )
         _report(f"Selected {len(selected_projects)} project(s), {len(selected_files)} file(s).")
         diversity = diversity_summary(selected_files)
         validity = validity_summary(selected_files)
@@ -868,6 +968,11 @@ def discover_pride_dataset(
             "inspection_outcome_counts": inspection_outcome_counts,
             "selected_projects": len(selected_projects),
             "selected_files": len(selected_files),
+            "selected_primary_files": len(selected_primary_ids),
+            "selected_companion_files": len(selected_companion_ids),
+            "file_families": [
+                family.model_dump(mode="json") for family in selected_families
+            ],
             "max_projects": request.max_projects,
             "max_files": request.max_files,
             "generated_at": datetime.now(timezone.utc).isoformat(),

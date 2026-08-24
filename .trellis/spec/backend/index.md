@@ -20,6 +20,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 | [Repository Pagination](./repository-pagination.md) | Executable PRIDE pagination, resume, and completeness contract | Active |
+| [File-level Selection](./file-level-selection.md) | File judgment, SDRF companions, live review, and export contract | Active |
 
 ---
 

@@ -13,6 +13,8 @@ from agent.discovery.publication import (
 )
 from agent.discovery.evidence_store import EvidenceStoreArtifact
 from agent.discovery.builder_contract import BuilderDryRunResult
+from agent.discovery.file_family import FileFamily
+from agent.discovery.file_judgment import FileJudgmentInput
 from agent.discovery.project_judgment import ProjectJudgmentInput
 from agent.models import JsonModel
 
@@ -394,6 +396,9 @@ class AgentRunRecord(JsonModel):
     repair_no_progress_count: int = Field(default=0, ge=0)
     auth_refresh_attempts: int = Field(default=0, ge=0)
     project_judgments: dict[str, ProjectJudgmentInput] = Field(default_factory=dict)
+    file_judgments: dict[str, FileJudgmentInput] = Field(default_factory=dict)
+    file_families: dict[str, FileFamily] = Field(default_factory=dict)
+    selected_file_ids: list[str] = Field(default_factory=list)
     qualified_project_count: int = Field(default=0, ge=0)
     qualified_no_gain_count: int = Field(default=0, ge=0)
     consecutive_zero_yield: int = 0

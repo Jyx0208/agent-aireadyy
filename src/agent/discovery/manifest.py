@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.discovery.models import DatasetManifest, DiscoveredFile, DiscoveryEvidence
+from agent.discovery.file_export import write_file_selection_exports
 from agent.discovery.task_profiles import active_task_types
 from agent.discovery.task_readiness import annotate_manifest_task_readiness, pipeline_eligible_files, task_ready_files
 from agent.utils import write_json
@@ -15,6 +16,7 @@ from agent.utils import write_json
 MANIFEST_COLUMNS = [
     "run_id",
     "harvest_run_id",
+    "file_id",
     "ms_run_id",
     "repository",
     "project_accession",
@@ -28,6 +30,9 @@ MANIFEST_COLUMNS = [
     "transfer_method",
     "file_type",
     "file_role",
+    "selection_role",
+    "family_id",
+    "companion_file_ids",
     "file_role_reasons",
     "sdrf_match_status",
     "evidence_level",
@@ -66,6 +71,11 @@ MANIFEST_COLUMNS = [
     "judgment_constraint_assessments",
     "judgment_limitations",
     "judgment_rubric_version",
+    "review_status",
+    "reason_status",
+    "reason_scope",
+    "reason_text",
+    "judgment_model_id",
     "retrieval_project_score",
     "retrieval_file_score",
     "retrieval_confidence",
@@ -137,9 +147,19 @@ def _ms_run_id(file: DiscoveredFile) -> str:
 def _judgment_for_file(file: DiscoveredFile, judgments: dict[str, dict[str, Any]] | None) -> dict[str, Any]:
     if not judgments:
         return {}
-    return judgments.get(str(file.project_accession or "").upper()) or judgments.get(
+    file_judgment = judgments.get(file.file_id)
+    if isinstance(file_judgment, dict):
+        return file_judgment
+    project_judgment = judgments.get(str(file.project_accession or "").upper()) or judgments.get(
         str(file.project_accession or "")
-    ) or {}
+    )
+    if not isinstance(project_judgment, dict):
+        return {}
+    return {
+        **project_judgment,
+        "reason_scope": "project_legacy",
+        "reason_text": project_judgment.get("explanation"),
+    }
 
 
 def _csv_row(
@@ -153,6 +173,7 @@ def _csv_row(
     return {
         "run_id": run_id or "",
         "harvest_run_id": run_id or "",
+        "file_id": file.file_id,
         "ms_run_id": _ms_run_id(file),
         "repository": file.repository,
         "project_accession": file.project_accession,
@@ -166,6 +187,11 @@ def _csv_row(
         "transfer_method": file.transfer_method or "",
         "file_type": file.file_type,
         "file_role": file.file_role,
+        "selection_role": judgment.get("selection_role", file.selection_role),
+        "family_id": judgment.get("family_id", file.family_id or ""),
+        "companion_file_ids": _join_values(
+            judgment.get("companion_file_ids") or file.companion_file_ids
+        ),
         "file_role_reasons": _join_values(file.file_role_reasons),
         "sdrf_match_status": file.sdrf_match_status,
         "evidence_level": file.evidence_level,
@@ -199,7 +225,7 @@ def _csv_row(
         "judgment_decision": judgment.get("decision", ""),
         "judgment_next_action": judgment.get("next_action", ""),
         "judgment_evidence_stage": judgment.get("evidence_stage", ""),
-        "judgment_explanation": judgment.get("explanation", ""),
+        "judgment_explanation": judgment.get("reason_text") or judgment.get("explanation", ""),
         "judgment_evidence_refs": _join_values(judgment.get("evidence_refs") or []),
         "judgment_constraint_assessments": json.dumps(
             judgment.get("constraint_assessments") or [],
@@ -208,6 +234,11 @@ def _csv_row(
         ),
         "judgment_limitations": _join_values(judgment.get("limitations") or []),
         "judgment_rubric_version": judgment.get("rubric_version", ""),
+        "review_status": judgment.get("review_status", file.review_status),
+        "reason_status": judgment.get("reason_status", file.reason_status),
+        "reason_scope": judgment.get("reason_scope", file.reason_scope),
+        "reason_text": judgment.get("reason_text", file.reason_text or ""),
+        "judgment_model_id": judgment.get("model_id", ""),
         "retrieval_project_score": file.project_score,
         "retrieval_file_score": file.file_score,
         "retrieval_confidence": file.confidence,
@@ -270,6 +301,41 @@ def _write_manifest_csv(
         writer.writeheader()
         for file in files:
             writer.writerow(_csv_row(file, run_id, judgments=judgments))
+
+
+def _write_manifest_jsonl(
+    path: Path,
+    files: list[DiscoveredFile],
+    run_id: str | None,
+    *,
+    judgments: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for file in files:
+            handle.write(
+                json.dumps(
+                    _csv_row(file, run_id, judgments=judgments),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+
+
+def _write_judgments_jsonl(
+    path: Path,
+    judgments: dict[str, dict[str, Any]],
+) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for file_id in sorted(judgments):
+            handle.write(
+                json.dumps(
+                    {"file_id": file_id, **judgments[file_id]},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
 
 
 def _batch_input_line(file: DiscoveredFile) -> str:
@@ -563,7 +629,12 @@ def _write_repository_audit(json_path: Path, csv_path: Path, md_path: Path, mani
     md_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
 
 
-def write_dataset_manifest(manifest: DatasetManifest, output_dir: str | Path) -> dict[str, Path]:
+def write_dataset_manifest(
+    manifest: DatasetManifest,
+    output_dir: str | Path,
+    *,
+    include_file_exports: bool = True,
+) -> dict[str, Path]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -575,6 +646,7 @@ def write_dataset_manifest(manifest: DatasetManifest, output_dir: str | Path) ->
         "dataset_manifest_valid_csv": output_dir / "dataset_manifest_valid.csv",
         "dataset_manifest_usable_csv": output_dir / "dataset_manifest_usable.csv",
         "dataset_manifest_task_ready_csv": output_dir / "dataset_manifest_task_ready.csv",
+        "file_judgments_jsonl": output_dir / "file_judgments.jsonl",
         "batch_inputs": output_dir / "batch_inputs.txt",
         "batch_inputs_valid": output_dir / "batch_inputs_valid.txt",
         "batch_inputs_usable": output_dir / "batch_inputs_usable.txt",
@@ -609,16 +681,31 @@ def write_dataset_manifest(manifest: DatasetManifest, output_dir: str | Path) ->
     task_files = task_ready_files(manifest)
     # L1 batch/list delivery keeps weak_ready via pipeline_eligible; strict ready remains separate.
     pipeline_files = pipeline_eligible_files(manifest)
-    judgments = (manifest.summary or {}).get("project_judgments")
+    all_file_judgments = (manifest.summary or {}).get("all_file_judgments")
+    judgments = (manifest.summary or {}).get("file_judgments")
+    if not isinstance(judgments, dict):
+        judgments = (manifest.summary or {}).get("project_judgments")
     judgments = judgments if isinstance(judgments, dict) else None
     _write_manifest_csv(paths["dataset_manifest_csv"], manifest.files, manifest.run_id, judgments=judgments)
     _write_manifest_csv(paths["dataset_manifest_valid_csv"], valid_files, manifest.run_id, judgments=judgments)
     _write_manifest_csv(paths["dataset_manifest_usable_csv"], usable_files, manifest.run_id, judgments=judgments)
     _write_manifest_csv(paths["dataset_manifest_task_ready_csv"], pipeline_files, manifest.run_id, judgments=judgments)
+    if isinstance(all_file_judgments, dict):
+        _write_judgments_jsonl(paths["file_judgments_jsonl"], all_file_judgments)
+    else:
+        _write_manifest_jsonl(
+            paths["file_judgments_jsonl"],
+            manifest.files,
+            manifest.run_id,
+            judgments=judgments,
+        )
     _write_batch_inputs(paths["batch_inputs"], manifest.files)
     _write_batch_inputs(paths["batch_inputs_valid"], valid_files)
     _write_batch_inputs(paths["batch_inputs_usable"], usable_files)
     _write_batch_inputs(paths["batch_inputs_task_ready"], pipeline_files)
+
+    if include_file_exports:
+        paths.update(write_file_selection_exports(manifest, output_dir))
 
     return paths
 

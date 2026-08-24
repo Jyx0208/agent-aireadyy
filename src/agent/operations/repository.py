@@ -8,9 +8,10 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import exists, func, or_, select, text
+from sqlalchemy import case, exists, func, or_, select, text
 from sqlalchemy.orm import Session, aliased
 
+from agent.discovery.file_judgment import stable_file_id
 from agent.operations.config import OperationsSettings
 from agent.operations.database import OperationsDatabase
 from agent.operations.models import (
@@ -161,18 +162,26 @@ class Page:
     page: int
     page_size: int
     total: int
+    next_cursor: int | None = None
+    summary: dict[str, int] | None = None
+    has_more: bool | None = None
 
     def as_dict(self) -> dict[str, Any]:
         pages = max(1, math.ceil(self.total / self.page_size))
-        return {
+        result = {
             "items": self.items,
             "page": self.page,
             "page_size": self.page_size,
             "total": self.total,
             "pages": pages,
             "has_previous": self.page > 1,
-            "has_next": self.page < pages,
+            "has_next": self.has_more if self.has_more is not None else self.page < pages,
         }
+        if self.next_cursor is not None:
+            result["next_cursor"] = self.next_cursor
+        if self.summary is not None:
+            result["summary"] = self.summary
+        return result
 
 
 class OperationsRepository:
@@ -599,6 +608,11 @@ class OperationsRepository:
                 select(FileRecord).where(FileRecord.job_id == job_row.job_id)
             ).all()
         }
+        existing_files_by_id = {
+            str(row.file_id): row
+            for row in existing_files.values()
+            if row.file_id
+        }
         if isinstance(files, Sequence) and not isinstance(files, str):
             for item in files:
                 if not isinstance(item, Mapping):
@@ -616,19 +630,30 @@ class OperationsRepository:
                 if not native_id:
                     continue
                 repository = _text(item.get("repository")) or job_row.repository or "pride"
+                file_id = _text(item.get("file_id")) or stable_file_id(
+                    repository,
+                    project_accession,
+                    native_id,
+                )
                 file_key = (repository, project_accession, native_id)
-                file_row = existing_files.get(file_key)
+                file_row = existing_files.get(file_key) or existing_files_by_id.get(file_id)
                 if file_row is None:
                     file_row = FileRecord(
                         job_id=job_row.job_id,
                         repository=repository,
                         project_accession=project_accession,
                         native_id=native_id,
+                        file_id=file_id,
                         file_name=_text(item.get("file_name")) or native_id,
                         created_at=job_row.created_at,
                     )
                     session.add(file_row)
                     existing_files[file_key] = file_row
+                    existing_files_by_id[file_id] = file_row
+                file_row.repository = repository
+                file_row.project_accession = project_accession
+                file_row.native_id = native_id
+                file_row.file_id = file_id
                 file_row.file_name = _text(item.get("file_name")) or file_row.file_name
                 file_row.logical_path = _text(
                     item.get("logical_path")
@@ -641,21 +666,62 @@ class OperationsRepository:
                 )
                 file_row.file_category = _text(item.get("file_category"))
                 file_row.file_role = _text(item.get("file_role"))
+                file_row.selection_role = _text(item.get("selection_role")) or "primary_input"
+                file_row.family_id = _text(item.get("family_id")) or None
+                file_row.companion_file_ids = _json_value(
+                    item.get("companion_file_ids") or [],
+                    [],
+                )
                 file_row.acquisition_mode = _text(item.get("acquisition_mode")) or "unknown"
                 file_row.size_bytes = _int(item.get("size_bytes"), 0) or None
                 file_row.status = _text(
                     item.get("status")
                     or item.get("validity_status")
                 ) or "usable"
+                file_row.review_status = _text(item.get("review_status")) or "unreviewed"
+                file_row.decision = _text(
+                    item.get("decision") or item.get("judgment_decision")
+                ) or None
+                file_row.reason_status = _text(item.get("reason_status")) or "pending"
+                file_row.reason_scope = _text(item.get("reason_scope")) or "project_legacy"
+                file_row.reason_text = _text(
+                    item.get("reason_text")
+                    or item.get("judgment_explanation")
+                ) or None
+                file_row.grade = _int(
+                    item.get("grade") if item.get("grade") is not None else item.get("final_grade"),
+                    -1,
+                )
+                if file_row.grade < 0:
+                    file_row.grade = None
+                file_row.hard_gate = _text(item.get("hard_gate")) or None
+                file_row.confidence = _float(
+                    item.get("judgment_confidence")
+                    if item.get("judgment_confidence") is not None
+                    else item.get("confidence")
+                )
+                file_row.judgment_model_id = _text(
+                    item.get("judgment_model_id") or item.get("model_id")
+                ) or None
+                file_row.judgment_version = _text(
+                    item.get("judgment_version") or item.get("judgment_rubric_version")
+                ) or None
+                file_row.limitations = _json_value(
+                    item.get("limitations") or item.get("judgment_limitations") or [],
+                    [],
+                )
                 explicit_eligible = item.get("eligible")
                 if explicit_eligible is None:
                     explicit_eligible = item.get("usable")
-                file_row.eligible = (
-                    bool(explicit_eligible)
-                    if explicit_eligible is not None
-                    else file_row.status
-                    not in {"excluded", "invalid", "unusable", "missing"}
-                )
+                if file_row.decision is not None:
+                    file_row.eligible = file_row.decision == "include"
+                else:
+                    file_row.eligible = (
+                        bool(explicit_eligible)
+                        if explicit_eligible is not None
+                        else file_row.status
+                        not in {"excluded", "invalid", "unusable", "missing"}
+                    )
                 file_row.reason_code = _text(
                     item.get("reason_code")
                     or item.get("primary_reason")
@@ -1951,6 +2017,10 @@ class OperationsRepository:
         query: str = "",
         sort: str = "project_accession",
         direction: str = "asc",
+        cursor: int | None = None,
+        review_status: str = "",
+        decision: str = "",
+        reason_status: str = "",
     ) -> Page:
         page = max(1, page)
         page_size = min(max(1, page_size), 100)
@@ -1959,6 +2029,12 @@ class OperationsRepository:
             filters.append(FileRecord.eligible.is_(eligible))
         if project_accession:
             filters.append(FileRecord.project_accession == project_accession)
+        if review_status:
+            filters.append(FileRecord.review_status == review_status)
+        if decision:
+            filters.append(FileRecord.decision == decision)
+        if reason_status:
+            filters.append(FileRecord.reason_status == reason_status)
         if query:
             token = f"%{query.strip()}%"
             filters.append(
@@ -1981,19 +2057,154 @@ class OperationsRepository:
             total = _int(
                 session.scalar(select(func.count(FileRecord.id)).where(*filters))
             )
-            rows = session.scalars(
-                select(FileRecord)
-                .where(*filters)
-                .order_by(order, FileRecord.id.asc())
-                .offset((page - 1) * page_size)
-                .limit(page_size)
-            ).all()
+            query_statement = select(FileRecord).where(*filters)
+            if cursor is not None:
+                if direction.lower() == "desc":
+                    query_statement = query_statement.where(FileRecord.id < cursor)
+                    id_order = FileRecord.id.desc()
+                else:
+                    query_statement = query_statement.where(FileRecord.id > cursor)
+                    id_order = FileRecord.id.asc()
+                fetched = session.scalars(
+                    query_statement.order_by(id_order).limit(page_size + 1)
+                ).all()
+                has_more = len(fetched) > page_size
+                rows = fetched[:page_size]
+                next_cursor = rows[-1].id if has_more and rows else None
+            else:
+                rows = session.scalars(
+                    query_statement
+                    .order_by(order, FileRecord.id.asc())
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
+                ).all()
+                has_more = None
+                next_cursor = None
             return Page(
-                [self._file_dict(row) for row in rows],
+                [self._file_dict(row, include_detail=False) for row in rows],
                 page,
                 page_size,
                 total,
+                next_cursor=next_cursor,
+                summary=self._file_summary_locked(session, job_id),
+                has_more=has_more,
             )
+
+    def get_file(self, job_id: str, file_id: str) -> dict[str, Any] | None:
+        with self.database.session() as session:
+            row = session.scalar(
+                select(FileRecord).where(
+                    FileRecord.job_id == job_id,
+                    FileRecord.file_id == file_id,
+                )
+            )
+            return self._file_dict(row) if row is not None else None
+
+    def project_file_review_event(
+        self,
+        job_id: str,
+        event_type: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Project bounded agent file-review events into the live file table."""
+
+        if event_type not in {"file_review_batch_started", "file_review_batch_completed"}:
+            return
+        key = "items" if event_type.endswith("started") else "judgments"
+        items = payload.get(key)
+        if not isinstance(items, Sequence) or isinstance(items, str):
+            return
+        with self.database.session() as session:
+            job = session.get(Job, job_id)
+            if job is None:
+                return
+            file_ids = [_text(item.get("file_id")) for item in items if isinstance(item, Mapping)]
+            existing = {
+                str(row.file_id): row
+                for row in session.scalars(
+                    select(FileRecord).where(
+                        FileRecord.job_id == job_id,
+                        FileRecord.file_id.in_(file_ids),
+                    )
+                ).all()
+            }
+            now = utc_now_iso()
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                file_id = _text(item.get("file_id"))
+                if not file_id:
+                    continue
+                row = existing.get(file_id)
+                if row is None:
+                    row = FileRecord(
+                        job_id=job_id,
+                        repository=job.repository or "pride",
+                        project_accession=_text(item.get("project_accession")),
+                        native_id=file_id,
+                        file_id=file_id,
+                        file_name=_text(item.get("file_name")) or file_id,
+                        created_at=now,
+                    )
+                    session.add(row)
+                    existing[file_id] = row
+                row.project_accession = _text(item.get("project_accession")) or row.project_accession
+                row.file_name = _text(item.get("file_name")) or row.file_name
+                row.file_format = _text(item.get("file_type")) or row.file_format
+                row.file_role = _text(item.get("file_role")) or row.file_role
+                row.selection_role = _text(item.get("selection_role")) or row.selection_role
+                row.family_id = _text(item.get("family_id")) or row.family_id
+                row.companion_file_ids = _json_value(item.get("companion_file_ids") or row.companion_file_ids, [])
+                if event_type.endswith("started"):
+                    row.review_status = "reviewing"
+                else:
+                    row.review_status = _text(item.get("review_status")) or "reviewed"
+                    row.decision = _text(item.get("decision")) or None
+                    row.reason_status = _text(item.get("reason_status")) or "pending"
+                    row.reason_scope = _text(item.get("reason_scope")) or "file"
+                    row.reason_text = _text(item.get("reason_text")) or None
+                    row.grade = _int(item.get("grade"), -1)
+                    if row.grade < 0:
+                        row.grade = None
+                    row.hard_gate = _text(item.get("hard_gate")) or None
+                    row.confidence = _float(item.get("confidence"))
+                    row.judgment_model_id = _text(item.get("model_id")) or None
+                    row.judgment_version = _text(item.get("judgment_version")) or None
+                    row.limitations = _json_value(item.get("limitations") or [], [])
+                    row.eligible = row.decision == "include"
+                    row.evidence = {"evidence_refs": item.get("evidence_refs") or []}
+                row.updated_at = now
+            session.commit()
+
+    @staticmethod
+    def _file_summary_locked(session: Session, job_id: str) -> dict[str, int]:
+        row = session.execute(
+            select(
+                func.count(FileRecord.id),
+                func.sum(case((FileRecord.review_status == "unreviewed", 1), else_=0)),
+                func.sum(case((FileRecord.review_status == "queued", 1), else_=0)),
+                func.sum(case((FileRecord.review_status == "reviewing", 1), else_=0)),
+                func.sum(case((FileRecord.review_status == "reviewed", 1), else_=0)),
+                func.sum(case((FileRecord.decision == "include", 1), else_=0)),
+                func.sum(case((FileRecord.decision == "investigate", 1), else_=0)),
+                func.sum(case((FileRecord.decision == "exclude", 1), else_=0)),
+                func.sum(case((FileRecord.review_status == "error", 1), else_=0)),
+                func.sum(case((FileRecord.reason_status == "ready", 1), else_=0)),
+            ).where(FileRecord.job_id == job_id)
+        ).one()
+        labels = (
+            "total",
+            "unreviewed",
+            "queued",
+            "reviewing",
+            "reviewed",
+            "selected",
+            "investigate",
+            "excluded",
+            "errors",
+            "reasons_ready",
+        )
+        return {label: _int(value) for label, value in zip(labels, row, strict=True)}
 
     def list_batches(self, job_id: str) -> list[dict[str, Any]]:
         with self.database.session() as session:
@@ -2555,9 +2766,14 @@ class OperationsRepository:
         }
 
     @staticmethod
-    def _file_dict(row: FileRecord) -> dict[str, Any]:
+    def _file_dict(
+        row: FileRecord,
+        *,
+        include_detail: bool = True,
+    ) -> dict[str, Any]:
         return {
             "id": row.id,
+            "file_id": row.file_id,
             "repository": row.repository,
             "project_accession": row.project_accession,
             "native_id": row.native_id,
@@ -2567,13 +2783,32 @@ class OperationsRepository:
             "file_format": row.file_format,
             "file_category": row.file_category,
             "file_role": row.file_role,
+            "selection_role": row.selection_role,
+            "family_id": row.family_id,
+            "companion_file_ids": row.companion_file_ids or [],
             "acquisition_mode": row.acquisition_mode,
             "size_bytes": row.size_bytes,
             "status": row.status,
+            "review_status": row.review_status,
+            "decision": row.decision,
+            "reason_status": row.reason_status,
+            "reason_scope": row.reason_scope,
+            "reason_text": row.reason_text if include_detail else None,
+            "reason_preview": (
+                str(row.reason_text or "")[:180]
+                if row.reason_text
+                else None
+            ),
+            "grade": row.grade,
+            "hard_gate": row.hard_gate,
+            "confidence": row.confidence,
+            "judgment_model_id": row.judgment_model_id,
+            "judgment_version": row.judgment_version,
+            "limitations": (row.limitations or []) if include_detail else [],
             "eligible": row.eligible,
             "reason_code": row.reason_code,
             "reasons": row.reasons or [],
-            "evidence": row.evidence or {},
+            "evidence": (row.evidence or {}) if include_detail else {},
             "updated_at": row.updated_at,
         }
 

@@ -297,6 +297,10 @@ async def operations_job_files(
     query: str = "",
     sort: str = "project_accession",
     direction: Literal["asc", "desc"] = "asc",
+    cursor: Annotated[int | None, Query(ge=0)] = None,
+    review_status: str = "",
+    decision: str = "",
+    reason_status: str = "",
 ) -> dict[str, Any]:
     _job_or_404(job_id)
     return get_operations_repository().list_files(
@@ -308,7 +312,20 @@ async def operations_job_files(
         query=query,
         sort=sort,
         direction=direction,
+        cursor=cursor,
+        review_status=review_status,
+        decision=decision,
+        reason_status=reason_status,
     ).as_dict()
+
+
+@router.get("/jobs/{job_id}/files/{file_id}")
+async def operations_job_file(job_id: str, file_id: str) -> dict[str, Any]:
+    _job_or_404(job_id)
+    item = get_operations_repository().get_file(job_id, file_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    return item
 
 
 @router.get("/jobs/{job_id}/batches")

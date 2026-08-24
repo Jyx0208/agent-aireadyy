@@ -75,6 +75,8 @@ from agent.discovery.publication import (
     materialize_build_ready_package,
 )
 from agent.discovery.project_judgment import ProjectJudgmentInput, summarize_project_judgments
+from agent.discovery.file_family import FileFamily
+from agent.discovery.file_judgment import FileJudgmentInput, summarize_file_judgments
 from agent.discovery.query_builder import build_pride_queries
 from agent.discovery.search_environment import (
     CandidateInspectionAction,
@@ -356,6 +358,52 @@ def submit_project_judgments(
     wrapper.context.raise_if_cancelled()
     return json.dumps(
         wrapper.context.service.record_project_judgments(judgments),
+        ensure_ascii=False,
+    )
+
+
+def submit_file_judgments(
+    wrapper: RunContextWrapper[DiscoveryAgentContext],
+    judgments: list[FileJudgmentInput],
+    families: list[FileFamily] | None = None,
+) -> str:
+    """Persist independent file judgments and optional primary/companion families.
+
+    Args:
+        judgments: One evidence-grounded judgment per exact file_id. Included files need
+            file-level evidence. Full reason_text is required before freezing selection.
+        families: Optional primary/SDRF/result-file relationships established from evidence.
+    """
+    wrapper.context.raise_if_cancelled()
+    return json.dumps(
+        wrapper.context.service.record_file_judgments(judgments, families),
+        ensure_ascii=False,
+    )
+
+
+def get_file_review_batch(
+    wrapper: RunContextWrapper[DiscoveryAgentContext],
+    after_file_id: str = "",
+    limit: Annotated[int, Field(ge=1, le=50)] = 30,
+) -> str:
+    """Return the next compact, unreviewed file batch with exact evidence refs."""
+    wrapper.context.raise_if_cancelled()
+    return compact_agent_tool_json(
+        wrapper.context.service.get_file_review_batch(
+            after_file_id=after_file_id,
+            limit=limit,
+        )
+    )
+
+
+def freeze_file_selection(
+    wrapper: RunContextWrapper[DiscoveryAgentContext],
+    file_ids: list[str],
+) -> str:
+    """Freeze exact file IDs after reasons, evidence, and companion closure pass."""
+    wrapper.context.raise_if_cancelled()
+    return json.dumps(
+        wrapper.context.service.freeze_file_selection(file_ids),
         ensure_ascii=False,
     )
 
@@ -2034,6 +2082,9 @@ def run_openai_agents_discovery(
             tools = [
                 sdk["function_tool"](inspect_project_sdrf),
                 sdk["function_tool"](submit_project_judgments),
+                sdk["function_tool"](get_file_review_batch),
+                sdk["function_tool"](submit_file_judgments),
+                sdk["function_tool"](freeze_file_selection),
                 sdk["function_tool"](get_discovery_state),
                 sdk["function_tool"](get_portfolio_state),
                 sdk["function_tool"](assess_portfolio_coverage),
@@ -2066,6 +2117,9 @@ def run_openai_agents_discovery(
                 sdk["function_tool"](inspect_repository_candidates),
                 sdk["function_tool"](inspect_project_sdrf),
                 sdk["function_tool"](submit_project_judgments),
+                sdk["function_tool"](get_file_review_batch),
+                sdk["function_tool"](submit_file_judgments),
+                sdk["function_tool"](freeze_file_selection),
                 sdk["function_tool"](get_discovery_state),
                 sdk["function_tool"](get_portfolio_state),
                 sdk["function_tool"](assess_portfolio_coverage),
@@ -2086,6 +2140,9 @@ def run_openai_agents_discovery(
                 sdk["function_tool"](inspect_repository_candidates),
                 sdk["function_tool"](inspect_project_sdrf),
                 sdk["function_tool"](submit_project_judgments),
+                sdk["function_tool"](get_file_review_batch),
+                sdk["function_tool"](submit_file_judgments),
+                sdk["function_tool"](freeze_file_selection),
                 sdk["function_tool"](get_discovery_state),
                 sdk["function_tool"](get_portfolio_state),
                 sdk["function_tool"](assess_portfolio_coverage),
@@ -2864,6 +2921,17 @@ def _quality_first_discovery_instructions(
         "paths are not inspection evidence, and unresolved constraint facts belong in missing_information. "
         "After project/file/SDRF inspection, call submit_project_judgments again "
         "for the same accessions so the inspection judgment replaces the provisional judgment. "
+        "After project judgments are evidence-backed, review the actual files. Repeatedly call "
+        "get_file_review_batch with batches of 20-40 files, then call submit_file_judgments with "
+        "exactly one independent result per returned file_id. The project is context only: a good "
+        "project never automatically includes its PDF, README, checksum, or every acquisition file. "
+        "First submit compact structural decisions and reason_outline values. Every investigate or "
+        "exclude file must already contain a concise reason_text explaining the missing evidence or "
+        "failed requirement. Then, only for decision "
+        "include files, submit a second version containing one coherent Chinese reason_text grounded "
+        "in the exact evidence_refs and describing material limitations and required companions. "
+        "If a file_id is omitted, retry only that missing file. Once all selected reasons are ready, "
+        "call freeze_file_selection with exact file_ids; do not freeze project accessions. "
         "Every inspection-backed judgment must populate evidence_refs using exact field names from "
         "project_assessments.available_evidence_refs. For every request.scientific_constraints item, "
         "add one constraint_assessment with status, observed_value, concise reason, and evidence_refs. "
@@ -3383,6 +3451,7 @@ def _write_run_outputs(
         run.project_judgments,
         target_project_count=int((run.request or {}).get("max_projects") or 1),
     )
+    file_judgment_summary = summarize_file_judgments(run.file_judgments.values())
     summary = {
         "schema_version": "openai-agents-discovery/v2",
         "status": run.status,
@@ -3424,6 +3493,16 @@ def _write_run_outputs(
             accession: judgment.model_dump(mode="json")
             for accession, judgment in run.project_judgments.items()
         },
+        "file_judgment_summary": file_judgment_summary,
+        "file_judgments": {
+            file_id: judgment.model_dump(mode="json")
+            for file_id, judgment in run.file_judgments.items()
+        },
+        "file_families": {
+            family_id: family.model_dump(mode="json")
+            for family_id, family in run.file_families.items()
+        },
+        "selected_file_ids": run.selected_file_ids,
         "qualified_no_gain_count": run.qualified_no_gain_count,
         "budget_audit": budget_audit,
         "tool_call_count": run.tool_call_count,

@@ -183,15 +183,38 @@ class FileRecord(Base):
     repository: Mapped[str] = mapped_column(String(48), nullable=False, default="pride")
     project_accession: Mapped[str] = mapped_column(String(96), nullable=False)
     native_id: Mapped[str] = mapped_column(String(900), nullable=False)
+    file_id: Mapped[str | None] = mapped_column(String(80))
     file_name: Mapped[str] = mapped_column(String(900), nullable=False)
     logical_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
     download_url: Mapped[str] = mapped_column(Text, nullable=False, default="")
     file_format: Mapped[str] = mapped_column(String(96), nullable=False, default="")
     file_category: Mapped[str] = mapped_column(String(96), nullable=False, default="")
     file_role: Mapped[str] = mapped_column(String(96), nullable=False, default="")
+    selection_role: Mapped[str] = mapped_column(
+        String(48), nullable=False, default="primary_input"
+    )
+    family_id: Mapped[str | None] = mapped_column(String(100))
+    companion_file_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     acquisition_mode: Mapped[str] = mapped_column(String(48), nullable=False, default="unknown")
     size_bytes: Mapped[int | None] = mapped_column(BigInteger)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="candidate")
+    review_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="unreviewed"
+    )
+    decision: Mapped[str | None] = mapped_column(String(32))
+    reason_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending"
+    )
+    reason_scope: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="project_legacy"
+    )
+    reason_text: Mapped[str | None] = mapped_column(Text)
+    grade: Mapped[int | None] = mapped_column(Integer)
+    hard_gate: Mapped[str | None] = mapped_column(String(24))
+    confidence: Mapped[float | None] = mapped_column(Float)
+    judgment_model_id: Mapped[str | None] = mapped_column(String(160))
+    judgment_version: Mapped[str | None] = mapped_column(String(80))
+    limitations: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     reason_code: Mapped[str | None] = mapped_column(String(160))
     reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
@@ -211,6 +234,15 @@ class FileRecord(Base):
         ),
         Index("ix_file_records_job_eligible", "job_id", "eligible"),
         Index("ix_file_records_job_project", "job_id", "project_accession"),
+        Index("ix_file_records_job_file_id", "job_id", "file_id", unique=True),
+        Index(
+            "ix_file_records_job_review_decision_id",
+            "job_id",
+            "review_status",
+            "decision",
+            "id",
+        ),
+        Index("ix_file_records_job_family_id", "job_id", "family_id", "id"),
         Index("ix_file_records_name", "file_name"),
     )
 

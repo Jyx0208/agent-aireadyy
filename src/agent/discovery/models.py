@@ -2,9 +2,16 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from agent.discovery.constraints import ScientificConstraint
+from agent.discovery.file_judgment import (
+    FileDecision,
+    FileReasonStatus,
+    FileReviewStatus,
+    FileSelectionRole,
+    stable_file_id,
+)
 from agent.models import JsonModel
 
 
@@ -163,6 +170,7 @@ class DiscoveredProject(JsonModel):
 
 
 class DiscoveredFile(JsonModel):
+    file_id: str = ""
     repository: DiscoveryRepository = "pride"
     project_accession: str
     project_source_url: str | None = None
@@ -175,6 +183,9 @@ class DiscoveredFile(JsonModel):
     transfer_method: str | None = None
     file_type: str
     file_role: FileRole = "unknown"
+    selection_role: FileSelectionRole = "primary_input"
+    family_id: str | None = None
+    companion_file_ids: list[str] = Field(default_factory=list)
     file_role_reasons: list[str] = Field(default_factory=list)
     sdrf_match_status: SdrfMatchStatus = "not_checked"
     evidence_level: EvidenceLevel = "unknown"
@@ -233,6 +244,12 @@ class DiscoveredFile(JsonModel):
     review_decision: str | None = None
     review_reason: str | None = None
     review_note: str | None = None
+    review_status: FileReviewStatus = "unreviewed"
+    decision: FileDecision | None = None
+    reason_status: FileReasonStatus = "pending"
+    reason_scope: Literal["file", "project_legacy"] = "project_legacy"
+    reason_text: str | None = None
+    judgment_version: str | None = None
     evidence: list[DiscoveryEvidence] = Field(default_factory=list)
     instrument_names: list[str] = Field(default_factory=list)
     instrument_families: list[str] = Field(default_factory=list)
@@ -244,6 +261,16 @@ class DiscoveredFile(JsonModel):
     lc_gradient_minutes: float | None = None
     diversity_tags: list[str] = Field(default_factory=list)
     raw_record: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def ensure_file_id(self) -> "DiscoveredFile":
+        if not self.file_id:
+            self.file_id = stable_file_id(
+                str(self.repository),
+                self.project_accession,
+                str(self.file_accession_or_path or self.file_name),
+            )
+        return self
 
 
 class DatasetManifest(JsonModel):

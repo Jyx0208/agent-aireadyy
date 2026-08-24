@@ -36,6 +36,7 @@ import {
 import {
   cancelOperationsJob,
   getOperationsBatches,
+  getOperationsFile,
   getOperationsFiles,
   getOperationsReviews,
   getOperationsTerms,
@@ -44,6 +45,7 @@ import {
   resumeOperationsJob,
   type OperationsBatch,
   type OperationsEvent,
+  type OperationsFile,
   type OperationsJob,
   type OperationsReview,
   type OperationsTerm,
@@ -569,6 +571,191 @@ function Files({ jobId }: { jobId: string }) {
         }}
       />
     </div>
+  );
+}
+
+const fileReviewViews = [
+  { id: "all", label: "全部" },
+  { id: "unreviewed", label: "未评审" },
+  { id: "reviewing", label: "正在评审" },
+  { id: "reviewed", label: "已评审" },
+  { id: "selected", label: "已入选" },
+  { id: "investigate", label: "待核查" },
+  { id: "excluded", label: "未纳入" },
+  { id: "error", label: "错误" },
+] as const;
+
+function FileReviewBoard({ jobId }: { jobId: string }) {
+  const [pageSize, setPageSize] = useState(25);
+  const [search, setSearch] = useState("");
+  const [viewIndex, setViewIndex] = useState(0);
+  const [cursors, setCursors] = useState<number[]>([0]);
+  const [selectedFileId, setSelectedFileId] = useState("");
+  const deferredSearch = useDeferredValue(search);
+  const view = fileReviewViews[viewIndex].id;
+  const cursor = cursors.at(-1) || 0;
+  const reviewStatus = ["unreviewed", "reviewing", "reviewed", "error"].includes(view)
+    ? view
+    : "";
+  const decision = view === "selected"
+    ? "include"
+    : view === "investigate"
+      ? "investigate"
+      : view === "excluded"
+        ? "exclude"
+        : "";
+
+  useEffect(() => {
+    setCursors([0]);
+    setSelectedFileId("");
+  }, [deferredSearch, pageSize, view]);
+
+  const query = useQuery({
+    queryKey: ["operations-job-detail", jobId, "file-review", cursor, pageSize, view, deferredSearch],
+    queryFn: ({ signal }) => getOperationsFiles(jobId, {
+      page: 1,
+      pageSize,
+      cursor,
+      reviewStatus,
+      decision,
+      query: deferredSearch,
+      sort: "id",
+    }, signal),
+    placeholderData: (previous) => previous,
+  });
+  const detailQuery = useQuery({
+    queryKey: ["operations-job-detail", jobId, "file", selectedFileId],
+    queryFn: ({ signal }) => getOperationsFile(jobId, selectedFileId, signal),
+    enabled: Boolean(selectedFileId),
+  });
+  const filesByRowId = new Map((query.data?.items || []).map((file) => [String(file.id), file]));
+  const rows = (query.data?.items || []).map((file) => ({
+    id: String(file.id),
+    project: file.project_accession,
+    file: file.file_name,
+    role: file.selection_role || file.file_role || "—",
+    status: file.review_status || file.status,
+    decision: file.decision || "—",
+    reason: file.reason_preview || file.reason_code || "点击文件名查看理由",
+  }));
+  const headers = [
+    { key: "project", header: "项目" },
+    { key: "file", header: "文件" },
+    { key: "role", header: "文件角色" },
+    { key: "status", header: "评审状态" },
+    { key: "decision", header: "判断" },
+    { key: "reason", header: "文件级理由" },
+  ];
+  const summary = query.data?.summary || {};
+  const cards: Array<[string, unknown]> = [
+    ["总文件", summary.total],
+    ["未评审", summary.unreviewed],
+    ["正在评审", summary.reviewing],
+    ["已入选", summary.selected],
+    ["待核查", summary.investigate],
+    ["未纳入", summary.excluded],
+  ];
+
+  return (
+    <div className="ops-section-stack">
+      <div className="ops-file-summary" aria-label="文件评审进度">
+        {cards.map(([label, value]) => (
+          <Tile key={String(label)}>
+            <p className="ops-eyebrow">{label}</p>
+            <strong>{Number(value || 0)}</strong>
+          </Tile>
+        ))}
+      </div>
+      <Tabs selectedIndex={viewIndex} onChange={({ selectedIndex }) => setViewIndex(selectedIndex)}>
+        <TabList aria-label="按文件评审状态查看">
+          {fileReviewViews.map((item) => <Tab key={item.id}>{item.label}</Tab>)}
+        </TabList>
+      </Tabs>
+      <Search
+        id="file-review-search"
+        labelText="搜索文件"
+        placeholder="搜索项目编号、文件名或格式"
+        value={search}
+        onChange={(event) => setSearch(event.currentTarget.value)}
+      />
+      <DataTable rows={rows} headers={headers} size="lg" useZebraStyles>
+        {({ rows: tableRows, headers: tableHeaders, getHeaderProps, getRowProps, getTableProps }) => (
+          <div className="ops-table-wrap">
+            <Table {...getTableProps()}>
+              <TableHead><TableRow>
+                {tableHeaders.map((header) => {
+                  const props = getHeaderProps({ header });
+                  const { key, ...rest } = props;
+                  return <TableHeader key={key} {...rest}>{header.header}</TableHeader>;
+                })}
+              </TableRow></TableHead>
+              <TableBody>
+                {tableRows.map((row) => {
+                  const props = getRowProps({ row });
+                  const { key, ...rest } = props;
+                  return <TableRow key={key} {...rest}>
+                    {row.cells.map((cell, index) => <TableCell key={cell.id}>
+                      {index === 1 ? (
+                        <Button size="sm" kind="ghost" onClick={() => {
+                          const file = filesByRowId.get(row.id);
+                          setSelectedFileId(String(file?.file_id || ""));
+                        }}>{cell.value}</Button>
+                      ) : cell.value}
+                    </TableCell>)}
+                  </TableRow>;
+                })}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </DataTable>
+      <div className="ops-action-row">
+        <Button kind="secondary" size="sm" disabled={cursors.length === 1} onClick={() => setCursors((values) => values.slice(0, -1))}>上一页</Button>
+        <span>第 {cursors.length} 页，每页 {pageSize} 个文件</span>
+        <Button kind="secondary" size="sm" disabled={!query.data?.has_next || !query.data.next_cursor} onClick={() => {
+          const next = Number(query.data?.next_cursor || 0);
+          if (next) setCursors((values) => [...values, next]);
+        }}>下一页</Button>
+        {[25, 50, 100].map((size) => (
+          <Button key={size} kind={pageSize === size ? "primary" : "ghost"} size="sm" onClick={() => setPageSize(size)}>{size}/页</Button>
+        ))}
+      </div>
+      {selectedFileId ? (
+        <FileReasonPanel file={detailQuery.data as OperationsFile | undefined} loading={detailQuery.isLoading} onClose={() => setSelectedFileId("")} />
+      ) : null}
+    </div>
+  );
+}
+
+function FileReasonPanel({ file, loading, onClose }: { file?: OperationsFile; loading: boolean; onClose: () => void }) {
+  return (
+    <aside className="ops-evidence-panel" aria-label="文件判断详情">
+      <Layer className="ops-evidence-panel__inner">
+        <div className="ops-evidence-panel__header">
+          <div><p className="ops-eyebrow">FILE REVIEW</p><h2>{file?.file_name || "正在读取…"}</h2></div>
+          <Button size="sm" kind="ghost" onClick={onClose}>关闭</Button>
+        </div>
+        {loading ? <SkeletonText paragraph lineCount={5} /> : <>
+          <dl className="ops-evidence-summary">
+            <div><dt>项目</dt><dd>{file?.project_accession || "—"}</dd></div>
+            <div><dt>评审状态</dt><dd>{file?.review_status || "—"}</dd></div>
+            <div><dt>判断</dt><dd>{file?.decision || "—"}</dd></div>
+            <div><dt>等级</dt><dd>{file?.grade ?? "—"}</dd></div>
+            <div><dt>置信度</dt><dd>{file?.confidence ?? "—"}</dd></div>
+            <div><dt>理由状态</dt><dd>{file?.reason_status || "—"}</dd></div>
+          </dl>
+          <h3>{file?.decision === "include" ? "入选理由" : "未入选理由"}</h3>
+          <p>{file?.reason_text || "该文件尚未完成评审，因此还没有理由。"}</p>
+          {file?.companion_file_ids?.length ? <p>配套文件：{file.companion_file_ids.join("、")}</p> : null}
+          <Accordion align="start">
+            <AccordionItem title="限制与注意事项">
+              {file?.limitations?.length ? <ul>{file.limitations.map((item) => <li key={item}>{item}</li>)}</ul> : <p>没有额外限制。</p>}
+            </AccordionItem>
+            <AccordionItem title="证据记录"><pre>{JSON.stringify(file?.evidence || {}, null, 2)}</pre></AccordionItem>
+          </Accordion>
+        </>}
+      </Layer>
+    </aside>
   );
 }
 
@@ -1196,7 +1383,7 @@ export function OperationsConsole({
               </div>
               <span>混合项目只纳入通过文件级判断的文件</span>
             </div>
-            <Files jobId={jobId} />
+            <FileReviewBoard jobId={jobId} />
           </section>
           <section hidden={activeTab !== "batches"} className="ops-tab-panel">
             <div className="ops-section-heading">

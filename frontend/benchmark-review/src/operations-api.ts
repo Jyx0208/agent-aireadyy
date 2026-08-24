@@ -119,6 +119,7 @@ export type OperationsReview = {
 
 export type OperationsFile = {
   id: number;
+  file_id?: string | null;
   repository: string;
   project_accession: string;
   native_id: string;
@@ -128,9 +129,24 @@ export type OperationsFile = {
   file_format: string;
   file_category: string;
   file_role: string;
+  selection_role: string;
+  family_id?: string | null;
+  companion_file_ids: string[];
   acquisition_mode: string;
   size_bytes?: number | null;
   status: string;
+  review_status: string;
+  decision?: string | null;
+  reason_status: string;
+  reason_scope: string;
+  reason_text?: string | null;
+  reason_preview?: string | null;
+  grade?: number | null;
+  hard_gate?: string | null;
+  confidence?: number | null;
+  judgment_model_id?: string | null;
+  judgment_version?: string | null;
+  limitations: string[];
   eligible: boolean;
   reason_code?: string | null;
   reasons: string[];
@@ -190,6 +206,7 @@ export type OperationsPage<T> = {
   pages: number;
   has_previous: boolean;
   has_next: boolean;
+  next_cursor?: number | null;
   summary?: WorkflowRecord;
 };
 
@@ -267,6 +284,10 @@ export const getOperationsFiles = (
     query?: string;
     sort?: string;
     direction?: "asc" | "desc";
+    cursor?: number | null;
+    reviewStatus?: string;
+    decision?: string;
+    reasonStatus?: string;
   },
   signal?: AbortSignal,
 ) =>
@@ -279,7 +300,21 @@ export const getOperationsFiles = (
       query: options.query,
       sort: options.sort,
       direction: options.direction,
+      cursor: options.cursor,
+      review_status: options.reviewStatus,
+      decision: options.decision,
+      reason_status: options.reasonStatus,
     })}`,
+    { signal },
+  );
+
+export const getOperationsFile = (
+  jobId: string,
+  fileId: string,
+  signal?: AbortSignal,
+) =>
+  workflowJson<OperationsFile & WorkflowRecord>(
+    `/api/ops/jobs/${encodeURIComponent(jobId)}/files/${encodeURIComponent(fileId)}`,
     { signal },
   );
 

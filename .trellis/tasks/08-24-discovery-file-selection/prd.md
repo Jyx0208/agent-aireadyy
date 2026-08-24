@@ -15,14 +15,14 @@ Turn Discovery into a file-level, evidence-backed selection system with independ
 
 ## Cross-child acceptance criteria
 
-- [ ] Every selected file has an independent, coherent model reason and valid evidence references.
-- [ ] Required SDRF/companions are included once and linked to their primary files.
-- [ ] Project-level judgment cannot authorize unrelated files.
-- [ ] PRIDE searches and file inventories are exhaustive or explicitly marked truncated.
-- [ ] Web status separates review progress from selection decisions and remains responsive at 100,000 files.
-- [ ] Excel is a readable selected-file summary; Parquet/JSONL retain complete authority data.
+- [x] Every selected file has an independent, coherent model reason and valid evidence references.
+- [x] Every reviewed excluded or investigate file has a concise file-level model reason.
+- [x] Required SDRF/companions are included once and linked to their primary files.
+- [x] Project-level judgment cannot authorize unrelated files.
+- [x] PRIDE searches and file inventories are exhaustive or explicitly marked truncated.
+- [x] Web status separates review progress from selection decisions with cursor paging and lazy detail.
+- [x] Excel is a readable selected-file summary; Parquet/JSONL retain complete authority data.
 
 ## Source plan
 
 The user-reviewed detailed plan remains in repository-root `task_plan.md`.
-

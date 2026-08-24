@@ -32,6 +32,14 @@ from agent.discovery.constraints import (
     is_substantive_constraint_value,
 )
 from agent.discovery.manifest import write_dataset_manifest
+from agent.discovery.file_family import FileFamily, freeze_file_selection as close_file_selection
+from agent.discovery.file_judgment import (
+    FileJudgmentInput,
+    check_file_evidence,
+    is_file_selection_ready,
+    summarize_file_judgments,
+)
+from agent.discovery.file_review import file_evidence_values, file_review_summary
 from agent.discovery.memory import DiscoveryMemory
 from agent.discovery.models import DatasetManifest, DatasetRequest, DiscoveredFile, DiscoveredProject
 from agent.discovery.portfolio import (
@@ -1364,6 +1372,7 @@ class DiscoveryToolService:
             paths = write_dataset_manifest(
                 batch_manifest,
                 self.output_dir / "verified_batches" / f"batch_{batch_index:03d}",
+                include_file_exports=False,
             )
             batch_record = VerifiedProjectBatch(
                 batch_index=batch_index,
@@ -1433,7 +1442,11 @@ class DiscoveryToolService:
             }
             manifest = manifest.model_copy(update={"run_id": self.run_id, "summary": summary})
             round_dir = self.output_dir / f"round_{round_index:02d}"
-            paths = write_dataset_manifest(manifest, round_dir)
+            paths = write_dataset_manifest(
+                manifest,
+                round_dir,
+                include_file_exports=False,
+            )
             events = self.store.list_events(self.run_id)
             search_event = next(
                 (
@@ -1478,7 +1491,11 @@ class DiscoveryToolService:
                 run_id=self.run_id,
                 retain_all_candidates=True,
             )
-            pool_paths = write_dataset_manifest(pool_manifest, self.output_dir / "candidate_pool")
+            pool_paths = write_dataset_manifest(
+                pool_manifest,
+                self.output_dir / "candidate_pool",
+                include_file_exports=False,
+            )
             pool_observation = _observation_from_manifest(
                 pool_manifest,
                 round_index=round_index,
@@ -1915,7 +1932,11 @@ class DiscoveryToolService:
             }
             manifest = manifest.model_copy(update={"run_id": self.run_id, "summary": summary})
             round_dir = self.output_dir / f"round_{round_index:02d}"
-            paths = write_dataset_manifest(manifest, round_dir)
+            paths = write_dataset_manifest(
+                manifest,
+                round_dir,
+                include_file_exports=False,
+            )
             observation = _observation_from_manifest(
                 manifest,
                 round_index=round_index,
@@ -1954,7 +1975,11 @@ class DiscoveryToolService:
                 run_id=self.run_id,
                 retain_all_candidates=True,
             )
-            pool_paths = write_dataset_manifest(pool_manifest, self.output_dir / "candidate_pool")
+            pool_paths = write_dataset_manifest(
+                pool_manifest,
+                self.output_dir / "candidate_pool",
+                include_file_exports=False,
+            )
             pool_observation = _observation_from_manifest(
                 pool_manifest,
                 round_index=round_index,
@@ -2456,6 +2481,226 @@ class DiscoveryToolService:
         )
         return payload
 
+    def get_file_review_batch(
+        self,
+        *,
+        after_file_id: str = "",
+        limit: int = 30,
+    ) -> dict[str, Any]:
+        """Return the next compact file batch without embedding whole manifests."""
+
+        run = self._require_run()
+        manifest_path = str(
+            run.candidate_pool_manifest_path or run.current_manifest_path or ""
+        ).strip()
+        if not manifest_path or not Path(manifest_path).exists():
+            return {"status": "blocked", "blockers": ["file_manifest_required"]}
+        manifest = _load_manifest(Path(manifest_path))
+        files = sorted(manifest.files, key=lambda item: item.file_id)
+        if after_file_id:
+            files = [file for file in files if file.file_id > after_file_id]
+        pending = [file for file in files if file.file_id not in run.file_judgments]
+        batch = pending[: max(1, min(int(limit), 50))]
+        next_cursor = batch[-1].file_id if batch else None
+        payload = {
+            "status": "completed",
+            "items": [file_review_summary(file) for file in batch],
+            "next_cursor": next_cursor,
+            "has_more": len(pending) > len(batch),
+            "remaining": len(pending),
+            "file_judgment_summary": summarize_file_judgments(
+                run.file_judgments.values()
+            ),
+        }
+        if batch:
+            self.store.append_event(
+                self.run_id,
+                "file_review_batch_started",
+                {
+                    "file_ids": [file.file_id for file in batch],
+                    "count": len(batch),
+                    "items": [
+                        {
+                            "file_id": file.file_id,
+                            "project_accession": file.project_accession,
+                            "file_name": file.file_name,
+                            "file_type": file.file_type,
+                            "file_role": file.file_role,
+                            "selection_role": file.selection_role,
+                            "family_id": file.family_id,
+                            "companion_file_ids": file.companion_file_ids,
+                        }
+                        for file in batch
+                    ],
+                },
+            )
+        return payload
+
+    def record_file_judgments(
+        self,
+        judgments: list[FileJudgmentInput],
+        families: list[FileFamily] | None = None,
+    ) -> dict[str, Any]:
+        """Persist one independently evidenced judgment per repository file."""
+
+        run = self._require_run()
+        policy = evaluate_tool_policy("submit_file_judgments", run)
+        if policy.outcome != "allow":
+            return {"status": "blocked", "blockers": [policy.reason]}
+        if not judgments:
+            return {"status": "blocked", "blockers": ["file_judgments_required"]}
+
+        manifest_path = str(
+            run.candidate_pool_manifest_path or run.current_manifest_path or ""
+        ).strip()
+        if not manifest_path or not Path(manifest_path).exists():
+            return {"status": "blocked", "blockers": ["file_manifest_required"]}
+        manifest = _load_manifest(Path(manifest_path))
+        files_by_id = {file.file_id: file for file in manifest.files}
+        unknown = sorted(
+            judgment.file_id
+            for judgment in judgments
+            if judgment.file_id not in files_by_id
+        )
+        if unknown:
+            return {
+                "status": "blocked",
+                "blockers": ["unknown_file_ids"],
+                "file_ids": unknown,
+            }
+
+        judgments = [
+            judgment.model_copy(
+                update={
+                    "selection_role": files_by_id[judgment.file_id].selection_role,
+                    "family_id": (
+                        files_by_id[judgment.file_id].family_id
+                        or judgment.family_id
+                    ),
+                    "companion_file_ids": list(
+                        dict.fromkeys(
+                            [
+                                *files_by_id[judgment.file_id].companion_file_ids,
+                                *judgment.companion_file_ids,
+                            ]
+                        )
+                    ),
+                }
+            )
+            for judgment in judgments
+        ]
+
+        evidence_failures: dict[str, list[str]] = {}
+        for judgment in judgments:
+            if judgment.decision != "include":
+                continue
+            check = check_file_evidence(
+                judgment,
+                file_evidence_values(files_by_id[judgment.file_id]),
+            )
+            if check.status == "fail":
+                evidence_failures[judgment.file_id] = check.missing_refs
+        if evidence_failures:
+            return {
+                "status": "blocked",
+                "blockers": ["file_evidence_refs_invalid"],
+                "evidence_failures": evidence_failures,
+            }
+
+        merged = dict(run.file_judgments)
+        merged.update({judgment.file_id: judgment for judgment in judgments})
+        manifest_families = {
+            family.family_id: family
+            for raw_family in (manifest.summary.get("file_families") or [])
+            if isinstance(raw_family, dict)
+            for family in [FileFamily.model_validate(raw_family)]
+        }
+        merged_families = {**manifest_families, **run.file_families}
+        merged_families.update(
+            {family.family_id: family for family in (families or [])}
+        )
+        summary = summarize_file_judgments(merged.values())
+        run = self.store.save_run(
+            run.model_copy(
+                update={
+                    "file_judgments": merged,
+                    "file_families": merged_families,
+                    "tool_call_count": run.tool_call_count + 1,
+                }
+            )
+        )
+        payload = {
+            "status": "completed",
+            "recorded_count": len(judgments),
+            "file_judgment_summary": summary,
+        }
+        self.store.append_event(
+            self.run_id,
+            "file_review_batch_completed",
+            {
+                **payload,
+                "file_ids": [judgment.file_id for judgment in judgments],
+                "judgments": [
+                    judgment.model_dump(mode="json") for judgment in judgments
+                ],
+            },
+        )
+        reasons_ready = [
+            judgment.file_id
+            for judgment in judgments
+            if judgment.reason_status == "ready"
+        ]
+        if reasons_ready:
+            self.store.append_event(
+                self.run_id,
+                "file_reason_batch_completed",
+                {"file_ids": reasons_ready, "count": len(reasons_ready)},
+            )
+        return payload
+
+    def freeze_file_selection(self, file_ids: list[str]) -> dict[str, Any]:
+        """Freeze selected file IDs after evidence, reasons, and companions close."""
+
+        run = self._require_run()
+        policy = evaluate_tool_policy("freeze_file_selection", run)
+        if policy.outcome != "allow":
+            return {"status": "blocked", "blockers": [policy.reason]}
+        selected, blockers = close_file_selection(
+            file_ids,
+            run.file_judgments,
+            run.file_families.values(),
+        )
+        manifest_path = str(
+            run.candidate_pool_manifest_path or run.current_manifest_path or ""
+        ).strip()
+        manifest = _load_manifest(Path(manifest_path)) if manifest_path else None
+        files_by_id = (
+            {file.file_id: file for file in manifest.files}
+            if manifest is not None
+            else {}
+        )
+        for file_id in selected:
+            judgment = run.file_judgments.get(file_id)
+            file = files_by_id.get(file_id)
+            if judgment is None or file is None:
+                blockers.append(f"file_judgment_missing:{file_id}")
+                continue
+            check = check_file_evidence(judgment, file_evidence_values(file))
+            if not is_file_selection_ready(judgment, check):
+                blockers.append(f"file_not_selection_ready:{file_id}")
+        blockers = list(dict.fromkeys(blockers))
+        if blockers:
+            return {"status": "blocked", "blockers": blockers}
+
+        self.store.save_run(run.model_copy(update={"selected_file_ids": selected}))
+        payload = {
+            "status": "completed",
+            "selected_file_ids": selected,
+            "selected_file_count": len(selected),
+        }
+        self.store.append_event(self.run_id, "file_selection_changed", payload)
+        return payload
+
     def select_discovery_manifest(
         self,
         round_index: int,
@@ -2511,6 +2756,35 @@ class DiscoveryToolService:
             return self._selection_rejected(round_index, "manifest_round_not_found")
 
         manifest = _load_manifest(manifest_path)
+        if run.file_judgments:
+            if not run.selected_file_ids:
+                return self._selection_rejected(
+                    round_index,
+                    "file_selection_must_be_frozen_before_publication",
+                )
+            requested_file_ids = {
+                str(value).strip().casefold()
+                for value in (file_identifiers or run.selected_file_ids)
+                if str(value).strip()
+            }
+            frozen_file_ids = {
+                str(value).strip().casefold()
+                for value in run.selected_file_ids
+                if str(value).strip()
+            }
+            if requested_file_ids != frozen_file_ids:
+                return self._selection_rejected(
+                    round_index,
+                    "selection_file_ids_do_not_match_frozen_file_selection",
+                )
+            file_identifiers = list(requested_file_ids)
+            selected_accessions = sorted(
+                {
+                    file.project_accession.upper()
+                    for file in manifest.files
+                    if file.file_id.casefold() in frozen_file_ids
+                }
+            )
         portfolio_state: PortfolioState | None = None
         frozen_file_identifiers: set[str] = set()
         if self.request.portfolio_spec:
@@ -2732,6 +3006,12 @@ class DiscoveryToolService:
                     }
                 }
             )
+        if run.file_judgments:
+            manifest = _manifest_with_file_judgments(
+                manifest,
+                run.file_judgments,
+                run.file_families,
+            )
         selected_files = _selected_file_count(manifest)
         if selected_files <= 0:
             payload = {
@@ -2943,8 +3223,36 @@ class DiscoveryToolService:
         }
         eligible_accessions &= audit_delivery_accessions
 
+        if run.file_judgments and not run.selected_file_ids:
+            blocker = "file_selection_must_be_frozen_before_publication"
+            return self.store.save_run(
+                run.model_copy(
+                    update={
+                        "blockers": _dedupe([*run.blockers, blocker]),
+                        "stop_reason": "selection_quality_gate_not_completed",
+                    }
+                )
+            )
+
         def eligible_manifest(manifest: DatasetManifest) -> DatasetManifest | None:
-            if harvest_all and eligible_accessions:
+            selected_file_ids = {
+                file_id.casefold() for file_id in run.selected_file_ids
+            }
+            if run.file_judgments:
+                files = [
+                    file
+                    for file in manifest.files
+                    if file.file_id.casefold() in selected_file_ids
+                ]
+                selected_projects = {
+                    file.project_accession.upper() for file in files
+                }
+                projects = [
+                    project
+                    for project in manifest.projects
+                    if project.project_accession.upper() in selected_projects
+                ]
+            elif harvest_all and eligible_accessions:
                 projects = [
                     project
                     for project in manifest.projects
@@ -2971,6 +3279,7 @@ class DiscoveryToolService:
                 files = list(manifest.files)
             deliverable = _delivery_manifest_subset(
                 manifest.model_copy(update={"projects": projects, "files": files}),
+                selected_file_identifiers=selected_file_ids or None,
                 project_judgments=run.project_judgments,
                 scientific_constraints=self.request.scientific_constraints,
             )
@@ -2981,7 +3290,7 @@ class DiscoveryToolService:
                 request=self.request,
                 run_id=self.run_id,
             )
-            return filtered.model_copy(
+            filtered = filtered.model_copy(
                 update={
                     "summary": {
                         **filtered.summary,
@@ -3000,6 +3309,13 @@ class DiscoveryToolService:
                     }
                 }
             )
+            if run.file_judgments:
+                filtered = _manifest_with_file_judgments(
+                    filtered,
+                    run.file_judgments,
+                    run.file_families,
+                )
+            return filtered
 
         candidates: list[tuple[tuple[int, int, int, float], int, Path, DatasetManifest]] = []
         if run.candidate_pool_manifest_path:
@@ -4971,6 +5287,9 @@ class DiscoveryToolService:
             run.project_judgments,
             target_project_count=target_project_count,
         )
+        file_judgment_summary = summarize_file_judgments(
+            run.file_judgments.values()
+        )
         return {
             "run_id": run.run_id,
             "status": run.status,
@@ -5035,6 +5354,8 @@ class DiscoveryToolService:
                 for accession, judgment in run.project_judgments.items()
             },
             "project_judgment_summary": judgment_summary,
+            "file_judgment_summary": file_judgment_summary,
+            "selected_file_ids": run.selected_file_ids,
             "qualified_project_count": judgment_summary["qualified_projects"],
             "target_project_count": judgment_summary["qualified_target"],
             "quality_target_reached": judgment_summary["quality_target_reached"],
@@ -5537,7 +5858,12 @@ def _delivery_manifest_subset(
                 f"{file.file_accession_or_path or file.file_name}"
             ).casefold()
             short_identifier = str(file.file_accession_or_path or file.file_name).casefold()
-            if identifier not in selected_file_identifiers and short_identifier not in selected_file_identifiers:
+            stable_identifier = file.file_id.casefold()
+            if (
+                stable_identifier not in selected_file_identifiers
+                and identifier not in selected_file_identifiers
+                and short_identifier not in selected_file_identifiers
+            ):
                 continue
         if not _is_delivery_eligible(projects_by_accession.get(accession), file):
             continue
@@ -5558,6 +5884,67 @@ def _delivery_manifest_subset(
         and _is_delivery_eligible(project)
     ]
     return manifest.model_copy(update={"projects": projects, "files": files})
+
+
+def _manifest_with_file_judgments(
+    manifest: DatasetManifest,
+    judgments: dict[str, FileJudgmentInput],
+    families: dict[str, FileFamily],
+) -> DatasetManifest:
+    files: list[DiscoveredFile] = []
+    visible_judgments: dict[str, dict[str, Any]] = {}
+    for file in manifest.files:
+        judgment = judgments.get(file.file_id)
+        if judgment is None:
+            continue
+        visible_judgments[file.file_id] = judgment.model_dump(mode="json")
+        files.append(
+            file.model_copy(
+                update={
+                    "selection_role": judgment.selection_role,
+                    "family_id": judgment.family_id,
+                    "companion_file_ids": list(judgment.companion_file_ids),
+                    "review_status": judgment.review_status,
+                    "decision": judgment.decision,
+                    "reason_status": judgment.reason_status,
+                    "reason_scope": judgment.reason_scope,
+                    "reason_text": judgment.reason_text,
+                    "judgment_version": judgment.judgment_version,
+                    "review_decision": judgment.decision,
+                    "review_reason": judgment.reason_text
+                    or "; ".join(judgment.reason_outline),
+                }
+            )
+        )
+    selected_family_ids = {
+        judgment.family_id
+        for judgment in judgments.values()
+        if judgment.file_id in visible_judgments and judgment.family_id
+    }
+    visible_families = {
+        family_id: family.model_dump(mode="json")
+        for family_id, family in families.items()
+        if family_id in selected_family_ids
+    }
+    return manifest.model_copy(
+        update={
+            "files": files,
+            "summary": {
+                **manifest.summary,
+                "selected_files": len(files),
+                "file_judgment_summary": summarize_file_judgments(
+                    judgments[file.file_id] for file in files
+                ),
+                "file_judgments": visible_judgments,
+                "all_file_judgments": {
+                    file_id: judgment.model_dump(mode="json")
+                    for file_id, judgment in judgments.items()
+                },
+                "file_families": visible_families,
+                "selection_authority": "file_id",
+            },
+        }
+    )
 
 
 def _selected_file_count(manifest: DatasetManifest) -> int:

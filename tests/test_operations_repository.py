@@ -22,6 +22,7 @@ from agent.operations.models import (
     ProjectReview,
 )
 from agent.operations.state import InvalidJobTransition
+from agent.discovery.file_judgment import stable_file_id
 
 
 def settings(tmp_path: Path) -> OperationsSettings:
@@ -313,6 +314,83 @@ def test_operations_final_record_indexes_only_selected_files(tmp_path: Path):
         )
         assert [item["file_name"] for item in usable.items] == ["selected.raw"]
         assert [item["file_name"] for item in excluded.items] == ["excluded.dia"]
+    finally:
+        repository.close()
+
+
+def test_file_review_filters_cursor_and_detail_reason(tmp_path: Path):
+    repository = OperationsRepository(settings(tmp_path))
+    try:
+        files = []
+        for index, decision in enumerate(("include", "exclude", "investigate"), start=1):
+            native_id = f"sample-{index}.raw"
+            files.append(
+                {
+                    "repository": "pride",
+                    "project_accession": "PXD000003",
+                    "file_accession_or_path": native_id,
+                    "file_name": native_id,
+                    "file_id": stable_file_id("pride", "PXD000003", native_id),
+                    "review_status": "reviewed",
+                    "decision": decision,
+                    "reason_status": "ready",
+                    "reason_scope": "file",
+                    "reason_text": f"file-specific reason {index}",
+                    "judgment_confidence": 0.9,
+                }
+            )
+        repository.sync_legacy_job(
+            {
+                "job_id": "file-review-job",
+                "status": "completed",
+                "body": {"objective": "file review", "repository": "pride"},
+                "record": {"files": files},
+            }
+        )
+        repository.project_file_review_event(
+            "file-review-job",
+            "file_review_batch_started",
+            {"items": [files[0]]},
+        )
+        repository.project_file_review_event(
+            "file-review-job",
+            "file_review_batch_completed",
+            {
+                "judgments": [
+                    {
+                        **files[0],
+                        "review_status": "reviewed",
+                        "decision": "include",
+                        "reason_status": "ready",
+                    }
+                ]
+            },
+        )
+
+        first = repository.list_files(
+            "file-review-job",
+            page_size=1,
+            cursor=0,
+            review_status="reviewed",
+        )
+        second = repository.list_files(
+            "file-review-job",
+            page_size=1,
+            cursor=first.next_cursor,
+            review_status="reviewed",
+        )
+        excluded = repository.list_files(
+            "file-review-job",
+            cursor=0,
+            decision="exclude",
+        )
+        detail = repository.get_file("file-review-job", files[1]["file_id"])
+
+        assert first.items[0]["file_id"] != second.items[0]["file_id"]
+        assert first.items[0]["reason_text"] is None
+        assert excluded.summary and excluded.summary["excluded"] == 1
+        assert [item["decision"] for item in excluded.items] == ["exclude"]
+        assert detail and detail["reason_text"] == "file-specific reason 2"
     finally:
         repository.close()
 
