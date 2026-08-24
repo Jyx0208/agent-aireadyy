@@ -436,6 +436,14 @@ def test_manifest_respects_project_and_file_limits():
     assert len(manifest.files) == 2
     assert all(project.selected_file_count == 1 for project in manifest.projects)
     assert all(file.file_name.endswith((".raw", ".mzML")) for file in manifest.files)
+    assert manifest.summary["search_pagination"]
+    assert manifest.summary["search_pagination"][0]["mode"] == "budgeted"
+    assert manifest.summary["search_pagination"][0]["exhausted"] is True
+    assert all(
+        "file_inventory_truncated" in outcome
+        for outcome in manifest.summary["inspection_outcomes"]
+        if outcome["category"] != "not_inspected"
+    )
 
 
 def test_discovery_reports_project_metadata_score_and_evidence_fields():

@@ -8,7 +8,11 @@ from agent.input.normalizer import InputTask
 from agent.metadata.canonical import CanonicalFile, CanonicalMetadataValue, CanonicalProject
 from agent.metadata.context import build_project_context
 from agent.models import FileAsset, ProjectCandidate, ProjectContext, ProjectResolution
-from agent.pride.client import PrideClient
+from agent.pride.client import (
+    PrideClient,
+    PridePaginationState,
+    list_project_files_paginated_with_state,
+)
 from agent.pride.resolver import resolve_input_to_project
 
 
@@ -58,7 +62,19 @@ class PrideAdapter:
         return self.map_project(raw)
 
     def list_project_files(self, project: CanonicalProject) -> list[CanonicalFile]:
-        return [self.map_file(record, project) for record in self.client.list_project_files(project.primary_accession)]
+        files, _state = self.list_project_files_with_state(project)
+        return files
+
+    def list_project_files_with_state(
+        self,
+        project: CanonicalProject,
+    ) -> tuple[list[CanonicalFile], PridePaginationState]:
+        result = list_project_files_paginated_with_state(
+            self.client,
+            project.primary_accession,
+            mode="exhaustive",
+        )
+        return [self.map_file(record, project) for record in result.records], result.state
 
     def match_file(self, task: InputTask, files: list[CanonicalFile]) -> CanonicalFile | None:
         from agent.repositories.matching import match_canonical_file

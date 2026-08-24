@@ -120,9 +120,31 @@ def find_project_candidates(
 ) -> list[ProjectCandidate]:
     candidates: dict[str, ProjectCandidate] = {}
     for query, query_type in _normalized_variants(task):
-        for project in client.search_projects(query):
+        project_search = client.search_projects_with_state(
+            query,
+            mode="exhaustive",
+        )
+        for project in project_search.records:
             accession = project["accession"]
-            files = client.list_project_files(accession, keyword=query, max_files=max_files_per_project)
+            if max_files_per_project is None:
+                file_inventory = client.list_project_files_with_state(
+                    accession,
+                    mode="exhaustive",
+                    keyword=query,
+                )
+            else:
+                file_inventory = client.list_project_files_with_state(
+                    accession,
+                    mode="budgeted",
+                    keyword=query,
+                    max_files=max_files_per_project,
+                )
+                if file_inventory.state.truncated:
+                    raise RuntimeError(
+                        f"PRIDE file inventory for {accession} stopped at "
+                        f"{max_files_per_project} records; resolution would be incomplete"
+                    )
+            files = file_inventory.records
             for file_record in files:
                 scored = _score_file_match(query, file_record.get("fileName", ""), query_type)
                 if not scored:

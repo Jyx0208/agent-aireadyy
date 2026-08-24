@@ -76,4 +76,36 @@ def test_neutral_collector_dedupes_and_records_query_provenance() -> None:
     assert result.candidates[0]["matched_queries"] == client.queries
     assert result.candidates[0]["paired_raw_and_results"] is True
     assert result.candidates[0]["file_role_counts"]["raw_acquisition"] == 1
+    assert result.candidates[0]["file_inventory_exhausted"] is True
+    assert result.candidates[0]["file_inventory_truncated"] is False
     assert len(result.query_trace) == len(client.queries)
+    assert all(row["pagination"]["mode"] == "budgeted" for row in result.query_trace)
+    assert all(row["pagination"]["exhausted"] is True for row in result.query_trace)
+    assert all(row["pagination"]["truncated"] is False for row in result.query_trace)
+
+
+def test_neutral_collector_marks_candidates_outside_enrichment_as_not_inspected() -> None:
+    class TwoProjectClient(FakeClient):
+        def search_projects(self, keyword: str, page_size: int = 100):
+            self.queries.append(keyword)
+            return [
+                {"accession": "PXD000001", "title": "First"},
+                {"accession": "PXD000002", "title": "Second"},
+            ][:page_size]
+
+    result = collect_neutral_pool(
+        [_scenario()],
+        TwoProjectClient(),
+        query_depth=10,
+        max_candidates_per_variant=2,
+        enrich_projects=1,
+    )
+
+    second = next(
+        row for row in result.candidates if row["project_accession"] == "PXD000002"
+    )
+    assert second["selected_file_count"] == 0
+    assert second["file_inventory_stop_reason"] == "not_inspected"
+    assert second["file_inventory_exhausted"] is False
+    assert second["file_inventory_truncated"] is True
+    assert second["file_inventory_project_accession"] == "PXD000002"

@@ -81,6 +81,11 @@ def test_preflight_pride_download_candidates_writes_safe_candidates(tmp_path: Pa
     assert result["small_download_candidates"] == 1
     assert result["direct_export_candidate_projects"] == 1
     assert "PXD000900" not in {project["project_accession"] for project in result["projects"]}
+    assert result["repository_search_complete"] is True
+    assert result["search_pagination"][0]["mode"] == "budgeted"
+    assert result["search_pagination"][0]["exhausted"] is True
+    assert all(project["file_inventory_truncated"] is False for project in result["projects"])
+    assert all(project["file_inventory_exhausted"] is True for project in result["projects"])
 
     small_csv = tmp_path / "pride_download_preflight_small_download_candidates.csv"
     assert small_csv.exists()

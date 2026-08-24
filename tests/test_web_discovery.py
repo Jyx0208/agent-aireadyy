@@ -1310,6 +1310,41 @@ def test_local_discovery_enriches_project_directory_metadata(monkeypatch, tmp_pa
     assert created["files"][0]["fragmentation_methods"] == ["HCD"]
     assert created["files"][0]["lc_gradient_minutes"] == 90.0
     assert created["summary"]["metadata_enrichment"] == "pride_project_hint"
+    inventory = created["summary"]["pride_metadata_inventories"][0]
+    assert inventory["project_accession"] == "PXD000001"
+    assert inventory["file_inventory"]["exhausted"] is True
+    assert inventory["file_inventory"]["truncated"] is False
+    assert inventory["sdrf_inventory"]["exhausted"] is True
+
+
+def test_local_pride_context_keeps_inventory_schema_when_sdrf_lookup_fails() -> None:
+    class FailingSdrfClient(_FakePrideClient):
+        def list_project_files(
+            self,
+            accession: str,
+            keyword: str | None = None,
+            page_size: int = 1000,
+            max_files: int | None = None,
+        ):
+            if keyword == "sdrf":
+                raise RuntimeError("SDRF endpoint unavailable")
+            return super().list_project_files(
+                accession,
+                keyword=keyword,
+                page_size=page_size,
+                max_files=max_files,
+            )
+
+    context = web_app._load_local_pride_context(
+        "PXD000001",
+        DatasetRequest(max_files=5, max_files_per_project=5),
+        FailingSdrfClient(),
+    )
+
+    assert set(context["sdrf_inventory"]) == set(context["file_inventory"])
+    assert context["sdrf_inventory"]["stop_reason"] == "error"
+    assert context["sdrf_inventory"]["exhausted"] is False
+    assert context["sdrf_inventory"]["truncated"] is True
 
 
 def test_web_discovery_agentic_exposes_round_summary(monkeypatch, tmp_path: Path):

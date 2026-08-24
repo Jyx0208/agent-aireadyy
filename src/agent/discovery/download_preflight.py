@@ -6,7 +6,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agent.pride.client import PrideClient
+from agent.pride.client import (
+    PrideClient,
+    PridePaginationState,
+    list_project_files_paginated_with_state,
+    search_projects_paginated_with_state,
+)
 from agent.utils import write_json
 
 
@@ -132,7 +137,12 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerow(row)
 
 
-def _project_summary(project: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _project_summary(
+    project: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    file_inventory: PridePaginationState,
+) -> dict[str, Any]:
     role_counts = Counter(str(row["file_role"]) for row in rows)
     small_acquisition = [
         row
@@ -149,6 +159,7 @@ def _project_summary(project: dict[str, Any], rows: list[dict[str, Any]]) -> dic
         "project_accession": _accession(project),
         "project_title": _title(project),
         "files_seen": len(rows),
+        **file_inventory.to_prefixed_dict("file_inventory"),
         "role_counts": dict(role_counts),
         "small_acquisition_count": len(small_acquisition),
         "preferred_small_acquisition_count": len(preferred_small_acquisition),
@@ -178,13 +189,35 @@ def preflight_pride_download_candidates(
     pride = client or PrideClient(timeout=30)
     failures: list[dict[str, str]] = []
     project_records: list[dict[str, Any]] = []
+    search_pagination: list[dict[str, Any]] = []
 
     try:
         for query in queries:
             try:
-                project_records.extend(pride.search_projects(query, page_size=max_projects))
+                search_result = search_projects_paginated_with_state(
+                    pride,
+                    query,
+                    mode="budgeted",
+                    page_size=max(1, min(max_projects, 100)),
+                    max_results=max(1, max_projects),
+                )
+                project_records.extend(search_result.records)
+                search_pagination.append({"query": query, **search_result.state.to_dict()})
             except Exception as exc:  # pragma: no cover - network boundary
                 failures.append({"stage": "search_projects", "query": query, "error": str(exc)})
+                search_pagination.append(
+                    {
+                        "query": query,
+                        **PridePaginationState.unavailable(
+                            operation="search_projects",
+                            mode="budgeted",
+                            query_text=query,
+                            keyword=query,
+                            page_size=max(1, min(max_projects, 100)),
+                            stop_reason="error",
+                        ).to_dict(),
+                    }
+                )
             project_records = _dedupe_projects(project_records, max_projects, excluded)
             if len(project_records) >= max_projects:
                 break
@@ -199,7 +232,13 @@ def preflight_pride_download_candidates(
                 failures.append({"stage": "get_project", "project": accession, "error": str(exc)})
                 project = project_hit
             try:
-                files = pride.list_project_files(accession, max_files=max_files_per_project)
+                file_result = list_project_files_paginated_with_state(
+                    pride,
+                    accession,
+                    mode="budgeted",
+                    max_files=max(1, max_files_per_project),
+                )
+                files = file_result.records
             except Exception as exc:  # pragma: no cover - network boundary
                 failures.append({"stage": "list_project_files", "project": accession, "error": str(exc)})
                 continue
@@ -218,7 +257,13 @@ def preflight_pride_download_candidates(
                 )
                 project_rows.append(row)
                 all_rows.append(row)
-            project_summaries.append(_project_summary(project, project_rows))
+            project_summaries.append(
+                _project_summary(
+                    project,
+                    project_rows,
+                    file_inventory=file_result.state,
+                )
+            )
 
         small_download_candidates = [
             row
@@ -240,6 +285,11 @@ def preflight_pride_download_candidates(
             "max_files_per_project": max_files_per_project,
             "max_file_mb": max_file_mb,
             "projects_seen": len(project_records),
+            "repository_search_complete": (
+                len(search_pagination) == len(queries)
+                and all(bool(row.get("exhausted")) for row in search_pagination)
+            ),
+            "search_pagination": search_pagination,
             "candidate_files_seen": len(all_rows),
             "small_download_candidates": len(small_download_candidates),
             "direct_export_candidate_projects": len(direct_export_candidates),

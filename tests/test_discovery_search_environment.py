@@ -1175,6 +1175,15 @@ def test_continuous_search_has_no_pool_ceiling_and_resumes_exact_result_offset(
     assert page_counts and max(page_counts) <= 80
     # Offset 80 resumes inside page zero; later calls advance to pages one and two.
     assert client.start_pages == [0, 0, 1, 2]
+    completions = [
+        payload
+        for event_type, payload in events
+        if event_type == "repository_query_completed"
+    ]
+    assert completions
+    assert all("pagination" in payload for payload in completions)
+    assert completions[-1]["exhausted"] is True
+    assert completions[-1]["stop_reason"] == "short_page"
 
 
 def test_continuous_search_corrects_synonym_to_active_primary_theme(

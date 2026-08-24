@@ -10,6 +10,11 @@ from agent.discovery.query_builder import prepare_pride_search_queries
 from agent.discovery.replacement_evaluation import PromptVariant, ReplacementBenchmarkScenario
 from agent.discovery.scoring import classify_file_role
 from agent.models import JsonModel
+from agent.pride.client import (
+    PridePaginationState,
+    list_project_files_paginated_with_state,
+    search_projects_paginated_with_state,
+)
 
 
 class ProjectSearchClient(Protocol):
@@ -83,10 +88,28 @@ def collect_neutral_pool(
             queries = build_neutral_queries(scenario, variant)
             for query in queries:
                 try:
-                    rows = client.search_projects(query, page_size=query_depth)
+                    page_size = max(1, min(int(query_depth), 100))
+                    search_result = search_projects_paginated_with_state(
+                        client,
+                        query,
+                        mode="budgeted",
+                        page_size=page_size,
+                        max_pages=max(1, (int(query_depth) + page_size - 1) // page_size),
+                        max_results=max(1, int(query_depth)),
+                    )
+                    rows = search_result.records
+                    pagination = search_result.state.to_dict()
                     error = None
                 except Exception as exc:  # pragma: no cover - network boundary
                     rows = []
+                    pagination = PridePaginationState.unavailable(
+                        operation="search_projects",
+                        mode="budgeted",
+                        query_text=query,
+                        keyword=query,
+                        page_size=max(1, min(int(query_depth), 100)),
+                        stop_reason="error",
+                    ).to_dict()
                     error = str(exc)
                 trace.append(
                     {
@@ -94,6 +117,7 @@ def collect_neutral_pool(
                         "variant_id": variant.id,
                         "query": query,
                         "result_count": len(rows),
+                        "pagination": pagination,
                         "error": error,
                     }
                 )
@@ -113,11 +137,27 @@ def collect_neutral_pool(
                 except Exception:  # pragma: no cover - network boundary
                     pass
                 try:
-                    file_evidence[accession] = _file_bundle(
-                        client.list_project_files(accession, max_files=100)
+                    file_result = list_project_files_paginated_with_state(
+                        client,
+                        accession,
+                        mode="budgeted",
+                        max_files=100,
+                    )
+                    file_evidence[accession] = _file_inventory_bundle(
+                        file_result.records,
+                        file_result.state,
                     )
                 except Exception:  # pragma: no cover - network boundary
-                    file_evidence[accession] = _file_bundle([])
+                    file_evidence[accession] = _file_inventory_bundle(
+                        [],
+                        PridePaginationState.unavailable(
+                            operation="list_project_files",
+                            mode="budgeted",
+                            project_accession=accession,
+                            page_size=100,
+                            stop_reason="error",
+                        ),
+                    )
             for accession in accessions:
                 candidates.append(
                     {
@@ -126,7 +166,19 @@ def collect_neutral_pool(
                         "project_accession": accession,
                         "matched_queries": hits.get(accession, []),
                         **_project_metadata(records[accession]),
-                        **file_evidence.get(accession, _file_bundle([])),
+                        **file_evidence.get(
+                            accession,
+                            _file_inventory_bundle(
+                                [],
+                                PridePaginationState.unavailable(
+                                    operation="list_project_files",
+                                    mode="budgeted",
+                                    project_accession=accession,
+                                    page_size=100,
+                                    stop_reason="not_inspected",
+                                ),
+                            ),
+                        ),
                     }
                 )
     return NeutralPoolResult(candidates=candidates, query_trace=trace)
@@ -192,6 +244,16 @@ def _file_bundle(files: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "task_readiness_counts": {},
         "missing_task_requirements": [],
         "paired_raw_and_results": bool(raw_count and roles["search_result"]),
+    }
+
+
+def _file_inventory_bundle(
+    files: Sequence[dict[str, Any]],
+    state: PridePaginationState,
+) -> dict[str, Any]:
+    return {
+        **_file_bundle(files),
+        **state.to_prefixed_dict("file_inventory"),
     }
 
 

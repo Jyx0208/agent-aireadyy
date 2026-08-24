@@ -38,7 +38,12 @@ from agent.metadata.context import (
     select_sdrf_rows_for_file,
     summarize_sdrf_rows,
 )
-from agent.pride.client import PrideClient, search_projects_paginated
+from agent.pride.client import (
+    PrideClient,
+    PridePaginationState,
+    list_project_files_paginated_with_state,
+    search_projects_paginated_with_state,
+)
 
 
 InspectionOutcomeCategory = Literal[
@@ -177,6 +182,7 @@ def discover_pride_dataset(
         queries = list(queries or [])
         searched_records = list(candidate_records)
     failures: list[dict[str, str]] = []
+    search_pagination: list[dict[str, Any]] = []
     review_decisions = memory.load_review_decisions() if memory is not None else []
 
     def _report(message: str) -> None:
@@ -231,14 +237,30 @@ def discover_pride_dataset(
                     f"Searching PRIDE projects: {query} "
                     f"(up to {per_query_pages} page(s), max {per_query_max_results} hits)."
                 )
+
+                def _report_search_page(
+                    page: int,
+                    page_count: int,
+                    cumulative: int,
+                    query_text: str = query,
+                ) -> None:
+                    _report(
+                        f"PRIDE query '{query_text}': page {page}, "
+                        f"{page_count} hit(s), {cumulative} cumulative."
+                    )
+
                 try:
-                    batch = search_projects_paginated(
+                    search_result = search_projects_paginated_with_state(
                         pride,
                         query,
+                        mode="budgeted",
                         page_size=search_page_size,
                         max_pages=per_query_pages,
                         max_results=per_query_max_results,
+                        on_page=_report_search_page,
                     )
+                    batch = search_result.records
+                    search_pagination.append({"query": query, **search_result.state.to_dict()})
                     searched_records.extend(batch)
                     _report(
                         f"Project search returned {len(batch)} hit(s) for '{query}' "
@@ -246,6 +268,19 @@ def discover_pride_dataset(
                     )
                 except Exception as exc:  # pragma: no cover - defensive network boundary
                     failures.append({"stage": "search_projects", "query": query, "error": str(exc)})
+                    search_pagination.append(
+                        {
+                            "query": query,
+                            **PridePaginationState.unavailable(
+                                operation="search_projects",
+                                mode="budgeted",
+                                query_text=query,
+                                keyword=query,
+                                page_size=search_page_size,
+                                stop_reason="error",
+                            ).to_dict(),
+                        }
+                    )
                     _report(f"Project search failed for query '{query}': {exc}")
                     if "hard_repository_request_limit" in str(exc):
                         _report("Repository request budget exhausted during search; stopping further queries.")
@@ -279,8 +314,10 @@ def discover_pride_dataset(
             excluded_file_count: int = 0,
             file_role_counts: dict[str, int] | None = None,
             filter_reason_counts: dict[str, int] | None = None,
+            file_inventory: PridePaginationState | None = None,
+            sdrf_lookup_truncated: bool = False,
         ) -> None:
-            inspection_outcomes[accession] = {
+            outcome = {
                 "project_accession": accession,
                 "category": category,
                 "stage": stage,
@@ -293,7 +330,17 @@ def discover_pride_dataset(
                 "filter_reason_counts": dict(
                     sorted((filter_reason_counts or {}).items())
                 ),
+                "sdrf_lookup_truncated": sdrf_lookup_truncated,
             }
+            inventory_state = file_inventory or PridePaginationState.unavailable(
+                operation="list_project_files",
+                mode="budgeted",
+                project_accession=accession,
+                page_size=100,
+                stop_reason="not_inspected",
+            )
+            outcome.update(inventory_state.to_prefixed_dict("file_inventory"))
+            inspection_outcomes[accession] = outcome
 
         for candidate in candidates:
             _check_cancel()
@@ -406,6 +453,21 @@ def discover_pride_dataset(
                 file_fetch_limit = None
             else:
                 file_fetch_limit = max(int(request.max_files_per_project), 100)
+
+            def _report_inventory_page(
+                page: int,
+                page_count: int,
+                cumulative: int,
+            ) -> None:
+                _project_event(
+                    accession,
+                    "file_inventory_page",
+                    "completed",
+                    page=page,
+                    page_result_count=page_count,
+                    cumulative_count=cumulative,
+                )
+
             try:
                 _project_event(
                     accession,
@@ -416,11 +478,24 @@ def discover_pride_dataset(
                     _report(f"Listing files for {accession} (all pages, no per-project cap).")
                 else:
                     _report(f"Listing files for {accession} (limit {file_fetch_limit}).")
-                raw_files = pride.list_project_files(accession, max_files=file_fetch_limit)
+                if file_fetch_limit is None:
+                    file_result = list_project_files_paginated_with_state(
+                        pride,
+                        accession,
+                        mode="exhaustive",
+                        on_page=_report_inventory_page,
+                    )
+                else:
+                    file_result = list_project_files_paginated_with_state(
+                        pride,
+                        accession,
+                        mode="budgeted",
+                        max_files=file_fetch_limit,
+                        on_page=_report_inventory_page,
+                    )
+                raw_files = file_result.records
                 total_fetched = len(raw_files)
-                is_truncated = (
-                    file_fetch_limit is not None and total_fetched >= file_fetch_limit
-                )
+                is_truncated = file_result.state.truncated
                 _report(
                     f"{accession}: fetched {total_fetched} file record(s)"
                     + (
@@ -435,6 +510,10 @@ def discover_pride_dataset(
                     "completed",
                     raw_file_count=total_fetched,
                     truncated=is_truncated,
+                    exhausted=file_result.state.exhausted,
+                    stop_reason=file_result.state.stop_reason,
+                    next_page=file_result.state.next_page,
+                    next_page_offset=file_result.state.next_page_offset,
                 )
             except Exception as exc:  # pragma: no cover - defensive network boundary
                 failures.append({"stage": "list_project_files", "project": accession, "error": str(exc)})
@@ -444,6 +523,13 @@ def discover_pride_dataset(
                     stage="list_project_files",
                     reason="repository_or_network_failure",
                     error=str(exc),
+                    file_inventory=PridePaginationState.unavailable(
+                        operation="list_project_files",
+                        mode="exhaustive" if file_fetch_limit is None else "budgeted",
+                        project_accession=accession,
+                        page_size=100,
+                        stop_reason="error",
+                    ),
                 )
                 _project_event(
                     accession,
@@ -467,10 +553,19 @@ def discover_pride_dataset(
             sdrf_hash: str | None = None
             sdrf_status = "not_found"
             sdrf_errors: list[str] = []
+            sdrf_lookup_truncated = False
             try:
                 _project_event(accession, "sdrf_lookup")
                 _report(f"{accession}: checking SDRF metadata.")
-                sdrf_candidates = pride.list_project_files(accession, keyword="sdrf", max_files=5)
+                sdrf_result = list_project_files_paginated_with_state(
+                    pride,
+                    accession,
+                    mode="budgeted",
+                    keyword="sdrf",
+                    max_files=5,
+                )
+                sdrf_candidates = sdrf_result.records
+                sdrf_lookup_truncated = sdrf_result.state.truncated
             except Exception as exc:  # pragma: no cover - defensive network boundary
                 failures.append({"stage": "find_sdrf", "project": accession, "error": str(exc)})
                 sdrf_status = "lookup_error"
@@ -630,6 +725,8 @@ def discover_pride_dataset(
                         excluded_file_count=project_excluded_files,
                         file_role_counts=dict(file_role_counts),
                         filter_reason_counts=dict(filter_reason_counts),
+                        file_inventory=file_result.state,
+                        sdrf_lookup_truncated=sdrf_lookup_truncated,
                     )
                     _report(
                         f"{accession}: failed to parse {len(file_parse_errors)} file record(s)."
@@ -644,6 +741,8 @@ def discover_pride_dataset(
                         excluded_file_count=project_excluded_files,
                         file_role_counts=dict(file_role_counts),
                         filter_reason_counts=dict(filter_reason_counts),
+                        file_inventory=file_result.state,
+                        sdrf_lookup_truncated=sdrf_lookup_truncated,
                     )
                     _report(
                         f"{accession}: no usable acquisition/peaklist file candidates after filtering."
@@ -685,6 +784,8 @@ def discover_pride_dataset(
                 excluded_file_count=project_excluded_files,
                 file_role_counts=dict(file_role_counts),
                 filter_reason_counts=dict(filter_reason_counts),
+                file_inventory=file_result.state,
+                sdrf_lookup_truncated=sdrf_lookup_truncated,
             )
             _project_event(
                 accession,
@@ -752,6 +853,13 @@ def discover_pride_dataset(
             "canonical_species": request.canonical_species,
             "organism_taxon_id": request.organism_taxon_id,
             "queries": queries,
+            "search_pagination": search_pagination,
+            "repository_search_complete": (
+                None
+                if candidate_records is not None
+                else len(search_pagination) == len(queries)
+                and all(bool(item.get("exhausted")) for item in search_pagination)
+            ),
             "candidate_projects_seen": len(candidates),
             "eligible_projects_seen": len(scored_items),
             "excluded_projects": excluded_projects,

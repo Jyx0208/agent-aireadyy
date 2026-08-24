@@ -107,7 +107,11 @@ from agent.input.normalizer import safe_output_stem
 from agent.metadata.context import detect_sdrf_file, load_sdrf_rows, select_sdrf_rows_for_file
 from agent.oneclick.preflight import normalize_resource_policy, normalize_run_mode, run_preflight
 from agent.progress import render_download_progress
-from agent.pride.client import PrideClient
+from agent.pride.client import (
+    PrideClient,
+    PridePaginationState,
+    list_project_files_paginated_with_state,
+)
 from agent.repositories.smoke import run_repository_smoke
 from agent.repositories.iprox_adapter import IproxAdapter, refresh_public_iprox_index
 from agent.repositories.massive_adapter import MassiveAdapter
@@ -10398,13 +10402,43 @@ def _load_local_pride_context(
     pride: PrideClient,
 ) -> dict[str, Any]:
     project_record = pride.get_project(accession)
-    project_files = pride.list_project_files(accession, max_files=max(request.max_files_per_project * 10, 100))
+    file_inventory = list_project_files_paginated_with_state(
+        pride,
+        accession,
+        mode="budgeted",
+        max_files=max(request.max_files_per_project * 10, 100),
+    )
+    project_files = file_inventory.records
     sdrf_rows: list[dict[str, Any]] = []
     sdrf_candidates: list[dict[str, Any]] = []
+    sdrf_inventory = PridePaginationState.unavailable(
+        operation="list_project_files",
+        mode="budgeted",
+        project_accession=accession,
+        keyword="sdrf",
+        page_size=100,
+        stop_reason="not_started",
+    )
     try:
-        sdrf_candidates = pride.list_project_files(accession, keyword="sdrf", max_files=5)
+        sdrf_result = list_project_files_paginated_with_state(
+            pride,
+            accession,
+            mode="budgeted",
+            keyword="sdrf",
+            max_files=5,
+        )
+        sdrf_candidates = sdrf_result.records
+        sdrf_inventory = sdrf_result.state
     except Exception:
         sdrf_candidates = []
+        sdrf_inventory = PridePaginationState.unavailable(
+            operation="list_project_files",
+            mode="budgeted",
+            project_accession=accession,
+            keyword="sdrf",
+            page_size=100,
+            stop_reason="error",
+        )
     sdrf_file = detect_sdrf_file([*project_files, *sdrf_candidates])
     if sdrf_file:
         sdrf_url = PrideClient.first_download_url(sdrf_file)
@@ -10449,6 +10483,8 @@ def _load_local_pride_context(
         "project_files": project_files,
         "project_features": project_features,
         "sdrf_rows": sdrf_rows,
+        "file_inventory": file_inventory.state.to_dict(),
+        "sdrf_inventory": sdrf_inventory.to_dict(),
     }
 
 
@@ -10731,6 +10767,15 @@ def _local_discovery_manifest(
         "source": "local_dir",
         "local_dir": str(root),
         "metadata_enrichment": "pride_project_hint",
+        "pride_metadata_inventories": [
+            {
+                "project_accession": accession,
+                "file_inventory": context["file_inventory"],
+                "sdrf_inventory": context["sdrf_inventory"],
+            }
+            for accession, context in sorted(context_cache.items())
+            if context is not None
+        ],
         "goal": request.goal,
         "ptm_type": request.ptm_type,
         "modification_scope": request.modification_scope or request.ptm_type,

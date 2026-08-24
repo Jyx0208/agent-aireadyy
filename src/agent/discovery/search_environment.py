@@ -28,7 +28,7 @@ from agent.discovery.query_portfolio import (
 from agent.discovery.candidate_evidence_matrix import build_provisional_cem
 from agent.discovery.scoring import score_project
 from agent.models import JsonModel
-from agent.pride.client import PrideClient, search_projects_paginated
+from agent.pride.client import PrideClient, search_projects_paginated_with_state
 from agent.utils import write_json
 
 
@@ -869,7 +869,10 @@ class PrideDiscoverySearchEnvironment:
                         max_pages = min(max_pages, share, page_requests_remaining)
                         page_requests_remaining -= max_pages
                         pending_seed_count = max(0, pending_seed_count - 1)
-                    max_results = min(raw_target, page_size * max_pages)
+                    max_results = min(
+                        target_per_query,
+                        max(1, page_size * max_pages - page_prefix_to_skip),
+                    )
                     self._emit_search_event(
                         "repository_query_started",
                         query=query_spec.query,
@@ -884,7 +887,6 @@ class PrideDiscoverySearchEnvironment:
                         page_number=start_page + 1,
                     )
                     last_page_count: int | None = None
-                    last_cumulative_count = 0
                     actual_pages_requested = 0
 
                     def report_page(
@@ -892,9 +894,8 @@ class PrideDiscoverySearchEnvironment:
                         page_count: int,
                         cumulative_count: int,
                     ) -> None:
-                        nonlocal last_page_count, last_cumulative_count, actual_pages_requested
+                        nonlocal last_page_count, actual_pages_requested
                         last_page_count = page_count
-                        last_cumulative_count = cumulative_count
                         actual_pages_requested += 1
                         self._emit_search_event(
                             "repository_query_page_completed",
@@ -917,33 +918,26 @@ class PrideDiscoverySearchEnvironment:
                             start_offset=absolute_offset,
                         )
 
-                    raw_rows = search_projects_paginated(
+                    search_result = search_projects_paginated_with_state(
                         self.client,
                         executed_query,
+                        mode="budgeted",
                         page_size=page_size,
                         max_pages=max_pages,
                         max_results=max_results,
                         start_page=start_page,
+                        start_page_offset=page_prefix_to_skip,
                         on_page=report_page,
                     )
+                    actual_pages_requested = search_result.state.pages_completed
                     if page_requests_remaining is not None:
                         page_requests_remaining += max(
                             0, max_pages - actual_pages_requested
                         )
-                    rows = raw_rows[
-                        page_prefix_to_skip : page_prefix_to_skip + target_per_query
-                    ]
+                    rows = search_result.records
                     if continuous_search:
                         self._seed_offsets[seed_key] = absolute_offset + len(rows)
-                        # A short repository page (or an empty starting page)
-                        # proves that this exact phrase has no later results.
-                        available_after_prefix = max(
-                            0, last_cumulative_count - page_prefix_to_skip
-                        )
-                        if last_page_count is None or (
-                            last_page_count < page_size
-                            and available_after_prefix <= target_per_query
-                        ):
+                        if search_result.state.exhausted:
                             self._exhausted_seeds.add(seed_key)
                     self._seed_depths[seed_key] = max(
                         previous_depth, query_spec.depth
@@ -1044,6 +1038,12 @@ class PrideDiscoverySearchEnvironment:
                     duplicate_count=duplicate_for_query,
                     pages_completed=actual_pages_requested,
                     last_page_result_count=last_page_count or 0,
+                    pagination=search_result.state.to_dict(),
+                    exhausted=search_result.state.exhausted,
+                    truncated=search_result.state.truncated,
+                    stop_reason=search_result.state.stop_reason,
+                    next_page=search_result.state.next_page,
+                    next_page_offset=search_result.state.next_page_offset,
                 )
             # Portfolio unit audit status.
             if unit_executed:

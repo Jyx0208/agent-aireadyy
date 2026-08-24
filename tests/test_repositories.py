@@ -490,6 +490,45 @@ def test_pride_adapter_maps_project_and_download_file():
     assert canonical_file.transfer_method == "https"
 
 
+def test_pride_adapter_exposes_exhaustive_file_inventory_state() -> None:
+    class PagedClient:
+        @staticmethod
+        def first_download_url(_record):
+            return None
+
+        def list_project_files(
+            self,
+            _accession: str,
+            keyword: str | None = None,
+            page_size: int = 100,
+            max_files: int | None = None,
+            *,
+            page: int = 0,
+        ):
+            del keyword, max_files
+            if page == 0:
+                return [
+                    {"fileName": f"sample-{index:03d}.raw"}
+                    for index in range(page_size)
+                ]
+            if page == 1:
+                return [{"fileName": "last.raw"}]
+            return []
+
+    adapter = PrideAdapter(client=PagedClient())  # type: ignore[arg-type]
+    project = adapter.map_project(
+        {"accession": "PXD000001", "title": "Paged PRIDE project"}
+    )
+
+    files, state = adapter.list_project_files_with_state(project)
+
+    assert len(files) == 101
+    assert state.mode == "exhaustive"
+    assert state.exhausted is True
+    assert state.truncated is False
+    assert state.pages_completed == 2
+
+
 def test_massive_adapter_maps_native_and_px_accessions_and_prioritizes_raw(tmp_path: Path):
     adapter = MassiveAdapter(client=None)
     project = adapter.map_project(

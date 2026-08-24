@@ -11,7 +11,7 @@ import pandas as pd
 
 from agent.input.normalizer import normalize_input
 from agent.models import MetadataValue, ProjectContext
-from agent.pride.client import PrideClient
+from agent.pride.client import PrideClient, list_project_files_paginated_with_state
 
 
 SDRF_CANONICAL_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -253,7 +253,11 @@ def build_project_context(
     file_name: str,
 ) -> ProjectContext:
     project = client.get_project(project_accession)
-    project_files = client.list_project_files(project_accession)
+    project_files = list_project_files_paginated_with_state(
+        client,
+        project_accession,
+        mode="exhaustive",
+    ).records
     metadata = {
         "title": MetadataValue(
             value=project.get("title"),
