@@ -6132,6 +6132,7 @@ def _project_assessments(
                 ),
                 "matched_intent_terms": list(preview.get("matched_intent_terms") or []),
                 "query_hits": list(preview.get("query_hits") or []),
+                "discovered_by_terms": list(preview.get("query_hits") or []),
                 "needs_review": project.needs_review,
                 "available_evidence_refs": sorted(
                     _available_project_evidence_refs(project, project_files)

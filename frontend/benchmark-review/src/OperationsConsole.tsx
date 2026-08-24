@@ -110,6 +110,239 @@ const hasProjectJudgment = (review: OperationsReview) =>
   review.score != null ||
   review.confidence != null;
 
+const asRecord = (value: unknown): WorkflowRecord =>
+  value && typeof value === "object" && !Array.isArray(value)
+    ? (value as WorkflowRecord)
+    : {};
+
+const stringList = (value: unknown) =>
+  Array.isArray(value)
+    ? value.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+
+const metadataFieldLabel = (value: string) =>
+  ({
+    experimentTypes: "实验类型",
+    keywords: "关键词",
+    sampleProcessing: "样本处理说明",
+    dataProcessing: "数据处理说明",
+    semantic_metadata: "语义 metadata",
+    "structured:organisms.accession": "物种编号",
+    "structured:organisms.name": "物种名称",
+    "structured:taxon": "分类学编号",
+  })[value] || value;
+
+const evidenceRefLabel = (value: string) =>
+  ({
+    acquisition_mode: "采集模式",
+    data_processing_excerpt: "数据处理说明",
+    evidence_level_counts: "证据层级统计",
+    immunopeptide_evidence_terms: "免疫肽证据词",
+    instrument_names: "仪器名称",
+    project_description_excerpt: "项目描述",
+    project_publication_date: "发布日期",
+    project_title: "项目标题",
+    sample_processing_excerpt: "样本处理说明",
+    selected_file_examples: "文件示例",
+    species: "物种",
+    validity_status_counts: "有效性统计",
+    sdrf: "SDRF",
+  })[value] || value.replaceAll("_", " ");
+
+const fileRoleLabel = (value: string) =>
+  ({
+    raw_acquisition: "原始采集文件",
+    converted_peaklist: "转换峰表",
+    search_result: "检索结果",
+    report_table: "报告表格",
+    metadata: "元数据文件",
+    unknown: "未识别类型",
+  })[value] || value.replaceAll("_", " ");
+
+const missingColumnLabel = (value: string) =>
+  ({
+    cell_line: "细胞系",
+    organism: "物种",
+    disease: "疾病",
+    treatment: "处理条件",
+    control: "对照信息",
+    assay: "实验方法",
+    fraction: "分级信息",
+  })[value] || value.replaceAll("_", " ");
+
+const filterReasonLabel = (value: string) => {
+  const [code, detail] = value.split(":", 2);
+  if (code === "unsupported_file_role") {
+    return `${fileRoleLabel(detail || "unknown")}不是本任务的采集文件或峰表`;
+  }
+  return value.replaceAll("_", " ");
+};
+
+function ChipList({
+  items,
+  empty = "暂无记录",
+}: {
+  items: string[];
+  empty?: string;
+}) {
+  if (!items.length) return <p className="ops-muted">{empty}</p>;
+  return (
+    <div className="ops-chip-list">
+      {items.map((item) => <Tag size="sm" type="cool-gray" key={item}>{item}</Tag>)}
+    </div>
+  );
+}
+
+function CountList({
+  values,
+  label,
+}: {
+  values: WorkflowRecord;
+  label: (key: string) => string;
+}) {
+  const rows = Object.entries(values).filter(([, value]) => Number(value || 0) > 0);
+  if (!rows.length) return <p className="ops-muted">暂无记录</p>;
+  return (
+    <dl className="ops-count-list">
+      {rows.map(([key, value]) => (
+        <div key={key}><dt>{label(key)}</dt><dd>{Number(value)}</dd></div>
+      ))}
+    </dl>
+  );
+}
+
+function ProjectMetadataSummary({ metadata }: { metadata: WorkflowRecord }) {
+  const sdrf = asRecord(metadata.sdrf);
+  const matchCounts = asRecord(sdrf.match_status_counts);
+  const examples = Array.isArray(sdrf.file_match_examples)
+    ? sdrf.file_match_examples.map(asRecord).filter((item) => item.file_name)
+    : [];
+  const sdrfStatus = String(metadata.sdrf_status || sdrf.status || "unknown");
+  const statusLabels: Record<string, string> = {
+    available: "已找到",
+    not_found: "未找到",
+    invalid: "解析失败",
+    unknown: "未知",
+  };
+  const species = stringList(metadata.species).map((item) =>
+    item.toLowerCase() === "human" ? "人类（human）" : item,
+  );
+  const hla = stringList(metadata.hla_class).map((item) =>
+    item === "class_i" ? "HLA I 类" : item === "class_ii" ? "HLA II 类" : item,
+  );
+  const acquisition = String(metadata.acquisition_mode || "unknown").toUpperCase();
+  const validity = String(metadata.validity_status || "unknown");
+
+  return (
+    <div className="ops-product-summary">
+      <dl className="ops-fact-grid">
+        <div><dt>物种</dt><dd>{species.join("、") || "未记录"}</dd></div>
+        <div><dt>采集模式</dt><dd>{acquisition === "UNKNOWN" ? "未确定" : acquisition}</dd></div>
+        <div><dt>HLA 类型</dt><dd>{hla.join("、") || "未记录"}</dd></div>
+        <div><dt>项目有效性</dt><dd>{validity === "valid" ? "通过基础校验" : validity}</dd></div>
+        <div><dt>SDRF</dt><dd>{statusLabels[sdrfStatus] || sdrfStatus}</dd></div>
+        <div><dt>SDRF 行数</dt><dd>{Number(metadata.sdrf_row_count || sdrf.row_count || 0)}</dd></div>
+      </dl>
+
+      <section className="ops-detail-section">
+        <h3>质谱仪器</h3>
+        <ChipList items={stringList(metadata.instrument_names)} empty="PRIDE metadata 未记录仪器" />
+      </section>
+      <section className="ops-detail-section">
+        <h3>判断用到的 metadata 字段</h3>
+        <ChipList items={stringList(metadata.evidence_fields).map(metadataFieldLabel)} />
+      </section>
+      {metadata.sample_processing_excerpt ? (
+        <section className="ops-detail-section ops-prose-block">
+          <h3>样本如何处理</h3><p>{String(metadata.sample_processing_excerpt)}</p>
+        </section>
+      ) : null}
+      {metadata.data_processing_excerpt ? (
+        <section className="ops-detail-section ops-prose-block">
+          <h3>数据如何处理</h3><p>{String(metadata.data_processing_excerpt)}</p>
+        </section>
+      ) : null}
+
+      <section className="ops-detail-section ops-sdrf-card">
+        <div className="ops-detail-heading">
+          <div><h3>SDRF 样本表</h3><p>用于把每个文件对应到样本、疾病、处理和分级信息。</p></div>
+          <Tag size="sm" type={sdrfStatus === "available" ? "green" : "purple"}>
+            {statusLabels[sdrfStatus] || sdrfStatus}
+          </Tag>
+        </div>
+        {sdrfStatus === "not_found" ? (
+          <p className="ops-callout-text">PRIDE 中没有找到 SDRF；文件仍可评审，但样本条件只能依赖项目描述，不能做精确的文件—样本对应。</p>
+        ) : null}
+        <dl className="ops-count-list ops-count-list--three">
+          <div><dt>已匹配</dt><dd>{Number(matchCounts.matched || 0)}</dd></div>
+          <div><dt>未匹配文件</dt><dd>{Number(matchCounts.no_file_match || 0)}</dd></div>
+          <div><dt>无 SDRF</dt><dd>{Number(matchCounts.no_sdrf || 0)}</dd></div>
+        </dl>
+        {stringList(sdrf.missing_columns).length ? (
+          <div><h4>缺少的样本字段</h4><ChipList items={stringList(sdrf.missing_columns).map(missingColumnLabel)} /></div>
+        ) : null}
+        {examples.length ? (
+          <div className="ops-compact-table-wrap">
+            <table className="ops-compact-table">
+              <thead><tr><th>文件示例</th><th>SDRF 对应情况</th><th>匹配行</th></tr></thead>
+              <tbody>{examples.map((item, index) => (
+                <tr key={`${String(item.file_name)}-${index}`}>
+                  <td>{String(item.file_name)}</td>
+                  <td>{String(item.status) === "no_sdrf" ? "无 SDRF" : String(item.status || "未知")}</td>
+                  <td>{Number(item.matched_row_count || 0)}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        ) : null}
+        {stringList(sdrf.conflicts).length ? <div><h4>冲突</h4><ul>{stringList(sdrf.conflicts).map((item) => <li key={item}>{item}</li>)}</ul></div> : null}
+        {stringList(sdrf.errors).length ? <div><h4>解析问题</h4><ul>{stringList(sdrf.errors).map((item) => <li key={item}>{item}</li>)}</ul></div> : null}
+      </section>
+    </div>
+  );
+}
+
+function ProjectEvidenceSummary({ evidence }: { evidence: WorkflowRecord }) {
+  const refs = stringList(evidence.available_evidence_refs).map(evidenceRefLabel);
+  const examples = stringList(evidence.selected_file_examples);
+  const roles = asRecord(evidence.file_role_counts);
+  const reasons = asRecord(evidence.filter_reason_counts);
+  const missing = stringList(evidence.missing_information);
+  const limitations = stringList(evidence.limitations);
+  const selectionReason = String(
+    evidence.selection_reason || evidence.explanation || evidence.judgment_reason || "",
+  ).trim();
+
+  return (
+    <div className="ops-product-summary">
+      {selectionReason ? <section className="ops-detail-section ops-prose-block"><h3>证据结论</h3><p>{selectionReason}</p></section> : null}
+      <section className="ops-detail-section">
+        <h3>文件类型统计</h3>
+        <CountList values={roles} label={fileRoleLabel} />
+      </section>
+      <section className="ops-detail-section">
+        <h3>文件被过滤的原因</h3>
+        <CountList values={reasons} label={filterReasonLabel} />
+      </section>
+      <section className="ops-detail-section">
+        <h3>可追溯证据来源</h3>
+        <ChipList items={refs} empty="暂无额外证据引用" />
+      </section>
+      {examples.length ? (
+        <section className="ops-detail-section">
+          <h3>通过初筛的文件示例</h3>
+          <ul className="ops-file-example-list">{examples.map((item) => <li key={item}>{item}</li>)}</ul>
+        </section>
+      ) : null}
+      {missing.length ? <section className="ops-detail-section"><h3>仍缺少的信息</h3><ul>{missing.map((item) => <li key={item}>{item}</li>)}</ul></section> : null}
+      {limitations.length ? <section className="ops-detail-section"><h3>限制与注意事项</h3><ul>{limitations.map((item) => <li key={item}>{item}</li>)}</ul></section> : null}
+      {!selectionReason && !refs.length && !examples.length && !Object.keys(roles).length && !Object.keys(reasons).length ? (
+        <p className="ops-muted">暂无额外证据摘要；核心依据请查看项目 metadata 和判断理由。</p>
+      ) : null}
+    </div>
+  );
+}
+
 function useMediaQuery(query: string) {
   const [matches, setMatches] = useState(
     () => typeof window !== "undefined" && window.matchMedia(query).matches,
@@ -1067,14 +1300,17 @@ function EvidencePanel({
               <ul>{review.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
             ) : <p>{projectJudgmentReason(review)}</p>}
           </AccordionItem>
-          <AccordionItem title="项目 metadata">
-            <pre>{JSON.stringify(review.metadata_summary, null, 2)}</pre>
+          <AccordionItem title="项目信息与实验设计">
+            <ProjectMetadataSummary metadata={review.metadata_summary} />
           </AccordionItem>
-          <AccordionItem title="证据摘要">
-            <pre>{JSON.stringify(review.evidence_summary, null, 2)}</pre>
+          <AccordionItem title="文件证据摘要">
+            <ProjectEvidenceSummary evidence={review.evidence_summary} />
           </AccordionItem>
           <AccordionItem title="命中的检索词">
-            <p>{review.discovered_by_terms.join("；") || "暂无记录。"}</p>
+            <ChipList
+              items={review.discovered_by_terms}
+              empty="这条旧记录没有保存检索词；不代表项目没有命中检索。"
+            />
           </AccordionItem>
         </Accordion>
       </Layer>

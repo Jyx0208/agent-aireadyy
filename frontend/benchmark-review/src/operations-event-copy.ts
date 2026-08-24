@@ -34,6 +34,37 @@ const reviewStep = (value: unknown) =>
     failed: "项目审查失败",
   })[text(value)] || text(value) || "处理项目";
 
+const auditIssueLabel = (value: unknown) =>
+  ({
+    quality_audit_policy_denied: "质量检查策略未获授权",
+    candidate_manifest_missing: "候选文件清单缺失",
+    inspected_projects_missing_judgments: "部分已审项目还没有模型判断",
+    constraint_assessment_evidence_invalid: "约束判断缺少可追溯证据",
+    selected_manifest_contains_unqualified_projects: "最终清单仍含未合格项目",
+    qualified_project_has_no_inspected_files: "合格项目尚未完成文件检查",
+    selected_manifest_contains_non_delivery_files: "最终清单仍含不可交付文件",
+    qualified_project_has_no_delivery_assets: "合格项目没有可交付文件",
+    hard_per_project_min_files_not_met: "单项目最低文件数未满足",
+    hard_per_project_min_samples_not_met: "单项目最低样本数未满足",
+    hard_builtin_constraint_not_met: "物种、采集模式等硬条件未满足",
+    hard_portfolio_constraint_not_met: "项目组合的硬条件未满足",
+    qualified_projects_have_unresolved_constraints: "合格项目仍有未解决的科学条件",
+    qualified_project_still_needs_review: "合格项目仍被标记为需要复核",
+    zero_strict_valid_files_with_qualified_projects: "合格项目中没有严格有效的文件",
+    candidate_inspections_failed: "部分候选项目读取失败",
+    preview_coverage_not_backed_by_selection: "检索到的主题覆盖没有进入最终选择",
+    high_relevance_inspection_coverage_incomplete: "高相关候选还没有审完",
+    high_relevance_inspection_coverage_stopped: "高相关候选审查提前停止",
+    portfolio_search_not_converged: "检索结果尚未稳定收敛",
+    portfolio_search_stopped_at_hard_ceiling: "检索达到硬上限后停止",
+    portfolio_search_stopped_before_convergence: "检索在结果稳定前停止",
+    quality_target_not_reached: "目标数量或质量尚未达到",
+    fixed_quality_target_shortfall: "固定质量目标仍有缺口",
+    quality_target_shortfall_at_stop: "停止时质量目标仍有缺口",
+    autonomous_repair_ceiling_exhausted: "自动补救次数已经用完",
+    selected_manifest_missing: "最终文件清单缺失",
+  })[text(value)] || text(value).replaceAll("_", " ");
+
 const technicalEvent = (event: OperationsEvent) => {
   const kind = event.type.toLowerCase();
   const actor = event.actor.toLowerCase();
@@ -246,6 +277,52 @@ export function describeOperationsEvent(
         detail: "任务仍会继续评审剩余文件，最终清单尚未冻结。",
         actor: "文件评审",
         typeLabel: "选择更新",
+        technical,
+      };
+    case "discovery_quality_audited": {
+      const counts =
+        payload.counts && typeof payload.counts === "object" && !Array.isArray(payload.counts)
+          ? (payload.counts as Record<string, unknown>)
+          : {};
+      const issues = Array.isArray(payload.issues)
+        ? payload.issues
+            .map((item) =>
+              item && typeof item === "object" && !Array.isArray(item)
+                ? auditIssueLabel((item as Record<string, unknown>).code)
+                : "",
+            )
+            .filter(Boolean)
+        : [];
+      const status = text(payload.status);
+      const projects = number(counts.delivery_eligible_projects);
+      const files = number(counts.usable_files);
+      return {
+        title:
+          status === "ready"
+            ? "科学质量检查已通过"
+            : `科学质量检查发现 ${issues.length} 项需要继续处理`,
+        detail: `当前有 ${projects} 个可交付项目、${files} 个可用文件。${
+          issues.length ? `待处理：${issues.join("；")}。` : "没有发现阻断交付的问题。"
+        }`,
+        actor: "科学质量检查",
+        typeLabel: status === "ready" ? "检查通过" : "需要处理",
+        technical,
+      };
+    }
+    case "discovery_quality_repair_started":
+      return {
+        title: "正在补齐质量检查发现的缺口",
+        detail: "已有结果不会丢失；系统正在完成缺少的判断、证据或文件检查。",
+        actor: "科学质量检查",
+        typeLabel: "正在修复",
+        technical,
+      };
+    case "discovery_quality_repair_completed":
+      return {
+        title: "本轮质量补齐已完成，正在重新检查",
+        detail: "重新检查通过后才会冻结最终交付清单。",
+        actor: "科学质量检查",
+        typeLabel: "重新检查",
         technical,
       };
     case "job_cancel_requested":

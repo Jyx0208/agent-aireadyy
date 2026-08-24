@@ -45,4 +45,32 @@ describe("operations event copy", () => {
 
     expect(event.technical).toBe(true);
   });
+
+  it("explains a repair-required quality audit in plain Chinese", () => {
+    const event = describeOperationsEvent({
+      id: 3,
+      sequence: 3,
+      job_id: "job",
+      type: "discovery_quality_audited",
+      level: "warning",
+      actor: "quality-audit",
+      phase: "finalizing",
+      message: "Quality audit repair_required: 18 delivery-eligible project(s).",
+      payload: {
+        status: "repair_required",
+        counts: { delivery_eligible_projects: 18, usable_files: 646 },
+        issues: [
+          { code: "inspected_projects_missing_judgments" },
+          { code: "qualified_projects_have_unresolved_constraints" },
+          { code: "quality_target_not_reached" },
+        ],
+      },
+      created_at: "2026-08-24T16:00:00+08:00",
+    });
+
+    expect(event.title).toBe("科学质量检查发现 3 项需要继续处理");
+    expect(event.detail).toContain("18 个可交付项目、646 个可用文件");
+    expect(event.detail).toContain("部分已审项目还没有模型判断");
+    expect(event.detail).not.toContain("repair_required");
+  });
 });

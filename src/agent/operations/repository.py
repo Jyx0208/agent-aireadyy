@@ -1536,7 +1536,9 @@ class OperationsRepository:
             row.score = _float(assessment.get("score") or assessment.get("grade"))
             row.confidence = _float(assessment.get("confidence"))
             row.discovered_by_terms = _json_value(
-                assessment.get("discovered_by_terms") or [],
+                assessment.get("discovered_by_terms")
+                or assessment.get("query_hits")
+                or [],
                 [],
             )
             row.reasons = _json_value(
