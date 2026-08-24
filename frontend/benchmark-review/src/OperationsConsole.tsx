@@ -79,7 +79,7 @@ const tabs: Array<{ id: OperationsTab; label: string }> = [
   { id: "overview", label: "总览" },
   { id: "search", label: "检索词" },
   { id: "reviews", label: "项目审查" },
-  { id: "files", label: "可用文件" },
+  { id: "files", label: "文件评审" },
   { id: "batches", label: "交付批次" },
   { id: "events", label: "运行事件" },
   { id: "chat", label: "任务对话" },
@@ -1682,9 +1682,9 @@ export function OperationsConsole({
             <div className="ops-section-heading">
               <div>
                 <p className="ops-eyebrow">DELIVERABLE FILES</p>
-                <h2>验证通过的文件</h2>
+                <h2>文件评审与选择</h2>
               </div>
-              <span>混合项目只纳入通过文件级判断的文件</span>
+              <span>全部候选文件；可切换未评审、正在评审和已评审</span>
             </div>
             <FileReviewBoard jobId={jobId} />
           </section>
