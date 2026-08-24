@@ -7,6 +7,7 @@ import {
   DataTable,
   InlineNotification,
   Layer,
+  Loading,
   Pagination,
   ProgressBar,
   ProgressIndicator,
@@ -85,6 +86,29 @@ const tabs: Array<{ id: OperationsTab; label: string }> = [
 ];
 
 const CARBON_MD_MEDIA_QUERY = "(max-width: 42rem)";
+
+const projectJudgmentReason = (review: OperationsReview) => {
+  const recordedReason = review.reasons.find(
+    (reason) => typeof reason === "string" && reason.trim().length > 0,
+  );
+  if (recordedReason) return recordedReason.trim();
+
+  const evidence = review.evidence_summary || {};
+  for (const key of ["explanation", "selection_reason", "judgment_reason"]) {
+    const value = evidence[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+
+  if (review.status === "running") return "大模型正在判断，请稍候。";
+  return "文件清单已检查，等待大模型生成判断理由。";
+};
+
+const hasProjectJudgment = (review: OperationsReview) =>
+  review.reasons.some(
+    (reason) => typeof reason === "string" && reason.trim().length > 0,
+  ) ||
+  review.score != null ||
+  review.confidence != null;
 
 function useMediaQuery(query: string) {
   const [matches, setMatches] = useState(
@@ -363,18 +387,25 @@ function Reviews({
   const byId = new Map(
     (query.data?.items || []).map((review) => [String(review.id), review]),
   );
-  const rows = (query.data?.items || []).map((review) => ({
-    id: String(review.id),
-    accession: review.accession,
-    title: review.title || "—",
-    status: review.status === "running" ? `Worker ${review.worker_slot || "—"} · ${reviewStepLabel(review.current_step)}` : statusLabel(review.status),
-    decision: review.decision || "pending",
-    score: review.score == null ? "—" : review.score.toFixed(1),
-    confidence:
-      review.confidence == null ? "—" : review.confidence.toFixed(2),
-    usable: review.usable_file_count,
-    reason: review.reason_code || review.reasons[0] || "—",
-  }));
+  const rows = (query.data?.items || []).map((review) => {
+    const judged = hasProjectJudgment(review);
+    return {
+      id: String(review.id),
+      accession: review.accession,
+      title: review.title || "—",
+      status: review.status === "running"
+        ? `Worker ${review.worker_slot || "—"} · ${reviewStepLabel(review.current_step)}`
+        : !judged && review.status === "completed"
+          ? "文件检查完成，等待大模型判断"
+          : statusLabel(review.status),
+      decision: judged ? (review.decision || "pending") : "待判断",
+      score: review.score == null ? "—" : review.score.toFixed(1),
+      confidence:
+        review.confidence == null ? "—" : review.confidence.toFixed(2),
+      usable: review.usable_file_count,
+      reason: projectJudgmentReason(review),
+    };
+  });
   const headers = [
     { key: "accession", header: "项目" },
     { key: "title", header: "标题" },
@@ -660,9 +691,19 @@ function FileReviewBoard({ jobId }: { jobId: string }) {
     <div className="ops-section-stack">
       <div className="ops-file-summary" aria-label="文件评审进度">
         {cards.map(([label, value]) => (
-          <Tile key={String(label)}>
+          <Tile
+            key={String(label)}
+            className={label === "正在评审" && Number(value || 0) > 0
+              ? "ops-file-summary__active"
+              : undefined}
+          >
             <p className="ops-eyebrow">{label}</p>
-            <strong>{Number(value || 0)}</strong>
+            <div className="ops-file-summary__value">
+              {label === "正在评审" && Number(value || 0) > 0
+                ? <Loading small withOverlay={false} description="文件正在评审" />
+                : null}
+              <strong>{Number(value || 0)}</strong>
+            </div>
           </Tile>
         ))}
       </div>
@@ -1024,7 +1065,7 @@ function EvidencePanel({
           <AccordionItem title="入选或排除理由" open>
             {review.reasons.length ? (
               <ul>{review.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
-            ) : <p>{review.reason_code || "暂无结构化理由。"}</p>}
+            ) : <p>{projectJudgmentReason(review)}</p>}
           </AccordionItem>
           <AccordionItem title="项目 metadata">
             <pre>{JSON.stringify(review.metadata_summary, null, 2)}</pre>
@@ -1054,6 +1095,14 @@ export function OperationsConsole({
   const [actionError, setActionError] = useState("");
   const [actionBusy, setActionBusy] = useState(false);
   const activeIndex = Math.max(0, tabs.findIndex((tab) => tab.id === activeTab));
+  const running = !operationsTerminal(job?.status || "");
+  const latestVisibleEvent = [...events]
+    .reverse()
+    .map((event) => ({ event, copy: describeOperationsEvent(event) }))
+    .find(({ copy }) => !copy.technical);
+  const fileReviewActive = running && Boolean(
+    latestVisibleEvent?.event.type.startsWith("file_"),
+  );
 
   const percentage = useMemo(() => {
     if (!job) return 0;
@@ -1136,6 +1185,22 @@ export function OperationsConsole({
             </span>
             <span>最近心跳：{formatTime(job.heartbeat_at)}</span>
           </div>
+          {running ? (
+            <div className="ops-running-status" role="status" aria-live="polite">
+              <Loading small withOverlay={false} description="任务仍在运行" />
+              <div>
+                <strong>
+                  正在运行：{latestVisibleEvent?.copy.title || statusLabel(job.phase)}
+                </strong>
+                <span>
+                  {latestVisibleEvent?.copy.detail || "后台仍在工作，新的判断完成后会自动更新。"}
+                  {latestVisibleEvent?.event.created_at
+                    ? ` · 更新于 ${formatTime(latestVisibleEvent.event.created_at)}`
+                    : ""}
+                </span>
+              </div>
+            </div>
+          ) : null}
         </div>
         <div className="ops-command-bar__actions">
           {!operationsTerminal(job.status) ? (
@@ -1294,9 +1359,11 @@ export function OperationsConsole({
             <div className="ops-overview-grid">
               <Tile>
                 <p className="ops-eyebrow">CURRENT ACTIVITY</p>
-                <h2>{statusLabel(job.phase)}</h2>
+                <h2>{fileReviewActive ? "文件级评审" : statusLabel(job.phase)}</h2>
                 <p>
-                  {job.phase === "searching"
+                  {fileReviewActive
+                    ? `${latestVisibleEvent?.copy.title || "正在逐文件评审"}。${latestVisibleEvent?.copy.detail || "完成后会自动领取下一批。"}`
+                    : job.phase === "searching"
                     ? `正在按确认顺序拉取检索词；当前为“${job.progress.current_term || "等待下一个检索词"}”。`
                     : job.phase === "reviewing"
                       ? "候选已经全局去重，worker 正在读取项目 metadata、SDRF 和文件线索并形成项目级结论。"

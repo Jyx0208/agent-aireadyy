@@ -395,6 +395,54 @@ def test_file_review_filters_cursor_and_detail_reason(tmp_path: Path):
         repository.close()
 
 
+def test_file_review_summary_counts_full_pool_and_active_batch(tmp_path: Path):
+    repository = OperationsRepository(settings(tmp_path))
+    try:
+        repository.create_job(
+            job_id="file-review-counts",
+            payload={"objective": "review candidate files", "repository": "pride"},
+        )
+        candidates = [
+            {
+                "file_id": f"file-{index}",
+                "repository": "pride",
+                "project_accession": "PXD000001",
+                "file_accession_or_path": f"native-{index}",
+                "file_name": f"sample-{index}.raw",
+                "file_type": ".raw",
+                "file_role": "raw_acquisition",
+            }
+            for index in range(3)
+        ]
+        repository.sync_file_review_candidates("file-review-counts", candidates)
+        repository.project_file_review_event(
+            "file-review-counts",
+            "file_review_batch_started",
+            {"items": candidates[:2]},
+        )
+
+        page = repository.list_files(
+            "file-review-counts",
+            cursor=0,
+            page_size=25,
+        )
+        assert page.total == 3
+        assert page.summary == {
+            "total": 3,
+            "unreviewed": 1,
+            "queued": 0,
+            "reviewing": 2,
+            "reviewed": 0,
+            "selected": 0,
+            "investigate": 0,
+            "excluded": 0,
+            "errors": 0,
+            "reasons_ready": 0,
+        }
+    finally:
+        repository.close()
+
+
 def test_invalid_terminal_transition_is_rejected(tmp_path: Path):
     repository = OperationsRepository(settings(tmp_path))
     try:

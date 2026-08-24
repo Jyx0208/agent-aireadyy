@@ -216,6 +216,38 @@ export function describeOperationsEvent(
         typeLabel: "达到目标",
         technical,
       };
+    case "file_review_batch_started":
+      return {
+        title: `大模型正在评审新一批 ${number(payload.count)} 个文件`,
+        detail: "正在逐文件判断纳入、待核查或排除，并记录文件级理由。",
+        actor: "文件评审",
+        typeLabel: "正在评审",
+        technical,
+      };
+    case "file_review_batch_completed":
+      return {
+        title: "一批文件的结构判断已经完成",
+        detail: "正在保存判断，并为纳入文件补充连贯理由。",
+        actor: "文件评审",
+        typeLabel: "批次完成",
+        technical,
+      };
+    case "file_reason_batch_completed":
+      return {
+        title: `已写好 ${number(payload.count)} 个文件的判断理由`,
+        detail: "结果已实时写入文件看板，后台会继续领取下一批。",
+        actor: "文件评审",
+        typeLabel: "理由完成",
+        technical,
+      };
+    case "file_selection_changed":
+      return {
+        title: `已更新文件选择，目前纳入 ${number(payload.selected_file_count)} 个`,
+        detail: "任务仍会继续评审剩余文件，最终清单尚未冻结。",
+        actor: "文件评审",
+        typeLabel: "选择更新",
+        technical,
+      };
     case "job_cancel_requested":
       return {
         title: "已收到停止请求",

@@ -2100,6 +2100,90 @@ class OperationsRepository:
             )
             return self._file_dict(row) if row is not None else None
 
+    def sync_file_review_candidates(
+        self,
+        job_id: str,
+        items: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Register the complete candidate pool before the model reviews batches."""
+
+        with self.database.session() as session:
+            job = session.get(Job, job_id)
+            if job is None:
+                return
+            existing_rows = session.scalars(
+                select(FileRecord).where(FileRecord.job_id == job_id)
+            ).all()
+            existing_by_id = {
+                str(row.file_id): row for row in existing_rows if row.file_id
+            }
+            existing_by_identity = {
+                (row.repository, row.project_accession, row.native_id): row
+                for row in existing_rows
+            }
+            now = utc_now_iso()
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                repository = _text(item.get("repository")) or job.repository or "pride"
+                project_accession = _text(item.get("project_accession"))
+                native_id = _text(
+                    item.get("file_accession_or_path")
+                    or item.get("native_id")
+                    or item.get("file_name")
+                )
+                if not project_accession or not native_id:
+                    continue
+                file_id = _text(item.get("file_id")) or stable_file_id(
+                    repository,
+                    project_accession,
+                    native_id,
+                )
+                row = existing_by_id.get(file_id) or existing_by_identity.get(
+                    (repository, project_accession, native_id)
+                )
+                if row is None:
+                    row = FileRecord(
+                        job_id=job_id,
+                        repository=repository,
+                        project_accession=project_accession,
+                        native_id=native_id,
+                        file_id=file_id,
+                        file_name=_text(item.get("file_name")) or native_id,
+                        review_status="unreviewed",
+                        reason_status="pending",
+                        created_at=now,
+                    )
+                    session.add(row)
+                    existing_by_id[file_id] = row
+                    existing_by_identity[(repository, project_accession, native_id)] = row
+                row.repository = repository
+                row.project_accession = project_accession
+                row.native_id = native_id
+                row.file_id = file_id
+                row.file_name = _text(item.get("file_name")) or row.file_name
+                row.logical_path = _text(item.get("logical_path") or native_id)
+                row.download_url = _text(item.get("download_url"))
+                row.file_format = _text(item.get("file_type") or item.get("file_format"))
+                row.file_category = _text(item.get("file_category"))
+                row.file_role = _text(item.get("file_role"))
+                row.selection_role = _text(item.get("selection_role")) or "primary_input"
+                row.family_id = _text(item.get("family_id")) or None
+                row.companion_file_ids = _json_value(
+                    item.get("companion_file_ids") or [],
+                    [],
+                )
+                row.acquisition_mode = _text(item.get("acquisition_mode")) or "unknown"
+                row.size_bytes = _int(
+                    item.get("expected_size_bytes") or item.get("size_bytes"),
+                    0,
+                ) or None
+                row.status = _text(item.get("validity_status")) or "candidate"
+                if row.review_status not in {"reviewing", "reviewed", "error"}:
+                    row.review_status = "unreviewed"
+                row.updated_at = now
+            session.commit()
+
     def project_file_review_event(
         self,
         job_id: str,

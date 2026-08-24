@@ -17910,6 +17910,21 @@ def _append_discovery_job_event(job_id: str, event: AgentEvent) -> None:
             phase = _clean_text(execution.get("phase"))
     try:
         operations_repository = get_operations_repository()
+        if event.event_type == "candidate_inspection_completed":
+            observation = event.payload.get("observation") or {}
+            if isinstance(observation, Mapping):
+                manifest_path = _clean_text(
+                    observation.get("candidate_pool_manifest_path")
+                    or observation.get("manifest_path")
+                )
+                if manifest_path:
+                    manifest = _read_json_if_exists(Path(manifest_path))
+                    candidate_files = manifest.get("files")
+                    if isinstance(candidate_files, list):
+                        operations_repository.sync_file_review_candidates(
+                            job_id,
+                            candidate_files,
+                        )
         operations_repository.project_file_review_event(
             job_id,
             event.event_type,
