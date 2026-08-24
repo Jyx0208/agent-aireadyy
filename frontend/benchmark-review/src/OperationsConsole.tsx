@@ -1507,7 +1507,7 @@ export function OperationsConsole({
           />
           <ProgressStep
             label="完成"
-            secondaryLabel={`${job.progress.usable_file_count} 个文件`}
+            secondaryLabel={`${job.progress.usable_file_count} 个初筛文件`}
           />
         </ProgressIndicator>
         <ProgressBar
@@ -1546,9 +1546,9 @@ export function OperationsConsole({
           detail="项目级结论"
         />
         <Metric
-          label="可交付文件"
+          label="项目初筛可用"
           value={job.progress.usable_file_count}
-          detail={`${job.progress.batch_count} 个冻结批次`}
+          detail="仍需完成文件级模型确认"
         />
       </div>
 
