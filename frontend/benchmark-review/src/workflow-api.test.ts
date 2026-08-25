@@ -82,6 +82,26 @@ describe("operational workflow API", () => {
     });
   });
 
+  it("treats a blocked operations job with structured error detail as a valid record", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            job_id: "job-blocked",
+            status: "blocked",
+            error: { code: "blocked", message: null },
+          }),
+        ),
+      ),
+    );
+
+    await expect(workflowJson("/api/ops/jobs/job-blocked")).resolves.toMatchObject({
+      job_id: "job-blocked",
+      status: "blocked",
+    });
+  });
+
   it("normalizes server completion to blocked when Authority reports progress only", async () => {
     vi.stubGlobal(
       "fetch",

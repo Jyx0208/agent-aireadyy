@@ -19,6 +19,16 @@ export function isDiscoveryJobStatus(status: unknown): boolean {
   return DISCOVERY_JOB_STATUSES.includes(String(status || "").toLowerCase() as (typeof DISCOVERY_JOB_STATUSES)[number]);
 }
 
+const apiErrorMessage = (value: unknown, status: number) => {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const detail = value as Record<string, unknown>;
+    const message = String(detail.message || detail.detail || detail.code || "").trim();
+    if (message) return message;
+  }
+  return `HTTP ${status}`;
+};
+
 export async function workflowJson<T extends WorkflowRecord>(
   path: string,
   options: RequestInit = {},
@@ -38,11 +48,14 @@ export async function workflowJson<T extends WorkflowRecord>(
   }
   // Discovery job bodies may carry status=failed with a domain error string.
   // That is a successful HTTP response of a job record — do not treat as transport failure.
+  const payloadError = (payload as Record<string, unknown>).error;
   const jobOk =
     isDiscoveryJobStatus(payload.status) &&
-    (path.includes("/api/discovery/jobs") || path.includes("/api/discovery/job"));
-  if (!response.ok || payload.ok === false || (payload.error && !jobOk)) {
-    throw new Error(payload.error || `HTTP ${response.status}`);
+    (path.includes("/api/discovery/jobs") ||
+      path.includes("/api/discovery/job") ||
+      path.includes("/api/ops/jobs"));
+  if (!response.ok || payload.ok === false || (payloadError && !jobOk)) {
+    throw new Error(apiErrorMessage(payloadError, response.status));
   }
   return payload;
 }
