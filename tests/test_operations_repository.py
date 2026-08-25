@@ -443,6 +443,51 @@ def test_file_review_summary_counts_full_pool_and_active_batch(tmp_path: Path):
         repository.close()
 
 
+def test_legacy_sync_does_not_erase_newer_file_judgment(tmp_path: Path):
+    repository = OperationsRepository(settings(tmp_path))
+    try:
+        file_item = {
+            "file_id": "file-reviewed",
+            "repository": "pride",
+            "project_accession": "PXD000001",
+            "file_accession_or_path": "sample.raw",
+            "file_name": "sample.raw",
+        }
+        legacy_job = {
+            "job_id": "legacy-file-review-job",
+            "status": "running",
+            "body": {"objective": "file review", "repository": "pride"},
+            "record": {"files": [file_item]},
+        }
+        repository.sync_legacy_job(legacy_job)
+        repository.project_file_review_event(
+            "legacy-file-review-job",
+            "file_review_batch_completed",
+            {
+                "judgments": [
+                    {
+                        **file_item,
+                        "review_status": "reviewed",
+                        "decision": "include",
+                        "reason_status": "ready",
+                        "reason_scope": "file",
+                        "reason_text": "This file matches the requested experiment.",
+                    }
+                ]
+            },
+        )
+
+        repository.sync_legacy_job(legacy_job)
+
+        detail = repository.get_file("legacy-file-review-job", "file-reviewed")
+        assert detail and detail["review_status"] == "reviewed"
+        assert detail["decision"] == "include"
+        assert detail["reason_status"] == "ready"
+        assert detail["reason_text"] == "This file matches the requested experiment."
+    finally:
+        repository.close()
+
+
 def test_invalid_terminal_transition_is_rejected(tmp_path: Path):
     repository = OperationsRepository(settings(tmp_path))
     try:

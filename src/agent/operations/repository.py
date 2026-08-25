@@ -637,6 +637,7 @@ class OperationsRepository:
                 )
                 file_key = (repository, project_accession, native_id)
                 file_row = existing_files.get(file_key) or existing_files_by_id.get(file_id)
+                is_new_file = file_row is None
                 if file_row is None:
                     file_row = FileRecord(
                         job_id=job_row.job_id,
@@ -678,63 +679,86 @@ class OperationsRepository:
                     item.get("status")
                     or item.get("validity_status")
                 ) or "usable"
-                file_row.review_status = _text(item.get("review_status")) or "unreviewed"
-                file_row.decision = _text(
+                incoming_review_status = _text(item.get("review_status"))
+                if incoming_review_status or is_new_file:
+                    file_row.review_status = incoming_review_status or "unreviewed"
+                incoming_decision = _text(
                     item.get("decision") or item.get("judgment_decision")
-                ) or None
-                file_row.reason_status = _text(item.get("reason_status")) or "pending"
-                file_row.reason_scope = _text(item.get("reason_scope")) or "project_legacy"
-                file_row.reason_text = _text(
+                )
+                if incoming_decision:
+                    file_row.decision = incoming_decision
+                incoming_reason_status = _text(item.get("reason_status"))
+                if incoming_reason_status or is_new_file:
+                    file_row.reason_status = incoming_reason_status or "pending"
+                incoming_reason_scope = _text(item.get("reason_scope"))
+                if incoming_reason_scope or is_new_file:
+                    file_row.reason_scope = incoming_reason_scope or "project_legacy"
+                incoming_reason_text = _text(
                     item.get("reason_text")
                     or item.get("judgment_explanation")
-                ) or None
-                file_row.grade = _int(
-                    item.get("grade") if item.get("grade") is not None else item.get("final_grade"),
-                    -1,
                 )
-                if file_row.grade < 0:
-                    file_row.grade = None
-                file_row.hard_gate = _text(item.get("hard_gate")) or None
-                file_row.confidence = _float(
+                if incoming_reason_text:
+                    file_row.reason_text = incoming_reason_text
+                incoming_grade = item.get("grade")
+                if incoming_grade is None:
+                    incoming_grade = item.get("final_grade")
+                if incoming_grade is not None:
+                    parsed_grade = _int(incoming_grade, -1)
+                    file_row.grade = parsed_grade if parsed_grade >= 0 else None
+                incoming_hard_gate = _text(item.get("hard_gate"))
+                if incoming_hard_gate:
+                    file_row.hard_gate = incoming_hard_gate
+                incoming_confidence = (
                     item.get("judgment_confidence")
                     if item.get("judgment_confidence") is not None
                     else item.get("confidence")
                 )
-                file_row.judgment_model_id = _text(
+                if incoming_confidence is not None:
+                    file_row.confidence = _float(incoming_confidence)
+                incoming_model_id = _text(
                     item.get("judgment_model_id") or item.get("model_id")
-                ) or None
-                file_row.judgment_version = _text(
-                    item.get("judgment_version") or item.get("judgment_rubric_version")
-                ) or None
-                file_row.limitations = _json_value(
-                    item.get("limitations") or item.get("judgment_limitations") or [],
-                    [],
                 )
+                if incoming_model_id:
+                    file_row.judgment_model_id = incoming_model_id
+                incoming_judgment_version = _text(
+                    item.get("judgment_version") or item.get("judgment_rubric_version")
+                )
+                if incoming_judgment_version:
+                    file_row.judgment_version = incoming_judgment_version
+                incoming_limitations = item.get("limitations")
+                if incoming_limitations is None:
+                    incoming_limitations = item.get("judgment_limitations")
+                if incoming_limitations is not None:
+                    file_row.limitations = _json_value(incoming_limitations, [])
                 explicit_eligible = item.get("eligible")
                 if explicit_eligible is None:
                     explicit_eligible = item.get("usable")
-                if file_row.decision is not None:
-                    file_row.eligible = file_row.decision == "include"
-                else:
+                if incoming_decision:
+                    file_row.eligible = incoming_decision == "include"
+                elif explicit_eligible is not None or is_new_file:
                     file_row.eligible = (
                         bool(explicit_eligible)
                         if explicit_eligible is not None
                         else file_row.status
                         not in {"excluded", "invalid", "unusable", "missing"}
                     )
-                file_row.reason_code = _text(
+                incoming_reason_code = _text(
                     item.get("reason_code")
                     or item.get("primary_reason")
-                ) or None
-                file_row.reasons = _json_value(item.get("reasons") or [], [])
-                file_row.evidence = _bounded_payload(
-                    item.get("evidence")
-                    if isinstance(item.get("evidence"), Mapping)
-                    else {
-                        "evidence_refs": item.get("evidence_refs") or [],
-                        "file_role": item.get("file_role"),
-                    }
                 )
+                if incoming_reason_code:
+                    file_row.reason_code = incoming_reason_code
+                if item.get("reasons") is not None:
+                    file_row.reasons = _json_value(item.get("reasons"), [])
+                if isinstance(item.get("evidence"), Mapping) or item.get("evidence_refs"):
+                    file_row.evidence = _bounded_payload(
+                        item.get("evidence")
+                        if isinstance(item.get("evidence"), Mapping)
+                        else {
+                            "evidence_refs": item.get("evidence_refs") or [],
+                            "file_role": item.get("file_role"),
+                        }
+                    )
                 file_row.updated_at = job_row.updated_at
         for batch_payload in job.get("result_batches") or []:
             if isinstance(batch_payload, Mapping):
